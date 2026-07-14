@@ -82,8 +82,8 @@ class BeliefMCTS:
 
     def __init__(
         self,
-        model: PolicyValueBeliefNet,
-        device: torch.device,
+        model: Optional[PolicyValueBeliefNet],
+        device: Optional[torch.device],
         config: MCTSConfig,
         inference: Optional[BatchedInference] = None,
     ) -> None:
@@ -118,6 +118,8 @@ class BeliefMCTS:
         events: List[Dict[str, object] | None] | None = None,
     ) -> List[Tuple[Dict[int, float], float]]:
         """Evaluate variable-action MCTS leaves in one GPU forward pass."""
+        if self.model is None or self.device is None:
+            raise RuntimeError("direct MCTS inference requires a local model and device")
         tensors = packets_to_tensors(packets, self.device, events)
         output = self.model(
             tensors.map_tokens,
@@ -156,7 +158,18 @@ class BeliefMCTS:
 
     @torch.no_grad()
     def _particles(self, packet: Dict[str, object], events: Dict[str, object] | None = None) -> List[np.ndarray]:
+        remote_sample = getattr(self.inference, "sample_particles", None)
+        if callable(remote_sample):
+            return remote_sample(
+                packet,
+                events,
+                self.config.particles,
+                max(self.config.temperature, 0.35),
+            )
+
         def sample() -> List[torch.Tensor]:
+            if self.model is None or self.device is None:
+                raise RuntimeError("local particle sampling requires a model and device")
             tensors = packet_to_tensors(packet, self.device, events)
             return self.model.sample_completed_maps(
                 tensors.map_tokens,

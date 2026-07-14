@@ -49,6 +49,12 @@ def main() -> None:
         help="Parallel CPU self-play actors sharing one CUDA inference worker.",
     )
     parser.add_argument(
+        "--actor-processes",
+        type=int,
+        default=0,
+        help="CPU processes for PolyEnv/MCTS; use on CUDA to bypass the Python GIL.",
+    )
+    parser.add_argument(
         "--actor-round-games",
         type=int,
         default=8,
@@ -70,6 +76,7 @@ def main() -> None:
         mixed_opponent=args.mixed_opponent,
         teacher_replay_fraction=args.teacher_replay_fraction,
         actor_workers=args.actor_workers,
+        actor_processes=args.actor_processes,
         actor_round_games=args.actor_round_games,
         inference_max_batch_size=args.inference_max_batch_size,
         inference_wait_ms=args.inference_wait_ms,

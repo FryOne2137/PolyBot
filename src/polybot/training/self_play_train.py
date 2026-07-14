@@ -18,9 +18,11 @@ from ..infrastructure.model_io import save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.batched_inference import BatchedInference
 from ..planning.belief_mcts import BeliefMCTS
+from ..planning.process_inference import ProcessInferenceServer
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer
 from .self_play import SelfPlayRunner
+from .process_actors import ProcessActorPool
 from .teacher_bootstrap import _teacher_game
 
 
@@ -35,6 +37,7 @@ def train_self_play(
     mixed_opponent: str = "heuristic",
     teacher_replay_fraction: float = 0.25,
     actor_workers: int = 1,
+    actor_processes: int = 0,
     actor_round_games: int = 8,
     inference_max_batch_size: int = 64,
     inference_wait_ms: float = 0.25,
@@ -56,6 +59,8 @@ def train_self_play(
         raise ValueError("teacher_replay_fraction must be between 0 and 1")
     if actor_workers < 1:
         raise ValueError("actor_workers must be at least one")
+    if actor_processes < 0:
+        raise ValueError("actor_processes cannot be negative")
     if actor_round_games < 1:
         raise ValueError("actor_round_games must be at least one")
     device = select_device(training.device)
@@ -76,7 +81,7 @@ def train_self_play(
     print(
         f"device: {device} | games: {games} | MCTS simulations: "
         f"{mcts_config.simulations} | particles: {mcts_config.particles} | "
-        f"actors: {actor_workers} | games per actor round: {actor_round_games}"
+        f"actors: {actor_processes or actor_workers} | games per actor round: {actor_round_games}"
     )
     environment_progress = tqdm(
         total=games,
@@ -108,7 +113,20 @@ def train_self_play(
             max_batch_size=inference_max_batch_size,
             wait_ms=inference_wait_ms,
         )
-        if actor_workers > 1
+        if actor_workers > 1 and actor_processes == 0
+        else None
+    )
+    process_pool = ProcessActorPool(actor_processes, training, mcts_config) if actor_processes else None
+    process_inference = (
+        ProcessInferenceServer(
+            process_pool.requests,
+            process_pool.responses,
+            prototype._evaluate_packets_direct,
+            lambda packet, events, _count, _temperature: prototype._particles(packet, events),
+            max_batch_size=inference_max_batch_size,
+            wait_ms=inference_wait_ms,
+        )
+        if process_pool is not None
         else None
     )
 
@@ -126,65 +144,83 @@ def train_self_play(
         )
         return game_index, use_anchor_opponent, examples, metrics
 
+    def record_completed(completed_games: list[Tuple[int, bool, list, Dict[str, float]]]) -> None:
+        nonlocal opponent_games, exploration_actions
+        for game_index, used_anchor, examples, game_metrics in completed_games:
+            replay.extend(examples)
+            if teacher_replay_fraction > 0.0:
+                teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + game_index, training)
+                teacher_replay.extend(teacher_examples)
+            opponent_games += float(used_anchor)
+            exploration_actions += game_metrics.get("exploration_actions", 0.0)
+            rewards.extend(value for name, value in game_metrics.items() if name.startswith("shaped_reward_player_"))
+            for name, value in game_metrics.items():
+                if name.startswith("reward_"):
+                    reward_totals[name] = reward_totals.get(name, 0.0) + value
+                if name == "model_actions" or name.startswith("model_action_"):
+                    action_totals[name] = action_totals.get(name, 0.0) + value
+            environment_progress.update(1)
+            environment_progress.set_postfix(
+                moves=int(game_metrics["moves"]),
+                examples=len(replay),
+                actors=actor_processes or actor_workers,
+            )
+
+    def optimise_after_generation(generated_games: int) -> None:
+        nonlocal optimisation_seconds
+        if len(replay) < training.batch_size:
+            return
+        optimisation_started = perf_counter()
+        for _ in range(updates_per_game * generated_games):
+            teacher_count = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher_replay))
+            self_play_count = training.batch_size - teacher_count
+            if len(replay) < self_play_count:
+                teacher_count = training.batch_size
+                self_play_count = 0
+            examples_batch = []
+            if self_play_count:
+                examples_batch.extend(replay.sample(self_play_count, rng, training.priority_replay_fraction))
+            if teacher_count:
+                examples_batch.extend(teacher_replay.sample(teacher_count, rng, training.priority_replay_fraction))
+            losses.append(train_batch(model, optimiser, stack_examples(examples_batch, device), training))
+        optimisation_seconds += perf_counter() - optimisation_started
+
     try:
         model.eval()
-        with ThreadPoolExecutor(max_workers=actor_workers, thread_name_prefix="polybot-actor") as actors:
-            # Queue several games per actor.  A worker that finishes early
-            # immediately pulls the next job rather than idling at a barrier.
-            # We only stop after a complete round to apply optimiser updates;
-            # changing weights while another actor searches would be unsafe.
-            round_size = actor_workers * actor_round_games
+        active_actors = actor_processes or actor_workers
+        round_size = active_actors * actor_round_games
+        if process_pool is not None:
             for start in range(0, games, round_size):
-                # Optimisation leaves the module in train mode.  Search must
-                # always use deterministic dropout-free inference.
                 model.eval()
                 generation_started = perf_counter()
-                futures = [actors.submit(play_job, job) for job in jobs[start:start + round_size]]
-                completed_games = [future.result() for future in as_completed(futures)]
-                for game_index, used_anchor, examples, game_metrics in completed_games:
-                    replay.extend(examples)
-                    if teacher_replay_fraction > 0.0:
-                        teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + game_index, training)
-                        teacher_replay.extend(teacher_examples)
-                    opponent_games += float(used_anchor)
-                    exploration_actions += game_metrics.get("exploration_actions", 0.0)
-                    rewards.extend(value for name, value in game_metrics.items() if name.startswith("shaped_reward_player_"))
-                    for name, value in game_metrics.items():
-                        if name.startswith("reward_"):
-                            reward_totals[name] = reward_totals.get(name, 0.0) + value
-                        if name == "model_actions" or name.startswith("model_action_"):
-                            action_totals[name] = action_totals.get(name, 0.0) + value
-                    environment_progress.update(1)
-                    environment_progress.set_postfix(
-                        moves=int(game_metrics["moves"]),
-                        examples=len(replay),
-                        actors=actor_workers,
-                    )
-
+                completed_games = []
+                for result in process_pool.run(jobs[start:start + round_size]):
+                    completed = (result[2], result[3], result[4], result[5])
+                    completed_games.append(completed)
+                    record_completed([completed])
                 generation_seconds += perf_counter() - generation_started
-
-                if len(replay) < training.batch_size:
-                    continue
-                optimisation_started = perf_counter()
-                for _ in range(updates_per_game * len(completed_games)):
-                    teacher_count = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher_replay))
-                    self_play_count = training.batch_size - teacher_count
-                    if len(replay) < self_play_count:
-                        teacher_count = training.batch_size
-                        self_play_count = 0
-                    examples_batch = []
-                    if self_play_count:
-                        examples_batch.extend(replay.sample(self_play_count, rng, training.priority_replay_fraction))
-                    if teacher_count:
-                        examples_batch.extend(teacher_replay.sample(teacher_count, rng, training.priority_replay_fraction))
-                    losses.append(train_batch(model, optimiser, stack_examples(examples_batch, device), training))
-                optimisation_seconds += perf_counter() - optimisation_started
+                optimise_after_generation(len(completed_games))
+        else:
+            with ThreadPoolExecutor(max_workers=actor_workers, thread_name_prefix="polybot-actor") as actors:
+                for start in range(0, games, round_size):
+                    model.eval()
+                    generation_started = perf_counter()
+                    futures = [actors.submit(play_job, job) for job in jobs[start:start + round_size]]
+                    completed_games = [future.result() for future in as_completed(futures)]
+                    generation_seconds += perf_counter() - generation_started
+                    record_completed(completed_games)
+                    optimise_after_generation(len(completed_games))
     finally:
         environment_progress.close()
+        if process_pool is not None:
+            process_pool.close()
+        if process_inference is not None:
+            inference_stats = process_inference.stats()
+            process_inference.close()
         if inference is not None:
             inference_stats = inference.stats()
             inference.close()
-        else:
+        elif process_inference is None:
             inference_stats = {}
 
     if model_out is not None:
@@ -198,6 +234,7 @@ def train_self_play(
         "actual_exploration_rate": exploration_actions / max(1, len(replay)),
         "opponent_games": opponent_games,
         "actor_workers": float(actor_workers),
+        "actor_processes": float(actor_processes),
         "actor_round_games": float(actor_round_games),
         "inference_max_batch_size": float(inference_max_batch_size),
         "generation_seconds": generation_seconds,

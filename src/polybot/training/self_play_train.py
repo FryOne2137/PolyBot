@@ -35,6 +35,7 @@ def train_self_play(
     mixed_opponent: str = "heuristic",
     teacher_replay_fraction: float = 0.25,
     actor_workers: int = 1,
+    actor_round_games: int = 8,
     inference_max_batch_size: int = 64,
     inference_wait_ms: float = 0.25,
     model_out: Optional[Path] = None,
@@ -55,6 +56,8 @@ def train_self_play(
         raise ValueError("teacher_replay_fraction must be between 0 and 1")
     if actor_workers < 1:
         raise ValueError("actor_workers must be at least one")
+    if actor_round_games < 1:
+        raise ValueError("actor_round_games must be at least one")
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(
@@ -72,7 +75,7 @@ def train_self_play(
     progress.stage(
         f"device: {device} | games: {games} | MCTS simulations: "
         f"{mcts_config.simulations} | particles: {mcts_config.particles} | "
-        f"actors: {actor_workers}"
+        f"actors: {actor_workers} | games per actor round: {actor_round_games}"
     )
     losses = []
     rewards = []
@@ -123,12 +126,17 @@ def train_self_play(
     try:
         model.eval()
         with ThreadPoolExecutor(max_workers=actor_workers, thread_name_prefix="polybot-actor") as actors:
-            for start in range(0, games, actor_workers):
+            # Queue several games per actor.  A worker that finishes early
+            # immediately pulls the next job rather than idling at a barrier.
+            # We only stop after a complete round to apply optimiser updates;
+            # changing weights while another actor searches would be unsafe.
+            round_size = actor_workers * actor_round_games
+            for start in range(0, games, round_size):
                 # Optimisation leaves the module in train mode.  Search must
                 # always use deterministic dropout-free inference.
                 model.eval()
                 generation_started = perf_counter()
-                futures = [actors.submit(play_job, job) for job in jobs[start:start + actor_workers]]
+                futures = [actors.submit(play_job, job) for job in jobs[start:start + round_size]]
                 completed_games = [future.result() for future in as_completed(futures)]
                 for game_index, used_anchor, examples, game_metrics in completed_games:
                     progress.game_complete(
@@ -186,6 +194,7 @@ def train_self_play(
         "actual_exploration_rate": exploration_actions / max(1, len(replay)),
         "opponent_games": opponent_games,
         "actor_workers": float(actor_workers),
+        "actor_round_games": float(actor_round_games),
         "inference_max_batch_size": float(inference_max_batch_size),
         "generation_seconds": generation_seconds,
         "games_per_generation_second": games / max(generation_seconds, 1e-9),

@@ -84,7 +84,7 @@ Postęp i składniki reward są wypisywane wyłącznie do terminala. Self-play p
 
 MCTS zbiera domyślnie `8` liści i wysyła je do GPU w jednym forwardzie (`--inference-batch-size 8`). To zwiększa wykorzystanie CUDA bez zmiany liczby symulacji ani informacji dostępnej botowi. Na GPU z większym zapasem pamięci można próbować `16` albo `32`; przy błędzie CUDA out-of-memory wróć do `8` lub `4`.
 
-Na CUDA można też uruchomić kilka niezależnych actorów (`--actor-workers 4`). Każdy zachowuje własne środowisko i drzewo MCTS na CPU, a wspólny worker GPU łączy ich żądania w batch do `--inference-max-batch-size 64`. Domyślne okno łączenia to tylko `--inference-wait-ms 0.25`, aby nie spowalniać małych batchy. Zacznij od czterech actorów; zwiększaj tylko po krótkim teście stabilności. Ten tryb nadal zapisuje wyłącznie checkpoint modelu.
+Na CUDA można też uruchomić kilka niezależnych actorów (`--actor-workers 4`). Każdy zachowuje własne środowisko i drzewo MCTS na CPU, a wspólny worker GPU łączy ich żądania w batch do `--inference-max-batch-size 64`. Domyślne okno łączenia to tylko `--inference-wait-ms 0.25`, aby nie spowalniać małych batchy. Worker, który kończy grę, od razu pobiera następną z kolejki; `--actor-round-games 8` określa tylko, po ilu grach na actor następuje wspólna pauza na aktualizację wag. Zacznij od czterech actorów; zwiększaj tylko po krótkim teście stabilności. Ten tryb nadal zapisuje wyłącznie checkpoint modelu.
 
 W pierwszych rundach self-play `--exploration-rate 0.20` wykonuje część ruchów z bezpiecznego curriculum legalnych akcji (miasta, walka, eksploracja), aby uniknąć danych z samych remisów. MCTS nadal tworzy target policy dla każdej pozycji.
 

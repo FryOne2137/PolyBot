@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -35,7 +36,7 @@ def train_self_play(
     teacher_replay_fraction: float = 0.25,
     actor_workers: int = 1,
     inference_max_batch_size: int = 64,
-    inference_wait_ms: float = 2.0,
+    inference_wait_ms: float = 0.25,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
 ) -> Dict[str, float]:
@@ -79,6 +80,8 @@ def train_self_play(
     opponent_games = 0.0
     reward_totals: Dict[str, float] = {}
     action_totals: Dict[str, float] = {}
+    generation_seconds = 0.0
+    optimisation_seconds = 0.0
     schedule_rng = np.random.default_rng(training.seed ^ 0xA17C0)
     jobs: list[Tuple[int, bool, Optional[str], Optional[int]]] = []
     for game_index in range(games):
@@ -103,10 +106,10 @@ def train_self_play(
         game_index, use_anchor_opponent, opponent_agent, train_player = job
         planner = BeliefMCTS(model, device, mcts_config, inference=inference)
         runner = SelfPlayRunner(planner, training, logger=None)
-        report_search = None
-        if actor_workers == 1:
-            def report_search(move: int, completed: int, total: int, particles: int) -> None:
-                progress.mcts(game_index + 1, games, move, completed, total, particles)
+        def report_search(move: int, completed: int, total: int, particles: int) -> None:
+            # ConsoleProgress serialises writes, so parallel actors can safely
+            # update one live status line without corrupting the terminal.
+            progress.mcts(game_index + 1, games, move, completed, total, particles)
         examples, metrics = runner.play_game(
             training.seed + game_index,
             iteration=0,
@@ -124,6 +127,7 @@ def train_self_play(
                 # Optimisation leaves the module in train mode.  Search must
                 # always use deterministic dropout-free inference.
                 model.eval()
+                generation_started = perf_counter()
                 futures = [actors.submit(play_job, job) for job in jobs[start:start + actor_workers]]
                 completed_games = [future.result() for future in as_completed(futures)]
                 for game_index, used_anchor, examples, game_metrics in completed_games:
@@ -146,8 +150,11 @@ def train_self_play(
                         if name == "model_actions" or name.startswith("model_action_"):
                             action_totals[name] = action_totals.get(name, 0.0) + value
 
+                generation_seconds += perf_counter() - generation_started
+
                 if len(replay) < training.batch_size:
                     continue
+                optimisation_started = perf_counter()
                 for _ in range(updates_per_game * len(completed_games)):
                     teacher_count = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher_replay))
                     self_play_count = training.batch_size - teacher_count
@@ -160,9 +167,13 @@ def train_self_play(
                     if teacher_count:
                         examples_batch.extend(teacher_replay.sample(teacher_count, rng, training.priority_replay_fraction))
                     losses.append(train_batch(model, optimiser, stack_examples(examples_batch, device), training))
+                optimisation_seconds += perf_counter() - optimisation_started
     finally:
         if inference is not None:
+            inference_stats = inference.stats()
             inference.close()
+        else:
+            inference_stats = {}
 
     if model_out is not None:
         save_model(model_out, model, model_config)
@@ -176,6 +187,10 @@ def train_self_play(
         "opponent_games": opponent_games,
         "actor_workers": float(actor_workers),
         "inference_max_batch_size": float(inference_max_batch_size),
+        "generation_seconds": generation_seconds,
+        "games_per_generation_second": games / max(generation_seconds, 1e-9),
+        "optimisation_seconds": optimisation_seconds,
+        **inference_stats,
     }
     total_examples = max(1, len(replay))
     for name, value in reward_totals.items():

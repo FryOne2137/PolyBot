@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from threading import Event, RLock, Thread
+from threading import Event, Lock, RLock, Thread
 from time import monotonic
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -30,12 +30,15 @@ class BatchedInference:
     from independent games fill a useful GPU batch.
     """
 
-    def __init__(self, evaluate: EvaluateFn, max_batch_size: int = 64, wait_ms: float = 2.0) -> None:
+    def __init__(self, evaluate: EvaluateFn, max_batch_size: int = 64, wait_ms: float = 0.25) -> None:
         self._evaluate = evaluate
         self.max_batch_size = max(1, int(max_batch_size))
         self.wait_seconds = max(0.0, float(wait_ms)) / 1_000.0
         self._requests: Queue[_Request | None] = Queue()
         self._model_lock = RLock()
+        self._stats_lock = Lock()
+        self._batches = 0
+        self._packets = 0
         self._closed = False
         self._worker = Thread(target=self._run, name="polybot-gpu-inference", daemon=True)
         self._worker.start()
@@ -66,6 +69,15 @@ class BatchedInference:
             self._closed = True
             self._requests.put(None)
             self._worker.join()
+
+    def stats(self) -> Dict[str, float]:
+        """Return compact in-memory throughput diagnostics for terminal output."""
+        with self._stats_lock:
+            return {
+                "inference_batches": float(self._batches),
+                "inference_packets": float(self._packets),
+                "mean_inference_batch_size": self._packets / max(1, self._batches),
+            }
 
     def _run(self) -> None:
         while True:
@@ -99,6 +111,9 @@ class BatchedInference:
             try:
                 with self._model_lock:
                     evaluations = self._evaluate(packets, events)
+                with self._stats_lock:
+                    self._batches += 1
+                    self._packets += len(packets)
                 offset = 0
                 for request in requests:
                     size = len(request.packets)

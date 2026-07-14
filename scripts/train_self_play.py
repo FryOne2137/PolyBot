@@ -49,7 +49,7 @@ def main() -> None:
         help="Parallel CPU self-play actors sharing one CUDA inference worker.",
     )
     parser.add_argument("--inference-max-batch-size", type=int, default=64)
-    parser.add_argument("--inference-wait-ms", type=float, default=2.0)
+    parser.add_argument("--inference-wait-ms", type=float, default=0.25)
     args = parser.parse_args()
     training = training_config_from_args(args)
     model, model_config = load_model(args.model_in, select_device(training.device))

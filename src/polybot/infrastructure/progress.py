@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from threading import RLock
 
 
 class ConsoleProgress:
@@ -13,10 +14,12 @@ class ConsoleProgress:
         self.width = width
         self._interactive = sys.stdout.isatty()
         self._last_line = ""
+        self._lock = RLock()
 
     def stage(self, text: str) -> None:
-        if self.enabled:
-            self._write(text, replace=False)
+        with self._lock:
+            if self.enabled:
+                self._write(text, replace=False)
 
     def mcts(
         self,
@@ -27,21 +30,23 @@ class ConsoleProgress:
         total: int,
         valid_particles: int,
     ) -> None:
-        total = max(total, 1)
-        fraction = min(completed / total, 1.0)
-        filled = int(fraction * self.width)
-        bar = "#" * filled + "-" * (self.width - filled)
-        line = (
-            f"game {game}/{games} | move {move} | "
-            f"MCTS [{bar}] {completed}/{total} | particles {valid_particles}"
-        )
-        self._write(line, replace=True)
+        with self._lock:
+            total = max(total, 1)
+            fraction = min(completed / total, 1.0)
+            filled = int(fraction * self.width)
+            bar = "#" * filled + "-" * (self.width - filled)
+            line = (
+                f"game {game}/{games} | move {move} | "
+                f"MCTS [{bar}] {completed}/{total} | particles {valid_particles}"
+            )
+            self._write(line, replace=True)
 
     def game_complete(self, game: int, games: int, moves: int, examples: int) -> None:
-        self._write(
-            f"game {game}/{games} complete | moves {moves} | examples {examples}",
-            replace=False,
-        )
+        with self._lock:
+            self._write(
+                f"game {game}/{games} complete | moves {moves} | examples {examples}",
+                replace=False,
+            )
 
     def _write(self, line: str, replace: bool) -> None:
         if not self.enabled:

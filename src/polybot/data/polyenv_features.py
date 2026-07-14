@@ -1,0 +1,273 @@
+"""Conversion between PolyEnv packets and neural-network tensors.
+
+The model only receives ``model_request_numpy()`` packets.  Full maps are
+handled separately as supervised labels in the training loop.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List
+
+import numpy as np
+import torch
+
+from .token_schema import (
+    ACTION_CATEGORICAL_FIELDS,
+    ACTION_CONTINUOUS_FIELDS,
+    EVENT_SUMMARY_SIZE,
+    MAP_FEATURE_MAX,
+)
+
+
+@dataclass
+class PacketTensors:
+    map_tokens: torch.Tensor
+    global_features: torch.Tensor
+    event_features: torch.Tensor
+    action_categorical: torch.Tensor
+    action_continuous: torch.Tensor
+    action_mask: torch.Tensor
+
+
+def _scalar(value: Any, default: float = 0.0) -> float:
+    """Convert PolyEnv scalar/list values to a safe numeric feature."""
+    if value is None:
+        return default
+    if isinstance(value, (str, bytes)):
+        return default
+    array = np.asarray(value)
+    if array.size == 0:
+        return default
+    if array.ndim == 0:
+        return float(array.item())
+    return float(array.size)
+
+
+def global_features_from_obs(obs: Dict[str, Any]) -> np.ndarray:
+    """Small, stable global vector; unknown keys are deliberately ignored."""
+    map_type = str(obs.get("map_type", "lakes")).lower()
+    pending = obs.get("pending_city_reward", obs.get("pending_city_rewards", 0))
+    values = [
+        _scalar(obs.get("turn")) / 100.0,
+        _scalar(obs.get("current_player", obs.get("player"))) / 16.0,
+        _scalar(obs.get("player_stars", obs.get("stars"))) / 50.0,
+        _scalar(obs.get("next_turn_star_income", obs.get("income"))) / 20.0,
+        _scalar(obs.get("owns_units", obs.get("own_units", obs.get("units")))) / 32.0,
+        _scalar(obs.get("own_cities", obs.get("cities"))) / 16.0,
+        _scalar(pending),
+        _scalar(obs.get("map_size")) / 32.0,
+        1.0 if map_type == "drylands" else 0.0,
+    ]
+    return np.asarray(values, dtype=np.float32)
+
+
+def event_summary(events: Dict[str, Any] | None) -> np.ndarray:
+    """Compress the *visible* journal into fixed-size belief-model context.
+
+    The summary intentionally has no engine unit IDs.  Passing a raw history to
+    a Transformer is a useful later upgrade; this compact form keeps the first
+    implementation fast enough for MCTS while retaining movement/combat signal.
+    """
+    result = np.zeros(EVENT_SUMMARY_SIZE, dtype=np.float32)
+    if not events or "type_id" not in events:
+        return result
+    types = np.asarray(events["type_id"], dtype=np.int64).reshape(-1)
+    result[0] = min(types.size, 128) / 128.0
+    for event_type in range(8):
+        result[1 + event_type] = float(np.count_nonzero(types == event_type)) / 32.0
+    if "damage" in events:
+        result[9] = float(np.clip(np.asarray(events["damage"]).clip(min=0).sum(), 0, 200)) / 200.0
+    if "unit_destroyed" in events:
+        result[10] = float(np.count_nonzero(np.asarray(events["unit_destroyed"]) > 0)) / 16.0
+    if "source_unit_destroyed" in events:
+        result[11] = float(np.count_nonzero(np.asarray(events["source_unit_destroyed"]) > 0)) / 16.0
+    return result
+
+
+def visible_events_or_empty(env: Any, since: int = 0) -> Dict[str, Any]:
+    """Read the optional visible-event API without requiring a new PolyEnv.
+
+    Older PolyEnv installations do not expose ``visible_events_numpy`` yet.
+    Empty event features are safe: they reduce belief quality but never reveal
+    hidden information or prevent policy/value training.
+    """
+    read_events = getattr(env, "visible_events_numpy", None)
+    if read_events is None:
+        return {}
+    return read_events(since)
+
+
+def _field(actions: Dict[str, Any], name: str, count: int) -> np.ndarray:
+    value = actions.get(name)
+    if value is None:
+        return np.full(count, -1, dtype=np.int64)
+    result = np.asarray(value, dtype=np.int64).reshape(-1)
+    if result.size != count:
+        raise ValueError("action field %r has %d rows, expected %d" % (name, result.size, count))
+    return result
+
+
+def action_features(actions: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Return one categorical and one continuous feature row per legal action."""
+    if "action_id" not in actions:
+        raise ValueError("PolyEnv action packet is missing action_id")
+    count = int(np.asarray(actions["action_id"]).reshape(-1).size)
+    categorical = np.stack([_field(actions, name, count) for name in ACTION_CATEGORICAL_FIELDS], axis=-1)
+    continuous = np.stack([_field(actions, name, count) for name in ACTION_CONTINUOUS_FIELDS], axis=-1)
+    return categorical, continuous.astype(np.float32)
+
+
+def capture_flags(packet: Dict[str, Any], action_row: int) -> tuple[bool, bool]:
+    """Return whether a legal action captures a visible city/capital.
+
+    The action list and its visible target are part of the normal player
+    observation, so this helper is safe for both MCTS and evaluation.
+    """
+    actions = packet["actions"]
+    full_names = actions.get("type_fullname", [])
+    if action_row >= len(full_names) or str(full_names[action_row]) != "tile_action:capture_city":
+        return False, False
+    city_ids = np.asarray(actions.get("city", []), dtype=np.int64).reshape(-1)
+    if action_row >= city_ids.size or city_ids[action_row] < 0:
+        return True, False
+    tokens = np.asarray(packet["map_tokens"], dtype=np.int64)
+    city_id = city_ids[action_row]
+    capital = bool(np.any((tokens[:, 15] == city_id) & (tokens[:, 9] == 1)))
+    return True, capital
+
+
+def strategic_action_bias(
+    packet: Dict[str, Any],
+    *,
+    capture_city_bonus: float = 2.0,
+    capture_capital_bonus: float = 4.0,
+    found_city_bonus: float = 3.0,
+    attack_bonus: float = 0.8,
+    end_turn_penalty: float = 2.0,
+) -> np.ndarray:
+    """Small safe prior biases for productive legal actions.
+
+    Every value comes from the visible packet and legal-action list.  This is
+    a curriculum aid for early self-play, not a substitute for learned policy.
+    """
+    actions = packet["actions"]
+    action_ids = np.asarray(actions["action_id"], dtype=np.int64).reshape(-1)
+    count = action_ids.size
+    bias = np.zeros(count, dtype=np.float32)
+    full_names = actions.get("type_fullname", [])
+    damage = np.asarray(actions.get("damage_dealt", np.zeros(count)), dtype=np.float32).reshape(-1)
+    targets = np.asarray(actions.get("target_index", np.full(count, -1)), dtype=np.int64).reshape(-1)
+    sources = np.asarray(actions.get("source_index", np.full(count, -1)), dtype=np.int64).reshape(-1)
+    tokens = np.asarray(packet["map_tokens"], dtype=np.int64)
+    player = int(packet["obs"].get("current_player", 0))
+    width = int(packet.get("spec", {}).get("map_width", max(1, round(len(tokens) ** 0.5))))
+    visible = tokens[:, 0] == 1
+    enemy_city = visible & (tokens[:, 14] == 2) & (tokens[:, 16] >= 0) & (tokens[:, 16] != player)
+    village = visible & (tokens[:, 14] == 1)
+    enemy_unit = visible & (tokens[:, 4] >= 0) & (tokens[:, 3] >= 0) & (tokens[:, 3] != player)
+    goal_indices = np.flatnonzero(enemy_city | village | enemy_unit)
+
+    def distance(index: int, goals: np.ndarray) -> int:
+        x, y = index % width, index // width
+        goal_x, goal_y = goals % width, goals // width
+        return int(np.min(np.abs(goal_x - x) + np.abs(goal_y - y)))
+
+    for row in range(count):
+        name = str(full_names[row]) if row < len(full_names) else ""
+        captures_city, captures_capital = capture_flags(packet, row)
+        if captures_capital:
+            bias[row] += capture_capital_bonus
+        elif captures_city:
+            bias[row] += capture_city_bonus
+        elif name == "tile_action:found_city":
+            bias[row] += found_city_bonus
+        elif name == "attack":
+            dealt = damage[row] if row < damage.size else 0.0
+            bias[row] += attack_bonus + min(max(float(dealt), 0.0), 10.0) * 0.12
+        elif name in {"tile_action:ruin", "tile_action:explorer"}:
+            bias[row] += 0.8
+        elif name.startswith("build:") or name.startswith("upgrade_city:"):
+            bias[row] += 0.45
+        elif name.startswith("spawn_unit:") or name.startswith("buy_tech:"):
+            bias[row] += 0.25
+        elif name == "move":
+            target = targets[row] if row < targets.size else -1
+            if 0 <= target < len(tokens) and tokens[target, 0] == 0:
+                bias[row] += 0.5
+            source = sources[row] if row < sources.size else -1
+            if 0 <= source < len(tokens) and 0 <= target < len(tokens) and goal_indices.size:
+                improvement = distance(source, goal_indices) - distance(target, goal_indices)
+                if improvement > 0:
+                    # Prefer moving toward visible objectives, but preserve
+                    # learned policy between equally useful paths.
+                    bias[row] += min(1.2, 0.4 * improvement)
+
+    if count > 1:
+        for row in range(count):
+            name = str(full_names[row]) if row < len(full_names) else ""
+            if name == "end_turn":
+                bias[row] -= end_turn_penalty
+    return bias
+
+
+def packet_to_tensors(
+    packet: Dict[str, Any],
+    device: torch.device,
+    events: Dict[str, Any] | None = None,
+) -> PacketTensors:
+    """Make a batch of one, retaining the current legal-action order."""
+    map_tokens = np.asarray(packet["map_tokens"], dtype=np.int64)
+    if map_tokens.ndim != 2 or map_tokens.shape[1] != len(MAP_FEATURE_MAX):
+        raise ValueError("expected map_tokens with shape [tiles, 23]")
+    categorical, continuous = action_features(packet["actions"])
+    return PacketTensors(
+        map_tokens=torch.as_tensor(map_tokens[None], dtype=torch.long, device=device),
+        global_features=torch.as_tensor(global_features_from_obs(packet["obs"])[None], device=device),
+        event_features=torch.as_tensor(event_summary(events)[None], dtype=torch.float32, device=device),
+        action_categorical=torch.as_tensor(categorical[None], dtype=torch.long, device=device),
+        action_continuous=torch.as_tensor(continuous[None], dtype=torch.float32, device=device),
+        action_mask=torch.ones((1, categorical.shape[0]), dtype=torch.bool, device=device),
+    )
+
+
+def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    """Pad variable-length legal-action lists for one optimisation batch."""
+    rows: List[Any] = list(examples)
+    if not rows:
+        raise ValueError("cannot stack an empty batch")
+    max_actions = max(int(row.action_categorical.shape[0]) for row in rows)
+    batch_size = len(rows)
+    tiles, features = rows[0].map_tokens.shape
+    cat_dim = rows[0].action_categorical.shape[1]
+    cont_dim = rows[0].action_continuous.shape[1]
+
+    maps = np.stack([row.map_tokens for row in rows]).astype(np.int64)
+    globals_ = np.stack([row.global_features for row in rows]).astype(np.float32)
+    events_ = np.stack([row.event_features for row in rows]).astype(np.float32)
+    full_maps = np.stack([row.full_map_target for row in rows]).astype(np.int64)
+    hidden = np.stack([row.hidden_mask for row in rows]).astype(bool)
+    values = np.asarray([row.value_target for row in rows], dtype=np.float32)
+    cats = np.full((batch_size, max_actions, cat_dim), -1, dtype=np.int64)
+    conts = np.zeros((batch_size, max_actions, cont_dim), dtype=np.float32)
+    masks = np.zeros((batch_size, max_actions), dtype=bool)
+    policies = np.zeros((batch_size, max_actions), dtype=np.float32)
+    for index, row in enumerate(rows):
+        length = row.action_categorical.shape[0]
+        cats[index, :length] = row.action_categorical
+        conts[index, :length] = row.action_continuous
+        masks[index, :length] = True
+        policies[index, :length] = row.policy_target
+
+    return {
+        "map_tokens": torch.as_tensor(maps, dtype=torch.long, device=device),
+        "global_features": torch.as_tensor(globals_, dtype=torch.float32, device=device),
+        "event_features": torch.as_tensor(events_, dtype=torch.float32, device=device),
+        "action_categorical": torch.as_tensor(cats, dtype=torch.long, device=device),
+        "action_continuous": torch.as_tensor(conts, dtype=torch.float32, device=device),
+        "action_mask": torch.as_tensor(masks, dtype=torch.bool, device=device),
+        "policy_target": torch.as_tensor(policies, dtype=torch.float32, device=device),
+        "value_target": torch.as_tensor(values, dtype=torch.float32, device=device),
+        "full_map_target": torch.as_tensor(full_maps, dtype=torch.long, device=device),
+        "hidden_mask": torch.as_tensor(hidden, dtype=torch.bool, device=device),
+    }

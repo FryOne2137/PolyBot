@@ -9,12 +9,12 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
 from ..data.polyenv_features import stack_examples
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
-from ..infrastructure.progress import ConsoleProgress
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.batched_inference import BatchedInference
 from ..planning.belief_mcts import BeliefMCTS
@@ -71,11 +71,18 @@ def train_self_play(
     # forgetting), while the rest of the batch still learns self-play.
     teacher_replay = ReplayBuffer(training.replay_capacity)
     rng = np.random.default_rng(training.seed)
-    progress = ConsoleProgress()
-    progress.stage(
+    # One progress bar owned by the main thread stays readable while actor
+    # threads complete environments in arbitrary order.
+    print(
         f"device: {device} | games: {games} | MCTS simulations: "
         f"{mcts_config.simulations} | particles: {mcts_config.particles} | "
         f"actors: {actor_workers} | games per actor round: {actor_round_games}"
+    )
+    environment_progress = tqdm(
+        total=games,
+        desc=f"self-play envs ({device})",
+        unit="env",
+        dynamic_ncols=True,
     )
     losses = []
     rewards = []
@@ -109,17 +116,13 @@ def train_self_play(
         game_index, use_anchor_opponent, opponent_agent, train_player = job
         planner = BeliefMCTS(model, device, mcts_config, inference=inference)
         runner = SelfPlayRunner(planner, training, logger=None)
-        def report_search(move: int, completed: int, total: int, particles: int) -> None:
-            # ConsoleProgress serialises writes, so parallel actors can safely
-            # update one live status line without corrupting the terminal.
-            progress.mcts(game_index + 1, games, move, completed, total, particles)
         examples, metrics = runner.play_game(
             training.seed + game_index,
             iteration=0,
             game_index=game_index,
             train_player=train_player,
             opponent_agent=opponent_agent,
-            on_search_progress=report_search,
+            on_search_progress=None,
         )
         return game_index, use_anchor_opponent, examples, metrics
 
@@ -139,12 +142,6 @@ def train_self_play(
                 futures = [actors.submit(play_job, job) for job in jobs[start:start + round_size]]
                 completed_games = [future.result() for future in as_completed(futures)]
                 for game_index, used_anchor, examples, game_metrics in completed_games:
-                    progress.game_complete(
-                        game=game_index + 1,
-                        games=games,
-                        moves=int(game_metrics["moves"]),
-                        examples=len(examples),
-                    )
                     replay.extend(examples)
                     if teacher_replay_fraction > 0.0:
                         teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + game_index, training)
@@ -157,6 +154,12 @@ def train_self_play(
                             reward_totals[name] = reward_totals.get(name, 0.0) + value
                         if name == "model_actions" or name.startswith("model_action_"):
                             action_totals[name] = action_totals.get(name, 0.0) + value
+                    environment_progress.update(1)
+                    environment_progress.set_postfix(
+                        moves=int(game_metrics["moves"]),
+                        examples=len(replay),
+                        actors=actor_workers,
+                    )
 
                 generation_seconds += perf_counter() - generation_started
 
@@ -177,6 +180,7 @@ def train_self_play(
                     losses.append(train_batch(model, optimiser, stack_examples(examples_batch, device), training))
                 optimisation_seconds += perf_counter() - optimisation_started
     finally:
+        environment_progress.close()
         if inference is not None:
             inference_stats = inference.stats()
             inference.close()

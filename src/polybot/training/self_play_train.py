@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..infrastructure.progress import ConsoleProgress
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..planning.batched_inference import BatchedInference
 from ..planning.belief_mcts import BeliefMCTS
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer
@@ -31,6 +33,9 @@ def train_self_play(
     random_opponent_rate: float = 0.5,
     mixed_opponent: str = "heuristic",
     teacher_replay_fraction: float = 0.25,
+    actor_workers: int = 1,
+    inference_max_batch_size: int = 64,
+    inference_wait_ms: float = 2.0,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
 ) -> Dict[str, float]:
@@ -47,6 +52,8 @@ def train_self_play(
         raise ValueError("mixed_opponent must be random or heuristic")
     if not 0.0 <= teacher_replay_fraction <= 1.0:
         raise ValueError("teacher_replay_fraction must be between 0 and 1")
+    if actor_workers < 1:
+        raise ValueError("actor_workers must be at least one")
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(
@@ -54,8 +61,6 @@ def train_self_play(
         lr=training.learning_rate,
         weight_decay=training.weight_decay,
     )
-    planner = BeliefMCTS(model, device, mcts_config)
-    runner = SelfPlayRunner(planner, training, logger=None)
     replay = ReplayBuffer(training.replay_capacity)
     # This is not written to disk.  It protects a productive bootstrap policy
     # from being overwritten by noisy early MCTS targets (catastrophic
@@ -65,7 +70,8 @@ def train_self_play(
     progress = ConsoleProgress()
     progress.stage(
         f"device: {device} | games: {games} | MCTS simulations: "
-        f"{mcts_config.simulations} | particles: {mcts_config.particles}"
+        f"{mcts_config.simulations} | particles: {mcts_config.particles} | "
+        f"actors: {actor_workers}"
     )
     losses = []
     rewards = []
@@ -73,97 +79,90 @@ def train_self_play(
     opponent_games = 0.0
     reward_totals: Dict[str, float] = {}
     action_totals: Dict[str, float] = {}
-
+    schedule_rng = np.random.default_rng(training.seed ^ 0xA17C0)
+    jobs: list[Tuple[int, bool, Optional[str], Optional[int]]] = []
     for game_index in range(games):
-        model.eval()
-        seed = training.seed + game_index
         use_anchor_opponent = opponent in {"random", "heuristic"} or (
-            opponent == "mixed" and rng.random() < random_opponent_rate
+            opponent == "mixed" and schedule_rng.random() < random_opponent_rate
         )
-        opponent_agent = (
-            mixed_opponent if opponent == "mixed" else opponent
-        ) if use_anchor_opponent else None
-        train_player = game_index % 2 if use_anchor_opponent else None
-        def report_search(move: int, completed: int, total: int, particles: int) -> None:
-            progress.mcts(
-                game=game_index + 1,
-                games=games,
-                move=move,
-                completed=completed,
-                total=total,
-                valid_particles=particles,
-            )
+        opponent_agent = (mixed_opponent if opponent == "mixed" else opponent) if use_anchor_opponent else None
+        jobs.append((game_index, use_anchor_opponent, opponent_agent, game_index % 2 if use_anchor_opponent else None))
 
-        examples, game_metrics = runner.play_game(
-            seed,
+    prototype = BeliefMCTS(model, device, mcts_config)
+    inference = (
+        BatchedInference(
+            prototype._evaluate_packets_direct,
+            max_batch_size=inference_max_batch_size,
+            wait_ms=inference_wait_ms,
+        )
+        if actor_workers > 1
+        else None
+    )
+
+    def play_job(job: Tuple[int, bool, Optional[str], Optional[int]]) -> Tuple[int, bool, list, Dict[str, float]]:
+        game_index, use_anchor_opponent, opponent_agent, train_player = job
+        planner = BeliefMCTS(model, device, mcts_config, inference=inference)
+        runner = SelfPlayRunner(planner, training, logger=None)
+        report_search = None
+        if actor_workers == 1:
+            def report_search(move: int, completed: int, total: int, particles: int) -> None:
+                progress.mcts(game_index + 1, games, move, completed, total, particles)
+        examples, metrics = runner.play_game(
+            training.seed + game_index,
             iteration=0,
             game_index=game_index,
             train_player=train_player,
             opponent_agent=opponent_agent,
             on_search_progress=report_search,
         )
-        progress.game_complete(
-            game=game_index + 1,
-            games=games,
-            moves=int(game_metrics["moves"]),
-            examples=len(examples),
-        )
-        replay.extend(examples)
-        if teacher_replay_fraction > 0.0:
-            teacher_examples, _ = _teacher_game(
-                training.seed + 1_000_000 + game_index,
-                training,
-            )
-            teacher_replay.extend(teacher_examples)
-        opponent_games += float(use_anchor_opponent)
-        exploration_actions += game_metrics.get("exploration_actions", 0.0)
-        rewards.extend(
-            value
-            for name, value in game_metrics.items()
-            if name.startswith("shaped_reward_player_")
-        )
-        for name, value in game_metrics.items():
-            if name.startswith("reward_"):
-                reward_totals[name] = reward_totals.get(name, 0.0) + value
-            if name == "model_actions" or name.startswith("model_action_"):
-                action_totals[name] = action_totals.get(name, 0.0) + value
+        return game_index, use_anchor_opponent, examples, metrics
 
-        if len(replay) < training.batch_size:
-            continue
-        for _ in range(updates_per_game):
-            teacher_count = min(
-                int(round(training.batch_size * teacher_replay_fraction)),
-                len(teacher_replay),
-            )
-            self_play_count = training.batch_size - teacher_count
-            # A short game can temporarily leave fewer self-play rows than a
-            # batch.  In that case the teacher fills the batch rather than
-            # failing or sampling with replacement.
-            if len(replay) < self_play_count:
-                teacher_count = training.batch_size
-                self_play_count = 0
-            examples_batch = []
-            if self_play_count:
-                examples_batch.extend(
-                    replay.sample(
-                        self_play_count,
-                        rng,
-                        priority_fraction=training.priority_replay_fraction,
+    try:
+        model.eval()
+        with ThreadPoolExecutor(max_workers=actor_workers, thread_name_prefix="polybot-actor") as actors:
+            for start in range(0, games, actor_workers):
+                # Optimisation leaves the module in train mode.  Search must
+                # always use deterministic dropout-free inference.
+                model.eval()
+                futures = [actors.submit(play_job, job) for job in jobs[start:start + actor_workers]]
+                completed_games = [future.result() for future in as_completed(futures)]
+                for game_index, used_anchor, examples, game_metrics in completed_games:
+                    progress.game_complete(
+                        game=game_index + 1,
+                        games=games,
+                        moves=int(game_metrics["moves"]),
+                        examples=len(examples),
                     )
-                )
-            if teacher_count:
-                examples_batch.extend(
-                    teacher_replay.sample(
-                        teacher_count,
-                        rng,
-                        priority_fraction=training.priority_replay_fraction,
-                    )
-                )
-            batch = stack_examples(
-                examples_batch,
-                device,
-            )
-            losses.append(train_batch(model, optimiser, batch, training))
+                    replay.extend(examples)
+                    if teacher_replay_fraction > 0.0:
+                        teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + game_index, training)
+                        teacher_replay.extend(teacher_examples)
+                    opponent_games += float(used_anchor)
+                    exploration_actions += game_metrics.get("exploration_actions", 0.0)
+                    rewards.extend(value for name, value in game_metrics.items() if name.startswith("shaped_reward_player_"))
+                    for name, value in game_metrics.items():
+                        if name.startswith("reward_"):
+                            reward_totals[name] = reward_totals.get(name, 0.0) + value
+                        if name == "model_actions" or name.startswith("model_action_"):
+                            action_totals[name] = action_totals.get(name, 0.0) + value
+
+                if len(replay) < training.batch_size:
+                    continue
+                for _ in range(updates_per_game * len(completed_games)):
+                    teacher_count = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher_replay))
+                    self_play_count = training.batch_size - teacher_count
+                    if len(replay) < self_play_count:
+                        teacher_count = training.batch_size
+                        self_play_count = 0
+                    examples_batch = []
+                    if self_play_count:
+                        examples_batch.extend(replay.sample(self_play_count, rng, training.priority_replay_fraction))
+                    if teacher_count:
+                        examples_batch.extend(teacher_replay.sample(teacher_count, rng, training.priority_replay_fraction))
+                    losses.append(train_batch(model, optimiser, stack_examples(examples_batch, device), training))
+    finally:
+        if inference is not None:
+            inference.close()
 
     if model_out is not None:
         save_model(model_out, model, model_config)
@@ -175,6 +174,8 @@ def train_self_play(
         "mean_shaped_reward": float(np.mean(rewards)) if rewards else 0.0,
         "actual_exploration_rate": exploration_actions / max(1, len(replay)),
         "opponent_games": opponent_games,
+        "actor_workers": float(actor_workers),
+        "inference_max_batch_size": float(inference_max_batch_size),
     }
     total_examples = max(1, len(replay))
     for name, value in reward_totals.items():

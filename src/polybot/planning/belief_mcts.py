@@ -16,6 +16,7 @@ from ..data.polyenv_features import (
     visible_events_or_empty,
 )
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from .batched_inference import BatchedInference
 
 
 @dataclass
@@ -79,10 +80,17 @@ class BeliefMCTS:
     source environment's hidden state.
     """
 
-    def __init__(self, model: PolicyValueBeliefNet, device: torch.device, config: MCTSConfig) -> None:
+    def __init__(
+        self,
+        model: PolicyValueBeliefNet,
+        device: torch.device,
+        config: MCTSConfig,
+        inference: Optional[BatchedInference] = None,
+    ) -> None:
         self.model = model
         self.device = device
         self.config = config
+        self.inference = inference
         self._reported_particle_errors: set[str] = set()
 
     @torch.no_grad()
@@ -95,6 +103,16 @@ class BeliefMCTS:
 
     @torch.no_grad()
     def _evaluate_packets(
+        self,
+        packets: List[Dict[str, object]],
+        events: List[Dict[str, object] | None] | None = None,
+    ) -> List[Tuple[Dict[int, float], float]]:
+        if self.inference is not None:
+            return self.inference.evaluate(packets, events)
+        return self._evaluate_packets_direct(packets, events)
+
+    @torch.no_grad()
+    def _evaluate_packets_direct(
         self,
         packets: List[Dict[str, object]],
         events: List[Dict[str, object] | None] | None = None,
@@ -138,14 +156,17 @@ class BeliefMCTS:
 
     @torch.no_grad()
     def _particles(self, packet: Dict[str, object], events: Dict[str, object] | None = None) -> List[np.ndarray]:
-        tensors = packet_to_tensors(packet, self.device, events)
-        particles = self.model.sample_completed_maps(
-            tensors.map_tokens,
-            tensors.global_features,
-            particles=self.config.particles,
-            temperature=max(self.config.temperature, 0.35),
-            event_features=tensors.event_features,
-        )
+        def sample() -> List[torch.Tensor]:
+            tensors = packet_to_tensors(packet, self.device, events)
+            return self.model.sample_completed_maps(
+                tensors.map_tokens,
+                tensors.global_features,
+                particles=self.config.particles,
+                temperature=max(self.config.temperature, 0.35),
+                event_features=tensors.event_features,
+            )
+
+        particles = self.inference.exclusive(sample) if self.inference is not None else sample()
         return [particle.detach().cpu().numpy().astype(np.int32) for particle in particles]
 
     def decide(

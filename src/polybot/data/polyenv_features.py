@@ -231,6 +231,63 @@ def packet_to_tensors(
     )
 
 
+def packets_to_tensors(
+    packets: Iterable[Dict[str, Any]],
+    device: torch.device,
+    events: Iterable[Dict[str, Any] | None] | None = None,
+) -> PacketTensors:
+    """Pad several player-visible packets into one inference batch.
+
+    MCTS produces positions with differing legal-action counts.  Padding them
+    here lets the GPU evaluate many tree leaves in one forward pass; masks make
+    the padding invisible to the policy head.  This function deliberately uses
+    exactly the same player-view fields as :func:`packet_to_tensors`.
+    """
+    rows = list(packets)
+    if not rows:
+        raise ValueError("cannot batch zero model packets")
+    event_rows = list(events) if events is not None else [None] * len(rows)
+    if len(event_rows) != len(rows):
+        raise ValueError("events must have one row per packet")
+    maps = [np.asarray(packet["map_tokens"], dtype=np.int64) for packet in rows]
+    if any(row.ndim != 2 or row.shape[1] != len(MAP_FEATURE_MAX) for row in maps):
+        raise ValueError("expected every map_tokens row to have shape [tiles, 23]")
+    if any(row.shape != maps[0].shape for row in maps[1:]):
+        raise ValueError("MCTS inference batch mixes incompatible board shapes")
+    action_rows = [action_features(packet["actions"]) for packet in rows]
+    max_actions = max(categorical.shape[0] for categorical, _ in action_rows)
+    if max_actions == 0:
+        raise ValueError("cannot evaluate a packet with no legal actions")
+    categorical = np.full(
+        (len(rows), max_actions, len(ACTION_CATEGORICAL_FIELDS)), -1, dtype=np.int64
+    )
+    continuous = np.zeros(
+        (len(rows), max_actions, len(ACTION_CONTINUOUS_FIELDS)), dtype=np.float32
+    )
+    mask = np.zeros((len(rows), max_actions), dtype=bool)
+    for index, (cats, conts) in enumerate(action_rows):
+        count = cats.shape[0]
+        categorical[index, :count] = cats
+        continuous[index, :count] = conts
+        mask[index, :count] = True
+    return PacketTensors(
+        map_tokens=torch.as_tensor(np.stack(maps), dtype=torch.long, device=device),
+        global_features=torch.as_tensor(
+            np.stack([global_features_from_obs(packet["obs"]) for packet in rows]),
+            dtype=torch.float32,
+            device=device,
+        ),
+        event_features=torch.as_tensor(
+            np.stack([event_summary(row) for row in event_rows]),
+            dtype=torch.float32,
+            device=device,
+        ),
+        action_categorical=torch.as_tensor(categorical, dtype=torch.long, device=device),
+        action_continuous=torch.as_tensor(continuous, dtype=torch.float32, device=device),
+        action_mask=torch.as_tensor(mask, dtype=torch.bool, device=device),
+    )
+
+
 def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, torch.Tensor]:
     """Pad variable-length legal-action lists for one optimisation batch."""
     rows: List[Any] = list(examples)

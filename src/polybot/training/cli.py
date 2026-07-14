@@ -33,7 +33,11 @@ def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
 
 
 def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
-    return MCTSConfig(simulations=args.simulations, particles=args.particles)
+    return MCTSConfig(
+        simulations=args.simulations,
+        particles=args.particles,
+        inference_batch_size=getattr(args, "inference_batch_size", 8),
+    )
 
 
 def print_summary(summary: Dict[str, object]) -> None:

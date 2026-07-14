@@ -9,7 +9,12 @@ import numpy as np
 import torch
 
 from ..config import MCTSConfig
-from ..data.polyenv_features import packet_to_tensors, strategic_action_bias, visible_events_or_empty
+from ..data.polyenv_features import (
+    packet_to_tensors,
+    packets_to_tensors,
+    strategic_action_bias,
+    visible_events_or_empty,
+)
 from ..models.policy_value_belief import PolicyValueBeliefNet
 
 
@@ -19,6 +24,9 @@ class SearchNode:
     children: Dict[int, "SearchNode"] = field(default_factory=dict)
     visits: int = 0
     value_sum: float = 0.0
+    # Temporary reservations prevent all leaves in one GPU batch from selecting
+    # the same unexpanded child before any of their values are backed up.
+    virtual_visits: int = 0
     to_play: Optional[int] = None
 
     @property
@@ -26,11 +34,11 @@ class SearchNode:
         return self.value_sum / self.visits if self.visits else 0.0
 
     def select(self, c_puct: float, root_player: int) -> int:
-        parent_scale = float(np.sqrt(max(1, self.visits)))
+        parent_scale = float(np.sqrt(max(1, self.visits + self.virtual_visits)))
         best_action, best_score = None, -float("inf")
         for action_id, prior in self.priors.items():
             child = self.children.get(action_id)
-            child_visits = child.visits if child else 0
+            child_visits = (child.visits + child.virtual_visits) if child else 0
             child_value = child.value if child else 0.0
             # Values are stored from root_player's perspective.  At an
             # opponent node, choose the action worst for root_player.
@@ -53,6 +61,16 @@ class MCTSDecision:
     valid_particles: int
 
 
+@dataclass
+class PendingLeaf:
+    """A selected leaf waiting for a batched neural-network evaluation."""
+
+    node: SearchNode
+    path: List[SearchNode]
+    packet: Dict[str, object]
+    acting_player: int
+
+
 class BeliefMCTS:
     """MCTS that never calls clone() on the authoritative environment.
 
@@ -73,7 +91,16 @@ class BeliefMCTS:
         packet: Dict[str, object],
         events: Dict[str, object] | None = None,
     ) -> Tuple[Dict[int, float], float]:
-        tensors = packet_to_tensors(packet, self.device, events)
+        return self._evaluate_packets([packet], [events])[0]
+
+    @torch.no_grad()
+    def _evaluate_packets(
+        self,
+        packets: List[Dict[str, object]],
+        events: List[Dict[str, object] | None] | None = None,
+    ) -> List[Tuple[Dict[int, float], float]]:
+        """Evaluate variable-action MCTS leaves in one GPU forward pass."""
+        tensors = packets_to_tensors(packets, self.device, events)
         output = self.model(
             tensors.map_tokens,
             tensors.global_features,
@@ -82,23 +109,32 @@ class BeliefMCTS:
             tensors.action_mask,
             tensors.event_features,
         )
-        logits = output.policy_logits[0].clone()
-        bias = strategic_action_bias(
-            packet,
-            capture_city_bonus=self.config.capture_city_prior_bonus,
-            capture_capital_bonus=self.config.capture_capital_prior_bonus,
-            found_city_bonus=self.config.found_city_prior_bonus,
-            attack_bonus=self.config.attack_prior_bonus,
-            end_turn_penalty=self.config.end_turn_prior_penalty,
-        )
-        logits = logits + torch.as_tensor(bias, dtype=logits.dtype, device=logits.device)
-        priors = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-        action_ids = np.asarray(packet["actions"]["action_id"], dtype=np.int64)
-        action_priors = {
-            int(action_id): float(prior)
-            for action_id, prior in zip(action_ids, priors)
-        }
-        return action_priors, float(output.value.item())
+        logits = output.policy_logits.clone()
+        for row, packet in enumerate(packets):
+            bias = strategic_action_bias(
+                packet,
+                capture_city_bonus=self.config.capture_city_prior_bonus,
+                capture_capital_bonus=self.config.capture_capital_prior_bonus,
+                found_city_bonus=self.config.found_city_prior_bonus,
+                attack_bonus=self.config.attack_prior_bonus,
+                end_turn_penalty=self.config.end_turn_prior_penalty,
+            )
+            logits[row, :bias.size] += torch.as_tensor(
+                bias, dtype=logits.dtype, device=logits.device
+            )
+        probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+        values = output.value.detach().cpu().numpy()
+        result: List[Tuple[Dict[int, float], float]] = []
+        for row, packet in enumerate(packets):
+            action_ids = np.asarray(packet["actions"]["action_id"], dtype=np.int64)
+            result.append((
+                {
+                    int(action_id): float(prior)
+                    for action_id, prior in zip(action_ids, probabilities[row, :action_ids.size])
+                },
+                float(values[row]),
+            ))
+        return result
 
     @torch.no_grad()
     def _particles(self, packet: Dict[str, object], events: Dict[str, object] | None = None) -> List[np.ndarray]:
@@ -133,6 +169,7 @@ class BeliefMCTS:
         completed_simulations = 0
         valid_particles = 0
 
+        inference_batch_size = max(1, int(self.config.inference_batch_size))
         for completed in self._particles(root_packet, root_events):
             try:
                 # The only branch creation from the authoritative env.
@@ -150,9 +187,22 @@ class BeliefMCTS:
                     on_progress(completed_simulations, total_simulations, valid_particles)
                 continue
             valid_particles += 1
-            for _ in range(simulations_per_particle):
-                self._simulate(belief_env, root, root_player)
-                completed_simulations += 1
+            remaining = simulations_per_particle
+            while remaining:
+                selected = min(remaining, inference_batch_size)
+                pending: List[PendingLeaf] = []
+                for _ in range(selected):
+                    leaf = self._select_leaf(belief_env, root, root_player)
+                    if leaf is not None:
+                        pending.append(leaf)
+                if pending:
+                    evaluations = self._evaluate_packets([leaf.packet for leaf in pending])
+                    for leaf, (priors, local_value) in zip(pending, evaluations):
+                        leaf.node.priors = priors
+                        root_value = local_value if leaf.acting_player == root_player else -local_value
+                        self._backup(leaf.path, root_value, reserved=True)
+                completed_simulations += selected
+                remaining -= selected
                 if on_progress:
                     on_progress(completed_simulations, total_simulations, valid_particles)
 
@@ -171,25 +221,28 @@ class BeliefMCTS:
             row = int(np.random.choice(len(action_ids), p=weights / weights.sum()))
         return MCTSDecision(int(action_ids[row]), row, visits, priors, valid_particles)
 
-    def _simulate(self, belief_env: object, root: SearchNode, root_player: int) -> None:
+    def _select_leaf(
+        self,
+        belief_env: object,
+        root: SearchNode,
+        root_player: int,
+    ) -> Optional[PendingLeaf]:
+        """Select one leaf on CPU; its inference is batched later on GPU."""
         env = belief_env.clone()
         node = root
         path = [node]
-        value: Optional[float] = None
         for _ in range(self.config.max_depth):
             if env.is_done():
                 winner = int(env.model_request_numpy()["obs"].get("winner", -1))
-                value = 1.0 if winner == root_player else -1.0
-                break
+                self._backup(path, 1.0 if winner == root_player else -1.0)
+                return None
             packet = env.model_request_numpy()
             acting_player = int(packet["obs"].get("current_player", env.current_player()))
             if node.to_play is None:
                 node.to_play = acting_player
             if not node.priors:
-                priors, local_value = self._evaluate_packet(packet)
-                node.priors = priors
-                value = local_value if acting_player == root_player else -local_value
-                break
+                self._reserve(path)
+                return PendingLeaf(node, path, packet, acting_player)
             action_id = node.select(self.config.c_puct, root_player)
             ok, done, reward, winner, _ = env.step_fast(action_id)
             if not ok:
@@ -198,16 +251,29 @@ class BeliefMCTS:
                 # but never remove it from shared priors or another particle.
                 child = node.children.setdefault(action_id, SearchNode())
                 path.append(child)
-                value = -1.0
-                break
+                self._backup(path, -1.0)
+                return None
             child = node.children.setdefault(action_id, SearchNode())
             node = child
             path.append(node)
             if done:
-                value = 1.0 if int(winner) == root_player else -1.0
-                break
-        if value is None:
-            value = 0.0
+                self._backup(path, 1.0 if int(winner) == root_player else -1.0)
+                return None
+        self._backup(path, 0.0)
+
+        return None
+
+    @staticmethod
+    def _reserve(path: List[SearchNode]) -> None:
         for visited in path:
+            visited.virtual_visits += 1
+
+    @staticmethod
+    def _backup(path: List[SearchNode], value: float, reserved: bool = False) -> None:
+        for visited in path:
+            if reserved:
+                visited.virtual_visits -= 1
+                if visited.virtual_visits < 0:
+                    raise RuntimeError("MCTS virtual visit underflow")
             visited.visits += 1
             visited.value_sum += value

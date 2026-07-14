@@ -82,6 +82,8 @@ To compare a newer checkpoint with an older one, pass `--model-b`.
 
 Postęp i składniki reward są wypisywane wyłącznie do terminala. Self-play pokazuje wybrane urządzenie (`mps`, `cuda` albo `cpu`), numer gry/ruchu oraz płynny pasek bieżącego MCTS. `--max-moves` ogranicza długość jednej gry (domyślnie 300); po przekroczeniu limitu wynik jest traktowany jako remis. Replay buffer, gry, pełne mapy, eventy i stan optymalizera nie są zapisywane na dysk.
 
+MCTS zbiera domyślnie `8` liści i wysyła je do GPU w jednym forwardzie (`--inference-batch-size 8`). To zwiększa wykorzystanie CUDA bez zmiany liczby symulacji ani informacji dostępnej botowi. Na GPU z większym zapasem pamięci można próbować `16` albo `32`; przy błędzie CUDA out-of-memory wróć do `8` lub `4`.
+
 W pierwszych rundach self-play `--exploration-rate 0.20` wykonuje część ruchów z bezpiecznego curriculum legalnych akcji (miasta, walka, eksploracja), aby uniknąć danych z samych remisów. MCTS nadal tworzy target policy dla każdej pozycji.
 
 Gdy dwa identyczne checkpointy produkują same remisy, użyj `--opponent heuristic` albo `--opponent mixed --random-opponent-rate 0.25 --mixed-opponent heuristic`. W grach przeciw zewnętrznemu przeciwnikowi model zbiera przykłady wyłącznie ze swoich ruchów; przeciwnik nadal wpływa na jego target value. Domyślne `--teacher-replay-fraction 0.25` dodaje do każdego batcha w RAM przykłady heuristic teacher. To chroni dobry bootstrap przed utratą ofensywnego zachowania wskutek szumnych targetów wczesnego MCTS; nie zapisuje partii ani replay na dysk.

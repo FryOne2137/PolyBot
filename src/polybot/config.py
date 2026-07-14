@@ -23,6 +23,9 @@ class MCTSConfig:
     c_puct: float = 1.5
     max_depth: int = 96
     temperature: float = 1.0
+    # Number of selected MCTS leaves evaluated in one neural-network forward
+    # pass.  It changes throughput, not the information exposed to search.
+    inference_batch_size: int = 8
     # Applied only to already legal, visible capture actions in MCTS.
     capture_city_prior_bonus: float = 2.0
     capture_capital_prior_bonus: float = 4.0

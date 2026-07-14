@@ -41,6 +41,7 @@ def main() -> None:
     )
     parser.add_argument("--simulations", type=int, default=64)
     parser.add_argument("--particles", type=int, default=4)
+    parser.add_argument("--inference-batch-size", type=int, default=8)
     args = parser.parse_args()
     training = training_config_from_args(args)
     model, model_config = load_model(args.model_in, select_device(training.device))

@@ -42,6 +42,18 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=64)
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--inference-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="Concurrent GameEnv/MCTS actors. Each actor immediately takes the next seed.",
+    )
+    parser.add_argument(
+        "--global-inference-batch-size", type=int, default=256,
+        help="Maximum leaf requests combined from all actors into one model forward pass.",
+    )
+    parser.add_argument(
+        "--inference-wait-ms", type=float, default=1.0,
+        help="Brief queue window for combining leaves from concurrent MCTS trees.",
+    )
     args = parser.parse_args()
     training = training_config_from_args(args)
     model, model_config = load_model(args.model_in, select_device(training.device))
@@ -55,6 +67,9 @@ def main() -> None:
         random_opponent_rate=args.random_opponent_rate,
         mixed_opponent=args.mixed_opponent,
         teacher_replay_fraction=args.teacher_replay_fraction,
+        workers=args.workers,
+        global_inference_batch_size=args.global_inference_batch_size,
+        inference_wait_ms=args.inference_wait_ms,
         model_out=args.model_out,
         model=model,
     )

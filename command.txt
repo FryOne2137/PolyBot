@@ -1,3 +1,5 @@
+# Windows PowerShell: concurrent MCTS actors with one shared CUDA inference queue.
+# A worker starts its next game immediately after completing the previous one.
 python scripts/train_self_play.py `
   --model-in models\teacher-v1.pt `
   --model-out models\candidate-fast.pt `
@@ -13,6 +15,9 @@ python scripts/train_self_play.py `
   --simulations 64 `
   --particles 4 `
   --inference-batch-size 32 `
+  --workers 8 `
+  --global-inference-batch-size 256 `
+  --inference-wait-ms 1.0 `
   --max-moves 300 `
   --batch-size 64 `
   --device cuda

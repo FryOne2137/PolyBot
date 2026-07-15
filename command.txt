@@ -95,3 +95,14 @@ python scripts/train_flat_actor_critic.py `
   --mcts-max-actions 1024 `
   --max-moves 300 `
   --device cuda
+
+
+python scripts/evaluate.py `
+  --model-a models\flat-ac-10k.pt `
+  --model-b models\teacher-v1.pt `
+  --games 20 `
+  --simulations 16 `
+  --particles 4 `
+  --mcts-max-actions 1024 `
+  --max-moves 300 `
+  --device cuda

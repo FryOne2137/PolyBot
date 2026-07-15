@@ -41,6 +41,19 @@ class _Episode:
     winner: int = -1
 
 
+def _native_leaf_bias(categorical: torch.Tensor, continuous: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Visible-only priors for every native MCTS leaf, not just the root."""
+    action_type, tile_action = categorical[..., 0], categorical[..., 9]
+    damage = continuous[..., 2].clamp_min(0)
+    bias = torch.zeros_like(action_type, dtype=torch.float32)
+    bias += ((action_type == 8) & (tile_action == 14)).float() * 2.0  # capture city
+    bias += ((action_type == 8) & (tile_action == 11)).float() * 3.0  # found city
+    bias += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
+    bias += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
+    bias -= (action_type == 3).float() * 2.0
+    return bias.masked_fill(~mask, 0.0)
+
+
 def _new_episode(index: int, training: TrainingConfig, train_player: Optional[int], opponent: Optional[str]) -> _Episode:
     return _Episode(
         index=index,
@@ -132,8 +145,11 @@ def _plan_many(
             leaf_tensors.action_categorical, leaf_tensors.action_continuous,
             leaf_tensors.action_mask, leaf_tensors.event_features, include_belief=False,
         )
+        leaf_logits = leaf_output.policy_logits + _native_leaf_bias(
+            leaf_tensors.action_categorical, leaf_tensors.action_continuous, leaf_tensors.action_mask,
+        ).to(leaf_output.policy_logits.dtype)
         pool.expand_and_backup(
-            leaf_ids, leaf_output.policy_logits.float().cpu().numpy(),
+            leaf_ids, leaf_logits.float().cpu().numpy(),
             leaf_output.value.float().cpu().numpy(),
         )
 

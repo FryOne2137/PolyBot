@@ -42,26 +42,6 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=64)
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--inference-batch-size", type=int, default=8)
-    parser.add_argument(
-        "--actor-workers",
-        type=int,
-        default=1,
-        help="Parallel CPU self-play actors sharing one CUDA inference worker.",
-    )
-    parser.add_argument(
-        "--actor-processes",
-        type=int,
-        default=0,
-        help="CPU processes for PolyEnv/MCTS; use on CUDA to bypass the Python GIL.",
-    )
-    parser.add_argument(
-        "--actor-round-games",
-        type=int,
-        default=8,
-        help="Queued games per actor before pausing all actors for model updates.",
-    )
-    parser.add_argument("--inference-max-batch-size", type=int, default=64)
-    parser.add_argument("--inference-wait-ms", type=float, default=0.25)
     args = parser.parse_args()
     training = training_config_from_args(args)
     model, model_config = load_model(args.model_in, select_device(training.device))
@@ -75,11 +55,6 @@ def main() -> None:
         random_opponent_rate=args.random_opponent_rate,
         mixed_opponent=args.mixed_opponent,
         teacher_replay_fraction=args.teacher_replay_fraction,
-        actor_workers=args.actor_workers,
-        actor_processes=args.actor_processes,
-        actor_round_games=args.actor_round_games,
-        inference_max_batch_size=args.inference_max_batch_size,
-        inference_wait_ms=args.inference_wait_ms,
         model_out=args.model_out,
         model=model,
     )

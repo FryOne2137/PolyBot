@@ -36,7 +36,8 @@ Nie uruchamiaj pełnego MCTS na losowym modelu. Pipeline ma dwa etapy:
 
 1. `train_belief.py` — losowe legalne akcje, uczenie ukrytej mapy z `full_map_numpy()` jako etykiety. Liczy wyłącznie pozycje, w których istnieje fog-of-war.
 2. `train_teacher.py` — behavior-cloning z wbudowanego, sieciowo-niezależnego heuristic teacher; generuje i uczy dane wyłącznie w RAM.
-3. `train_self_play.py` — self-play z MCTS na już rozgrzanym modelu.
+3. `train_vector_teacher.py` — szybkie, natywne C++ VectorGameEnv behavior-cloning policy na setkach envów równolegle. Ten etap nie używa `full_map_numpy()`, więc nie trenuje belief decoder.
+4. `train_self_play.py` — wolniejsze, scalar self-play z MCTS na już rozgrzanym modelu.
 
 Cały pipeline uruchamiany jedną komendą zapisuje **wyłącznie końcowy plik modelu**:
 
@@ -61,8 +62,12 @@ python scripts/train_belief.py \
 python scripts/train_teacher.py \
   --model-in models/belief.pt --games 100 --model-out models/teacher.pt
 
+python scripts/train_vector_teacher.py \
+  --model-in models/teacher.pt --num-envs 128 --steps 10_000 \
+  --num-threads 8 --device cuda --model-out models/vector_teacher.pt
+
 python scripts/train_self_play.py \
-  --model-in models/teacher.pt --model-out models/self_play.pt \
+  --model-in models/vector_teacher.pt --model-out models/self_play.pt \
   --max-moves 300
 ```
 
@@ -83,10 +88,6 @@ To compare a newer checkpoint with an older one, pass `--model-b`.
 Postęp i składniki reward są wypisywane wyłącznie do terminala. Self-play pokazuje wybrane urządzenie (`mps`, `cuda` albo `cpu`), numer gry/ruchu oraz płynny pasek bieżącego MCTS. `--max-moves` ogranicza długość jednej gry (domyślnie 300); po przekroczeniu limitu wynik jest traktowany jako remis. Replay buffer, gry, pełne mapy, eventy i stan optymalizera nie są zapisywane na dysk.
 
 MCTS zbiera domyślnie `8` liści i wysyła je do GPU w jednym forwardzie (`--inference-batch-size 8`). To zwiększa wykorzystanie CUDA bez zmiany liczby symulacji ani informacji dostępnej botowi. Na GPU z większym zapasem pamięci można próbować `16` albo `32`; przy błędzie CUDA out-of-memory wróć do `8` lub `4`.
-
-Na CUDA można też uruchomić kilka niezależnych actorów (`--actor-workers 4`). Każdy zachowuje własne środowisko i drzewo MCTS na CPU, a wspólny worker GPU łączy ich żądania w batch do `--inference-max-batch-size 64`. Domyślne okno łączenia to tylko `--inference-wait-ms 0.25`, aby nie spowalniać małych batchy. Worker, który kończy grę, od razu pobiera następną z kolejki; `--actor-round-games 8` określa tylko, po ilu grach na actor następuje wspólna pauza na aktualizację wag. Zacznij od czterech actorów; zwiększaj tylko po krótkim teście stabilności. Ten tryb nadal zapisuje wyłącznie checkpoint modelu.
-
-Na Windows z CUDA użyj zamiast wątków `--actor-processes 4`. Każdy proces ma własny PolyEnv i MCTS, a jedyny model CUDA pozostaje w procesie nadrzędnym; requesty policy/value są łączone przez IPC w duży batch GPU. Nie łącz `--actor-processes` z większym `--actor-workers` — przy procesach wartość workers jest ignorowana.
 
 W pierwszych rundach self-play `--exploration-rate 0.20` wykonuje część ruchów z bezpiecznego curriculum legalnych akcji (miasta, walka, eksploracja), aby uniknąć danych z samych remisów. MCTS nadal tworzy target policy dla każdej pozycji.
 
@@ -115,7 +116,9 @@ src/polybot/
 
 scripts/
 ├── train_belief.py               stage 1: belief warm-up
-├── train_self_play.py            stage 2: MCTS self-play
+├── train_teacher.py              stage 2: scalar heuristic teacher
+├── train_vector_teacher.py       stage 3: native C++ vector curriculum
+├── train_self_play.py            stage 4: scalar MCTS self-play
 └── train_pipeline.py             both stages, one final model write
 ```
 

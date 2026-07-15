@@ -19,6 +19,14 @@ from .token_schema import (
     MAP_FEATURE_MAX,
 )
 
+# Dense action layout used by PolyEnv's VectorGameEnv and MctsPool.  Keeping
+# this conversion here lets both native APIs feed the same policy network
+# without constructing a Python ``dict`` per environment or MCTS leaf.
+NATIVE_ACTION_CATEGORICAL_COLUMNS = np.asarray(
+    (0, 1, 2, 10, 3, 4, 5, 6, 7, 8, 9, 14), dtype=np.int64
+)
+NATIVE_ACTION_CONTINUOUS_COLUMNS = np.asarray((12, 13, 15, 16), dtype=np.int64)
+
 
 @dataclass
 class PacketTensors:
@@ -28,6 +36,47 @@ class PacketTensors:
     action_categorical: torch.Tensor
     action_continuous: torch.Tensor
     action_mask: torch.Tensor
+
+
+def native_batch_to_tensors(
+    batch: Dict[str, np.ndarray],
+    device: torch.device,
+    map_size: int,
+    map_type: str,
+) -> PacketTensors:
+    """Adapt one dense VectorGameEnv/MctsPool batch to model inputs.
+
+    The native APIs already return padded arrays.  This conversion deliberately
+    has no per-leaf Python packet construction, which is essential for MCTS
+    throughput.
+    """
+    state = np.asarray(batch["state"], dtype=np.int32)
+    features = np.asarray(batch["action_features"], dtype=np.int64)
+    count = state.shape[0]
+    global_features = np.empty((count, 9), dtype=np.float32)
+    global_features[:, 0] = state[:, 0] / 100.0
+    global_features[:, 1] = state[:, 1] / 16.0
+    global_features[:, 2] = state[:, 4] / 50.0
+    global_features[:, 3] = state[:, 7] / 20.0
+    global_features[:, 4] = state[:, 5] / 32.0
+    global_features[:, 5] = state[:, 6] / 16.0
+    global_features[:, 6] = np.maximum(state[:, 8], 0) / 1024.0
+    global_features[:, 7] = float(map_size) / 32.0
+    global_features[:, 8] = 1.0 if map_type == "drylands" else 0.0
+    return PacketTensors(
+        map_tokens=torch.as_tensor(batch["map_tokens"], dtype=torch.long, device=device),
+        global_features=torch.as_tensor(global_features, dtype=torch.float32, device=device),
+        # MctsPool intentionally omits journals from its hot path. Zero is the
+        # neutral representation and never introduces hidden information.
+        event_features=torch.zeros((count, EVENT_SUMMARY_SIZE), dtype=torch.float32, device=device),
+        action_categorical=torch.as_tensor(
+            features[..., NATIVE_ACTION_CATEGORICAL_COLUMNS], dtype=torch.long, device=device
+        ),
+        action_continuous=torch.as_tensor(
+            features[..., NATIVE_ACTION_CONTINUOUS_COLUMNS], dtype=torch.float32, device=device
+        ),
+        action_mask=torch.as_tensor(batch["action_mask"], dtype=torch.bool, device=device),
+    )
 
 
 def _scalar(value: Any, default: float = 0.0) -> float:

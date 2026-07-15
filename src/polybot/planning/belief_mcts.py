@@ -10,6 +10,7 @@ import torch
 
 from ..config import MCTSConfig
 from ..data.polyenv_features import (
+    native_batch_to_tensors,
     packet_to_tensors,
     packets_to_tensors,
     strategic_action_bias,
@@ -227,6 +228,129 @@ class BeliefMCTS:
         return priors, [particle.cpu().numpy().astype(np.int32) for particle in particles]
 
     def decide(
+        self,
+        env: object,
+        on_progress: Optional[Callable[[int, int, int], None]] = None,
+    ) -> MCTSDecision:
+        """Use native PolyEnv MctsPool when available, else the safe fallback."""
+        try:
+            from PolyEnv import MctsPool  # type: ignore[import-not-found]
+        except ImportError:
+            return self._decide_python(env, on_progress)
+        return self._decide_native(env, MctsPool, on_progress)
+
+    def _native_prior_bias(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Vectorised visible-action curriculum bias for MctsPool logits."""
+        action_type = features[..., 0]
+        tile_action = features[..., 8]
+        damage = features[..., 15].float().clamp_min(0)
+        bias = torch.zeros_like(action_type, dtype=torch.float32)
+        bias = bias + ((action_type == 8) & (tile_action == 14)).float() * self.config.capture_city_prior_bonus
+        bias = bias + ((action_type == 8) & (tile_action == 11)).float() * self.config.found_city_prior_bonus
+        bias = bias + (action_type == 1).float() * (
+            self.config.attack_prior_bonus + damage.clamp_max(10.0) * 0.12
+        )
+        bias = bias + ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
+        bias = bias - (action_type == 3).float() * self.config.end_turn_prior_penalty
+        return bias.masked_fill(~mask, 0.0)
+
+    @torch.inference_mode()
+    def _decide_native(
+        self,
+        env: object,
+        mcts_pool_type: object,
+        on_progress: Optional[Callable[[int, int, int], None]],
+    ) -> MCTSDecision:
+        """Run PUCT selection, branching and backup in PolyEnv's C++ pool."""
+        if self.model is None or self.device is None:
+            raise RuntimeError("native MCTS requires a local model and device")
+        root_packet = env.model_request_numpy()
+        action_ids = np.asarray(root_packet["actions"]["action_id"], dtype=np.int64)
+        if action_ids.size == 0:
+            raise RuntimeError("PolyEnv returned no legal actions")
+        root_events = visible_events_or_empty(env)
+        root_priors, completed_particles = self._root_priors_and_particles(root_packet, root_events)
+        root_player = int(root_packet["obs"].get("current_player", env.current_player()))
+        belief_envs: List[object] = []
+        for completed in completed_particles:
+            try:
+                belief_envs.append(env.make_belief_env(completed, perspective=root_player))
+            except Exception as error:
+                reason = str(error) or type(error).__name__
+                if reason not in self._reported_particle_errors:
+                    print(f"belief particle rejected: {reason}", flush=True)
+                    self._reported_particle_errors.add(reason)
+        if not belief_envs:
+            priors = np.asarray([root_priors.get(int(action), 0.0) for action in action_ids], dtype=np.float64)
+            row = int(priors.argmax())
+            return MCTSDecision(int(action_ids[row]), row, np.zeros_like(priors), priors, 0)
+
+        # Passing detached belief worlds is the documented fog-safe MctsPool
+        # entry point. The original GameEnv is never given to the pool.
+        pool = mcts_pool_type(
+            belief_envs,
+            num_threads=self.config.native_threads,
+            max_actions=self.config.native_max_actions,
+            c_puct=self.config.c_puct,
+        )
+        evaluations = 0
+        target = max(1, self.config.simulations)
+        while evaluations < target:
+            leaves = pool.select_leaves()
+            leaf_ids = np.asarray(leaves["leaf_id"])
+            if leaf_ids.size == 0:
+                break
+            tensors = native_batch_to_tensors(
+                leaves, self.device,
+                map_size=int(root_packet["obs"].get("map_size", round(len(root_packet["map_tokens"]) ** 0.5))),
+                map_type=str(root_packet["obs"].get("map_type", "lakes")),
+            )
+            def evaluate_native_leaf():
+                return self.model(
+                    tensors.map_tokens, tensors.global_features,
+                    tensors.action_categorical, tensors.action_continuous,
+                    tensors.action_mask, tensors.event_features,
+                    include_belief=False,
+                )
+
+            # In concurrent self-play the same PyTorch module is shared by
+            # several native pools.  Serialising only the forward call keeps
+            # CUDA/MPS stream ownership correct; C++ tree work continues in
+            # the other actors while this pool waits for its result.
+            output = self.inference.exclusive(evaluate_native_leaf) if self.inference is not None else evaluate_native_leaf()
+            logits = output.policy_logits + self._native_prior_bias(
+                tensors.action_categorical, tensors.action_mask
+            ).to(output.policy_logits.dtype)
+            pool.expand_and_backup(
+                leaf_ids,
+                logits.float().cpu().numpy(),
+                output.value.float().cpu().numpy(),
+            )
+            evaluations += int(leaf_ids.size)
+            if on_progress:
+                on_progress(min(evaluations, target), target, len(belief_envs))
+
+        roots = pool.root_policy(temperature=1.0)
+        root_actions = np.asarray(roots["action_id"], dtype=np.int64)
+        root_mask = np.asarray(roots["action_mask"], dtype=bool)
+        root_visits = np.asarray(roots["visit_count"], dtype=np.float64)
+        visit_by_action: Dict[int, float] = {}
+        for actions_row, mask_row, visits_row in zip(root_actions, root_mask, root_visits):
+            for action, valid, visits in zip(actions_row, mask_row, visits_row):
+                if valid:
+                    visit_by_action[int(action)] = visit_by_action.get(int(action), 0.0) + float(visits)
+        visits = np.asarray([visit_by_action.get(int(action), 0.0) for action in action_ids], dtype=np.float64)
+        priors = np.asarray([root_priors.get(int(action), 0.0) for action in action_ids], dtype=np.float64)
+        if visits.sum() == 0:
+            row = int(priors.argmax())
+        elif self.config.temperature <= 1e-5:
+            row = int(visits.argmax())
+        else:
+            weights = np.power(visits, 1.0 / self.config.temperature)
+            row = int(np.random.choice(len(action_ids), p=weights / weights.sum()))
+        return MCTSDecision(int(action_ids[row]), row, visits, priors, len(belief_envs))
+
+    def _decide_python(
         self,
         env: object,
         on_progress: Optional[Callable[[int, int, int], None]] = None,

@@ -25,6 +25,8 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
     parser.add_argument("--inference-batch-size", type=int, default=32)
+    parser.add_argument("--mcts-threads", type=int, help="C++ threads used by PolyEnv MctsPool; default uses logical cores")
+    parser.add_argument("--mcts-max-actions", type=int, default=512)
     args = parser.parse_args()
 
     training = training_config_from_args(args)
@@ -37,6 +39,8 @@ def main() -> None:
         particles=args.particles,
         temperature=0.0,
         inference_batch_size=args.inference_batch_size,
+        native_threads=args.mcts_threads,
+        native_max_actions=args.mcts_max_actions,
     )
     print_summary(evaluate_matches(model_a, device, training, mcts, args.games, model_b))
 

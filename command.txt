@@ -15,6 +15,7 @@ python scripts/train_self_play.py `
   --simulations 64 `
   --particles 4 `
   --inference-batch-size 32 `
+  --mcts-max-actions 512 `
   --workers 8 `
   --global-inference-batch-size 256 `
   --inference-wait-ms 1.0 `

@@ -1,6 +1,7 @@
 """Central, serialisable configuration objects."""
 
 from dataclasses import dataclass
+from typing import Optional
 @dataclass
 class ModelConfig:
     """Network size. The defaults fit an Apple Silicon laptop."""
@@ -26,6 +27,10 @@ class MCTSConfig:
     # Number of selected MCTS leaves evaluated in one neural-network forward
     # pass.  It changes throughput, not the information exposed to search.
     inference_batch_size: int = 32
+    # Native PolyEnv MctsPool options. ``None`` lets its persistent C++ pool
+    # use the available logical CPU cores.
+    native_threads: Optional[int] = None
+    native_max_actions: int = 512
     # Applied only to already legal, visible capture actions in MCTS.
     capture_city_prior_bonus: float = 2.0
     capture_capital_prior_bonus: float = 4.0

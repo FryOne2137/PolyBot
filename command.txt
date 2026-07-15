@@ -19,3 +19,21 @@ python scripts/train_self_play.py `
   --max-moves 300 `
   --batch-size 64 `
   --device cuda
+
+
+# Szybki etap gradientowy bez MCTS. Najpierw uruchom go jako smoke test
+# (np. 2 000 kroków), sprawdź flat_reward/flat_entropy, potem zwiększ kroki.
+python scripts/train_flat_actor_critic.py `
+  --model-in models\teacher-v1.pt `
+  --model-out models\flat-ac-smoke.pt `
+  --num-envs 256 `
+  --steps 2000 `
+  --max-actions 512 `
+  --learning-rate 5e-5 `
+  --map-size 11 `
+  --map-type lakes `
+  --device cuda
+
+
+# Po udanym flat actor-critic użyj jego modelu jako wejścia do globalnego MCTS.
+# Podmień --model-in w pierwszej komendzie na models\flat-ac-smoke.pt.

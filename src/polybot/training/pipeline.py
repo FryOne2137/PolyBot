@@ -11,6 +11,7 @@ from ..infrastructure.model_io import load_model, save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .belief_warmup import warmup_belief
 from .self_play_train import train_self_play
+from .vector_actor_critic import train_vector_actor_critic
 
 
 def run_pipeline(
@@ -21,6 +22,8 @@ def run_pipeline(
     belief_batch_size: int,
     self_play_games: int,
     updates_per_game: int,
+    flat_envs: int,
+    flat_steps: int,
     model_out: Path,
     model_in: Path | None = None,
 ) -> Dict[str, Dict[str, float]]:
@@ -38,6 +41,12 @@ def run_pipeline(
         batch_size=belief_batch_size,
         model=model,
     )
+    flat = {}
+    if flat_steps:
+        flat = train_vector_actor_critic(
+            training, model_config, num_envs=flat_envs, steps=flat_steps,
+            model=model,
+        )
     self_play = train_self_play(
         training,
         model_config,
@@ -47,4 +56,4 @@ def run_pipeline(
         model=model,
     )
     save_model(model_out, model, model_config)
-    return {"belief_warmup": belief, "self_play": self_play}
+    return {"belief_warmup": belief, "flat_actor_critic": flat, "self_play": self_play}

@@ -25,6 +25,8 @@ def main() -> None:
     parser.add_argument("--belief-positions", type=int, default=20_000)
     parser.add_argument("--belief-batch-size", type=int, default=16)
     parser.add_argument("--self-play-games", type=int, default=200)
+    parser.add_argument("--flat-envs", type=int, default=256)
+    parser.add_argument("--flat-steps", type=int, default=0, help="optional fast VectorGameEnv actor-critic stage")
     parser.add_argument("--updates-per-game", type=int, default=4)
     parser.add_argument("--exploration-rate", type=float, default=0.20)
     parser.add_argument("--simulations", type=int, default=64)
@@ -40,6 +42,8 @@ def main() -> None:
         belief_batch_size=args.belief_batch_size,
         self_play_games=args.self_play_games,
         updates_per_game=args.updates_per_game,
+        flat_envs=args.flat_envs,
+        flat_steps=args.flat_steps,
         model_out=args.model_out,
         model_in=args.model_in,
     )

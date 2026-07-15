@@ -37,10 +37,11 @@ Nie uruchamiaj pełnego MCTS na losowym modelu. Pipeline ma dwa etapy:
 1. `train_belief.py` — losowe legalne akcje, uczenie ukrytej mapy z `full_map_numpy()` jako etykiety. Liczy wyłącznie pozycje, w których istnieje fog-of-war.
 2. `train_teacher.py` — behavior-cloning z wbudowanego, sieciowo-niezależnego heuristic teacher; generuje i uczy dane wyłącznie w RAM.
 3. `train_vector_teacher.py` — szybkie, natywne C++ VectorGameEnv behavior-cloning policy na setkach envów równolegle. Ten etap nie używa `full_map_numpy()`, więc nie trenuje belief decoder.
-4. `train_self_play.py` — self-play z natywnym PolyEnv `MctsPool`: selekcja,
-   branchowanie i backup PUCT działają w C++; PyTorch wykonuje tylko batchową
-   inferencję liści. Na starej wersji PolyEnv skrypt bezpiecznie wraca do
-   wolniejszego MCTS w Pythonie.
+4. `train_self_play.py` — globalny self-play z natywnym PolyEnv `MctsPool`:
+   wszystkie aktywne gry i particles są jednym pool-em, więc selekcja,
+   branchowanie i backup PUCT działają w C++, a PyTorch liczy duże batch'e
+   liści. Na starej wersji PolyEnv skrypt bezpiecznie wraca do wolniejszego
+   MCTS w Pythonie.
 
 Cały pipeline uruchamiany jedną komendą zapisuje **wyłącznie końcowy plik modelu**:
 

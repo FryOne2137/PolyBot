@@ -60,6 +60,20 @@ def train_self_play(
     if global_inference_batch_size < 1:
         raise ValueError("global_inference_batch_size must be at least one")
 
+    # Modern PolyEnv exposes a single native MctsPool over all active games.
+    # Use it in preference to the legacy Python-worker scheduler below.
+    try:
+        from PolyEnv import MctsPool  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        from .global_mcts_train import train_global_mcts_self_play
+        return train_global_mcts_self_play(
+            training, model_config, mcts_config, games, updates_per_game,
+            opponent, random_opponent_rate, mixed_opponent, teacher_replay_fraction,
+            active_envs=workers, model_out=model_out, model=model,
+        )
+
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)

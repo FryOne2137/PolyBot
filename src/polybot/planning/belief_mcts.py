@@ -17,7 +17,7 @@ from ..data.polyenv_features import (
     visible_events_or_empty,
 )
 from ..models.policy_value_belief import PolicyValueBeliefNet
-from .batched_inference import BatchedInference
+from .batched_inference import BatchedInference, NativeLeafInference
 
 
 @dataclass
@@ -87,11 +87,17 @@ class BeliefMCTS:
         device: Optional[torch.device],
         config: MCTSConfig,
         inference: Optional[BatchedInference] = None,
+        native_leaf_inference: Optional[NativeLeafInference] = None,
+        map_size: int = 11,
+        map_type: str = "lakes",
     ) -> None:
         self.model = model
         self.device = device
         self.config = config
         self.inference = inference
+        self.native_leaf_inference = native_leaf_inference
+        self.map_size = map_size
+        self.map_type = map_type
         self._reported_particle_errors: set[str] = set()
 
     @torch.inference_mode()
@@ -255,6 +261,23 @@ class BeliefMCTS:
         return bias.masked_fill(~mask, 0.0)
 
     @torch.inference_mode()
+    def _evaluate_native_leaves_direct(self, leaves: Dict[str, object]) -> Tuple[np.ndarray, np.ndarray]:
+        """One dense model forward for native MctsPool leaves."""
+        if self.model is None or self.device is None:
+            raise RuntimeError("native MCTS requires a local model and device")
+        tensors = native_batch_to_tensors(leaves, self.device, self.map_size, self.map_type)
+        output = self.model(
+            tensors.map_tokens, tensors.global_features,
+            tensors.action_categorical, tensors.action_continuous,
+            tensors.action_mask, tensors.event_features,
+            include_belief=False,
+        )
+        logits = output.policy_logits + self._native_prior_bias(
+            tensors.action_categorical, tensors.action_mask
+        ).to(output.policy_logits.dtype)
+        return logits.float().cpu().numpy(), output.value.float().cpu().numpy()
+
+    @torch.inference_mode()
     def _decide_native(
         self,
         env: object,
@@ -300,31 +323,14 @@ class BeliefMCTS:
             leaf_ids = np.asarray(leaves["leaf_id"])
             if leaf_ids.size == 0:
                 break
-            tensors = native_batch_to_tensors(
-                leaves, self.device,
-                map_size=int(root_packet["obs"].get("map_size", round(len(root_packet["map_tokens"]) ** 0.5))),
-                map_type=str(root_packet["obs"].get("map_type", "lakes")),
-            )
-            def evaluate_native_leaf():
-                return self.model(
-                    tensors.map_tokens, tensors.global_features,
-                    tensors.action_categorical, tensors.action_continuous,
-                    tensors.action_mask, tensors.event_features,
-                    include_belief=False,
-                )
-
-            # In concurrent self-play the same PyTorch module is shared by
-            # several native pools.  Serialising only the forward call keeps
-            # CUDA/MPS stream ownership correct; C++ tree work continues in
-            # the other actors while this pool waits for its result.
-            output = self.inference.exclusive(evaluate_native_leaf) if self.inference is not None else evaluate_native_leaf()
-            logits = output.policy_logits + self._native_prior_bias(
-                tensors.action_categorical, tensors.action_mask
-            ).to(output.policy_logits.dtype)
+            if self.native_leaf_inference is not None:
+                logits, values = self.native_leaf_inference.evaluate(leaves)
+            else:
+                logits, values = self._evaluate_native_leaves_direct(leaves)
             pool.expand_and_backup(
                 leaf_ids,
-                logits.float().cpu().numpy(),
-                output.value.float().cpu().numpy(),
+                logits,
+                values,
             )
             evaluations += int(leaf_ids.size)
             if on_progress:

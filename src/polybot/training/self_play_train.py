@@ -16,7 +16,7 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..infrastructure.progress import ConsoleProgress
 from ..models.policy_value_belief import PolicyValueBeliefNet
-from ..planning.batched_inference import BatchedInference
+from ..planning.batched_inference import BatchedInference, NativeLeafInference
 from ..planning.belief_mcts import BeliefMCTS
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer
@@ -85,16 +85,27 @@ def train_self_play(
         schedules.append((use_anchor, opponent_agent))
 
     model.eval()
-    template = BeliefMCTS(model, device, mcts_config)
+    template = BeliefMCTS(model, device, mcts_config, map_size=training.map_size, map_type=training.map_type)
     inference = BatchedInference(
         template._evaluate_packets_direct,
+        max_batch_size=global_inference_batch_size,
+        wait_ms=inference_wait_ms,
+    )
+    native_leaf_inference = NativeLeafInference(
+        lambda leaves: inference.exclusive(lambda: template._evaluate_native_leaves_direct(leaves)),
         max_batch_size=global_inference_batch_size,
         wait_ms=inference_wait_ms,
     )
 
     def play_one(game_index: int):
         use_anchor, opponent_agent = schedules[game_index]
-        planner = BeliefMCTS(model, device, mcts_config, inference=inference)
+        planner = BeliefMCTS(
+            model, device, mcts_config,
+            inference=inference,
+            native_leaf_inference=native_leaf_inference,
+            map_size=training.map_size,
+            map_type=training.map_type,
+        )
         runner = SelfPlayRunner(planner, training, logger=None)
         examples, metrics = runner.play_game(
             training.seed + game_index,
@@ -136,6 +147,7 @@ def train_self_play(
                     bar.set_postfix(examples=len(replay), moves=int(metrics["moves"]), workers=workers)
     finally:
         inference.close()
+        native_leaf_inference.close()
 
     # Preserve the requested update budget while avoiding concurrent AdamW and
     # inference access to the same model parameters.
@@ -177,4 +189,5 @@ def train_self_play(
         for name in losses[0]:
             summary[name] = float(np.mean([loss[name] for loss in losses]))
     summary.update(inference.stats())
+    summary.update(native_leaf_inference.stats())
     return summary

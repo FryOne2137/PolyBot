@@ -44,8 +44,8 @@ def evaluate_matches(
     model_a.eval()
     if model_b is not None:
         model_b.eval()
-    planner_a = BeliefMCTS(model_a, device, mcts)
-    planner_b = BeliefMCTS(model_b, device, mcts) if model_b is not None else None
+    planner_a = BeliefMCTS(model_a, device, mcts, map_size=training.map_size, map_type=training.map_type)
+    planner_b = BeliefMCTS(model_b, device, mcts, map_size=training.map_size, map_type=training.map_type) if model_b is not None else None
     rng = np.random.default_rng(training.seed)
     totals: Dict[str, float] = {
         "games": float(games),

@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 Evaluation = Tuple[Dict[int, float], float]
 EvaluateFn = Callable[[List[Dict[str, object]], Optional[List[Dict[str, object] | None]]], List[Evaluation]]
+NativeEvaluateFn = Callable[[Dict[str, object]], Tuple[object, object]]
 
 
 @dataclass
@@ -118,6 +119,110 @@ class BatchedInference:
                 for request in requests:
                     size = len(request.packets)
                     request.result = evaluations[offset:offset + size]
+                    offset += size
+                    request.ready.set()
+            except BaseException as error:
+                for request in requests:
+                    request.error = error
+                    request.ready.set()
+            if self._closed:
+                return
+
+
+@dataclass
+class _NativeRequest:
+    leaves: Dict[str, object]
+    ready: Event = field(default_factory=Event)
+    result: Optional[Tuple[object, object]] = None
+    error: Optional[BaseException] = None
+
+
+class NativeLeafInference:
+    """Batch dense leaves emitted by several native ``MctsPool`` instances.
+
+    MctsPool performs tree work in C++, but emits at most one pending leaf per
+    tree. This service combines those small per-game batches before the model
+    call, restoring a large GPU batch without moving tree control into Python.
+    """
+
+    def __init__(self, evaluate: NativeEvaluateFn, max_batch_size: int = 256, wait_ms: float = 1.0) -> None:
+        self._evaluate = evaluate
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.wait_seconds = max(0.0, float(wait_ms)) / 1_000.0
+        self._requests: Queue[_NativeRequest | None] = Queue()
+        self._stats_lock = Lock()
+        self._batches = 0
+        self._leaves = 0
+        self._closed = False
+        self._worker = Thread(target=self._run, name="polybot-native-leaf-inference", daemon=True)
+        self._worker.start()
+
+    def evaluate(self, leaves: Dict[str, object]) -> Tuple[object, object]:
+        if self._closed:
+            raise RuntimeError("native leaf inference service is closed")
+        request = _NativeRequest(leaves)
+        self._requests.put(request)
+        request.ready.wait()
+        if request.error is not None:
+            raise request.error
+        if request.result is None:
+            raise RuntimeError("native leaf inference service returned no result")
+        return request.result
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._requests.put(None)
+            self._worker.join()
+
+    def stats(self) -> Dict[str, float]:
+        with self._stats_lock:
+            return {
+                "native_inference_batches": float(self._batches),
+                "native_inference_leaves": float(self._leaves),
+                "native_mean_inference_batch_size": self._leaves / max(1, self._batches),
+            }
+
+    def _run(self) -> None:
+        while True:
+            first = self._requests.get()
+            if first is None:
+                return
+            requests = [first]
+            leaf_count = len(first.leaves["leaf_id"])
+            deadline = monotonic() + self.wait_seconds
+            while leaf_count < self.max_batch_size:
+                timeout = deadline - monotonic()
+                if timeout <= 0:
+                    break
+                try:
+                    request = self._requests.get(timeout=timeout)
+                except Empty:
+                    break
+                if request is None:
+                    self._closed = True
+                    break
+                requests.append(request)
+                leaf_count += len(request.leaves["leaf_id"])
+            try:
+                # Every MctsPool leaf schema is dense and has the same board
+                # shape/max_actions, so concatenation is a single NumPy op per
+                # field, not a Python loop over individual leaves.
+                import numpy as np
+
+                keys = tuple(requests[0].leaves.keys())
+                merged = {
+                    key: np.concatenate([np.asarray(request.leaves[key]) for request in requests], axis=0)
+                    for key in keys
+                }
+                logits, values = self._evaluate(merged)
+                with self._stats_lock:
+                    self._batches += 1
+                    self._leaves += leaf_count
+                offset = 0
+                for request in requests:
+                    size = len(request.leaves["leaf_id"])
+                    request.result = (logits[offset:offset + size], values[offset:offset + size])
                     offset += size
                     request.ready.set()
             except BaseException as error:

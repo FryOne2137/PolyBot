@@ -245,11 +245,22 @@ class BeliefMCTS:
             return self._decide_python(env, on_progress)
         return self._decide_native(env, MctsPool, on_progress)
 
-    def _native_prior_bias(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Vectorised visible-action curriculum bias for MctsPool logits."""
-        action_type = features[..., 0]
-        tile_action = features[..., 8]
-        damage = features[..., 15].float().clamp_min(0)
+    def _native_prior_bias(
+        self,
+        categorical: torch.Tensor,
+        continuous: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorised visible-action curriculum bias for MctsPool logits.
+
+        ``native_batch_to_tensors`` maps PolyEnv's 17 action columns to the
+        model's 12 categorical + 4 continuous columns.  Keep these indices in
+        that *adapted* schema: tile_action is categorical column 9 and
+        damage_dealt is continuous column 2.
+        """
+        action_type = categorical[..., 0]
+        tile_action = categorical[..., 9]
+        damage = continuous[..., 2].clamp_min(0)
         bias = torch.zeros_like(action_type, dtype=torch.float32)
         bias = bias + ((action_type == 8) & (tile_action == 14)).float() * self.config.capture_city_prior_bonus
         bias = bias + ((action_type == 8) & (tile_action == 11)).float() * self.config.found_city_prior_bonus
@@ -273,7 +284,7 @@ class BeliefMCTS:
             include_belief=False,
         )
         logits = output.policy_logits + self._native_prior_bias(
-            tensors.action_categorical, tensors.action_mask
+            tensors.action_categorical, tensors.action_continuous, tensors.action_mask
         ).to(output.policy_logits.dtype)
         return logits.float().cpu().numpy(), output.value.float().cpu().numpy()
 

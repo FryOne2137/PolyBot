@@ -19,7 +19,7 @@ python scripts/train_self_play.py `
   --workers 16 `
   --mcts-threads 1 `
   --global-inference-batch-size 256 `
-  --inference-wait-ms 1.0 `
+  --inference-wait-ms 4.0 `
   --max-moves 300 `
   --batch-size 64 `
   --device cuda

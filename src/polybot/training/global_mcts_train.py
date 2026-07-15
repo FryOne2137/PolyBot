@@ -18,12 +18,13 @@ from ..data.polyenv_features import (
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
-from ..planning.heuristic_policy import choose_teacher_action
+from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .rewards import RewardShaper
-from .self_play import _action_bucket, _winner_to_value, SelfPlayRunner
+from .self_play import _action_bucket, SelfPlayRunner
 from .teacher_bootstrap import _teacher_game
+from .value_targets import assign_td_lambda_targets
 
 
 @dataclass
@@ -41,7 +42,12 @@ class _Episode:
     winner: int = -1
 
 
-def _native_leaf_bias(categorical: torch.Tensor, continuous: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _native_leaf_bias(
+    categorical: torch.Tensor,
+    continuous: torch.Tensor,
+    mask: torch.Tensor,
+    teacher_prior_weight: float,
+) -> torch.Tensor:
     """Visible-only priors for every native MCTS leaf, not just the root."""
     action_type, tile_action = categorical[..., 0], categorical[..., 9]
     damage = continuous[..., 2].clamp_min(0)
@@ -51,6 +57,19 @@ def _native_leaf_bias(categorical: torch.Tensor, continuous: torch.Tensor, mask:
     bias += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
     bias += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
     bias -= (action_type == 3).float() * 2.0
+    # The network still supplies every prior.  This decaying additive anchor
+    # only stops early self-play from unlearning city capture/founding before
+    # terminal games become common.  It is computed entirely from legal,
+    # visible action features.
+    teacher = torch.zeros_like(bias)
+    teacher += ((action_type == 8) & (tile_action == 14)).float() * 5.0
+    teacher += ((action_type == 8) & (tile_action == 11)).float() * 3.0
+    teacher += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
+    teacher += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
+    teacher += ((action_type == 5) | (action_type == 6)).float() * 0.45
+    teacher += ((action_type == 4) | (action_type == 7)).float() * 0.25
+    teacher -= (action_type == 3).float() * 2.0
+    bias += teacher * float(np.clip(teacher_prior_weight, 0.0, 1.0))
     return bias.masked_fill(~mask, 0.0)
 
 
@@ -69,7 +88,7 @@ def _new_episode(index: int, training: TrainingConfig, train_player: Optional[in
 def _plan_many(
     episodes: List[_Episode], model: PolicyValueBeliefNet, device: torch.device,
     training: TrainingConfig, config: MCTSConfig,
-) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+) -> List[Tuple[int, np.ndarray, np.ndarray, float | None]]:
     """Plan one decision per episode in one global native MctsPool.
 
     The pool contains ``len(episodes) * particles`` isolated belief roots. It
@@ -98,7 +117,10 @@ def _plan_many(
     probabilities = torch.softmax(logits, dim=-1).cpu().numpy()
     for row, packet in enumerate(packets):
         count = len(packet["actions"]["action_id"])
-        root_priors.append(probabilities[row, :count])
+        model_prior = probabilities[row, :count]
+        teacher_prior = teacher_policy(packet)
+        anchor = float(np.clip(config.teacher_prior_weight, 0.0, 1.0))
+        root_priors.append((1.0 - anchor) * model_prior + anchor * teacher_prior)
 
     belief_envs: List[object] = []
     owners: List[int] = []
@@ -121,7 +143,7 @@ def _plan_many(
 
     visits_by_episode = [np.zeros(len(packet["actions"]["action_id"]), dtype=np.float64) for packet in packets]
     if not belief_envs:
-        return [(row, visits_by_episode[row], root_priors[row]) for row in range(len(episodes))]
+        return [(row, visits_by_episode[row], root_priors[row], None) for row in range(len(episodes))]
     pool = MctsPool(
         belief_envs, num_threads=config.native_threads,
         max_actions=config.native_max_actions, c_puct=config.c_puct,
@@ -147,6 +169,7 @@ def _plan_many(
         )
         leaf_logits = leaf_output.policy_logits + _native_leaf_bias(
             leaf_tensors.action_categorical, leaf_tensors.action_continuous, leaf_tensors.action_mask,
+            config.teacher_prior_weight,
         ).to(leaf_output.policy_logits.dtype)
         pool.expand_and_backup(
             leaf_ids, leaf_logits.float().cpu().numpy(),
@@ -154,6 +177,12 @@ def _plan_many(
         )
 
     roots = pool.root_policy(temperature=1.0)
+    root_value_sums = np.zeros(len(episodes), dtype=np.float64)
+    root_value_counts = np.zeros(len(episodes), dtype=np.int64)
+    raw_root_values = (
+        np.asarray(roots["root_value"], dtype=np.float64).reshape(-1)
+        if "root_value" in roots else np.empty(0)
+    )
     for tree, owner in enumerate(owners):
         legal = np.asarray(roots["action_id"][tree], dtype=np.int64)
         mask = np.asarray(roots["action_mask"][tree], dtype=bool)
@@ -163,10 +192,28 @@ def _plan_many(
         for action, valid, visits in zip(legal, mask, count):
             if valid and int(action) in lookup:
                 visits_by_episode[owner][lookup[int(action)]] += visits
-    return [(row, visits_by_episode[row], root_priors[row]) for row in range(len(episodes))]
+        if tree < raw_root_values.size and np.isfinite(raw_root_values[tree]):
+            root_value_sums[owner] += raw_root_values[tree]
+            root_value_counts[owner] += 1
+    return [
+        (
+            row,
+            visits_by_episode[row],
+            root_priors[row],
+            float(root_value_sums[row] / root_value_counts[row]) if root_value_counts[row] else None,
+        )
+        for row in range(len(episodes))
+    ]
 
 
-def _apply_action(episode: _Episode, action_row: int, is_model: bool, policy: Optional[np.ndarray], training: TrainingConfig) -> None:
+def _apply_action(
+    episode: _Episode,
+    action_row: int,
+    is_model: bool,
+    policy: Optional[np.ndarray],
+    training: TrainingConfig,
+    bootstrap_value: float | None = None,
+) -> None:
     packet = episode.env.model_request_numpy()
     events = visible_events_or_empty(episode.env)
     player = int(packet["obs"].get("current_player", episode.env.current_player()))
@@ -179,6 +226,7 @@ def _apply_action(episode: _Episode, action_row: int, is_model: bool, policy: Op
             action_categorical=categorical.copy(), action_continuous=continuous.copy(),
             policy_target=policy.astype(np.float32), full_map_target=np.asarray(episode.env.full_map_numpy(), dtype=np.int64).copy(),
             hidden_mask=np.asarray(packet["map_tokens"])[:, 0] == 0, player_id=player,
+            bootstrap_value=bootstrap_value,
         )
         episode.examples.append(example)
     city, capital = capture_flags(packet, action_row)
@@ -202,13 +250,7 @@ def _apply_action(episode: _Episode, action_row: int, is_model: bool, policy: Op
 
 
 def _finish(episode: _Episode, training: TrainingConfig) -> None:
-    players = {row.player_id for row in episode.examples}
-    future = {player: 0.0 for player in players}
-    for actor, shaped, example in reversed(episode.transitions):
-        for player in players:
-            future[player] = training.reward_discount * future[player] + (1.0 if player == actor else -1.0) * shaped
-        if example is not None:
-            example.value_target = float(np.clip(_winner_to_value(episode.winner, example.player_id) + training.shaping_target_weight * future[example.player_id], -1.0, 1.0))
+    assign_td_lambda_targets(episode.examples, episode.transitions, episode.winner, training)
 
 
 def train_global_mcts_self_play(
@@ -243,16 +285,21 @@ def train_global_mcts_self_play(
                     row = int(episode.rng.integers(len(ids))) if episode.opponent_agent == "random" else choose_teacher_action(packet, episode.rng)
                     _apply_action(episode, row, False, None, training)
             if model_turns:
-                for index, visits, priors in _plan_many(model_turns, model, device, training, mcts):
+                for index, visits, priors, bootstrap_value in _plan_many(model_turns, model, device, training, mcts):
                     episode = model_turns[index]
                     weights = visits if visits.sum() else priors
-                    policy = weights / max(weights.sum(), 1e-8)
-                    row = int(policy.argmax()) if mcts.temperature <= 1e-5 else int(episode.rng.choice(len(policy), p=policy))
+                    search_policy = weights / max(weights.sum(), 1e-8)
+                    policy = search_policy
+                    target_anchor = float(np.clip(training.teacher_policy_target_weight, 0.0, 1.0))
+                    if target_anchor:
+                        teacher_target = teacher_policy(episode.env.model_request_numpy())
+                        policy = (1.0 - target_anchor) * policy + target_anchor * teacher_target
+                    row = int(search_policy.argmax()) if mcts.temperature <= 1e-5 else int(episode.rng.choice(len(search_policy), p=search_policy))
                     if episode.rng.random() < training.exploration_rate:
                         bias = strategic_action_bias(episode.env.model_request_numpy())
                         weights = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))
                         row = int(episode.rng.choice(len(weights), p=weights / weights.sum()))
-                    _apply_action(episode, row, True, policy, training)
+                    _apply_action(episode, row, True, policy, training, bootstrap_value)
             completed = [episode for episode in active if episode.env.is_done() or episode.moves >= training.max_moves]
             for episode in completed:
                 _finish(episode, training); replay.extend(episode.examples); active.remove(episode); done += 1; bar.update(1)
@@ -261,14 +308,19 @@ def train_global_mcts_self_play(
                     teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + episode.index, training); teacher.extend(teacher_examples)
                 bar.set_postfix(replay=len(replay), active=len(active), trees=len(model_turns) * mcts.particles)
     losses = []
-    for _ in tqdm(range(games * updates_per_game), desc=f"optimising ({device})", unit="update", dynamic_ncols=True):
+    bootstrap_examples = sum(example.bootstrap_value is not None for example in replay._examples)
+    for update in tqdm(range(games * updates_per_game), desc=f"optimising ({device})", unit="update", dynamic_ncols=True):
         if len(replay) < training.batch_size: break
         tc = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher)); sc = training.batch_size - tc
         rows = replay.sample(sc, sample_rng, training.priority_replay_fraction) if sc else []
         rows += teacher.sample(tc, sample_rng, training.priority_replay_fraction) if tc else []
         losses.append(train_batch(model, optimiser, stack_examples(rows, device), training))
     if model_out: save_model(model_out, model, model_config)
-    result = {"games": float(games), "active_envs": float(active_envs), "replay_examples": float(len(replay)), "teacher_replay_examples": float(len(teacher))}
+    result = {
+        "games": float(games), "active_envs": float(active_envs), "replay_examples": float(len(replay)),
+        "teacher_replay_examples": float(len(teacher)),
+        "mcts_value_bootstrap_fraction": float(bootstrap_examples / max(1, len(replay))),
+    }
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
     if losses: result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
     return result

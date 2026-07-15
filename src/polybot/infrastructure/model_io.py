@@ -27,7 +27,12 @@ def save_model(path: Path, model: PolicyValueBeliefNet, config: ModelConfig) -> 
 def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, ModelConfig]:
     """Load a model-only checkpoint created by :func:`save_model`."""
     payload = torch.load(path, map_location=device)
-    config = ModelConfig(**payload["model_config"])
+    saved_config = dict(payload["model_config"])
+    # Pre-factorized checkpoints have the old cross-attention policy and do
+    # not contain this field.  Keep them runnable instead of silently loading
+    # them into a different architecture with random policy weights.
+    saved_config.setdefault("policy_architecture", "attention")
+    config = ModelConfig(**saved_config)
     model = PolicyValueBeliefNet(config).to(device)
     model.load_state_dict(payload["state_dict"])
     return model, config

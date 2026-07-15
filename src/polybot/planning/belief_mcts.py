@@ -269,6 +269,20 @@ class BeliefMCTS:
         )
         bias = bias + ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
         bias = bias - (action_type == 3).float() * self.config.end_turn_prior_penalty
+        # Keep a small, explicitly configurable teacher anchor during early
+        # search.  It only sees the dense legal-action packet, never hidden
+        # state, and is gradually reduced by the training pipeline.
+        teacher = torch.zeros_like(bias)
+        teacher = teacher + ((action_type == 8) & (tile_action == 14)).float() * 5.0
+        teacher = teacher + ((action_type == 8) & (tile_action == 11)).float() * 3.0
+        teacher = teacher + (action_type == 1).float() * (
+            0.8 + damage.clamp_max(10.0) * 0.12
+        )
+        teacher = teacher + ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
+        teacher = teacher + ((action_type == 5) | (action_type == 6)).float() * 0.45
+        teacher = teacher + ((action_type == 4) | (action_type == 7)).float() * 0.25
+        teacher = teacher - (action_type == 3).float() * 2.0
+        bias = bias + teacher * float(np.clip(self.config.teacher_prior_weight, 0.0, 1.0))
         return bias.masked_fill(~mask, 0.0)
 
     @torch.inference_mode()

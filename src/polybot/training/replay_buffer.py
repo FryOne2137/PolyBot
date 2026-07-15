@@ -24,6 +24,9 @@ class TrainingExample:
     player_id: int
     shaped_reward: float = 0.0
     value_target: float = 0.0
+    # Mean root value returned by fog-safe particle MCTS.  It is a training
+    # target bootstrap, never an additional observation exposed to the model.
+    bootstrap_value: float | None = None
 
 
 class ReplayBuffer:

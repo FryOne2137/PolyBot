@@ -16,7 +16,7 @@ from ..data.polyenv_features import (
     visible_events_or_empty,
 )
 from ..planning.belief_mcts import BeliefMCTS
-from ..planning.heuristic_policy import choose_teacher_action
+from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .rewards import RewardShaper
 from .replay_buffer import TrainingExample
 
@@ -133,6 +133,9 @@ class SelfPlayRunner:
                     policy = decision.visit_counts / decision.visit_counts.sum()
                 else:
                     policy = decision.priors / decision.priors.sum()
+                target_anchor = float(np.clip(self.training.teacher_policy_target_weight, 0.0, 1.0))
+                if target_anchor:
+                    policy = (1.0 - target_anchor) * policy + target_anchor * teacher_policy(packet)
                 # Ground truth is captured only as a supervised belief target.
                 # It is never passed to planner/model inference.
                 example = TrainingExample(

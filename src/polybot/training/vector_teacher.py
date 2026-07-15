@@ -132,7 +132,7 @@ def train_vector_teacher(
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     cuda_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=cuda_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
     env = VectorGameEnv(
         num_envs=num_envs,
         seed=training.seed,
@@ -165,6 +165,7 @@ def train_vector_teacher(
                     output = model(
                         tensors["map_tokens"], tensors["global_features"], tensors["action_categorical"],
                         tensors["action_continuous"], tensors["action_mask"], tensors["event_features"],
+                        include_belief=False,
                     )
                     log_probabilities = F.log_softmax(output.policy_logits, dim=-1)
                     policy_loss = -(

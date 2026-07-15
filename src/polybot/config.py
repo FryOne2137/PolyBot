@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 from typing import Optional
+
+
 @dataclass
 class ModelConfig:
     """Network size. The defaults fit an Apple Silicon laptop."""
@@ -13,6 +15,11 @@ class ModelConfig:
     max_board_side: int = 32
     max_players: int = 16
     max_runtime_id: int = 512
+    # ``factorized`` scores a legal action as type + source tile + target
+    # tile + option fields.  It avoids materialising attention from every
+    # legal action to every map tile, which is both faster and less prone to
+    # memorising runtime ids.  ``attention`` remains for old checkpoints.
+    policy_architecture: str = "factorized"
 
 
 @dataclass
@@ -37,6 +44,9 @@ class MCTSConfig:
     found_city_prior_bonus: float = 3.0
     attack_prior_bonus: float = 0.8
     end_turn_prior_penalty: float = 2.0
+    # Blend a small amount of the legal-action teacher into early MCTS priors.
+    # It is a training aid only; the neural network still scores every leaf.
+    teacher_prior_weight: float = 0.20
 
 
 @dataclass
@@ -67,6 +77,13 @@ class TrainingConfig:
     capital_capture_reward: float = 4.0
     shaping_target_weight: float = 0.20
     reward_discount: float = 0.997
+    # MCTS value targets interpolate between a search bootstrap at the next
+    # decision and the later return.  1.0 is Monte Carlo; lower values put
+    # more trust in search/value estimates.
+    td_lambda: float = 0.80
+    # Preserve a small amount of the productive legal-action teacher in MCTS
+    # policy targets while early search is still shallow/noisy.
+    teacher_policy_target_weight: float = 0.10
     # During early self-play, occasionally execute a strategic legal action
     # instead of the current MCTS choice to create non-draw training data.
     exploration_rate: float = 0.20

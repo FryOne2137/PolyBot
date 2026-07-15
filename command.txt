@@ -1,3 +1,35 @@
+# Windows PowerShell: pełny, jednoplikowy pipeline nowej polityki faktoryzowanej.
+# W trakcie nie zapisuje gier, replayów ani checkpointów pośrednich.
+python scripts/train_pipeline.py `
+  --belief-positions 50000 `
+  --belief-batch-size 32 `
+  --teacher-games 300 `
+  --teacher-updates-per-game 16 `
+  --vector-teacher-envs 128 `
+  --vector-teacher-steps 30000 `
+  --flat-envs 64 `
+  --flat-steps 40000 `
+  --self-play-games 600 `
+  --refinement-games 300 `
+  --updates-per-game 8 `
+  --refinement-updates-per-game 8 `
+  --simulations 32 `
+  --particles 4 `
+  --workers 32 `
+  --mcts-max-actions 1024 `
+  --teacher-prior-weight 0.35 `
+  --teacher-policy-target-weight 0.15 `
+  --teacher-replay-fraction 0.35 `
+  --td-lambda 0.80 `
+  --batch-size 64 `
+  --learning-rate 5e-5 `
+  --max-moves 300 `
+  --map-size 11 `
+  --map-type lakes `
+  --device cuda `
+  --model-out models\polybot-factorized-v1.pt
+
+
 # Windows PowerShell: one global native MctsPool over all active games and particles.
 # It produces large CUDA batches while the C++ engine performs PUCT and backup.
 python scripts/train_self_play.py `

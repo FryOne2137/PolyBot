@@ -19,6 +19,11 @@ from ..data.token_schema import (
 
 ACTION_FEATURE_MAX: Sequence[int] = (9, 1023, 1023, 1023, 1023, 25, 16, 90, 8, 14, 5, 1)
 
+# Runtime IDs (unit, city, source and target indexes) are not stable semantic
+# categories.  The factorized policy handles source/target through tile states
+# and intentionally excludes the remaining runtime ids from option scoring.
+FACTOR_OPTION_FEATURES: Sequence[int] = (5, 6, 7, 8, 9, 10, 11)
+
 # These fields describe a hidden tile without introducing cross-tile entity
 # identities.  A city/unit decoder needs a separate constrained head because
 # city IDs and unit origins must refer to other generated tiles.
@@ -73,17 +78,35 @@ class PolicyValueBeliefNet(nn.Module):
         self.map_transformer = nn.TransformerEncoder(block, num_layers=config.transformer_layers)
         self.map_norm = nn.LayerNorm(d_model)
 
+        if config.policy_architecture not in {"factorized", "attention"}:
+            raise ValueError("policy_architecture must be 'factorized' or 'attention'")
+        self.policy_architecture = config.policy_architecture
         self.action_embeddings = nn.ModuleList(
             [nn.Embedding(largest + 2, d_model) for largest in ACTION_FEATURE_MAX]
         )
         self.action_continuous = nn.Sequential(
             nn.Linear(len(ACTION_CONTINUOUS_FIELDS), d_model), nn.GELU(), nn.Linear(d_model, d_model)
         )
-        self.action_to_map = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=config.attention_heads, dropout=config.dropout, batch_first=True
-        )
-        self.action_norm = nn.LayerNorm(d_model)
-        self.policy_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
+        if self.policy_architecture == "attention":
+            self.action_to_map = nn.MultiheadAttention(
+                embed_dim=d_model, num_heads=config.attention_heads, dropout=config.dropout, batch_first=True
+            )
+            self.action_norm = nn.LayerNorm(d_model)
+            self.policy_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
+        else:
+            # A legal action is decomposed into semantic factors.  This is
+            # equivalent to a compact action scorer, but avoids an expensive
+            # [batch, actions, tiles] attention operation at every MCTS leaf.
+            self.type_policy_head = nn.Linear(d_model, ACTION_FEATURE_MAX[0] + 2)
+            self.source_tile_policy_head = nn.Linear(d_model, 1)
+            self.target_tile_policy_head = nn.Linear(d_model, 1)
+            self.city_tile_policy_head = nn.Linear(d_model, 1)
+            self.source_present_head = nn.Linear(d_model, 1)
+            self.target_present_head = nn.Linear(d_model, 1)
+            self.city_present_head = nn.Linear(d_model, 1)
+            self.option_policy_head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1)
+            )
         self.value_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Tanh())
         self.belief_heads = nn.ModuleList(
             [nn.Linear(d_model, largest + 2) for largest in MAP_FEATURE_MAX]
@@ -131,37 +154,12 @@ class PolicyValueBeliefNet(nn.Module):
         include_belief: bool = True,
     ) -> ModelOutput:
         state, tile_states = self.encode_map(map_tokens, global_features, event_features)
-        batch, actions, _ = action_categorical.shape
-        action_states = torch.zeros(
-            (batch, actions, self.config.d_model),
-            dtype=torch.float32,
-            device=map_tokens.device,
-        )
-        for feature_index, (embedding, largest) in enumerate(zip(self.action_embeddings, ACTION_FEATURE_MAX)):
-            action_states = action_states + embedding(_indices(action_categorical[..., feature_index], largest))
-        action_states = action_states + self.action_continuous(action_continuous)
-
-        # Source and target tiles are particularly informative for movement and combat.
-        for action_column in (1, 2):
-            indices = action_categorical[..., action_column]
-            existing = indices >= 0
-            tile_indices = indices.clamp_min(0).clamp_max(tile_states.shape[1] - 1)
-            gather_shape = (-1, -1, tile_states.shape[-1])
-            gathered = tile_states.gather(
-                1,
-                tile_indices.unsqueeze(-1).expand(gather_shape),
+        if self.policy_architecture == "attention":
+            logits = self._attention_policy(tile_states, action_categorical, action_continuous)
+        else:
+            logits = self._factorized_policy(
+                state, tile_states, map_tokens, action_categorical, action_continuous
             )
-            action_states = action_states + gathered * existing.unsqueeze(-1)
-
-        # Attention weights are never consumed by the policy. Asking
-        # MultiheadAttention not to materialise them enables PyTorch's
-        # memory-efficient scaled-dot-product kernels and avoids allocating a
-        # [batch, actions, tiles] tensor in every training forward pass.
-        attended, _ = self.action_to_map(
-            action_states, tile_states, tile_states, need_weights=False
-        )
-        action_states = self.action_norm(action_states + attended)
-        logits = self.policy_head(action_states).squeeze(-1)
         logits = logits.masked_fill(~action_mask, float("-inf"))
         # Simulated MCTS leaves need only policy/value.  Belief decoding is
         # reserved for real observations that seed particle worlds.
@@ -171,6 +169,91 @@ class PolicyValueBeliefNet(nn.Module):
             value=self.value_head(state).squeeze(-1),
             belief_logits=belief_logits,
             tile_states=tile_states,
+        )
+
+    def _attention_policy(
+        self,
+        tile_states: torch.Tensor,
+        action_categorical: torch.Tensor,
+        action_continuous: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compatibility scorer for checkpoints created before factorization."""
+        batch, actions, _ = action_categorical.shape
+        action_states = torch.zeros(
+            (batch, actions, self.config.d_model),
+            dtype=torch.float32,
+            device=tile_states.device,
+        )
+        for feature_index, (embedding, largest) in enumerate(zip(self.action_embeddings, ACTION_FEATURE_MAX)):
+            action_states = action_states + embedding(_indices(action_categorical[..., feature_index], largest))
+        action_states = action_states + self.action_continuous(action_continuous)
+        for action_column in (1, 2):
+            indices = action_categorical[..., action_column]
+            existing = indices >= 0
+            tile_indices = indices.clamp_min(0).clamp_max(tile_states.shape[1] - 1)
+            gathered = tile_states.gather(
+                1, tile_indices.unsqueeze(-1).expand(-1, -1, tile_states.shape[-1])
+            )
+            action_states = action_states + gathered * existing.unsqueeze(-1)
+        attended, _ = self.action_to_map(action_states, tile_states, tile_states, need_weights=False)
+        return self.policy_head(self.action_norm(action_states + attended)).squeeze(-1)
+
+    def _factorized_policy(
+        self,
+        state: torch.Tensor,
+        tile_states: torch.Tensor,
+        map_tokens: torch.Tensor,
+        action_categorical: torch.Tensor,
+        action_continuous: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score legal actions using only semantic action factors.
+
+        Source/target indexes select encoded map tiles; they are never passed
+        through a learned id embedding.  Consequently the score transfers to
+        new boards and does not memorise ephemeral unit/city ids.
+        """
+        option_states = self.action_continuous(action_continuous)
+        for feature_index in FACTOR_OPTION_FEATURES:
+            option_states = option_states + self.action_embeddings[feature_index](
+                _indices(action_categorical[..., feature_index], ACTION_FEATURE_MAX[feature_index])
+            )
+        option_score = self.option_policy_head(option_states).squeeze(-1)
+
+        type_scores = self.type_policy_head(state)
+        type_index = _indices(action_categorical[..., 0], ACTION_FEATURE_MAX[0])
+        type_score = type_scores.gather(1, type_index)
+
+        def tile_score(column: int, tile_head: nn.Linear, present_head: nn.Linear) -> torch.Tensor:
+            indices = action_categorical[..., column]
+            present = indices >= 0
+            safe_indices = indices.clamp_min(0).clamp_max(tile_states.shape[1] - 1)
+            scores = tile_head(tile_states).squeeze(-1)
+            selected = scores.gather(1, safe_indices)
+            present_bias = present_head(state).squeeze(-1).unsqueeze(1)
+            return (selected + present_bias) * present.to(selected.dtype)
+
+        # City actions name a runtime city id instead of a tile. Resolve that
+        # pointer through the observed city-centre token (map column 15), then
+        # score its encoded local state. This preserves city-specific choices
+        # without learning an arbitrary city-id embedding.
+        city_ids = action_categorical[..., 4]
+        city_present = city_ids >= 0
+        map_city_ids = map_tokens[..., 15]
+        city_matches = city_ids.unsqueeze(-1).eq(map_city_ids.unsqueeze(1)) & city_present.unsqueeze(-1)
+        city_tile_scores = self.city_tile_policy_head(tile_states).squeeze(-1).unsqueeze(1)
+        matched_city_score = city_tile_scores.masked_fill(~city_matches, float("-inf")).amax(dim=-1)
+        city_score = torch.where(
+            city_matches.any(dim=-1),
+            matched_city_score + self.city_present_head(state).squeeze(-1).unsqueeze(1),
+            torch.zeros_like(matched_city_score),
+        )
+
+        return (
+            option_score
+            + type_score
+            + tile_score(1, self.source_tile_policy_head, self.source_present_head)
+            + tile_score(2, self.target_tile_policy_head, self.target_present_head)
+            + city_score
         )
 
     @torch.no_grad()

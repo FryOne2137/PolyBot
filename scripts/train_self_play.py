@@ -30,6 +30,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--exploration-rate", type=float, default=0.20)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
+    parser.add_argument("--td-lambda", type=float, default=0.80, help="TD(lambda) mix for MCTS value targets.")
+    parser.add_argument(
+        "--teacher-policy-target-weight", type=float, default=0.10,
+        help="Blend this fraction of the legal-action teacher into each MCTS policy target.",
+    )
     parser.add_argument("--opponent", choices=["self_play", "random", "heuristic", "mixed"], default="self_play")
     parser.add_argument("--random-opponent-rate", type=float, default=0.50)
     parser.add_argument("--mixed-opponent", choices=["random", "heuristic"], default="heuristic")
@@ -44,6 +49,10 @@ def main() -> None:
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--mcts-threads", type=int, help="C++ threads used by PolyEnv MctsPool; default uses logical cores")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument(
+        "--teacher-prior-weight", type=float, default=0.20,
+        help="Legal-action teacher anchor inside MCTS priors; use 0.0 for pure network search.",
+    )
     parser.add_argument(
         "--workers", type=int, default=32,
         help="Number of active games in one global native MctsPool (legacy fallback: Python actors).",

@@ -3,7 +3,7 @@
 PolyBot is a fog-of-war self-play agent for [PolyEnv](https://polyenv.readthedocs.io/).  It combines:
 
 - a Transformer over the player-view `map_tokens` (`[tiles, 23]`),
-- a policy that scores only `model_request_numpy()["actions"]`, i.e. actions legal now,
+- a factorized policy that scores only `model_request_numpy()["actions"]`, i.e. actions legal now,
 - a value head used by PUCT MCTS,
 - a belief decoder that samples complete map hypotheses,
 - `env.make_belief_env(...)` for detached MCTS particles with no access to the real hidden state,
@@ -32,28 +32,34 @@ python -c "import torch; print(torch.backends.mps.is_available())"
 
 ## Training pipeline
 
-Nie uruchamiaj pełnego MCTS na losowym modelu. Pipeline ma dwa etapy:
+Nie uruchamiaj pełnego MCTS na losowym modelu. Pipeline ma sześć etapów:
 
 1. `train_belief.py` — losowe legalne akcje, uczenie ukrytej mapy z `full_map_numpy()` jako etykiety. Liczy wyłącznie pozycje, w których istnieje fog-of-war.
 2. `train_teacher.py` — behavior-cloning z wbudowanego, sieciowo-niezależnego heuristic teacher; generuje i uczy dane wyłącznie w RAM.
 3. `train_vector_teacher.py` — szybkie, natywne C++ VectorGameEnv behavior-cloning policy na setkach envów równolegle. Ten etap nie używa `full_map_numpy()`, więc nie trenuje belief decoder.
-4. `train_self_play.py` — globalny self-play z natywnym PolyEnv `MctsPool`:
+4. `train_flat_actor_critic.py` — szybki, równoległy actor-critic na
+   `VectorGameEnv`; teacher-KL utrzymuje podstawy strategii, gdy reward jest
+   jeszcze rzadki.
+5. `train_self_play.py` — globalny self-play z natywnym PolyEnv `MctsPool`:
    wszystkie aktywne gry i particles są jednym pool-em, więc selekcja,
    branchowanie i backup PUCT działają w C++, a PyTorch liczy duże batch'e
    liści. Na starej wersji PolyEnv skrypt bezpiecznie wraca do wolniejszego
    MCTS w Pythonie.
+6. druga, mniej eksploracyjna runda MCTS. Jej target value używa TD(lambda):
+   root value kolejnej decyzji miesza się z późniejszym zwrotem z partii.
 
 Cały pipeline uruchamiany jedną komendą zapisuje **wyłącznie końcowy plik modelu**:
 
 ```bash
 python scripts/train_pipeline.py \
-  --belief-positions 2_000 \
-  --self-play-games 10 \
-  --updates-per-game 2 \
-  --simulations 16 \
-  --particles 2 \
-  --max-moves 300 \
-  --device auto \
+  --belief-positions 20_000 \
+  --teacher-games 100 \
+  --vector-teacher-steps 10_000 \
+  --flat-steps 10_000 \
+  --self-play-games 200 \
+  --refinement-games 100 \
+  --simulations 32 --particles 4 --workers 32 \
+  --max-moves 300 --device cuda \
   --model-out models/polybot.pt
 ```
 
@@ -103,7 +109,7 @@ Gdy dwa identyczne checkpointy produkują same remisy, użyj `--opponent heurist
 src/polybot/
 ├── config.py
 ├── models/
-│   └── policy_value_belief.py    Map Transformer + policy/value/belief heads
+│   └── policy_value_belief.py    Map Transformer + factorized policy/value/belief heads
 ├── planning/
 │   └── belief_mcts.py            PUCT over detached belief particles
 ├── training/
@@ -123,7 +129,7 @@ scripts/
 ├── train_teacher.py              stage 2: scalar heuristic teacher
 ├── train_vector_teacher.py       stage 3: native C++ vector curriculum
 ├── train_self_play.py            stage 4: scalar MCTS self-play
-└── train_pipeline.py             both stages, one final model write
+└── train_pipeline.py             all curriculum stages, one final model write
 ```
 
 ## Information-flow rule
@@ -141,8 +147,18 @@ Never use `env.clone()` to branch directly from the real game under fog. `clone(
 
 ```text
 loss = policy cross-entropy(MCTS visits)
-     + value Huber loss(final win/loss)
+     + value Huber loss(TD(lambda) return / final win-loss)
      + 0.35 × belief cross-entropy(hidden map tokens)
 ```
 
 The terminal objective is win `+1` / loss `-1`. Small logged shaping terms make early exploration less sparse; they do not replace the terminal objective.
+
+## Factorized legal-action policy
+
+The default new model does not run action-to-map attention for every legal
+action. It computes a score from four components: action type, encoded source
+tile, encoded target tile and remaining semantic options/costs. Raw unit/city
+runtime IDs are deliberately excluded from this fast score, so it is less able
+to memorise identifiers that change from one game to another. Existing
+checkpoints keep their old attention policy automatically; start a new
+pipeline without `--model-in` to use the factorized model.

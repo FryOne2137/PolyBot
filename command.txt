@@ -138,3 +138,21 @@ python scripts/evaluate.py `
   --mcts-max-actions 1024 `
   --max-moves 300 `
   --device cuda
+
+
+
+
+python scripts/train_pipeline.py `
+  --belief-positions 256 `
+  --teacher-games 2 `
+  --vector-teacher-steps 20 `
+  --flat-steps 20 `
+  --self-play-games 4 `
+  --refinement-games 0 `
+  --updates-per-game 1 `
+  --simulations 4 `
+  --particles 1 `
+  --workers 4 `
+  --batch-size 8 `
+  --device cuda `
+  --model-out models\pipeline-smoke.pt

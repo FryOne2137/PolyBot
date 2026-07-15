@@ -76,3 +76,6 @@ def assign_td_lambda_targets(
                 continuation = (1.0 - lambda_) * sign * float(bootstrap) + lambda_ * later_return
 
         example.value_target = float(np.clip(reward_sum + discount * continuation, -1.0, 1.0))
+        # The preceding decision uses this as its lambda-return continuation.
+        # Keep it by object identity because examples are mutable dataclasses.
+        targets[id(example)] = example.value_target

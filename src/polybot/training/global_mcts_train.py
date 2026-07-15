@@ -115,8 +115,12 @@ def _plan_many(
     )
     # Each wave exposes at most one leaf per tree. With B active games and P
     # particles, a wave has up to B*P leaves and is the natural GPU batch.
-    completed = 0
-    while completed < config.simulations:
+    # ``simulations`` is the total search budget *per real-game decision*, as
+    # in the former scalar trainer. One global pool wave evaluates one leaf
+    # per particle tree, so running it ``simulations`` times accidentally
+    # multiplied the requested budget by ``particles``. Divide it here.
+    waves = max(1, int(np.ceil(config.simulations / max(1, config.particles))))
+    for _ in range(waves):
         leaves = pool.select_leaves()
         leaf_ids = np.asarray(leaves["leaf_id"])
         if leaf_ids.size == 0:
@@ -132,7 +136,6 @@ def _plan_many(
             leaf_ids, leaf_output.policy_logits.float().cpu().numpy(),
             leaf_output.value.float().cpu().numpy(),
         )
-        completed += 1
 
     roots = pool.root_policy(temperature=1.0)
     for tree, owner in enumerate(owners):

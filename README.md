@@ -64,7 +64,7 @@ python scripts/train_teacher.py \
 
 python scripts/train_vector_teacher.py \
   --model-in models/teacher.pt --num-envs 128 --steps 10_000 \
-  --num-threads 8 --device cuda --model-out models/vector_teacher.pt
+  --num-threads 8 --updates-per-step 2 --device cuda --model-out models/vector_teacher.pt
 
 python scripts/train_self_play.py \
   --model-in models/vector_teacher.pt --model-out models/self_play.pt \

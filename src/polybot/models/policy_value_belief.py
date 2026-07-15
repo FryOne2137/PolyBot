@@ -127,6 +127,8 @@ class PolicyValueBeliefNet(nn.Module):
         action_continuous: torch.Tensor,
         action_mask: torch.Tensor,
         event_features: torch.Tensor | None = None,
+        *,
+        include_belief: bool = True,
     ) -> ModelOutput:
         state, tile_states = self.encode_map(map_tokens, global_features, event_features)
         batch, actions, _ = action_categorical.shape
@@ -155,7 +157,9 @@ class PolicyValueBeliefNet(nn.Module):
         action_states = self.action_norm(action_states + attended)
         logits = self.policy_head(action_states).squeeze(-1)
         logits = logits.masked_fill(~action_mask, float("-inf"))
-        belief_logits = [head(tile_states) for head in self.belief_heads]
+        # Simulated MCTS leaves need only policy/value.  Belief decoding is
+        # reserved for real observations that seed particle worlds.
+        belief_logits = [head(tile_states) for head in self.belief_heads] if include_belief else []
         return ModelOutput(
             policy_logits=logits,
             value=self.value_head(state).squeeze(-1),
@@ -181,20 +185,29 @@ class PolicyValueBeliefNet(nn.Module):
         hidden dynamic entities as absent.  This is conservative, valid and
         never reads hidden source state.
         """
-        batch = map_tokens.shape[0]
-        if batch != 1:
+        if map_tokens.shape[0] != 1:
             raise ValueError("MCTS particle generation currently expects a batch of one")
-        dummy_actions = torch.zeros((1, 1, len(ACTION_CATEGORICAL_FIELDS)), dtype=torch.long, device=map_tokens.device)
-        dummy_continuous = torch.zeros((1, 1, len(ACTION_CONTINUOUS_FIELDS)), device=map_tokens.device)
-        dummy_mask = torch.ones((1, 1), dtype=torch.bool, device=map_tokens.device)
-        output = self(
-            map_tokens,
-            global_features,
-            dummy_actions,
-            dummy_continuous,
-            dummy_mask,
-            event_features,
+        # This compatibility method has no policy action to score, so avoid a
+        # dummy action-attention pass entirely.
+        _, tile_states = self.encode_map(map_tokens, global_features, event_features)
+        belief_logits = [head(tile_states) for head in self.belief_heads]
+        return self.sample_completed_maps_from_belief_logits(
+            map_tokens, belief_logits, particles, temperature
         )
+
+    @torch.no_grad()
+    def sample_completed_maps_from_belief_logits(
+        self,
+        map_tokens: torch.Tensor,
+        belief_logits: Sequence[torch.Tensor],
+        particles: int,
+        temperature: float = 1.0,
+    ) -> List[torch.Tensor]:
+        """Sample particles from belief logits computed during root inference."""
+        if map_tokens.shape[0] != 1:
+            raise ValueError("MCTS particle generation currently expects a batch of one")
+        if len(belief_logits) != len(MAP_FEATURE_MAX):
+            raise ValueError("particle sampling requires all belief heads")
         observed = map_tokens[0]
         known = observed[:, 0] == 1
         hidden = ~known
@@ -206,14 +219,27 @@ class PolicyValueBeliefNet(nn.Module):
             dtype=observed.dtype,
             device=observed.device,
         )
+        # One softmax/multinomial per field replaces one per field * particle.
+        sampled_features: dict[int, torch.Tensor] = {}
+        has_hidden = bool(hidden.any())
+        for feature_index in SAFE_PARTICLE_FEATURES:
+            if has_hidden:
+                probabilities = torch.softmax(
+                    belief_logits[feature_index][0, hidden] / max(temperature, 1e-4), dim=-1
+                )
+                sampled_features[feature_index] = (
+                    torch.multinomial(probabilities, particles, replacement=True).transpose(0, 1) - 1
+                )
+            else:
+                sampled_features[feature_index] = torch.empty(
+                    (particles, 0), dtype=observed.dtype, device=observed.device
+                )
+
         result: List[torch.Tensor] = []
-        for _ in range(particles):
+        for particle_index in range(particles):
             completed = empty_tile.expand_as(observed).clone()
             for feature_index in SAFE_PARTICLE_FEATURES:
-                logits = output.belief_logits[feature_index]
-                probs = torch.softmax(logits[0] / max(temperature, 1e-4), dim=-1)
-                sampled = torch.multinomial(probs, 1).squeeze(-1) - 1
-                completed[hidden, feature_index] = sampled[hidden].clamp_min(0)
+                completed[hidden, feature_index] = sampled_features[feature_index][particle_index].clamp_min(0)
             # Settlement type 2 is a city and requires globally consistent
             # city id/owner/level fields.  Keep such hidden predictions empty
             # until the structured city head exists.

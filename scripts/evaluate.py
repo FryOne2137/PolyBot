@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
-    parser.add_argument("--inference-batch-size", type=int, default=8)
+    parser.add_argument("--inference-batch-size", type=int, default=32)
     args = parser.parse_args()
 
     training = training_config_from_args(args)

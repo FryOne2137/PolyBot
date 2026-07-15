@@ -36,7 +36,7 @@ def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
     return MCTSConfig(
         simulations=args.simulations,
         particles=args.particles,
-        inference_batch_size=getattr(args, "inference_batch_size", 8),
+        inference_batch_size=getattr(args, "inference_batch_size", 32),
     )
 
 

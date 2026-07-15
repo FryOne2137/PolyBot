@@ -93,7 +93,7 @@ class BeliefMCTS:
         self.inference = inference
         self._reported_particle_errors: set[str] = set()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _evaluate_packet(
         self,
         packet: Dict[str, object],
@@ -101,7 +101,7 @@ class BeliefMCTS:
     ) -> Tuple[Dict[int, float], float]:
         return self._evaluate_packets([packet], [events])[0]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _evaluate_packets(
         self,
         packets: List[Dict[str, object]],
@@ -111,7 +111,7 @@ class BeliefMCTS:
             return self.inference.evaluate(packets, events)
         return self._evaluate_packets_direct(packets, events)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _evaluate_packets_direct(
         self,
         packets: List[Dict[str, object]],
@@ -128,8 +128,18 @@ class BeliefMCTS:
             tensors.action_continuous,
             tensors.action_mask,
             tensors.event_features,
+            include_belief=False,
         )
-        logits = output.policy_logits.clone()
+        return self._decode_evaluations(packets, output.policy_logits, output.value)
+
+    def _decode_evaluations(
+        self,
+        packets: List[Dict[str, object]],
+        policy_logits: torch.Tensor,
+        values_tensor: torch.Tensor,
+    ) -> List[Tuple[Dict[int, float], float]]:
+        """Apply visible-only prior shaping and move compact outputs to CPU."""
+        logits = policy_logits.clone()
         for row, packet in enumerate(packets):
             bias = strategic_action_bias(
                 packet,
@@ -142,8 +152,8 @@ class BeliefMCTS:
             logits[row, :bias.size] += torch.as_tensor(
                 bias, dtype=logits.dtype, device=logits.device
             )
-        probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-        values = output.value.detach().cpu().numpy()
+        probabilities = torch.softmax(logits, dim=-1).cpu().numpy()
+        values = values_tensor.cpu().numpy()
         result: List[Tuple[Dict[int, float], float]] = []
         for row, packet in enumerate(packets):
             action_ids = np.asarray(packet["actions"]["action_id"], dtype=np.int64)
@@ -156,7 +166,7 @@ class BeliefMCTS:
             ))
         return result
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _particles(self, packet: Dict[str, object], events: Dict[str, object] | None = None) -> List[np.ndarray]:
         remote_sample = getattr(self.inference, "sample_particles", None)
         if callable(remote_sample):
@@ -182,6 +192,40 @@ class BeliefMCTS:
         particles = self.inference.exclusive(sample) if self.inference is not None else sample()
         return [particle.detach().cpu().numpy().astype(np.int32) for particle in particles]
 
+    @torch.inference_mode()
+    def _root_priors_and_particles(
+        self,
+        packet: Dict[str, object],
+        events: Dict[str, object] | None,
+    ) -> Tuple[Dict[int, float], List[np.ndarray]]:
+        """Evaluate and sample the root with one shared Transformer pass.
+
+        A root policy/value output already contains belief logits.  Reusing it
+        removes a formerly separate policy-less root forward pass.
+        """
+        if self.inference is not None:
+            priors, _ = self._evaluate_packet(packet, events)
+            return priors, self._particles(packet, events)
+        if self.model is None or self.device is None:
+            raise RuntimeError("local MCTS inference requires a model and device")
+        tensors = packet_to_tensors(packet, self.device, events)
+        output = self.model(
+            tensors.map_tokens,
+            tensors.global_features,
+            tensors.action_categorical,
+            tensors.action_continuous,
+            tensors.action_mask,
+            tensors.event_features,
+        )
+        priors, _ = self._decode_evaluations([packet], output.policy_logits, output.value)[0]
+        particles = self.model.sample_completed_maps_from_belief_logits(
+            tensors.map_tokens,
+            output.belief_logits,
+            self.config.particles,
+            max(self.config.temperature, 0.35),
+        )
+        return priors, [particle.cpu().numpy().astype(np.int32) for particle in particles]
+
     def decide(
         self,
         env: object,
@@ -193,7 +237,7 @@ class BeliefMCTS:
         if action_ids.size == 0:
             raise RuntimeError("PolyEnv returned no legal actions")
         root_events = visible_events_or_empty(env)
-        root_priors, _ = self._evaluate_packet(root_packet, root_events)
+        root_priors, completed_particles = self._root_priors_and_particles(root_packet, root_events)
         # Rollouts may prune/adjust a node.  Keep the policy evaluated on the
         # authoritative observation immutable for final targets and fallback.
         root_player = int(root_packet["obs"].get("current_player", env.current_player()))
@@ -204,7 +248,8 @@ class BeliefMCTS:
         valid_particles = 0
 
         inference_batch_size = max(1, int(self.config.inference_batch_size))
-        for completed in self._particles(root_packet, root_events):
+        belief_envs: List[object] = []
+        for completed in completed_particles:
             try:
                 # The only branch creation from the authoritative env.
                 belief_env = env.make_belief_env(completed, perspective=root_player)
@@ -221,24 +266,37 @@ class BeliefMCTS:
                     on_progress(completed_simulations, total_simulations, valid_particles)
                 continue
             valid_particles += 1
-            remaining = simulations_per_particle
-            while remaining:
-                selected = min(remaining, inference_batch_size)
-                pending: List[PendingLeaf] = []
-                for _ in range(selected):
-                    leaf = self._select_leaf(belief_env, root, root_player)
-                    if leaf is not None:
-                        pending.append(leaf)
-                if pending:
-                    evaluations = self._evaluate_packets([leaf.packet for leaf in pending])
-                    for leaf, (priors, local_value) in zip(pending, evaluations):
-                        leaf.node.priors = priors
-                        root_value = local_value if leaf.acting_player == root_player else -local_value
-                        self._backup(leaf.path, root_value, reserved=True)
-                completed_simulations += selected
-                remaining -= selected
-                if on_progress:
-                    on_progress(completed_simulations, total_simulations, valid_particles)
+            belief_envs.append(belief_env)
+
+        # Select from all particle worlds before invoking the network.  These
+        # worlds are independent hypotheses but share the root tree, so their
+        # leaves can safely be scored together.  This is the main way to make
+        # particle MCTS feed a worthwhile CUDA/MPS batch without exposing any
+        # hidden state or trying to clone the authoritative environment.
+        remaining = [simulations_per_particle] * len(belief_envs)
+        next_particle = 0
+        while any(count > 0 for count in remaining):
+            pending: List[PendingLeaf] = []
+            selected = 0
+            while selected < inference_batch_size and any(count > 0 for count in remaining):
+                particle_index = next_particle % len(belief_envs)
+                next_particle += 1
+                if remaining[particle_index] <= 0:
+                    continue
+                leaf = self._select_leaf(belief_envs[particle_index], root, root_player)
+                remaining[particle_index] -= 1
+                selected += 1
+                if leaf is not None:
+                    pending.append(leaf)
+            if pending:
+                evaluations = self._evaluate_packets([leaf.packet for leaf in pending])
+                for leaf, (priors, local_value) in zip(pending, evaluations):
+                    leaf.node.priors = priors
+                    root_value = local_value if leaf.acting_player == root_player else -local_value
+                    self._backup(leaf.path, root_value, reserved=True)
+            completed_simulations += selected
+            if on_progress:
+                on_progress(completed_simulations, total_simulations, valid_particles)
 
         visits = np.asarray(
             [root.children.get(int(action), SearchNode()).visits for action in action_ids],

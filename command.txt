@@ -1,0 +1,18 @@
+python scripts/train_self_play.py `
+  --model-in models\teacher-v1.pt `
+  --model-out models\candidate-fast.pt `
+  --games 200 `
+  --updates-per-game 8 `
+  --opponent mixed `
+  --mixed-opponent heuristic `
+  --random-opponent-rate 0.25 `
+  --teacher-replay-fraction 0.25 `
+  --learning-rate 5e-5 `
+  --exploration-rate 0.05 `
+  --priority-replay-fraction 0.35 `
+  --simulations 64 `
+  --particles 4 `
+  --inference-batch-size 32 `
+  --max-moves 300 `
+  --batch-size 64 `
+  --device cuda

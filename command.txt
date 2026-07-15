@@ -51,3 +51,25 @@ python scripts/train_flat_actor_critic.py `
   --map-size 11 `
   --map-type lakes `
   --device cuda
+
+
+
+  python scripts/train_self_play.py `
+  --model-in models\flat-ac-10k.pt `
+  --model-out models\mcts-curriculum-1.pt `
+  --games 100 `
+  --updates-per-game 8 `
+  --opponent mixed `
+  --mixed-opponent heuristic `
+  --random-opponent-rate 0.25 `
+  --teacher-replay-fraction 0.30 `
+  --learning-rate 3e-5 `
+  --exploration-rate 0.10 `
+  --priority-replay-fraction 0.35 `
+  --simulations 16 `
+  --particles 4 `
+  --mcts-max-actions 1024 `
+  --workers 32 `
+  --max-moves 250 `
+  --batch-size 64 `
+  --device cuda

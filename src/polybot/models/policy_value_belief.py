@@ -153,7 +153,13 @@ class PolicyValueBeliefNet(nn.Module):
             )
             action_states = action_states + gathered * existing.unsqueeze(-1)
 
-        attended, _ = self.action_to_map(action_states, tile_states, tile_states)
+        # Attention weights are never consumed by the policy. Asking
+        # MultiheadAttention not to materialise them enables PyTorch's
+        # memory-efficient scaled-dot-product kernels and avoids allocating a
+        # [batch, actions, tiles] tensor in every training forward pass.
+        attended, _ = self.action_to_map(
+            action_states, tile_states, tile_states, need_weights=False
+        )
         action_states = self.action_norm(action_states + attended)
         logits = self.policy_head(action_states).squeeze(-1)
         logits = logits.masked_fill(~action_mask, float("-inf"))

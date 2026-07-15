@@ -20,7 +20,7 @@ def main() -> None:
     add_environment_options(parser)
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, default=Path("models/flat_actor_critic.pt"))
-    parser.add_argument("--num-envs", type=int, default=256)
+    parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--num-threads", type=int)
     parser.add_argument("--max-actions", type=int, default=512)

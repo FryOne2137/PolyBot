@@ -26,7 +26,7 @@ python scripts/train_self_play.py `
 python scripts/train_flat_actor_critic.py `
   --model-in models\teacher-v1.pt `
   --model-out models\flat-ac-smoke.pt `
-  --num-envs 256 `
+  --num-envs 64 `
   --steps 2000 `
   --max-actions 512 `
   --learning-rate 5e-5 `
@@ -38,3 +38,16 @@ python scripts/train_flat_actor_critic.py `
 
 # Po udanym flat actor-critic użyj jego modelu jako wejścia do globalnego MCTS.
 # Podmień --model-in w pierwszej komendzie na models\flat-ac-smoke.pt.
+
+
+python scripts/train_flat_actor_critic.py `
+  --model-in models\flat-ac-smoke.pt `
+  --model-out models\flat-ac-10k.pt `
+  --num-envs 128 `
+  --steps 10000 `
+  --max-actions 512 `
+  --learning-rate 5e-5 `
+  --teacher-weight 0.25 `
+  --map-size 11 `
+  --map-type lakes `
+  --device cuda

@@ -26,13 +26,14 @@ def main() -> None:
     parser.add_argument("--max-actions", type=int, default=512)
     parser.add_argument("--entropy-weight", type=float, default=0.008)
     parser.add_argument("--value-weight", type=float, default=0.5)
+    parser.add_argument("--teacher-weight", type=float, default=0.25)
     parser.add_argument("--gamma", type=float, default=0.995)
     args = parser.parse_args()
     training = training_config_from_args(args)
     model, model_config = load_model(args.model_in, select_device(training.device))
     print_summary(train_vector_actor_critic(
         training, model_config, args.num_envs, args.steps, args.num_threads,
-        args.max_actions, args.entropy_weight, args.value_weight, args.gamma,
+        args.max_actions, args.entropy_weight, args.value_weight, args.teacher_weight, args.gamma,
         args.model_out, model,
     ))
 

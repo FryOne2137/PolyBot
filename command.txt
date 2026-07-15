@@ -30,6 +30,7 @@ python scripts/train_flat_actor_critic.py `
   --steps 2000 `
   --max-actions 512 `
   --learning-rate 5e-5 `
+  --teacher-weight 0.25 `
   --map-size 11 `
   --map-type lakes `
   --device cuda

@@ -47,7 +47,7 @@ def train_vector_actor_critic(
     num_envs: int,
     steps: int,
     num_threads: Optional[int] = None,
-    max_actions: int = 512,
+    max_actions: int = 1024,
     entropy_weight: float = 0.008,
     value_weight: float = 0.5,
     teacher_weight: float = 0.25,
@@ -103,7 +103,15 @@ def train_vector_actor_critic(
             action_rows = actions.detach().cpu().numpy().astype(np.int64)
             shaped = _visible_action_reward(action_features, action_rows)
             action_ids = np.asarray(batch["action_id"], dtype=np.int32)[np.arange(num_envs), action_rows]
-            next_batch = env.step(action_ids)
+            try:
+                next_batch = env.step(action_ids)
+            except RuntimeError:
+                # Keep the user's "models only" storage rule while avoiding
+                # losing a long RAM-only run to an underestimated action
+                # capacity. The partial checkpoint is still a normal model.
+                if model_out is not None:
+                    save_model(model_out, model, model_config)
+                raise
             terminal = np.asarray(next_batch["terminated"], dtype=bool)
             terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
             reward = shaped + terminal_reward

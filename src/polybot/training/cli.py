@@ -38,7 +38,7 @@ def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
         particles=args.particles,
         inference_batch_size=getattr(args, "inference_batch_size", 32),
         native_threads=getattr(args, "mcts_threads", None),
-        native_max_actions=getattr(args, "mcts_max_actions", 512),
+        native_max_actions=getattr(args, "mcts_max_actions", 1024),
     )
 
 

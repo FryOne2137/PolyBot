@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--num-threads", type=int)
-    parser.add_argument("--max-actions", type=int, default=512)
+    parser.add_argument("--max-actions", type=int, default=1024)
     parser.add_argument("--entropy-weight", type=float, default=0.008)
     parser.add_argument("--value-weight", type=float, default=0.5)
     parser.add_argument("--teacher-weight", type=float, default=0.25)

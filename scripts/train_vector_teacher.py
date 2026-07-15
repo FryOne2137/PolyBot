@@ -23,7 +23,7 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--num-threads", type=int, help="C++ simulation threads; default uses logical CPU count")
-    parser.add_argument("--max-actions", type=int, default=512)
+    parser.add_argument("--max-actions", type=int, default=1024)
     parser.add_argument("--visible-event-history", type=int, default=0)
     parser.add_argument("--updates-per-step", type=int, default=1)
     args = parser.parse_args()

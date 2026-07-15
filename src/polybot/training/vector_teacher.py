@@ -107,7 +107,7 @@ def train_vector_teacher(
     num_envs: int,
     steps: int,
     num_threads: Optional[int] = None,
-    max_actions: int = 512,
+    max_actions: int = 1024,
     visible_event_history: int = 0,
     updates_per_step: int = 1,
     model_out: Optional[Path] = None,

@@ -30,7 +30,7 @@ class MCTSConfig:
     # Native PolyEnv MctsPool options. ``None`` lets its persistent C++ pool
     # use the available logical CPU cores.
     native_threads: Optional[int] = None
-    native_max_actions: int = 512
+    native_max_actions: int = 1024
     # Applied only to already legal, visible capture actions in MCTS.
     capture_city_prior_bonus: float = 2.0
     capture_capital_prior_bonus: float = 4.0

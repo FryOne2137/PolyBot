@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--mcts-threads", type=int, help="C++ threads used by PolyEnv MctsPool; default uses logical cores")
-    parser.add_argument("--mcts-max-actions", type=int, default=512)
+    parser.add_argument("--mcts-max-actions", type=int, default=1024)
     parser.add_argument(
         "--workers", type=int, default=32,
         help="Number of active games in one global native MctsPool (legacy fallback: Python actors).",

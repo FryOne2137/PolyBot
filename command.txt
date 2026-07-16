@@ -158,3 +158,24 @@ python scripts/train_pipeline.py `
   --batch-size 8 `
   --device cuda `
   --model-out models\pipeline-smoke.pt
+
+
+python scripts/evaluate.py `
+  --model-a models\polybot-factorized-v1.pt `
+  --games 30 `
+  --simulations 32 `
+  --particles 4 `
+  --mcts-max-actions 1024 `
+  --max-moves 400 `
+  --device cuda
+
+
+  python scripts/evaluate.py `
+  --model-a models\polybot-factorized-v1.pt `
+  --model-b models\teacher-v1.pt `
+  --games 30 `
+  --simulations 32 `
+  --particles 4 `
+  --mcts-max-actions 1024 `
+  --max-moves 400 `
+  --device cuda

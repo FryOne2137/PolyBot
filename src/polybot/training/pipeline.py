@@ -43,8 +43,9 @@ def run_pipeline(
 
     The order intentionally gives the MCTS stage a competent prior:
     supervised belief -> legal-action teacher -> vector teacher -> flat
-    actor-critic -> anchored MCTS -> lower-noise MCTS refinement.  Intermediate
-    weights, games, replay buffers and optimiser states are never written.
+    actor-critic -> anchored MCTS -> lower-noise MCTS refinement. Games, replay
+    buffers and optimiser states are never written; the one requested model
+    path is overwritten at safe stage boundaries for crash recovery.
     """
     device = select_device(training.device)
     if model_in is None:
@@ -73,7 +74,6 @@ def run_pipeline(
             model_config,
             num_envs=vector_teacher_envs,
             steps=vector_teacher_steps,
-            num_threads=mcts_config.native_threads,
             max_actions=mcts_config.native_max_actions,
             updates_per_step=vector_teacher_updates_per_step,
             model=model,
@@ -85,10 +85,13 @@ def run_pipeline(
             model_config,
             num_envs=flat_envs,
             steps=flat_steps,
-            num_threads=mcts_config.native_threads,
             max_actions=mcts_config.native_max_actions,
             model=model,
         )
+    # Keep a single recoverable model artifact at ``model_out``. It is
+    # overwritten by the final model, but protects the expensive warm-up if a
+    # native extension terminates the process during MCTS.
+    save_model(model_out, model, model_config)
     self_play = {}
     if self_play_games:
         self_play = train_self_play(
@@ -104,6 +107,9 @@ def run_pipeline(
             workers=mcts_workers,
             model=model,
         )
+        # If refinement fails, leave the completed foundation model at the
+        # same permitted output path instead of reverting to pre-MCTS weights.
+        save_model(model_out, model, model_config)
     refinement = {}
     if refinement_games:
         refinement_training = replace(

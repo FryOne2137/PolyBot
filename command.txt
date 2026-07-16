@@ -16,6 +16,7 @@ python scripts/train_pipeline.py `
   --simulations 32 `
   --particles 4 `
   --workers 32 `
+  --mcts-threads 1 `
   --mcts-max-actions 1024 `
   --teacher-prior-weight 0.35 `
   --teacher-policy-target-weight 0.15 `
@@ -153,6 +154,7 @@ python scripts/train_pipeline.py `
   --simulations 4 `
   --particles 1 `
   --workers 4 `
+  --mcts-threads 1 `
   --batch-size 8 `
   --device cuda `
   --model-out models\pipeline-smoke.pt

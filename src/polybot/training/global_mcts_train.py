@@ -73,6 +73,17 @@ def _native_leaf_bias(
     return bias.masked_fill(~mask, 0.0)
 
 
+def _transient_pool_threads(requested: int | None) -> int:
+    """Use a safe thread count for a newly-created native MCTS pool.
+
+    PolyEnv owns a C++ worker pool per ``MctsPool`` and a real move requires a
+    new pool. The global batch already keeps the GPU busy with all roots;
+    spawning a hardware-sized C++ pool for every move can exhaust Windows
+    thread resources during long runs.
+    """
+    return 1 if requested is None else max(1, int(requested))
+
+
 def _new_episode(index: int, training: TrainingConfig, train_player: Optional[int], opponent: Optional[str]) -> _Episode:
     return _Episode(
         index=index,
@@ -145,7 +156,7 @@ def _plan_many(
     if not belief_envs:
         return [(row, visits_by_episode[row], root_priors[row], None) for row in range(len(episodes))]
     pool = MctsPool(
-        belief_envs, num_threads=config.native_threads,
+        belief_envs, num_threads=_transient_pool_threads(config.native_threads),
         max_actions=config.native_max_actions, c_puct=config.c_puct,
     )
     # Each wave exposes at most one leaf per tree. With B active games and P
@@ -195,7 +206,7 @@ def _plan_many(
         if tree < raw_root_values.size and np.isfinite(raw_root_values[tree]):
             root_value_sums[owner] += raw_root_values[tree]
             root_value_counts[owner] += 1
-    return [
+    result = [
         (
             row,
             visits_by_episode[row],
@@ -204,6 +215,10 @@ def _plan_many(
         )
         for row in range(len(episodes))
     ]
+    # Make the native worker-pool lifetime explicit. Its NumPy outputs do not
+    # retain a reference to the MctsPool, so this joins its workers now.
+    del pool
+    return result
 
 
 def _apply_action(
@@ -268,6 +283,12 @@ def train_global_mcts_self_play(
     active: List[_Episode] = []
     summaries: Dict[str, float] = {}
     model.eval()
+    # Persist only the requested model path before native MCTS begins. It is
+    # overwritten by later stages/final training and never contains replay,
+    # games or optimiser state, but remains a usable resume point after a
+    # fatal native-extension abort.
+    if model_out is not None:
+        save_model(model_out, model, model_config)
     with tqdm(total=games, desc=f"global native MCTS ({device})", unit="env", dynamic_ncols=True) as bar:
         while done < games:
             while next_game < games and len(active) < active_envs:
@@ -320,6 +341,7 @@ def train_global_mcts_self_play(
         "games": float(games), "active_envs": float(active_envs), "replay_examples": float(len(replay)),
         "teacher_replay_examples": float(len(teacher)),
         "mcts_value_bootstrap_fraction": float(bootstrap_examples / max(1, len(replay))),
+        "native_mcts_threads": float(_transient_pool_threads(mcts.native_threads)),
     }
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
     if losses: result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})

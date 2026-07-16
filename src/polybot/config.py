@@ -34,8 +34,9 @@ class MCTSConfig:
     # Number of selected MCTS leaves evaluated in one neural-network forward
     # pass.  It changes throughput, not the information exposed to search.
     inference_batch_size: int = 32
-    # Native PolyEnv MctsPool options. ``None`` lets its persistent C++ pool
-    # use the available logical CPU cores.
+    # A global self-play decision creates a short-lived MctsPool. ``None``
+    # resolves to one C++ thread there, avoiding OS resource exhaustion from
+    # repeatedly creating a hardware-sized native worker pool.
     native_threads: Optional[int] = None
     native_max_actions: int = 1024
     # Applied only to already legal, visible capture actions in MCTS.

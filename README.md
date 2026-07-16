@@ -58,7 +58,7 @@ python scripts/train_pipeline.py \
   --flat-steps 10_000 \
   --self-play-games 200 \
   --refinement-games 100 \
-  --simulations 32 --particles 4 --workers 32 \
+  --simulations 32 --particles 4 --workers 32 --mcts-threads 1 \
   --max-moves 300 --device cuda \
   --model-out models/polybot.pt
 ```
@@ -95,7 +95,9 @@ python scripts/evaluate.py \
 
 To compare a newer checkpoint with an older one, pass `--model-b`.
 
-Postęp i składniki reward są wypisywane wyłącznie do terminala. Self-play pokazuje wybrane urządzenie (`mps`, `cuda` albo `cpu`), numer gry/ruchu oraz płynny pasek bieżącego MCTS. `--max-moves` ogranicza długość jednej gry (domyślnie 300); po przekroczeniu limitu wynik jest traktowany jako remis. Replay buffer, gry, pełne mapy, eventy i stan optymalizera nie są zapisywane na dysk.
+Postęp i składniki reward są wypisywane wyłącznie do terminala. Self-play pokazuje wybrane urządzenie (`mps`, `cuda` albo `cpu`), numer gry/ruchu oraz płynny pasek bieżącego MCTS. `--max-moves` ogranicza długość jednej gry (domyślnie 300); po przekroczeniu limitu wynik jest traktowany jako remis. Replay buffer, gry, pełne mapy, eventy i stan optymalizera nie są zapisywane na dysk. Pipeline nadpisuje wyłącznie wskazany plik modelu po bezpiecznych granicach etapów, dzięki czemu po awarii natywnego MCTS pozostaje poprawny model do wznowienia.
+
+W globalnym MCTS zacznij od `--mcts-threads 1`. Każda realna decyzja tworzy nowy natywny `MctsPool`; jeden wątek C++ zapobiega tworzeniu wielkiej liczby krótkotrwałych workerów. GPU nadal dostaje jeden wspólny batch ze wszystkich aktywnych gier i particle worlds. Po stabilnym runie można ostrożnie sprawdzić `2` albo `4`.
 
 MCTS zbiera domyślnie `8` liści i wysyła je do GPU w jednym forwardzie (`--inference-batch-size 8`). To zwiększa wykorzystanie CUDA bez zmiany liczby symulacji ani informacji dostępnej botowi. Na GPU z większym zapasem pamięci można próbować `16` albo `32`; przy błędzie CUDA out-of-memory wróć do `8` lub `4`.
 

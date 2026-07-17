@@ -63,6 +63,28 @@ python scripts/train_pipeline.py \
   --model-out models/polybot.pt
 ```
 
+Po pierwszym dobrym checkpointcie nie trenuj kandydata wyłącznie przeciw
+heurystyce. Podaj obecnego championa jako zamrożony model przeciwnika. Pierwszy
+`--champion-model` jest punktem odniesienia dla bramki promocji, a kolejne
+tworzą pulę, z której przeciwnik jest losowany. Jeżeli kandydat nie uzyska na
+stałych seedach wyniku `win + 0.5 * draw >= --promotion-score`, `--model-out`
+zostanie nadpisany championem — nie słabszym kandydatem.
+
+```powershell
+python scripts/train_pipeline.py `
+  --model-in models\teacher-v1.pt `
+  --belief-positions 0 --teacher-games 0 `
+  --vector-teacher-steps 0 --flat-steps 0 `
+  --self-play-games 600 --refinement-games 300 `
+  --updates-per-game 8 --refinement-updates-per-game 8 `
+  --simulations 32 --particles 4 --workers 32 --mcts-threads 1 `
+  --mcts-max-actions 1024 --batch-size 64 --learning-rate 3e-5 `
+  --max-moves 400 --device cuda `
+  --champion-model models\teacher-v1.pt `
+  --promotion-games 40 --promotion-score 0.55 `
+  --model-out models\champion-v2.pt
+```
+
 Możesz uruchomić etapy osobno:
 
 ```bash
@@ -103,7 +125,7 @@ MCTS zbiera domyślnie `8` liści i wysyła je do GPU w jednym forwardzie (`--in
 
 W pierwszych rundach self-play `--exploration-rate 0.20` wykonuje część ruchów z bezpiecznego curriculum legalnych akcji (miasta, walka, eksploracja), aby uniknąć danych z samych remisów. MCTS nadal tworzy target policy dla każdej pozycji.
 
-Gdy dwa identyczne checkpointy produkują same remisy, użyj `--opponent heuristic` albo `--opponent mixed --random-opponent-rate 0.25 --mixed-opponent heuristic`. W grach przeciw zewnętrznemu przeciwnikowi model zbiera przykłady wyłącznie ze swoich ruchów; przeciwnik nadal wpływa na jego target value. Domyślne `--teacher-replay-fraction 0.25` dodaje do każdego batcha w RAM przykłady heuristic teacher. To chroni dobry bootstrap przed utratą ofensywnego zachowania wskutek szumnych targetów wczesnego MCTS; nie zapisuje partii ani replay na dysk.
+Gdy dwa identyczne checkpointy produkują same remisy, użyj `--opponent heuristic` albo `--opponent mixed --random-opponent-rate 0.25 --mixed-opponent heuristic`. Po uzyskaniu championa użyj zamiast tego `--opponent model --opponent-model models/champion.pt` albo puli przez wielokrotne `--opponent-model`. W grach przeciw zewnętrznemu przeciwnikowi model zbiera przykłady wyłącznie ze swoich ruchów; przeciwnik nadal wpływa na jego target value. Domyślne `--teacher-replay-fraction 0.25` dodaje do każdego batcha w RAM przykłady heuristic teacher. To chroni dobry bootstrap przed utratą ofensywnego zachowania wskutek szumnych targetów wczesnego MCTS; nie zapisuje partii ani replay na dysk.
 
 ## Project layout
 

@@ -49,6 +49,25 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=32, help="active games in the native global MctsPool")
     parser.add_argument("--model-in", type=Path)
     parser.add_argument("--model-out", type=Path, default=Path("models/polybot.pt"))
+    parser.add_argument(
+        "--champion-model",
+        type=Path,
+        action="append",
+        default=[],
+        help="Frozen opponent checkpoint; first one is the promotion champion, repeat to build a pool.",
+    )
+    parser.add_argument(
+        "--promotion-games",
+        type=int,
+        default=30,
+        help="Fixed-seed MCTS gate games against the first --champion-model; 0 disables the gate.",
+    )
+    parser.add_argument(
+        "--promotion-score",
+        type=float,
+        default=0.55,
+        help="Required win=1/draw=0.5 match score to replace the champion.",
+    )
     args = parser.parse_args()
     summary = run_pipeline(
         training_config_from_args(args),
@@ -71,6 +90,9 @@ def main() -> None:
         teacher_replay_fraction=args.teacher_replay_fraction,
         refinement_games=args.refinement_games,
         refinement_updates_per_game=args.refinement_updates_per_game,
+        champion_model_paths=args.champion_model,
+        promotion_games=args.promotion_games,
+        promotion_score=args.promotion_score,
     )
     print_summary(summary)
 

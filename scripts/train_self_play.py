@@ -35,9 +35,16 @@ def main() -> None:
         "--teacher-policy-target-weight", type=float, default=0.10,
         help="Blend this fraction of the legal-action teacher into each MCTS policy target.",
     )
-    parser.add_argument("--opponent", choices=["self_play", "random", "heuristic", "mixed"], default="self_play")
+    parser.add_argument("--opponent", choices=["self_play", "random", "heuristic", "model", "mixed"], default="self_play")
     parser.add_argument("--random-opponent-rate", type=float, default=0.50)
-    parser.add_argument("--mixed-opponent", choices=["random", "heuristic"], default="heuristic")
+    parser.add_argument("--mixed-opponent", choices=["random", "heuristic", "model"], default="heuristic")
+    parser.add_argument(
+        "--opponent-model",
+        type=Path,
+        action="append",
+        default=[],
+        help="Frozen checkpoint for --opponent model / --mixed-opponent model; repeat to sample a pool.",
+    )
     parser.add_argument(
         "--teacher-replay-fraction",
         type=float,
@@ -67,7 +74,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     training = training_config_from_args(args)
-    model, model_config = load_model(args.model_in, select_device(training.device))
+    device = select_device(training.device)
+    model, model_config = load_model(args.model_in, device)
+    frozen_models = [load_model(path, device)[0] for path in args.opponent_model]
     summary = train_self_play(
         training,
         model_config,
@@ -83,6 +92,7 @@ def main() -> None:
         inference_wait_ms=args.inference_wait_ms,
         model_out=args.model_out,
         model=model,
+        opponent_models=frozen_models,
     )
     print_summary(summary)
 

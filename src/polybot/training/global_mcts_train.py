@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -33,6 +33,7 @@ class _Episode:
     env: object
     train_player: Optional[int]
     opponent_agent: Optional[str]
+    opponent_model_index: Optional[int]
     rng: np.random.Generator
     shaper: RewardShaper
     examples: List[TrainingExample] = field(default_factory=list)
@@ -84,15 +85,36 @@ def _transient_pool_threads(requested: int | None) -> int:
     return 1 if requested is None else max(1, int(requested))
 
 
-def _new_episode(index: int, training: TrainingConfig, train_player: Optional[int], opponent: Optional[str]) -> _Episode:
+def _new_episode(
+    index: int,
+    training: TrainingConfig,
+    train_player: Optional[int],
+    opponent: Optional[str],
+    opponent_model_index: Optional[int] = None,
+) -> _Episode:
     return _Episode(
         index=index,
         env=SelfPlayRunner._new_env(training.seed + index, training.map_size, training.map_type),
         train_player=train_player,
         opponent_agent=opponent,
+        opponent_model_index=opponent_model_index,
         rng=np.random.default_rng((training.seed + index) ^ 0xC0DEC0DE),
         shaper=RewardShaper(training),
     )
+
+
+def _search_action(
+    visits: np.ndarray,
+    priors: np.ndarray,
+    rng: np.random.Generator,
+    mcts: MCTSConfig,
+) -> Tuple[int, np.ndarray]:
+    """Turn a legal MCTS root distribution into a selected action row."""
+    weights = visits if visits.sum() else priors
+    policy = weights / max(float(weights.sum()), 1e-8)
+    if mcts.temperature <= 1e-5:
+        return int(policy.argmax()), policy
+    return int(rng.choice(len(policy), p=policy)), policy
 
 
 @torch.inference_mode()
@@ -271,17 +293,26 @@ def _finish(episode: _Episode, training: TrainingConfig) -> None:
 def train_global_mcts_self_play(
     training: TrainingConfig, model_config: ModelConfig, mcts: MCTSConfig, games: int, updates_per_game: int,
     opponent: str, random_opponent_rate: float, mixed_opponent: str, teacher_replay_fraction: float,
-    active_envs: int, model_out: Optional[Path], model: Optional[PolicyValueBeliefNet],
+    active_envs: int,
+    model_out: Optional[Path],
+    model: Optional[PolicyValueBeliefNet],
+    opponent_models: Sequence[PolicyValueBeliefNet] = (),
 ) -> Dict[str, float]:
     """High-throughput global-MCTS trainer; writes only final model weights."""
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
+    # These are immutable adversaries.  They never receive gradients or an
+    # optimiser and are sampled independently for each anchored game.
+    frozen_models = [opponent_model.to(device).eval() for opponent_model in opponent_models]
+    if (opponent == "model" or mixed_opponent == "model") and not frozen_models:
+        raise ValueError("opponent model mode requires at least one --opponent-model checkpoint")
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     replay, teacher = ReplayBuffer(training.replay_capacity), ReplayBuffer(training.replay_capacity)
     schedule_rng, sample_rng = np.random.default_rng(training.seed ^ 0xA17C0), np.random.default_rng(training.seed)
     next_game, done = 0, 0
     active: List[_Episode] = []
     summaries: Dict[str, float] = {}
+    frozen_opponent_games = 0
     model.eval()
     # Persist only the requested model path before native MCTS begins. It is
     # overwritten by later stages/final training and never contains replay,
@@ -292,30 +323,55 @@ def train_global_mcts_self_play(
     with tqdm(total=games, desc=f"global native MCTS ({device})", unit="env", dynamic_ncols=True) as bar:
         while done < games:
             while next_game < games and len(active) < active_envs:
-                anchor = opponent in {"random", "heuristic"} or (opponent == "mixed" and schedule_rng.random() < random_opponent_rate)
-                active.append(_new_episode(next_game, training, next_game % 2 if anchor else None, (mixed_opponent if opponent == "mixed" else opponent) if anchor else None))
+                anchor = opponent in {"random", "heuristic", "model"} or (
+                    opponent == "mixed" and schedule_rng.random() < random_opponent_rate
+                )
+                opponent_agent = (mixed_opponent if opponent == "mixed" else opponent) if anchor else None
+                opponent_model_index = (
+                    int(schedule_rng.integers(len(frozen_models))) if opponent_agent == "model" else None
+                )
+                frozen_opponent_games += int(opponent_model_index is not None)
+                active.append(_new_episode(
+                    next_game,
+                    training,
+                    next_game % 2 if anchor else None,
+                    opponent_agent,
+                    opponent_model_index,
+                ))
                 next_game += 1
             model_turns = []
+            frozen_turns: Dict[int, List[_Episode]] = {}
             for episode in active:
                 packet = episode.env.model_request_numpy()
                 player = int(packet["obs"].get("current_player", episode.env.current_player()))
                 if episode.train_player is None or player == episode.train_player:
                     model_turns.append(episode)
+                elif episode.opponent_agent == "model":
+                    if episode.opponent_model_index is None:
+                        raise RuntimeError("model opponent game has no frozen model index")
+                    frozen_turns.setdefault(episode.opponent_model_index, []).append(episode)
                 else:
                     ids = np.asarray(packet["actions"]["action_id"])
                     row = int(episode.rng.integers(len(ids))) if episode.opponent_agent == "random" else choose_teacher_action(packet, episode.rng)
                     _apply_action(episode, row, False, None, training)
+            # Search frozen opponent turns with their own policy/value network.
+            # Their positions intentionally never enter the candidate replay.
+            for frozen_index, episodes in frozen_turns.items():
+                for index, visits, priors, _ in _plan_many(
+                    episodes, frozen_models[frozen_index], device, training, mcts,
+                ):
+                    row, _ = _search_action(visits, priors, episodes[index].rng, mcts)
+                    _apply_action(episodes[index], row, False, None, training)
             if model_turns:
                 for index, visits, priors, bootstrap_value in _plan_many(model_turns, model, device, training, mcts):
                     episode = model_turns[index]
-                    weights = visits if visits.sum() else priors
-                    search_policy = weights / max(weights.sum(), 1e-8)
+                    _, search_policy = _search_action(visits, priors, episode.rng, mcts)
                     policy = search_policy
                     target_anchor = float(np.clip(training.teacher_policy_target_weight, 0.0, 1.0))
                     if target_anchor:
                         teacher_target = teacher_policy(episode.env.model_request_numpy())
                         policy = (1.0 - target_anchor) * policy + target_anchor * teacher_target
-                    row = int(search_policy.argmax()) if mcts.temperature <= 1e-5 else int(episode.rng.choice(len(search_policy), p=search_policy))
+                    row, _ = _search_action(visits, priors, episode.rng, mcts)
                     if episode.rng.random() < training.exploration_rate:
                         bias = strategic_action_bias(episode.env.model_request_numpy())
                         weights = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))
@@ -327,7 +383,8 @@ def train_global_mcts_self_play(
                 for key, value in episode.metrics.items(): summaries[key] = summaries.get(key, 0.0) + value
                 if teacher_replay_fraction > 0.0:
                     teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + episode.index, training); teacher.extend(teacher_examples)
-                bar.set_postfix(replay=len(replay), active=len(active), trees=len(model_turns) * mcts.particles)
+                searched_episodes = len(model_turns) + sum(len(rows) for rows in frozen_turns.values())
+                bar.set_postfix(replay=len(replay), active=len(active), trees=searched_episodes * mcts.particles)
     losses = []
     bootstrap_examples = sum(example.bootstrap_value is not None for example in replay._examples)
     for update in tqdm(range(games * updates_per_game), desc=f"optimising ({device})", unit="update", dynamic_ncols=True):
@@ -342,6 +399,7 @@ def train_global_mcts_self_play(
         "teacher_replay_examples": float(len(teacher)),
         "mcts_value_bootstrap_fraction": float(bootstrap_examples / max(1, len(replay))),
         "native_mcts_threads": float(_transient_pool_threads(mcts.native_threads)),
+        "frozen_opponent_games": float(frozen_opponent_games),
     }
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
     if losses: result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})

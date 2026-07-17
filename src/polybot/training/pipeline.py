@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Sequence
 
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
+from ..evaluation.matches import evaluate_matches
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
@@ -38,6 +39,9 @@ def run_pipeline(
     teacher_replay_fraction: float = 0.35,
     refinement_games: int = 0,
     refinement_updates_per_game: int = 4,
+    champion_model_paths: Sequence[Path] = (),
+    promotion_games: int = 30,
+    promotion_score: float = 0.55,
 ) -> Dict[str, Dict[str, float]]:
     """Run all stages in RAM and write exactly one final model checkpoint.
 
@@ -47,11 +51,25 @@ def run_pipeline(
     buffers and optimiser states are never written; the one requested model
     path is overwritten at safe stage boundaries for crash recovery.
     """
+    if not 0.0 <= promotion_score <= 1.0:
+        raise ValueError("promotion_score must be between 0 and 1")
+    if promotion_games < 0:
+        raise ValueError("promotion_games must not be negative")
+
     device = select_device(training.device)
     if model_in is None:
         model = PolicyValueBeliefNet(model_config).to(device)
     else:
         model, model_config = load_model(model_in, device)
+
+    # A pool can contain the current champion plus older, still-useful styles.
+    # They remain frozen for the whole candidate run and are never saved here.
+    frozen_models = []
+    frozen_configs = []
+    for path in champion_model_paths:
+        frozen_model, frozen_config = load_model(path, device)
+        frozen_models.append(frozen_model.eval())
+        frozen_configs.append(frozen_config)
 
     belief = {}
     if belief_positions:
@@ -88,28 +106,40 @@ def run_pipeline(
             max_actions=mcts_config.native_max_actions,
             model=model,
         )
-    # Keep a single recoverable model artifact at ``model_out``. It is
-    # overwritten by the final model, but protects the expensive warm-up if a
-    # native extension terminates the process during MCTS.
-    save_model(model_out, model, model_config)
+    # Keep one recoverable model artifact. With a promotion champion, that
+    # file must remain the verified champion until the final gate succeeds;
+    # otherwise it is safe to preserve the current candidate as before.
+    if frozen_models:
+        save_model(model_out, frozen_models[0], frozen_configs[0])
+    else:
+        save_model(model_out, model, model_config)
     self_play = {}
     if self_play_games:
+        # With a frozen pool, the foundation is entirely candidate-vs-champion
+        # play. Without one we retain the bootstrap curriculum for a first run.
+        foundation_opponent = "model" if frozen_models else "mixed"
+        foundation_mixed_opponent = "model" if frozen_models else "heuristic"
+        foundation_anchor_rate = 1.0 if frozen_models else 0.35
         self_play = train_self_play(
             training,
             model_config,
             mcts_config,
             games=self_play_games,
             updates_per_game=updates_per_game,
-            opponent="mixed",
-            random_opponent_rate=0.35,
-            mixed_opponent="heuristic",
+            opponent=foundation_opponent,
+            random_opponent_rate=foundation_anchor_rate,
+            mixed_opponent=foundation_mixed_opponent,
             teacher_replay_fraction=teacher_replay_fraction,
             workers=mcts_workers,
             model=model,
+            opponent_models=frozen_models,
         )
-        # If refinement fails, leave the completed foundation model at the
-        # same permitted output path instead of reverting to pre-MCTS weights.
-        save_model(model_out, model, model_config)
+        # A failed refinement must never publish an untested candidate over a
+        # verified champion. Without a champion keep the existing resume aid.
+        if frozen_models:
+            save_model(model_out, frozen_models[0], frozen_configs[0])
+        else:
+            save_model(model_out, model, model_config)
     refinement = {}
     if refinement_games:
         refinement_training = replace(
@@ -122,19 +152,47 @@ def run_pipeline(
             mcts_config,
             teacher_prior_weight=min(mcts_config.teacher_prior_weight, 0.08),
         )
+        # Refinement sees both its own current play and the frozen pool. This
+        # prevents the candidate from optimising solely against one opponent.
+        refinement_opponent = "mixed" if frozen_models else "mixed"
+        refinement_mixed_opponent = "model" if frozen_models else "heuristic"
+        refinement_anchor_rate = 0.50 if frozen_models else 0.20
         refinement = train_self_play(
             refinement_training,
             model_config,
             refinement_mcts,
             games=refinement_games,
             updates_per_game=refinement_updates_per_game,
-            opponent="mixed",
-            random_opponent_rate=0.20,
-            mixed_opponent="heuristic",
+            opponent=refinement_opponent,
+            random_opponent_rate=refinement_anchor_rate,
+            mixed_opponent=refinement_mixed_opponent,
             teacher_replay_fraction=min(teacher_replay_fraction, 0.20),
             workers=mcts_workers,
             model=model,
+            opponent_models=frozen_models,
         )
+    promotion: Dict[str, float] = {}
+    if frozen_models and promotion_games:
+        # Evaluation uses fixed seeds and alternate player slots. It writes no
+        # games or metrics: only this compact terminal summary reaches stdout.
+        gate_mcts = replace(mcts_config, temperature=0.0)
+        match = evaluate_matches(
+            model, device, training, gate_mcts, promotion_games, model_b=frozen_models[0],
+        )
+        candidate_score = (
+            match["model_a_wins"] + 0.5 * match["draws"]
+        ) / max(1.0, match["games"])
+        promoted = candidate_score >= promotion_score
+        promotion = {
+            "candidate_score": float(candidate_score),
+            "promotion_threshold": float(promotion_score),
+            "promoted": float(promoted),
+            **{"match_" + key: float(value) for key, value in match.items()},
+        }
+        # A rejected candidate must not replace the usable model artifact.
+        # Save the first supplied checkpoint (the champion) back to model_out.
+        if not promoted:
+            model, model_config = frozen_models[0], frozen_configs[0]
     save_model(model_out, model, model_config)
     return {
         "belief_warmup": belief,
@@ -143,4 +201,5 @@ def run_pipeline(
         "flat_actor_critic": flat,
         "mcts_foundation": self_play,
         "mcts_refinement": refinement,
+        "promotion": promotion,
     }

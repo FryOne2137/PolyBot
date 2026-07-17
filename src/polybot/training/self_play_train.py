@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
@@ -39,6 +39,7 @@ def train_self_play(
     inference_wait_ms: float = 1.0,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
+    opponent_models: Sequence[PolicyValueBeliefNet] = (),
 ) -> Dict[str, float]:
     """Run independent games concurrently and retain examples only in RAM.
 
@@ -47,12 +48,14 @@ def train_self_play(
     receives the next game immediately after it returns its current result.
     Optimisation runs after actors have stopped, so it cannot race inference.
     """
-    if opponent not in {"self_play", "random", "heuristic", "mixed"}:
-        raise ValueError("opponent must be self_play, random, heuristic or mixed")
+    if opponent not in {"self_play", "random", "heuristic", "model", "mixed"}:
+        raise ValueError("opponent must be self_play, random, heuristic, model or mixed")
     if not 0.0 <= random_opponent_rate <= 1.0:
         raise ValueError("random_opponent_rate must be between 0 and 1")
-    if mixed_opponent not in {"random", "heuristic"}:
-        raise ValueError("mixed_opponent must be random or heuristic")
+    if mixed_opponent not in {"random", "heuristic", "model"}:
+        raise ValueError("mixed_opponent must be random, heuristic or model")
+    if (opponent == "model" or mixed_opponent == "model") and not opponent_models:
+        raise ValueError("model opponent mode requires at least one frozen opponent model")
     if not 0.0 <= teacher_replay_fraction <= 1.0:
         raise ValueError("teacher_replay_fraction must be between 0 and 1")
     if workers < 1:
@@ -71,8 +74,11 @@ def train_self_play(
         return train_global_mcts_self_play(
             training, model_config, mcts_config, games, updates_per_game,
             opponent, random_opponent_rate, mixed_opponent, teacher_replay_fraction,
-            active_envs=workers, model_out=model_out, model=model,
+            active_envs=workers, model_out=model_out, model=model, opponent_models=opponent_models,
         )
+
+    if opponent == "model" or mixed_opponent == "model":
+        raise RuntimeError("frozen model opponents require PolyEnv's native MctsPool")
 
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)

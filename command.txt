@@ -45,6 +45,7 @@ python scripts/train_self_play_pool.py `
   --updates 500 `
   --num-threads 16 `
   --max-pending-leaves 4 `
+  --belief-retries 4 `
   --simulations 32 `
   --mcts-max-actions 1024 `
   --batch-size 64 `

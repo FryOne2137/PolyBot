@@ -72,6 +72,7 @@ def _root_examples(
     request: Dict[str, np.ndarray],
     root: Dict[str, np.ndarray],
     training: TrainingConfig,
+    belief_targets: np.ndarray,
 ) -> List[TrainingExample]:
     """Create policy/value records from public root requests only.
 
@@ -105,8 +106,10 @@ def _root_examples(
             action_categorical=features[index, :count, NATIVE_ACTION_CATEGORICAL_COLUMNS].copy(),
             action_continuous=features[index, :count, NATIVE_ACTION_CONTINUOUS_COLUMNS].astype(np.float32, copy=True),
             policy_target=policy,
-            full_map_target=maps[index].copy(),
-            hidden_mask=np.zeros(maps.shape[1], dtype=bool),
+            # This training-only target is read after the belief hypothesis
+            # has been validated and is never sent to MCTS or policy inputs.
+            full_map_target=belief_targets[index].copy(),
+            hidden_mask=maps[index, :, 0] == 0,
             player_id=int(player_ids[index]),
         ))
     return examples
@@ -144,6 +147,7 @@ def train_self_play_pool(
     updates: int,
     num_threads: Optional[int] = None,
     max_pending_leaves: int = 4,
+    belief_retries: int = 4,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
 ) -> Dict[str, float]:
@@ -160,10 +164,19 @@ def train_self_play_pool(
         raise ValueError("MCTS simulations must be positive")
     if not 1 <= max_pending_leaves <= 8:
         raise ValueError("max_pending_leaves must be between one and eight")
+    if belief_retries < 0:
+        raise ValueError("belief_retries must not be negative")
     try:
         from PolyEnv import Bardur, Imperius, MapType, SelfPlayPool
     except ImportError as error:
         raise RuntimeError("Update PolyEnv to a version exposing SelfPlayPool.") from error
+    required_pool_api = ("belief_acceptance_mask", "belief_targets_numpy")
+    missing_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
+    if missing_api:
+        raise RuntimeError(
+            "PolyEnv is missing the training belief API " + ", ".join(missing_api) +
+            ". Rebuild/reinstall PolyEnv from the accompanying engine changes."
+        )
 
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
@@ -198,7 +211,15 @@ def train_self_play_pool(
     truncated_roots = 0
     completed_targets = 0
     leaf_counts: List[int] = []
-    belief_fallbacks = 0
+    belief_retries_used = 0
+    belief_fallback_rows = 0
+    # One accepted fog hypothesis per live slot and player. Visibility for a
+    # given player only grows, so merging newly visible tiles is a legitimate
+    # belief filter rather than an engine-state leak. Re-sampling an entire
+    # hidden map on every action is both noisy and very likely to alter one
+    # legal root action in a large batch.
+    belief_cache: List[List[np.ndarray | None]] = [[None, None] for _ in range(num_envs)]
+    belief_episode = np.zeros(num_envs, dtype=np.uint64)
     model.eval()
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -215,26 +236,62 @@ def train_self_play_pool(
                     temperature=max(mcts.temperature, 0.35),
                 )
             state_ids = np.asarray(request["state_id"], dtype=np.uint64)
-            try:
-                pool.submit_beliefs(
-                    state_ids,
-                    completed.numpy().astype(np.int32, copy=False),
-                )
-            except ValueError as error:
-                # A batched native pool must reject the whole request when a
-                # single sampled hidden terrain/building changes any public
-                # legal action. Retry the exact same observation with a
-                # deliberately empty fog hypothesis; it never reads source
-                # state and keeps the run alive without accepting a leak.
-                if "changes the current player's legal action set" not in str(error):
-                    raise
-                belief_fallbacks += 1
+            episode_ids = np.asarray(request["episode_id"], dtype=np.uint64)
+            actors = np.asarray(request["to_play"], dtype=np.int64)
+            observed_tokens = np.asarray(request["map_tokens"], dtype=np.int32)
+            candidate = completed.numpy().astype(np.int32, copy=False).copy()
+            for index in range(num_envs):
+                if belief_episode[index] != episode_ids[index]:
+                    belief_cache[index] = [None, None]
+                    belief_episode[index] = episode_ids[index]
+                actor = int(actors[index])
+                if not 0 <= actor < len(belief_cache[index]):
+                    raise RuntimeError(f"SelfPlayPool returned unsupported player id {actor}")
+                cached = belief_cache[index][actor]
+                if cached is None:
+                    continue
+                # Preserve this player's older fog hypothesis but replace all
+                # currently visible tokens exactly with the public request.
+                candidate[index] = cached
+                visible = observed_tokens[index, :, 0] == 1
+                candidate[index, visible] = observed_tokens[index, visible]
+                candidate[index, :, 0] = observed_tokens[index, :, 0]
+            # Validate every row first. Unlike submit_beliefs(), this returns
+            # a public-action acceptance mask, letting us resample only the
+            # rejected worlds instead of discarding a whole 128-env batch.
+            accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
+            for _ in range(belief_retries):
+                rejected = ~accepted
+                if not rejected.any():
+                    break
+                with torch.inference_mode():
+                    resampled = model.sample_completed_map_batch_from_belief_logits(
+                        root_tensors.map_tokens, root_output.belief_logits,
+                        temperature=max(mcts.temperature, 0.35),
+                    ).numpy().astype(np.int32, copy=False)
+                candidate[rejected] = resampled[rejected]
+                # A rejected cached particle is no longer compatible with the
+                # latest public action set, so do not reuse it next turn.
+                for index in np.flatnonzero(rejected):
+                    belief_cache[int(index)][int(actors[index])] = None
+                accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
+                belief_retries_used += 1
+            rejected = ~accepted
+            if rejected.any():
+                belief_fallback_rows += int(rejected.sum())
                 with torch.inference_mode():
                     conservative = model.conservative_completed_map_batch(root_tensors.map_tokens)
-                pool.submit_beliefs(
-                    state_ids,
-                    conservative.numpy().astype(np.int32, copy=False),
+                candidate[rejected] = conservative.numpy().astype(np.int32, copy=False)[rejected]
+                accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
+            if not accepted.all():
+                raise RuntimeError(
+                    "SelfPlayPool could not sample a legal non-terminal belief world for "
+                    f"{int((~accepted).sum())}/{num_envs} environments after {belief_retries} retries."
                 )
+            pool.submit_beliefs(state_ids, candidate)
+            # Cache only a hypothesis accepted by the native legality check.
+            for index, actor in enumerate(actors):
+                belief_cache[index][int(actor)] = candidate[index].copy()
 
             # One select call returns up to B * pending leaves. The native
             # virtual-loss scheduler reserves distinct paths in that batch.
@@ -307,7 +364,11 @@ def train_self_play_pool(
                 replay.extend([example])
                 completed_targets += 1
 
-            examples = _root_examples(request, root, training)
+            # The search is now complete. Full targets are fetched only for
+            # this supervised belief label and are never available to the
+            # policy/value inference or the MCTS expansion above.
+            belief_targets = np.asarray(pool.belief_targets_numpy(state_ids), dtype=np.int32)
+            examples = _root_examples(request, root, training, belief_targets)
             action_rows = _sample_root_rows(root, rng, mcts.temperature)
             action_features = np.asarray(request["action_features"], dtype=np.int64)
             chosen = action_features[np.arange(num_envs), action_rows]
@@ -352,7 +413,8 @@ def train_self_play_pool(
         "self_play_pool_pending_leaves": float(max_pending_leaves),
         "self_play_pool_terminals": float(terminal_episodes),
         "self_play_pool_completed_targets": float(completed_targets),
-        "self_play_pool_belief_fallbacks": float(belief_fallbacks),
+        "self_play_pool_belief_retries": float(belief_retries_used),
+        "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
         "self_play_pool_truncated_roots": float(truncated_roots),
         "replay_examples": float(len(replay)),
     }

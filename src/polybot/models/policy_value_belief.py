@@ -336,6 +336,7 @@ class PolicyValueBeliefNet(nn.Module):
             completed[known] = observed[known]
             completed[:, 0] = observed[:, 0]
             self._add_referenced_city_placeholders(completed, hidden)
+            self._add_missing_player_capitals(completed, hidden, player_count=2)
             result.append(completed)
         return result
 
@@ -392,6 +393,7 @@ class PolicyValueBeliefNet(nn.Module):
         # deterministic hypothesis built solely from the submitted observation.
         for row in range(batch):
             self._add_referenced_city_placeholders(completed_cpu[row], hidden_cpu[row])
+            self._add_missing_player_capitals(completed_cpu[row], hidden_cpu[row], player_count=2)
         return completed_cpu
 
     @staticmethod
@@ -429,3 +431,47 @@ class PolicyValueBeliefNet(nn.Module):
             completed[tile, 16] = 0  # valid player id; owner is unobserved
             completed[tile, 17] = 0
             existing.add(int(city_id))
+
+    @staticmethod
+    def _add_missing_player_capitals(
+        completed: torch.Tensor,
+        hidden: torch.Tensor,
+        player_count: int,
+    ) -> None:
+        """Keep every public player alive in a detached fog hypothesis.
+
+        At an early turn the opposing capital is normally hidden.  A completed
+        map with no city for that public player is syntactically valid, but the
+        engine correctly considers that player defeated and makes the detached
+        MCTS root terminal.  Allocate one conservative *hidden* capital for
+        every owner without a city.  Its location is a model hypothesis; the
+        number of players and their identities are public game metadata.
+        """
+        if player_count < 1:
+            return
+        city_rows = completed[:, 14] == 2
+        existing_owners = set(
+            int(owner) for owner in completed[city_rows, 16].tolist() if 0 <= int(owner) < player_count
+        )
+        if len(existing_owners) >= player_count:
+            return
+        existing_ids = completed[city_rows, 15]
+        next_city_id = max((int(city_id) for city_id in existing_ids.tolist() if city_id >= 0), default=-1) + 1
+        candidates = iter(torch.nonzero(hidden & ~city_rows, as_tuple=False).flatten().tolist())
+        for owner in range(player_count):
+            if owner in existing_owners:
+                continue
+            try:
+                tile = next(candidates)
+            except StopIteration:
+                return
+            completed[tile, 9] = 1   # capital
+            completed[tile, 10] = 1  # workshop, valid at level one
+            completed[tile, 11] = 0
+            completed[tile, 12] = 0
+            completed[tile, 13] = 1
+            completed[tile, 14] = 2  # SettlementTypeEnum::City
+            completed[tile, 15] = next_city_id
+            completed[tile, 16] = owner
+            completed[tile, 17] = 0
+            next_city_id += 1

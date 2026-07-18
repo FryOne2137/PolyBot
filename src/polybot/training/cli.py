@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 from typing import Dict
 
 from ..config import MCTSConfig, TrainingConfig
@@ -12,6 +13,10 @@ from ..config import MCTSConfig, TrainingConfig
 def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", default="auto", choices=["auto", "mps", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=2137)
+    parser.add_argument(
+        "--random-seed", action="store_true",
+        help="Draw a fresh base seed for this run and print it in the final summary.",
+    )
     parser.add_argument("--map-size", type=int, default=11)
     parser.add_argument("--map-type", default="lakes", choices=["lakes", "drylands"])
     parser.add_argument("--max-moves", type=int, default=300)
@@ -19,8 +24,9 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
 
 
 def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
+    seed = secrets.randbelow(2**31 - 1) + 1 if getattr(args, "random_seed", False) else args.seed
     return TrainingConfig(
-        seed=args.seed,
+        seed=seed,
         device=args.device,
         map_size=args.map_size,
         map_type=args.map_type,

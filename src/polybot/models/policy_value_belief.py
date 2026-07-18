@@ -402,12 +402,12 @@ class PolicyValueBeliefNet(nn.Module):
         map_tokens: torch.Tensor,
         player_count: int = 2,
     ) -> torch.Tensor:
-        """Return a legality-friendly fog completion without model samples.
+        """Return a legal low-information fallback for rejected belief rows.
 
-        It is the safe fallback for a batched scheduler: one independently
-        sampled road, terrain or building can otherwise change a legal move in
-        one of hundreds of environments and make the native API reject the
-        whole batch.  The fallback deliberately carries no source-map data.
+        This is never an engine-state fallback: hidden tiles are empty
+        hypotheses, while visible tokens are copied verbatim.  It only repairs
+        structural city references required for the engine to instantiate a
+        detached belief world.
         """
         if map_tokens.ndim != 3:
             raise ValueError("map_tokens must have shape [batch, tiles, features]")
@@ -424,9 +424,11 @@ class PolicyValueBeliefNet(nn.Module):
         completed[..., 0] = observed[..., 0]
         completed_cpu = completed.to(device="cpu")
         hidden_cpu = (~known).to(device="cpu")
-        for row in range(completed_cpu.shape[0]):
+        for row in range(observed.shape[0]):
             self._add_referenced_city_placeholders(completed_cpu[row], hidden_cpu[row])
-            self._add_missing_player_capitals(completed_cpu[row], hidden_cpu[row], player_count)
+            self._add_missing_player_capitals(
+                completed_cpu[row], hidden_cpu[row], player_count=player_count
+            )
         return completed_cpu
 
     @staticmethod

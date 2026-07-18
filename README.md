@@ -115,9 +115,10 @@ do GPU. PolyBot używa też buforów `*_into()` (na CUDA przypiętych w RAM) ora
 To jest szybki etap **czystego self-play**. API przyjmuje jedną poprawną
 hipotezę belief na żywą grę, dlatego parametr `--particles` tu nie ma sensu;
 dotychczasowy globalny MCTS z particle worlds zostaje dla meczów z championem
-i bramki promocji. W tym etapie nie istnieje dostęp do `full_map_numpy()`, więc
-nie może powstać wyciek danych; belief head uczy się nadal w etapie warm-up lub
-teacher, a policy/value uczą się z visit counts MCTS i terminal/TD targets.
+i bramki promocji. Po zakończeniu MCTS PolyEnv udostępnia wyłącznie dla lossu
+belief etykiety `belief_targets_numpy()`: nie są one przekazywane do
+`submit_beliefs`, policy ani MCTS, więc nie mogą wpłynąć na zagrany ruch.
+Policy/value nadal uczą się z visit counts MCTS i terminal/TD targets.
 
 Szybki samodzielny test na CUDA:
 

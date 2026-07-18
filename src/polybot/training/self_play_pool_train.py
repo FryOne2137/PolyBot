@@ -74,12 +74,11 @@ def _root_examples(
     training: TrainingConfig,
     belief_targets: np.ndarray,
 ) -> List[TrainingExample]:
-    """Create policy/value records from public root requests only.
+    """Create records from public MCTS roots plus training-only belief labels.
 
-    ``SelfPlayPool`` never exposes an authoritative full map. Self-play rows
-    therefore deliberately carry an all-false belief mask: policy/value learn
-    from them, while any optional teacher/belief stage supplies supervised fog
-    labels. This keeps the pool's no-leak contract intact.
+    ``belief_targets`` are requested *after* MCTS from a dedicated API. They
+    never enter the belief completion, legal-action check, policy or value
+    inference path, so they cannot leak hidden state into a played action.
     """
     maps = np.asarray(request["map_tokens"], dtype=np.int64)
     state = np.asarray(request["state"], dtype=np.int32)
@@ -109,8 +108,6 @@ def _root_examples(
             action_categorical=features[index, :count][:, NATIVE_ACTION_CATEGORICAL_COLUMNS].copy(),
             action_continuous=features[index, :count][:, NATIVE_ACTION_CONTINUOUS_COLUMNS].astype(np.float32, copy=True),
             policy_target=policy,
-            # This training-only target is read after the belief hypothesis
-            # has been validated and is never sent to MCTS or policy inputs.
             full_map_target=belief_targets[index].copy(),
             hidden_mask=maps[index, :, 0] == 0,
             player_id=int(player_ids[index]),
@@ -154,12 +151,12 @@ def train_self_play_pool(
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
 ) -> Dict[str, float]:
-    """Run fixed-horizon, fully native belief-MCTS rollouts and optimise in RAM.
+    """Run fully native belief-MCTS rollouts and optimise in RAM.
 
-    A vector horizon avoids imposing a Python-side game timeout on individual
-    native slots. Terminal transitions are still labelled exactly from
-    ``terminal_values``; non-terminal rows use the next root value as a
-    one-step TD target. The bounded replay is process memory only.
+    Per-slot validation/retry/reset keeps invalid detached belief worlds from
+    stalling a whole vector. Full-map labels are read only after MCTS and are
+    used solely for the belief loss; terminal rows use native terminal values
+    and other rows a one-step TD target.
     """
     if num_envs < 1 or steps < 1 or updates < 0:
         raise ValueError("num_envs and steps must be positive; updates must not be negative")
@@ -174,13 +171,13 @@ def train_self_play_pool(
     except ImportError as error:
         raise RuntimeError("Update PolyEnv to a version exposing SelfPlayPool.") from error
     required_pool_api = ("belief_acceptance_mask", "belief_targets_numpy", "reset_slots")
-    missing_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
-    if missing_api:
+    missing_pool_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
+    if missing_pool_api:
         raise RuntimeError(
-            "PolyEnv is missing the training belief API " + ", ".join(missing_api) +
-            ". Rebuild/reinstall PolyEnv from the accompanying engine changes."
+            "PolyEnv SelfPlayPool is missing required belief-MCTS APIs: "
+            + ", ".join(missing_pool_api)
+            + ". Rebuild/update the local PolyEnv bindings."
         )
-
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
@@ -260,39 +257,41 @@ def train_self_play_pool(
                 visible = observed_tokens[index, :, 0] == 1
                 candidate[index, visible] = observed_tokens[index, visible]
                 candidate[index, :, 0] = observed_tokens[index, :, 0]
-            # Validate every row first. Unlike submit_beliefs(), this returns
-            # a public-action acceptance mask, letting us resample only the
-            # rejected worlds instead of discarding a whole 128-env batch.
+            # Validate every detached world before submitting the whole
+            # forest.  The mask exposes no source-map information: it only
+            # tells us whether a row preserves the already public root action
+            # set and remains non-terminal.
             accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
             for _ in range(belief_retries):
                 rejected = ~accepted
                 if not rejected.any():
                     break
+                # Do not retain a failed proposal as this player's memory.
+                for index in np.flatnonzero(rejected):
+                    belief_cache[int(index)][int(actors[index])] = None
                 with torch.inference_mode():
                     resampled = model.sample_completed_map_batch_from_belief_logits(
                         root_tensors.map_tokens, root_output.belief_logits,
                         temperature=max(mcts.temperature, 0.35),
                     ).numpy().astype(np.int32, copy=False)
                 candidate[rejected] = resampled[rejected]
-                # A rejected cached particle is no longer compatible with the
-                # latest public action set, so do not reuse it next turn.
-                for index in np.flatnonzero(rejected):
-                    belief_cache[int(index)][int(actors[index])] = None
                 accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
-                belief_retries_used += 1
+                belief_retries_used += int(rejected.sum())
+
             rejected = ~accepted
             if rejected.any():
+                # A deliberately empty hidden world is a legal final attempt;
+                # it is constructed in PolyBot exclusively from observation.
                 belief_fallback_rows += int(rejected.sum())
-                with torch.inference_mode():
-                    conservative = model.conservative_completed_map_batch(root_tensors.map_tokens)
+                conservative = model.conservative_completed_map_batch(root_tensors.map_tokens)
                 candidate[rejected] = conservative.numpy().astype(np.int32, copy=False)[rejected]
                 accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
-            if not accepted.all():
-                # Do not ever fall back to the authoritative full map for
-                # MCTS. A genuinely incompatible slot is discarded and reset
-                # through the native API; the rest of the RAM-only run keeps
-                # going on the next vector decision.
-                invalid_rows = np.flatnonzero(~accepted).astype(np.int32, copy=False)
+
+            invalid_rows = np.flatnonzero(~accepted).astype(np.int32, copy=False)
+            if invalid_rows.size:
+                # Reset only unsatisfiable slots and immediately refresh their
+                # public packets. This is a training recovery path, never a
+                # fallback to an authoritative hidden map.
                 pool.reset_slots(invalid_rows)
                 pool.belief_requests_into(request)
                 for index in invalid_rows:
@@ -303,9 +302,11 @@ def train_self_play_pool(
                 progress.update(1)
                 progress.set_postfix(
                     env_steps=(step + 1) * num_envs,
-                    replay=len(replay), rejected=int(invalid_rows.size), resets=belief_reset_rows,
+                    replay=len(replay), terminals=terminal_episodes,
+                    resets=belief_reset_rows,
                 )
                 continue
+
             pool.submit_beliefs(state_ids, candidate)
             # Cache only a hypothesis accepted by the native legality check.
             for index, actor in enumerate(actors):
@@ -382,9 +383,6 @@ def train_self_play_pool(
                 replay.extend([example])
                 completed_targets += 1
 
-            # The search is now complete. Full targets are fetched only for
-            # this supervised belief label and are never available to the
-            # policy/value inference or the MCTS expansion above.
             belief_targets = np.asarray(pool.belief_targets_numpy(state_ids), dtype=np.int32)
             examples = _root_examples(request, root, training, belief_targets)
             action_rows = _sample_root_rows(root, rng, mcts.temperature)
@@ -424,6 +422,7 @@ def train_self_play_pool(
     if model_out is not None:
         save_model(model_out, model, model_config)
     summary: Dict[str, float] = {
+        "training_seed": float(training.seed),
         "self_play_pool_envs": float(num_envs),
         "self_play_pool_steps": float(steps),
         "self_play_pool_env_steps": float(num_envs * steps),

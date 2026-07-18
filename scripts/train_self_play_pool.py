@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument("--updates", type=int, default=1_000, help="Post-rollout optimiser updates")
     parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
-    parser.add_argument("--belief-retries", type=int, default=4, help="Fresh belief samples for each rejected env")
+    parser.add_argument("--belief-retries", type=int, default=4, help="Fresh belief samples for each rejected environment")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
     parser.add_argument("--simulations", type=int, default=32)

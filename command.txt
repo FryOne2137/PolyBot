@@ -1,3 +1,37 @@
+python scripts/train_self_play_pool.py `
+  --model-in models\champion-v3.pt `
+  --model-out models\selfplay-pool-1.pt `
+  --num-envs 128 `
+  --steps 5000 `
+  --updates 2500 `
+  --num-threads 16 `
+  --max-pending-leaves 4 `
+  --belief-retries 4 `
+  --simulations 32 `
+  --mcts-max-actions 1024 `
+  --batch-size 64 `
+  --learning-rate 3e-5 `
+  --map-size 11 `
+  --map-type lakes `
+  --device cuda
+
+
+
+python scripts/evaluate.py `
+  --model-a models\selfplay-pool-1.pt `
+  --model-b models\champion-v3.pt `
+  --games 50 `
+  --simulations 32 `
+  --particles 4 `
+  --mcts-max-actions 1024 `
+  --max-moves 400 `
+  --device cuda
+
+
+
+
+
+
 # Windows PowerShell: generacja v4 od potwierdzonego championa v3.
 # Pierwszy champion-model jest punktem promocji; drugi rozszerza pulę
 # przeciwników o wcześniejszy, odmienny styl. Wynik zapisze się jako v4 tylko

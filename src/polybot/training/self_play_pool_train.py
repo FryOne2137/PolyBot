@@ -170,7 +170,7 @@ def train_self_play_pool(
         from PolyEnv import Bardur, Imperius, MapType, SelfPlayPool
     except ImportError as error:
         raise RuntimeError("Update PolyEnv to a version exposing SelfPlayPool.") from error
-    required_pool_api = ("belief_acceptance_mask", "belief_targets_numpy")
+    required_pool_api = ("belief_acceptance_mask", "belief_targets_numpy", "reset_slots")
     missing_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
     if missing_api:
         raise RuntimeError(
@@ -213,6 +213,7 @@ def train_self_play_pool(
     leaf_counts: List[int] = []
     belief_retries_used = 0
     belief_fallback_rows = 0
+    belief_reset_rows = 0
     # One accepted fog hypothesis per live slot and player. Visibility for a
     # given player only grows, so merging newly visible tiles is a legitimate
     # belief filter rather than an engine-state leak. Re-sampling an entire
@@ -284,10 +285,24 @@ def train_self_play_pool(
                 candidate[rejected] = conservative.numpy().astype(np.int32, copy=False)[rejected]
                 accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
             if not accepted.all():
-                raise RuntimeError(
-                    "SelfPlayPool could not sample a legal non-terminal belief world for "
-                    f"{int((~accepted).sum())}/{num_envs} environments after {belief_retries} retries."
+                # Do not ever fall back to the authoritative full map for
+                # MCTS. A genuinely incompatible slot is discarded and reset
+                # through the native API; the rest of the RAM-only run keeps
+                # going on the next vector decision.
+                invalid_rows = np.flatnonzero(~accepted).astype(np.int32, copy=False)
+                pool.reset_slots(invalid_rows)
+                pool.belief_requests_into(request)
+                for index in invalid_rows:
+                    belief_cache[int(index)] = [None, None]
+                    belief_episode[int(index)] = 0
+                    pending[int(index)] = None
+                belief_reset_rows += int(invalid_rows.size)
+                progress.update(1)
+                progress.set_postfix(
+                    env_steps=(step + 1) * num_envs,
+                    replay=len(replay), rejected=int(invalid_rows.size), resets=belief_reset_rows,
                 )
+                continue
             pool.submit_beliefs(state_ids, candidate)
             # Cache only a hypothesis accepted by the native legality check.
             for index, actor in enumerate(actors):
@@ -415,6 +430,7 @@ def train_self_play_pool(
         "self_play_pool_completed_targets": float(completed_targets),
         "self_play_pool_belief_retries": float(belief_retries_used),
         "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
+        "self_play_pool_belief_reset_rows": float(belief_reset_rows),
         "self_play_pool_truncated_roots": float(truncated_roots),
         "replay_examples": float(len(replay)),
     }

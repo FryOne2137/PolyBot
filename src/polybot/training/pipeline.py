@@ -12,6 +12,7 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .belief_warmup import warmup_belief
+from .self_play_pool_train import train_self_play_pool
 from .self_play_train import train_self_play
 from .teacher_bootstrap import train_teacher_bootstrap
 from .vector_actor_critic import train_vector_actor_critic
@@ -28,6 +29,9 @@ def run_pipeline(
     updates_per_game: int,
     flat_envs: int,
     flat_steps: int,
+    self_play_pool_envs: int,
+    self_play_pool_steps: int,
+    self_play_pool_updates: int,
     model_out: Path,
     model_in: Path | None = None,
     teacher_games: int = 0,
@@ -35,6 +39,8 @@ def run_pipeline(
     vector_teacher_envs: int = 0,
     vector_teacher_steps: int = 0,
     vector_teacher_updates_per_step: int = 1,
+    self_play_pool_threads: int | None = None,
+    self_play_pool_pending_leaves: int = 4,
     mcts_workers: int = 1,
     teacher_replay_fraction: float = 0.35,
     refinement_games: int = 0,
@@ -47,7 +53,8 @@ def run_pipeline(
 
     The order intentionally gives the MCTS stage a competent prior:
     supervised belief -> legal-action teacher -> vector teacher -> flat
-    actor-critic -> anchored MCTS -> lower-noise MCTS refinement. Games, replay
+    actor-critic -> persistent native SelfPlayPool MCTS -> anchored MCTS ->
+    lower-noise MCTS refinement. Games, replay
     buffers and optimiser states are never written; the one requested model
     path is overwritten at safe stage boundaries for crash recovery.
     """
@@ -104,6 +111,21 @@ def run_pipeline(
             num_envs=flat_envs,
             steps=flat_steps,
             max_actions=mcts_config.native_max_actions,
+            model=model,
+        )
+    pool_self_play = {}
+    if self_play_pool_steps:
+        if self_play_pool_envs < 1:
+            raise ValueError("self_play_pool_envs must be positive when the SelfPlayPool stage is enabled")
+        pool_self_play = train_self_play_pool(
+            training,
+            model_config,
+            mcts_config,
+            num_envs=self_play_pool_envs,
+            steps=self_play_pool_steps,
+            updates=self_play_pool_updates,
+            num_threads=self_play_pool_threads,
+            max_pending_leaves=self_play_pool_pending_leaves,
             model=model,
         )
     # Keep one recoverable model artifact. With a promotion champion, that
@@ -199,6 +221,7 @@ def run_pipeline(
         "teacher_bootstrap": teacher,
         "vector_teacher": vector_teacher,
         "flat_actor_critic": flat,
+        "self_play_pool": pool_self_play,
         "mcts_foundation": self_play,
         "mcts_refinement": refinement,
         "promotion": promotion,

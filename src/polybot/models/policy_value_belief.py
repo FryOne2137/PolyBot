@@ -339,6 +339,61 @@ class PolicyValueBeliefNet(nn.Module):
             result.append(completed)
         return result
 
+    @torch.no_grad()
+    def sample_completed_map_batch_from_belief_logits(
+        self,
+        map_tokens: torch.Tensor,
+        belief_logits: Sequence[torch.Tensor],
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Create one valid detached belief completion for every batch row.
+
+        ``SelfPlayPool`` consumes exactly one completion per live environment.
+        This is the vectorised counterpart to the scalar particle sampler above:
+        it never reads source-world state and preserves every currently visible
+        token verbatim.  Dynamic hidden entities remain conservative/empty,
+        exactly as in the scalar sampler.
+        """
+        if len(belief_logits) != len(MAP_FEATURE_MAX):
+            raise ValueError("belief completion requires all belief heads")
+        observed = map_tokens
+        if observed.ndim != 3:
+            raise ValueError("map_tokens must have shape [batch, tiles, features]")
+        known = observed[..., 0] == 1
+        empty_tile = torch.tensor(
+            [0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
+             0, -1, -1, -1, 0, 2, 0, -1, -1],
+            dtype=observed.dtype,
+            device=observed.device,
+        )
+        completed = empty_tile.view(1, 1, -1).expand_as(observed).clone()
+        batch, tiles, _ = observed.shape
+        hidden = ~known
+        for feature_index in SAFE_PARTICLE_FEATURES:
+            logits = belief_logits[feature_index] / max(float(temperature), 1e-4)
+            probabilities = torch.softmax(logits, dim=-1).reshape(-1, logits.shape[-1])
+            samples = torch.multinomial(probabilities, 1).reshape(batch, tiles) - 1
+            completed[..., feature_index] = torch.where(
+                hidden, samples.to(completed.dtype).clamp_min(0), completed[..., feature_index]
+            )
+        completed[..., 14] = torch.where(
+            hidden & (completed[..., 14] == 2),
+            torch.zeros_like(completed[..., 14]),
+            completed[..., 14],
+        )
+        completed[known] = observed[known]
+        completed[..., 0] = observed[..., 0]
+        # SelfPlayPool needs a CPU ``int32`` packet. Move once before the
+        # small structured-city repair: doing ``tolist()`` for every GPU row
+        # would otherwise synchronise CUDA once per live environment.
+        completed_cpu = completed.to(device="cpu")
+        hidden_cpu = hidden.to(device="cpu")
+        # Referenced city IDs must still have a centre. The placement is a
+        # deterministic hypothesis built solely from the submitted observation.
+        for row in range(batch):
+            self._add_referenced_city_placeholders(completed_cpu[row], hidden_cpu[row])
+        return completed_cpu
+
     @staticmethod
     def _add_referenced_city_placeholders(completed: torch.Tensor, hidden: torch.Tensor) -> None:
         """Create valid hidden city centers for IDs visible only by reference.

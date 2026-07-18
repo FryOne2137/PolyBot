@@ -34,6 +34,48 @@ python scripts/train_pipeline.py `
   --model-out models\champion-v4.pt
 
 
+# Windows PowerShell: szybki, trwały SelfPlayPool. C++ utrzymuje wszystkie
+# gry i drzewa MCTS, a CUDA dostaje batche do 128 * 4 liści. To jest dobry
+# smoke test nowej ścieżki; zapisuje wyłącznie model.
+python scripts/train_self_play_pool.py `
+  --model-in models\champion-v3.pt `
+  --model-out models\selfplay-pool-smoke.pt `
+  --num-envs 128 `
+  --steps 1000 `
+  --updates 500 `
+  --num-threads 16 `
+  --max-pending-leaves 4 `
+  --simulations 32 `
+  --mcts-max-actions 1024 `
+  --batch-size 64 `
+  --learning-rate 3e-5 `
+  --map-size 11 `
+  --map-type lakes `
+  --device cuda
+
+
+# Windows PowerShell: champion-gated pipeline z szybkim etapem SelfPlayPool
+# przed dokładniejszym particle MCTS przeciw zamrożonemu championowi.
+python scripts/train_pipeline.py `
+  --model-in models\champion-v3.pt `
+  --belief-positions 0 --teacher-games 0 `
+  --vector-teacher-steps 0 --flat-steps 0 `
+  --self-play-pool-envs 128 `
+  --self-play-pool-steps 4000 `
+  --self-play-pool-updates 2000 `
+  --self-play-pool-threads 16 `
+  --self-play-pool-pending-leaves 4 `
+  --self-play-games 300 --refinement-games 150 `
+  --updates-per-game 8 --refinement-updates-per-game 8 `
+  --simulations 32 --particles 4 --workers 32 --mcts-threads 1 `
+  --mcts-max-actions 1024 --batch-size 64 --learning-rate 3e-5 `
+  --max-moves 400 --map-size 11 --map-type lakes --device cuda `
+  --champion-model models\champion-v3.pt `
+  --champion-model models\teacher-v1.pt `
+  --promotion-games 200 --promotion-score 0.55 `
+  --model-out models\champion-v5.pt
+
+
 # Windows PowerShell: kontynuacja od najlepszego modelu.
 # Kandydat gra z MCTS przeciw zamrożonemu championowi, a wynikowy plik jest
 # podmieniany tylko, gdy wygrywa bramkę promocji. Zero zapisanych gier/replayów.

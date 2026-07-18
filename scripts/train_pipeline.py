@@ -31,6 +31,23 @@ def main() -> None:
     parser.add_argument("--vector-teacher-updates-per-step", type=int, default=1)
     parser.add_argument("--flat-envs", type=int, default=64)
     parser.add_argument("--flat-steps", type=int, default=10_000)
+    parser.add_argument(
+        "--self-play-pool-envs", type=int, default=0,
+        help="Live native games in the persistent SelfPlayPool stage; 0 disables that stage.",
+    )
+    parser.add_argument(
+        "--self-play-pool-steps", type=int, default=0,
+        help="Vector decisions for the persistent native SelfPlayPool MCTS stage.",
+    )
+    parser.add_argument(
+        "--self-play-pool-updates", type=int, default=0,
+        help="Optimiser updates after the SelfPlayPool rollout is collected in RAM.",
+    )
+    parser.add_argument("--self-play-pool-threads", type=int, help="Native worker threads owned by SelfPlayPool")
+    parser.add_argument(
+        "--self-play-pool-pending-leaves", type=int, default=4,
+        help="Concurrent virtual-loss leaves per tree (1-8); 4 batches GPU inference efficiently.",
+    )
     parser.add_argument("--self-play-games", type=int, default=200, help="anchored MCTS foundation games")
     parser.add_argument("--refinement-games", type=int, default=100, help="lower-noise MCTS games after the foundation")
     parser.add_argument("--updates-per-game", type=int, default=8)
@@ -79,6 +96,9 @@ def main() -> None:
         updates_per_game=args.updates_per_game,
         flat_envs=args.flat_envs,
         flat_steps=args.flat_steps,
+        self_play_pool_envs=args.self_play_pool_envs,
+        self_play_pool_steps=args.self_play_pool_steps,
+        self_play_pool_updates=args.self_play_pool_updates,
         model_out=args.model_out,
         model_in=args.model_in,
         teacher_games=args.teacher_games,
@@ -86,6 +106,8 @@ def main() -> None:
         vector_teacher_envs=args.vector_teacher_envs,
         vector_teacher_steps=args.vector_teacher_steps,
         vector_teacher_updates_per_step=args.vector_teacher_updates_per_step,
+        self_play_pool_threads=args.self_play_pool_threads,
+        self_play_pool_pending_leaves=args.self_play_pool_pending_leaves,
         mcts_workers=args.workers,
         teacher_replay_fraction=args.teacher_replay_fraction,
         refinement_games=args.refinement_games,

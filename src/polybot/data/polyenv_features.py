@@ -63,19 +63,28 @@ def native_batch_to_tensors(
     global_features[:, 6] = np.maximum(state[:, 8], 0) / 1024.0
     global_features[:, 7] = float(map_size) / 32.0
     global_features[:, 8] = 1.0 if map_type == "drylands" else 0.0
+    # Keep native packets as their compact integer dtype until they reach the
+    # accelerator.  SelfPlayPool can provide pinned NumPy views, so this makes
+    # the large map/action copies asynchronous on CUDA instead of first making
+    # an unpinned CPU ``int64`` temporary for every MCTS batch.
+    non_blocking = device.type == "cuda"
+    map_tokens = torch.as_tensor(batch["map_tokens"]).to(device=device, non_blocking=non_blocking).long()
+    raw_features = torch.as_tensor(features).to(device=device, non_blocking=non_blocking)
+    categorical_columns = torch.as_tensor(NATIVE_ACTION_CATEGORICAL_COLUMNS, dtype=torch.long, device=device)
+    continuous_columns = torch.as_tensor(NATIVE_ACTION_CONTINUOUS_COLUMNS, dtype=torch.long, device=device)
     return PacketTensors(
-        map_tokens=torch.as_tensor(batch["map_tokens"], dtype=torch.long, device=device),
-        global_features=torch.as_tensor(global_features, dtype=torch.float32, device=device),
+        map_tokens=map_tokens,
+        global_features=torch.as_tensor(global_features, dtype=torch.float32).to(
+            device=device, non_blocking=non_blocking
+        ),
         # MctsPool intentionally omits journals from its hot path. Zero is the
         # neutral representation and never introduces hidden information.
         event_features=torch.zeros((count, EVENT_SUMMARY_SIZE), dtype=torch.float32, device=device),
-        action_categorical=torch.as_tensor(
-            features[..., NATIVE_ACTION_CATEGORICAL_COLUMNS], dtype=torch.long, device=device
-        ),
-        action_continuous=torch.as_tensor(
-            features[..., NATIVE_ACTION_CONTINUOUS_COLUMNS], dtype=torch.float32, device=device
-        ),
-        action_mask=torch.as_tensor(batch["action_mask"], dtype=torch.bool, device=device),
+        action_categorical=raw_features.index_select(-1, categorical_columns).long(),
+        action_continuous=raw_features.index_select(-1, continuous_columns).float(),
+        action_mask=torch.as_tensor(batch["action_mask"]).to(
+            device=device, non_blocking=non_blocking
+        ).bool(),
     )
 
 

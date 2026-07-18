@@ -103,6 +103,39 @@ python scripts/train_self_play.py \
   --max-moves 300
 ```
 
+## Fast native MCTS: `SelfPlayPool`
+
+Nowszy PolyEnv udostępnia `SelfPlayPool`: C++ utrzymuje jednocześnie żywe gry,
+ich hipotetyczne belief-worlds, drzewa MCTS i workery. Python nie tworzy w
+pętli `GameEnv` ani krótkotrwałego `MctsPool`; dostaje tylko stałe, gęste batche
+do GPU. PolyBot używa też buforów `*_into()` (na CUDA przypiętych w RAM) oraz
+`max_pending_leaves_per_tree`, więc jeden forward GPU może ocenić do
+`num_envs × pending_leaves` różnych liści.
+
+To jest szybki etap **czystego self-play**. API przyjmuje jedną poprawną
+hipotezę belief na żywą grę, dlatego parametr `--particles` tu nie ma sensu;
+dotychczasowy globalny MCTS z particle worlds zostaje dla meczów z championem
+i bramki promocji. W tym etapie nie istnieje dostęp do `full_map_numpy()`, więc
+nie może powstać wyciek danych; belief head uczy się nadal w etapie warm-up lub
+teacher, a policy/value uczą się z visit counts MCTS i terminal/TD targets.
+
+Szybki samodzielny test na CUDA:
+
+```powershell
+python scripts/train_self_play_pool.py `
+  --model-in models\champion-v3.pt `
+  --model-out models\pool-smoke.pt `
+  --num-envs 128 --steps 1000 --updates 500 `
+  --num-threads 16 --max-pending-leaves 4 `
+  --simulations 32 --mcts-max-actions 1024 `
+  --batch-size 64 --learning-rate 3e-5 --device cuda
+```
+
+Do pełnego pipeline dodaj np. `--self-play-pool-envs 128
+--self-play-pool-steps 4000 --self-play-pool-updates 2000
+--self-play-pool-threads 16 --self-play-pool-pending-leaves 4` przed
+wolniejszymi etapami `--self-play-games` i `--refinement-games`.
+
 ## Evaluation
 
 Evaluation uses fixed seeds, greedy MCTS and writes no games or metrics files.

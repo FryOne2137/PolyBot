@@ -103,8 +103,11 @@ def _root_examples(
             map_tokens=maps[index].copy(),
             global_features=globals_[index].copy(),
             event_features=np.zeros(EVENT_SUMMARY_SIZE, dtype=np.float32),
-            action_categorical=features[index, :count, NATIVE_ACTION_CATEGORICAL_COLUMNS].copy(),
-            action_continuous=features[index, :count, NATIVE_ACTION_CONTINUOUS_COLUMNS].astype(np.float32, copy=True),
+            # Index columns after slicing actions. NumPy advanced indexing in
+            # one expression moves the feature axis to the front, producing
+            # [fields, actions] and corrupting variable-length replay rows.
+            action_categorical=features[index, :count][:, NATIVE_ACTION_CATEGORICAL_COLUMNS].copy(),
+            action_continuous=features[index, :count][:, NATIVE_ACTION_CONTINUOUS_COLUMNS].astype(np.float32, copy=True),
             policy_target=policy,
             # This training-only target is read after the belief hypothesis
             # has been validated and is never sent to MCTS or policy inputs.

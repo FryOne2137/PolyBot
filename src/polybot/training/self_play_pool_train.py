@@ -197,6 +197,7 @@ def train_self_play_pool(
     terminal_episodes = 0
     truncated_roots = 0
     completed_targets = 0
+    leaf_counts: List[int] = []
     model.eval()
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -224,6 +225,7 @@ def train_self_play_pool(
             waves = 1 + int(np.ceil(max(0, mcts.simulations - 1) / max_pending_leaves))
             for _ in range(waves):
                 leaf_count = int(pool.select_leaves_into(leaves, max_leaves=leaf_capacity))
+                leaf_counts.append(leaf_count)
                 if leaf_count == 0:
                     break
                 leaf_batch = {name: value[:leaf_count] for name, value in leaves.items()}
@@ -246,6 +248,22 @@ def train_self_play_pool(
                 )
 
             pool.root_policy_into(root, temperature=1.0)
+            root_action_counts = np.asarray(root["action_mask"], dtype=np.uint8).sum(axis=1)
+            empty_roots = np.flatnonzero(root_action_counts == 0)
+            if empty_roots.size:
+                request_action_counts = np.asarray(request["action_mask"], dtype=np.uint8).sum(axis=1)
+                stats = pool.search_stats()
+                selected = leaf_counts[-waves:]
+                raise RuntimeError(
+                    "SelfPlayPool returned an unexpanded root after MCTS. "
+                    f"step={step}, empty_roots={empty_roots[:8].tolist()} "
+                    f"(total={empty_roots.size}), request_action_count="
+                    f"{request_action_counts[empty_roots[:8]].tolist()}, "
+                    f"selected_leaves={selected}, root_visits="
+                    f"{np.asarray(root['root_visit_count'])[empty_roots[:8]].tolist()}, "
+                    f"search_stats={stats}. This indicates a SelfPlayPool/MCTS API mismatch "
+                    "or a native engine issue, not an action-selection failure."
+                )
             root_values = np.asarray(root["root_value"], dtype=np.float32)
             next_players = np.asarray(request["to_play"], dtype=np.int64)
             terminal = np.asarray(request["terminated"], dtype=bool)

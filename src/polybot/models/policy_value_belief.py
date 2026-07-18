@@ -396,6 +396,39 @@ class PolicyValueBeliefNet(nn.Module):
             self._add_missing_player_capitals(completed_cpu[row], hidden_cpu[row], player_count=2)
         return completed_cpu
 
+    @torch.no_grad()
+    def conservative_completed_map_batch(
+        self,
+        map_tokens: torch.Tensor,
+        player_count: int = 2,
+    ) -> torch.Tensor:
+        """Return a legality-friendly fog completion without model samples.
+
+        It is the safe fallback for a batched scheduler: one independently
+        sampled road, terrain or building can otherwise change a legal move in
+        one of hundreds of environments and make the native API reject the
+        whole batch.  The fallback deliberately carries no source-map data.
+        """
+        if map_tokens.ndim != 3:
+            raise ValueError("map_tokens must have shape [batch, tiles, features]")
+        observed = map_tokens
+        known = observed[..., 0] == 1
+        empty_tile = torch.tensor(
+            [0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
+             0, -1, -1, -1, 0, 2, 0, -1, -1],
+            dtype=observed.dtype,
+            device=observed.device,
+        )
+        completed = empty_tile.view(1, 1, -1).expand_as(observed).clone()
+        completed[known] = observed[known]
+        completed[..., 0] = observed[..., 0]
+        completed_cpu = completed.to(device="cpu")
+        hidden_cpu = (~known).to(device="cpu")
+        for row in range(completed_cpu.shape[0]):
+            self._add_referenced_city_placeholders(completed_cpu[row], hidden_cpu[row])
+            self._add_missing_player_capitals(completed_cpu[row], hidden_cpu[row], player_count)
+        return completed_cpu
+
     @staticmethod
     def _add_referenced_city_placeholders(completed: torch.Tensor, hidden: torch.Tensor) -> None:
         """Create valid hidden city centers for IDs visible only by reference.

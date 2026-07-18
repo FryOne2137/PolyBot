@@ -198,6 +198,7 @@ def train_self_play_pool(
     truncated_roots = 0
     completed_targets = 0
     leaf_counts: List[int] = []
+    belief_fallbacks = 0
     model.eval()
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -213,10 +214,27 @@ def train_self_play_pool(
                     root_tensors.map_tokens, root_output.belief_logits,
                     temperature=max(mcts.temperature, 0.35),
                 )
-            pool.submit_beliefs(
-                np.asarray(request["state_id"], dtype=np.uint64),
-                completed.cpu().numpy().astype(np.int32, copy=False),
-            )
+            state_ids = np.asarray(request["state_id"], dtype=np.uint64)
+            try:
+                pool.submit_beliefs(
+                    state_ids,
+                    completed.numpy().astype(np.int32, copy=False),
+                )
+            except ValueError as error:
+                # A batched native pool must reject the whole request when a
+                # single sampled hidden terrain/building changes any public
+                # legal action. Retry the exact same observation with a
+                # deliberately empty fog hypothesis; it never reads source
+                # state and keeps the run alive without accepting a leak.
+                if "changes the current player's legal action set" not in str(error):
+                    raise
+                belief_fallbacks += 1
+                with torch.inference_mode():
+                    conservative = model.conservative_completed_map_batch(root_tensors.map_tokens)
+                pool.submit_beliefs(
+                    state_ids,
+                    conservative.numpy().astype(np.int32, copy=False),
+                )
 
             # One select call returns up to B * pending leaves. The native
             # virtual-loss scheduler reserves distinct paths in that batch.
@@ -334,6 +352,7 @@ def train_self_play_pool(
         "self_play_pool_pending_leaves": float(max_pending_leaves),
         "self_play_pool_terminals": float(terminal_episodes),
         "self_play_pool_completed_targets": float(completed_targets),
+        "self_play_pool_belief_fallbacks": float(belief_fallbacks),
         "self_play_pool_truncated_roots": float(truncated_roots),
         "replay_examples": float(len(replay)),
     }

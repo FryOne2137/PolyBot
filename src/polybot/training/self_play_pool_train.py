@@ -152,6 +152,7 @@ def _all_player_particles(
     """Sample one fog-safe hypothesis for every player of every live game."""
     maps = np.asarray(request["map_tokens"], dtype=np.int32)
     states = np.asarray(request["state"], dtype=np.int32)
+    perspectives = np.asarray(request["belief_player"], dtype=np.int64)
     history = np.asarray(request["visible_action_history"], dtype=np.int32)
     history_mask = np.asarray(request["visible_action_history_mask"], dtype=bool)
     envs, players, tiles, fields = maps.shape
@@ -175,7 +176,10 @@ def _all_player_particles(
         action_history_mask=torch.as_tensor(flat_history_mask, dtype=torch.bool, device=device),
     )
     completed = model.sample_completed_map_batch_from_belief_logits(
-        torch.as_tensor(flat_maps, dtype=torch.long, device=device), output.belief_logits, temperature=temperature,
+        torch.as_tensor(flat_maps, dtype=torch.long, device=device), output.belief_logits,
+        temperature=temperature,
+        perspective_players=torch.as_tensor(perspectives.reshape(-1), dtype=torch.long, device=device),
+        known_city_counts=torch.as_tensor(flat_states[:, 6], dtype=torch.long, device=device),
     )
     return completed.numpy().astype(np.int32, copy=False).reshape(envs, players, tiles, fields)
 
@@ -194,10 +198,14 @@ def _conservative_all_player_particles(
     entire vector batch indefinitely.
     """
     maps = np.asarray(request["map_tokens"], dtype=np.int32)
+    states = np.asarray(request["state"], dtype=np.int32)
+    perspectives = np.asarray(request["belief_player"], dtype=np.int64)
     envs, players, tiles, fields = maps.shape
     flat_maps = maps.reshape(envs * players, tiles, fields)
     completed = model.conservative_completed_map_batch(
-        torch.as_tensor(flat_maps, dtype=torch.long, device=device), player_count=players
+        torch.as_tensor(flat_maps, dtype=torch.long, device=device), player_count=players,
+        perspective_players=torch.as_tensor(perspectives.reshape(-1), dtype=torch.long, device=device),
+        known_city_counts=torch.as_tensor(states.reshape(envs * players, states.shape[-1])[:, 6], dtype=torch.long, device=device),
     )
     return completed.numpy().astype(np.int32, copy=False).reshape(envs, players, tiles, fields)
 
@@ -430,6 +438,10 @@ def train_self_play_pool(
                         # belief distribution; uncertainty remains in the
                         # non-active player particles below.
                         temperature=0.0,
+                        perspective_players=torch.as_tensor(actors, dtype=torch.long, device=device),
+                        known_city_counts=torch.as_tensor(
+                            np.asarray(request["state"], dtype=np.int32)[:, 6], dtype=torch.long, device=device
+                        ),
                     ).numpy().astype(np.int32, copy=False)
                     for _ in range(particle_count)
                 ], axis=1)

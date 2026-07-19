@@ -20,6 +20,26 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 from .batched_inference import BatchedInference, NativeLeafInference
 
 
+def _public_city_constraint(packet: Dict[str, object]) -> tuple[int | None, int | None]:
+    """Read the acting player's already-public identity and city count."""
+    observation = packet.get("obs")
+    if not isinstance(observation, dict):
+        return None, None
+    player = observation.get("current_player", observation.get("player"))
+    city_count = observation.get("own_cities", observation.get("cities"))
+    try:
+        perspective = int(player) if player is not None else None
+    except (TypeError, ValueError):
+        perspective = None
+    if isinstance(city_count, (list, tuple, np.ndarray)):
+        city_count = len(city_count)
+    try:
+        count = int(city_count) if city_count is not None else None
+    except (TypeError, ValueError):
+        count = None
+    return perspective, count
+
+
 @dataclass
 class SearchNode:
     priors: Dict[int, float] = field(default_factory=dict)
@@ -188,6 +208,7 @@ class BeliefMCTS:
             if self.model is None or self.device is None:
                 raise RuntimeError("local particle sampling requires a model and device")
             tensors = packet_to_tensors(packet, self.device, events)
+            perspective, city_count = _public_city_constraint(packet)
             return self.model.sample_completed_maps(
                 tensors.map_tokens,
                 tensors.global_features,
@@ -199,6 +220,8 @@ class BeliefMCTS:
                 action_mask=tensors.action_mask,
                 action_history=tensors.action_history,
                 action_history_mask=tensors.action_history_mask,
+                perspective_player=perspective,
+                known_city_count=city_count,
             )
 
         particles = self.inference.exclusive(sample) if self.inference is not None else sample()
@@ -221,6 +244,7 @@ class BeliefMCTS:
         if self.model is None or self.device is None:
             raise RuntimeError("local MCTS inference requires a model and device")
         tensors = packet_to_tensors(packet, self.device, events)
+        perspective, city_count = _public_city_constraint(packet)
         output = self.model(
             tensors.map_tokens,
             tensors.global_features,
@@ -237,6 +261,8 @@ class BeliefMCTS:
             output.belief_logits,
             self.config.particles,
             max(self.config.temperature, 0.35),
+            perspective_player=perspective,
+            known_city_count=city_count,
         )
         return priors, [particle.cpu().numpy().astype(np.int32) for particle in particles]
 

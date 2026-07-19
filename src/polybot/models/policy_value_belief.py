@@ -414,6 +414,8 @@ class PolicyValueBeliefNet(nn.Module):
         action_mask: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
         action_history_mask: torch.Tensor | None = None,
+        perspective_player: int | None = None,
+        known_city_count: int | None = None,
     ) -> List[torch.Tensor]:
         """Sample valid, detached map hypotheses while copying known rows.
 
@@ -431,7 +433,9 @@ class PolicyValueBeliefNet(nn.Module):
             )
         belief_logits = self._structured_belief_logits(tile_states)
         return self.sample_completed_maps_from_belief_logits(
-            map_tokens, belief_logits, particles, temperature
+            map_tokens, belief_logits, particles, temperature,
+            perspective_player=perspective_player,
+            known_city_count=known_city_count,
         )
 
     @torch.no_grad()
@@ -441,6 +445,9 @@ class PolicyValueBeliefNet(nn.Module):
         belief_logits: Sequence[torch.Tensor],
         particles: int,
         temperature: float = 1.0,
+        *,
+        perspective_player: int | None = None,
+        known_city_count: int | None = None,
     ) -> List[torch.Tensor]:
         """Sample particles from belief logits computed during root inference."""
         if map_tokens.shape[0] != 1:
@@ -489,9 +496,17 @@ class PolicyValueBeliefNet(nn.Module):
                 completed_cpu, hidden_cpu,
                 {field: values[particle_index].cpu() for field, values in sampled_features.items()},
                 player_count=2,
+                perspective_player=perspective_player,
             )
-            self._add_referenced_city_placeholders(completed_cpu, hidden_cpu)
-            self._add_missing_player_capitals(completed_cpu, hidden_cpu, player_count=2)
+            self._add_referenced_city_placeholders(
+                completed_cpu, hidden_cpu, player_count=2, perspective_player=perspective_player
+            )
+            self._add_missing_player_capitals(
+                completed_cpu, hidden_cpu, player_count=2, perspective_player=perspective_player
+            )
+            self._validate_perspective_city_count(
+                completed_cpu, perspective_player=perspective_player, known_city_count=known_city_count
+            )
             result.append(completed_cpu)
         return result
 
@@ -501,6 +516,9 @@ class PolicyValueBeliefNet(nn.Module):
         map_tokens: torch.Tensor,
         belief_logits: Sequence[torch.Tensor],
         temperature: float = 1.0,
+        *,
+        perspective_players: torch.Tensor | None = None,
+        known_city_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Create one valid detached belief completion for every batch row.
 
@@ -545,6 +563,8 @@ class PolicyValueBeliefNet(nn.Module):
         # would otherwise synchronise CUDA once per live environment.
         completed_cpu = completed.to(device="cpu")
         hidden_cpu = hidden.to(device="cpu")
+        perspectives = self._batch_constraint_values(perspective_players, batch, "perspective_players")
+        city_counts = self._batch_constraint_values(known_city_counts, batch, "known_city_counts")
         # Referenced city IDs must still have a centre. The placement is a
         # deterministic hypothesis built solely from the submitted observation.
         for row in range(batch):
@@ -552,10 +572,32 @@ class PolicyValueBeliefNet(nn.Module):
                 completed_cpu[row], hidden_cpu[row],
                 {field: values[row].to(device="cpu") for field, values in sampled_features.items()},
                 player_count=2,
+                perspective_player=perspectives[row],
             )
-            self._add_referenced_city_placeholders(completed_cpu[row], hidden_cpu[row])
-            self._add_missing_player_capitals(completed_cpu[row], hidden_cpu[row], player_count=2)
+            self._add_referenced_city_placeholders(
+                completed_cpu[row], hidden_cpu[row], player_count=2, perspective_player=perspectives[row]
+            )
+            self._add_missing_player_capitals(
+                completed_cpu[row], hidden_cpu[row], player_count=2, perspective_player=perspectives[row]
+            )
+            self._validate_perspective_city_count(
+                completed_cpu[row], perspective_player=perspectives[row], known_city_count=city_counts[row]
+            )
         return completed_cpu
+
+    @staticmethod
+    def _batch_constraint_values(
+        values: torch.Tensor | None,
+        batch: int,
+        name: str,
+    ) -> list[int | None]:
+        """Move public per-perspective constraints into the CPU repair path."""
+        if values is None:
+            return [None] * batch
+        flat = values.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+        if flat.numel() != batch:
+            raise ValueError(f"{name} must provide one value per belief row")
+        return [int(value) for value in flat.tolist()]
 
     @staticmethod
     def _place_structured_entities(
@@ -563,6 +605,7 @@ class PolicyValueBeliefNet(nn.Module):
         hidden: torch.Tensor,
         sampled: dict[int, torch.Tensor],
         player_count: int,
+        perspective_player: int | None = None,
     ) -> None:
         """Materialise sampled cities and units without invalid runtime IDs.
 
@@ -584,8 +627,17 @@ class PolicyValueBeliefNet(nn.Module):
         # category.  A cap prevents it from fabricating a whole board of cities
         # while retaining particle diversity once the decoder has learned them.
         city_limit = max(player_count, completed.shape[0] // 20)
-        for tile in city_candidates[:city_limit]:
+        placed_cities = 0
+        for tile in city_candidates:
+            if placed_cities >= city_limit:
+                break
             owner = int(sampled[16][tile]) % max(player_count, 1)
+            # A player always knows every city they own.  A city owned by the
+            # perspective on a hidden row is therefore not uncertainty: it is
+            # an impossible hypothesis that would corrupt tech prices, spawns
+            # and territory actions.
+            if perspective_player is not None and owner == perspective_player:
+                continue
             completed[tile, 9] = 0
             completed[tile, 10] = min(1, max(0, int(sampled[10][tile])))
             completed[tile, 11] = min(1, max(0, int(sampled[11][tile])))
@@ -596,6 +648,7 @@ class PolicyValueBeliefNet(nn.Module):
             completed[tile, 16] = owner
             completed[tile, 17] = max(0, int(sampled[17][tile]))
             next_city_id += 1
+            placed_cities += 1
 
         unit_candidates = torch.nonzero(hidden & (sampled[4] >= 1), as_tuple=False).flatten().tolist()
         # As with cities, a cap keeps early random checkpoints syntactically
@@ -625,6 +678,9 @@ class PolicyValueBeliefNet(nn.Module):
         self,
         map_tokens: torch.Tensor,
         player_count: int = 2,
+        *,
+        perspective_players: torch.Tensor | None = None,
+        known_city_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return a legal low-information fallback for rejected belief rows.
 
@@ -648,15 +704,34 @@ class PolicyValueBeliefNet(nn.Module):
         completed[..., 0] = observed[..., 0]
         completed_cpu = completed.to(device="cpu")
         hidden_cpu = (~known).to(device="cpu")
+        perspectives = self._batch_constraint_values(
+            perspective_players, observed.shape[0], "perspective_players"
+        )
+        city_counts = self._batch_constraint_values(
+            known_city_counts, observed.shape[0], "known_city_counts"
+        )
         for row in range(observed.shape[0]):
-            self._add_referenced_city_placeholders(completed_cpu[row], hidden_cpu[row])
+            self._add_referenced_city_placeholders(
+                completed_cpu[row], hidden_cpu[row],
+                player_count=player_count, perspective_player=perspectives[row],
+            )
             self._add_missing_player_capitals(
-                completed_cpu[row], hidden_cpu[row], player_count=player_count
+                completed_cpu[row], hidden_cpu[row],
+                player_count=player_count, perspective_player=perspectives[row],
+            )
+            self._validate_perspective_city_count(
+                completed_cpu[row], perspective_player=perspectives[row], known_city_count=city_counts[row]
             )
         return completed_cpu
 
     @staticmethod
-    def _add_referenced_city_placeholders(completed: torch.Tensor, hidden: torch.Tensor) -> None:
+    def _add_referenced_city_placeholders(
+        completed: torch.Tensor,
+        hidden: torch.Tensor,
+        *,
+        player_count: int = 2,
+        perspective_player: int | None = None,
+    ) -> None:
         """Create valid hidden city centers for IDs visible only by reference.
 
         A revealed territory or own unit can name a city whose center remains
@@ -687,7 +762,12 @@ class PolicyValueBeliefNet(nn.Module):
             completed[tile, 13] = 1  # city level
             completed[tile, 14] = 2  # SettlementTypeEnum::City
             completed[tile, 15] = int(city_id)
-            completed[tile, 16] = 0  # valid player id; owner is unobserved
+            # The owner is genuinely unknown, but it cannot be the
+            # perspective: their own city centre would already be known.
+            owner = next(
+                (candidate for candidate in range(player_count) if candidate != perspective_player), 0
+            )
+            completed[tile, 16] = owner
             completed[tile, 17] = 0
             existing.add(int(city_id))
 
@@ -696,6 +776,7 @@ class PolicyValueBeliefNet(nn.Module):
         completed: torch.Tensor,
         hidden: torch.Tensor,
         player_count: int,
+        perspective_player: int | None = None,
     ) -> None:
         """Keep every public player alive in a detached fog hypothesis.
 
@@ -720,6 +801,10 @@ class PolicyValueBeliefNet(nn.Module):
         for owner in range(player_count):
             if owner in existing_owners:
                 continue
+            # Missing own cities are never a fog hypothesis. Their absence is
+            # public information and must remain absent in the completion.
+            if perspective_player is not None and owner == perspective_player:
+                continue
             try:
                 tile = next(candidates)
             except StopIteration:
@@ -734,3 +819,22 @@ class PolicyValueBeliefNet(nn.Module):
             completed[tile, 16] = owner
             completed[tile, 17] = 0
             next_city_id += 1
+
+    @staticmethod
+    def _validate_perspective_city_count(
+        completed: torch.Tensor,
+        *,
+        perspective_player: int | None,
+        known_city_count: int | None,
+    ) -> None:
+        """Assert the public invariant that a player knows all own cities."""
+        if perspective_player is None or known_city_count is None:
+            return
+        city_rows = completed[:, 14] == 2
+        actual_count = int((city_rows & (completed[:, 16] == perspective_player)).sum().item())
+        if actual_count != known_city_count:
+            raise ValueError(
+                "belief completion violates the public own-city invariant: "
+                f"perspective={perspective_player}, expected_cities={known_city_count}, "
+                f"completed_cities={actual_count}"
+            )

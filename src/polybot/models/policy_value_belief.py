@@ -492,9 +492,24 @@ class PolicyValueBeliefNet(nn.Module):
             completed[:, 0] = observed[:, 0]
             completed_cpu = completed.to(device="cpu")
             hidden_cpu = hidden.to(device="cpu")
+            # ``sampled_features`` contains only the compact hidden rows for
+            # efficient multinomial sampling.  The structural repair below
+            # works in absolute tile coordinates, so expand every field back
+            # to a full board before handing it over.  Without this, scalar
+            # BeliefMCTS evaluation crashes as soon as a revealed tile makes
+            # ``hidden`` shorter than the board.
+            full_sampled: dict[int, torch.Tensor] = {}
+            for field, values in sampled_features.items():
+                full_values = torch.full(
+                    (observed.shape[0],),
+                    -1,
+                    dtype=observed.dtype,
+                    device="cpu",
+                )
+                full_values[hidden_cpu] = values[particle_index].to(device="cpu", dtype=observed.dtype)
+                full_sampled[field] = full_values
             self._place_structured_entities(
-                completed_cpu, hidden_cpu,
-                {field: values[particle_index].cpu() for field, values in sampled_features.items()},
+                completed_cpu, hidden_cpu, full_sampled,
                 player_count=2,
                 perspective_player=perspective_player,
             )

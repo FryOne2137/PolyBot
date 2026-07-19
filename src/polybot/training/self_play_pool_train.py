@@ -296,21 +296,24 @@ def _log_belief_reset_diagnostics(
             details += " missing_from_belief=[" + ", ".join(missing) + "]"
         if extra:
             details += " extra_in_belief=[" + ", ".join(extra) + "]"
+        if "first_difference_index" in row:
+            details += f" first_order_difference={int(row['first_difference_index'])}"
+            if row.get("real_action_at_difference"):
+                details += " real_at_difference=" + _format_belief_action(row["real_action_at_difference"])
+            if row.get("belief_action_at_difference"):
+                details += " belief_at_difference=" + _format_belief_action(row["belief_action_at_difference"])
         if row.get("error"):
             details += f" error={row['error']}"
         emit("belief reset: " + details)
     if rejected_rows == 0:
-        # Full ISMCTS submits maps for every player.  The public legal-action
-        # comparison above deliberately checks only the active player because
-        # only that player has a root action list.  Therefore an all-accepted
-        # diagnostic together with a failed submit means a *non-active*
-        # particle was structurally invalid (or failed its visible-map check),
-        # not that an unknown move was silently missed.
-        reason = "non_actor_particle_or_submit_validation"
+        # This should be unreachable: the full diagnostic mirrors the same
+        # [env, player, particle] validation as submit_beliefs. Keep the raw
+        # engine error visible instead of making an unsupported claim about a
+        # non-active particle.
+        reason = "full_diagnostic_empty"
         reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
         emit(
-            "belief reset: active-player legal actions match for every slot; "
-            "reset was caused by a non-actor ISMCTS particle or submit validation. "
+            "belief reset: full ISMCTS diagnostic returned no rejected particle; "
             f"submit_error={fallback_error}"
         )
 

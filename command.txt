@@ -24,9 +24,9 @@ python scripts/train_self_play_pool.py `
   --num-threads 4 `
   --max-pending-leaves 2 `
   --visible-action-history 32 `
-  --belief-retries 2 `
+  --belief-retries 4 `
   --simulations 4 `
-  --particles 2 `
+  --particles 1 `
   --mcts-max-actions 1024 `
   --batch-size 8 `
   --learning-rate 3e-5 `
@@ -46,9 +46,9 @@ python scripts/train_self_play_pool.py `
   --num-threads 8 `
   --max-pending-leaves 2 `
   --visible-action-history 32 `
-  --belief-retries 2 `
+  --belief-retries 4 `
   --simulations 8 `
-  --particles 2 `
+  --particles 1 `
   --mcts-max-actions 1024 `
   --batch-size 16 `
   --learning-rate 3e-5 `

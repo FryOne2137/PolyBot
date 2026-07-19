@@ -180,6 +180,42 @@ def _all_player_particles(
     return completed.numpy().astype(np.int32, copy=False).reshape(envs, players, tiles, fields)
 
 
+@torch.inference_mode()
+def _conservative_all_player_particles(
+    request: Dict[str, np.ndarray],
+    model: PolicyValueBeliefNet,
+    device: torch.device,
+) -> np.ndarray:
+    """Return an action-neutral, syntactically valid fallback hypothesis.
+
+    This path never reads a full map.  It is used only after a learned particle
+    failed the engine's public legal-action consistency check, allowing a new
+    model to keep collecting supervised belief data instead of resetting an
+    entire vector batch indefinitely.
+    """
+    maps = np.asarray(request["map_tokens"], dtype=np.int32)
+    envs, players, tiles, fields = maps.shape
+    flat_maps = maps.reshape(envs * players, tiles, fields)
+    completed = model.conservative_completed_map_batch(
+        torch.as_tensor(flat_maps, dtype=torch.long, device=device), player_count=players
+    )
+    return completed.numpy().astype(np.int32, copy=False).reshape(envs, players, tiles, fields)
+
+
+def _belief_rejection_kind(error: ValueError) -> str:
+    """Keep rejection diagnostics compact and stable in training summaries."""
+    message = str(error).lower()
+    if "legal action" in message:
+        return "legal_actions"
+    if "unit" in message:
+        return "unit_state"
+    if "city" in message:
+        return "city_state"
+    if "revealed" in message or "visible" in message:
+        return "visible_rows"
+    return "other"
+
+
 def train_self_play_pool(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -262,6 +298,8 @@ def train_self_play_pool(
     leaf_counts: List[int] = []
     belief_retries_used = 0
     belief_reset_rows = 0
+    belief_fallback_rows = 0
+    belief_rejections: Dict[str, int] = {}
     model.eval()
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -278,47 +316,68 @@ def train_self_play_pool(
             state_ids = np.asarray(request["state_id"], dtype=np.uint64)
             actors = np.asarray(request["to_play"], dtype=np.int64)
             particle_count = max(1, int(mcts.particles))
-            actor_particles = np.stack([
-                model.sample_completed_map_batch_from_belief_logits(
-                    root_tensors.map_tokens, root_output.belief_logits,
-                    temperature=max(mcts.temperature, 0.35),
-                ).numpy().astype(np.int32, copy=False)
-                for _ in range(particle_count)
-            ], axis=1)
+
+            def actor_particle_batch() -> np.ndarray:
+                return np.stack([
+                    model.sample_completed_map_batch_from_belief_logits(
+                        root_tensors.map_tokens, root_output.belief_logits,
+                        temperature=max(mcts.temperature, 0.35),
+                    ).numpy().astype(np.int32, copy=False)
+                    for _ in range(particle_count)
+                ], axis=1)
+
             # Full ISMCTS: every player supplies its own fog observation and
             # particle. The active actor is additionally conditioned on its
             # actual legal-action list, which is where blocked paths reveal
             # public information about hidden occupancy.
             all_players = pool.all_player_belief_requests()
-            particles = np.stack([
-                _all_player_particles(all_players, model, device, training, max(mcts.temperature, 0.35))
-                for _ in range(particle_count)
-            ], axis=2)
-            particles[np.arange(num_envs), actors] = actor_particles
+
+            def learned_particles() -> np.ndarray:
+                particles = np.stack([
+                    _all_player_particles(all_players, model, device, training, max(mcts.temperature, 0.35))
+                    for _ in range(particle_count)
+                ], axis=2)
+                # Re-sample this tensor on *every* retry. The active player's
+                # completion alone is required to preserve the public legal
+                # root action set, so retaining a rejected copy made retries
+                # deterministic failures.
+                particles[np.arange(num_envs), actors] = actor_particle_batch()
+                return particles
+
+            particles = learned_particles()
             submitted = False
             for attempt in range(belief_retries + 1):
                 try:
                     pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
                     submitted = True
                     break
-                except ValueError:
+                except ValueError as error:
+                    kind = _belief_rejection_kind(error)
+                    belief_rejections[kind] = belief_rejections.get(kind, 0) + num_envs
                     if attempt == belief_retries:
                         break
-                    particles = np.stack([
-                        _all_player_particles(all_players, model, device, training, max(mcts.temperature, 0.35))
-                        for _ in range(particle_count)
-                    ], axis=2)
-                    particles[np.arange(num_envs), actors] = actor_particles
+                    particles = learned_particles()
                     belief_retries_used += num_envs
             if not submitted:
-                # An incompatible hallucination is reset rather than replaced
-                # with authoritative state. The next public batch starts a
-                # fresh full-ISMCTS belief forest.
-                rows = np.arange(num_envs, dtype=np.int32)
-                pool.reset_slots(rows)
-                pool.belief_requests_into(request)
-                belief_reset_rows += num_envs
-                continue
+                # Bootstrap safely rather than throw away the whole batch. The
+                # fallback is a low-information *hypothesis*, not a copy of
+                # the engine's hidden map. It also gives the belief head more
+                # labelled positions until learned structured particles begin
+                # satisfying the action-equivalence test on their own.
+                fallback = _conservative_all_player_particles(all_players, model, device)
+                fallback = np.repeat(fallback[:, :, None], particle_count, axis=2)
+                try:
+                    pool.submit_beliefs(state_ids, np.ascontiguousarray(fallback))
+                    submitted = True
+                    belief_fallback_rows += num_envs
+                except ValueError as error:
+                    kind = _belief_rejection_kind(error)
+                    belief_rejections[kind] = belief_rejections.get(kind, 0) + num_envs
+                    rows = np.arange(num_envs, dtype=np.int32)
+                    pool.reset_slots(rows)
+                    pool.belief_requests_into(request)
+                    belief_reset_rows += num_envs
+                    continue
 
             # One select call returns up to B * pending leaves. The native
             # virtual-loss scheduler reserves distinct paths in that batch.
@@ -420,6 +479,7 @@ def train_self_play_pool(
                 progress.set_postfix(
                     env_steps=(step + 1) * num_envs,
                     replay=len(replay), terminals=terminal_episodes,
+                    fallbacks=belief_fallback_rows, resets=belief_reset_rows,
                 )
 
     losses: List[Dict[str, float]] = []
@@ -442,10 +502,13 @@ def train_self_play_pool(
         "self_play_pool_terminals": float(terminal_episodes),
         "self_play_pool_completed_targets": float(completed_targets),
         "self_play_pool_belief_retries": float(belief_retries_used),
+        "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
         "self_play_pool_belief_reset_rows": float(belief_reset_rows),
         "self_play_pool_truncated_roots": float(truncated_roots),
         "replay_examples": float(len(replay)),
     }
+    summary.update({f"self_play_pool_belief_rejection_{kind}": float(count)
+                    for kind, count in sorted(belief_rejections.items())})
     if losses:
         summary.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
     return summary

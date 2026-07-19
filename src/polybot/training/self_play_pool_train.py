@@ -262,9 +262,11 @@ def _log_belief_reset_diagnostics(
         reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
         emit(f"belief reset: diagnostic failed ({error}); submit error={fallback_error}")
         return
+    rejected_rows = 0
     for row in diagnostics:
         if bool(row.get("accepted", False)):
             continue
+        rejected_rows += 1
         reason = str(row.get("reason", "unknown"))
         reset_reasons[reason] = reset_reasons.get(reason, 0) + 1
         missing = [_format_belief_action(action) for action in row.get("missing_actions", [])[:3]]
@@ -281,6 +283,20 @@ def _log_belief_reset_diagnostics(
         if row.get("error"):
             details += f" error={row['error']}"
         emit("belief reset: " + details)
+    if rejected_rows == 0:
+        # Full ISMCTS submits maps for every player.  The public legal-action
+        # comparison above deliberately checks only the active player because
+        # only that player has a root action list.  Therefore an all-accepted
+        # diagnostic together with a failed submit means a *non-active*
+        # particle was structurally invalid (or failed its visible-map check),
+        # not that an unknown move was silently missed.
+        reason = "non_actor_particle_or_submit_validation"
+        reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
+        emit(
+            "belief reset: active-player legal actions match for every slot; "
+            "reset was caused by a non-actor ISMCTS particle or submit validation. "
+            f"submit_error={fallback_error}"
+        )
 
 
 def train_self_play_pool(

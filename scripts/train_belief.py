@@ -21,6 +21,14 @@ def main() -> None:
     add_environment_options(parser)
     parser.add_argument("--positions", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--min-hidden-tiles", type=int, default=24,
+        help="Keep only naturally foggy positions with at least this many hidden map tiles",
+    )
+    parser.add_argument(
+        "--max-moves-per-world", type=int, default=96,
+        help="Reset a random warm-up game before late, almost-revealed positions dominate",
+    )
     parser.add_argument("--model-in", type=Path, help="Optional checkpoint whose policy/value weights are preserved")
     parser.add_argument("--model-out", type=Path, default=Path("models/belief.pt"))
     args = parser.parse_args()
@@ -34,6 +42,8 @@ def main() -> None:
         model_config,
         positions=args.positions,
         batch_size=args.batch_size,
+        min_hidden_tiles=args.min_hidden_tiles,
+        max_moves_per_world=args.max_moves_per_world,
         model_out=args.model_out,
         model=model,
     )

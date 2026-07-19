@@ -9,6 +9,8 @@ python scripts/train_belief.py `
   --model-out models\belief-structured-smoke.pt `
   --positions 1000 `
   --batch-size 8 `
+  --min-hidden-tiles 48 `
+  --max-moves-per-world 64 `
   --map-size 11 `
   --map-type lakes `
   --random-seed `

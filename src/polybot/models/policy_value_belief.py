@@ -463,12 +463,14 @@ class PolicyValueBeliefNet(nn.Module):
         has_hidden = bool(hidden.any())
         for feature_index in (*SAFE_PARTICLE_FEATURES, 14, *CITY_PARTICLE_FEATURES, *UNIT_PARTICLE_FEATURES):
             if has_hidden:
-                probabilities = torch.softmax(
-                    belief_logits[feature_index][0, hidden] / max(temperature, 1e-4), dim=-1
-                )
-                sampled_features[feature_index] = (
-                    torch.multinomial(probabilities, particles, replacement=True).transpose(0, 1) - 1
-                )
+                logits = belief_logits[feature_index][0, hidden]
+                if temperature <= 0.0:
+                    sampled_features[feature_index] = (logits.argmax(dim=-1) - 1).expand(particles, -1)
+                else:
+                    probabilities = torch.softmax(logits / max(temperature, 1e-4), dim=-1)
+                    sampled_features[feature_index] = (
+                        torch.multinomial(probabilities, particles, replacement=True).transpose(0, 1) - 1
+                    )
             else:
                 sampled_features[feature_index] = torch.empty(
                     (particles, 0), dtype=observed.dtype, device=observed.device
@@ -524,9 +526,13 @@ class PolicyValueBeliefNet(nn.Module):
         hidden = ~known
         sampled_features: dict[int, torch.Tensor] = {}
         for feature_index in (*SAFE_PARTICLE_FEATURES, 14, *CITY_PARTICLE_FEATURES, *UNIT_PARTICLE_FEATURES):
-            logits = belief_logits[feature_index] / max(float(temperature), 1e-4)
-            probabilities = torch.softmax(logits, dim=-1).reshape(-1, logits.shape[-1])
-            samples = torch.multinomial(probabilities, 1).reshape(batch, tiles) - 1
+            logits = belief_logits[feature_index]
+            if temperature <= 0.0:
+                samples = logits.argmax(dim=-1) - 1
+            else:
+                scaled = logits / max(float(temperature), 1e-4)
+                probabilities = torch.softmax(scaled, dim=-1).reshape(-1, scaled.shape[-1])
+                samples = torch.multinomial(probabilities, 1).reshape(batch, tiles) - 1
             sampled_features[feature_index] = samples
             if feature_index in SAFE_PARTICLE_FEATURES:
                 completed[..., feature_index] = torch.where(

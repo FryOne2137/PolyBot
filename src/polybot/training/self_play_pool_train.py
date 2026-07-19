@@ -321,7 +321,12 @@ def train_self_play_pool(
                 return np.stack([
                     model.sample_completed_map_batch_from_belief_logits(
                         root_tensors.map_tokens, root_output.belief_logits,
-                        temperature=max(mcts.temperature, 0.35),
+                        # The active root must reproduce the already public
+                        # legal-action set exactly. Greedy decoding is far more
+                        # action-stable than sampling an early, uncertain
+                        # belief distribution; uncertainty remains in the
+                        # non-active player particles below.
+                        temperature=0.0,
                     ).numpy().astype(np.int32, copy=False)
                     for _ in range(particle_count)
                 ], axis=1)

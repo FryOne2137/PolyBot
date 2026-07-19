@@ -91,10 +91,22 @@ def warmup_belief(
     model_config: ModelConfig,
     positions: int,
     batch_size: int,
+    min_hidden_tiles: int = 24,
+    max_moves_per_world: int = 96,
     model_out: Optional[Path] = None,
     model: PolicyValueBeliefNet | None = None,
 ) -> Dict[str, float]:
-    """Explore random legal actions, learn belief online, save only weights."""
+    """Learn belief on naturally foggy, action-diverse random positions.
+
+    Late random games reveal almost every tile and make map completion a
+    trivial all-visible task.  Limiting their horizon and requiring a minimum
+    hidden-tile count concentrates supervision on the exact distribution used
+    by fog-of-war MCTS, without artificially hiding player memory.
+    """
+    if min_hidden_tiles < 0:
+        raise ValueError("min_hidden_tiles must be non-negative")
+    if max_moves_per_world < 1:
+        raise ValueError("max_moves_per_world must be positive")
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(
@@ -107,6 +119,8 @@ def warmup_belief(
     losses: List[float] = []
     env = _new_environment(training.seed, training)
     environment_index = 0
+    moves_in_world = 0
+    accepted_hidden_tiles: List[int] = []
     progress_description = f"belief warm-up ({device})"
     with tqdm(
         total=positions,
@@ -117,16 +131,21 @@ def warmup_belief(
         position = 0
         while position < positions:
             example = _belief_example(env)
-            # A fully revealed board supplies no belief label.  Start a fresh
-            # world instead of counting this as a zero-loss training example.
-            if not bool(np.any(example.hidden_mask)):
+            hidden_tiles = int(example.hidden_mask.sum())
+            # Do not let nearly solved boards dominate supervised completion.
+            # This is a natural curriculum: no previously seen tile is hidden
+            # artificially, so the model still receives a valid player view.
+            if hidden_tiles < min_hidden_tiles or moves_in_world >= max_moves_per_world:
                 environment_index += 1
                 env = _new_environment(training.seed + environment_index, training)
+                moves_in_world = 0
                 continue
 
             pending.append(example)
+            accepted_hidden_tiles.append(hidden_tiles)
             legal_ids = np.asarray(env.model_request_numpy()["actions"]["action_id"], dtype=np.int64)
             env.step_fast(int(rng.choice(legal_ids)))
+            moves_in_world += 1
 
             if len(pending) == batch_size:
                 latest_loss = _belief_update(model, optimiser, pending, device)
@@ -134,12 +153,13 @@ def warmup_belief(
                 pending.clear()
                 progress.set_postfix(
                     belief_loss=f"{latest_loss:.4f}",
-                    hidden_tiles=int(example.hidden_mask.sum()),
+                    hidden_tiles=hidden_tiles,
                 )
             progress.update(1)
             if env.is_done():
                 environment_index += 1
                 env = _new_environment(training.seed + environment_index, training)
+                moves_in_world = 0
             position += 1
 
     if pending:
@@ -149,4 +169,6 @@ def warmup_belief(
     return {
         "positions": float(positions),
         "belief_loss": float(np.mean(losses)) if losses else 0.0,
+        "mean_hidden_tiles": float(np.mean(accepted_hidden_tiles)) if accepted_hidden_tiles else 0.0,
+        "min_hidden_tiles": float(min_hidden_tiles),
     }

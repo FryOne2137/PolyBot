@@ -8,7 +8,7 @@ MCTS forest and persistent C++ workers; PyTorch receives only dense batches.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -216,6 +216,68 @@ def _belief_rejection_kind(error: ValueError) -> str:
     return "other"
 
 
+def _format_belief_action(action: Dict[str, Any]) -> str:
+    """Short, stable representation for a public legal-action difference."""
+    name = str(action.get("type_fullname", "unknown"))
+    action_id = int(action.get("action_id", -1))
+    source = int(action.get("source_index", -1))
+    target = int(action.get("target_index", -1))
+    return f"{name}(id={action_id}, src={source}, dst={target})"
+
+
+def _log_belief_reset_diagnostics(
+    pool: object,
+    state_ids: np.ndarray,
+    completed_maps: np.ndarray,
+    fallback_error: ValueError,
+    reset_reasons: Dict[str, int],
+) -> None:
+    """Print why each slot is reset without exposing the true hidden map.
+
+    The engine diagnostic returns the public real action set and actions from
+    the model's submitted *candidate* world only.  Thus a line such as
+    ``missing_from_belief=[move(...)]`` is actionable for debugging while
+    remaining safe under fog-of-war.
+    """
+    if not hasattr(pool, "belief_acceptance_diagnostics"):
+        reason = _belief_rejection_kind(fallback_error)
+        reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
+        tqdm.write(
+            "belief reset: engine lacks belief_acceptance_diagnostics; "
+            f"reason={reason}, error={fallback_error}"
+        )
+        return
+    try:
+        diagnostics = pool.belief_acceptance_diagnostics(
+            np.ascontiguousarray(state_ids, dtype=np.uint64),
+            np.ascontiguousarray(completed_maps, dtype=np.int32),
+        )
+    except Exception as error:  # diagnostics must never hide the original reset cause
+        reason = "diagnostic_error"
+        reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
+        tqdm.write(f"belief reset: diagnostic failed ({error}); submit error={fallback_error}")
+        return
+    for row in diagnostics:
+        if bool(row.get("accepted", False)):
+            continue
+        reason = str(row.get("reason", "unknown"))
+        reset_reasons[reason] = reset_reasons.get(reason, 0) + 1
+        missing = [_format_belief_action(action) for action in row.get("missing_actions", [])[:3]]
+        extra = [_format_belief_action(action) for action in row.get("extra_actions", [])[:3]]
+        details = (
+            f"env={int(row.get('env_id', -1))} reason={reason} "
+            f"real_actions={int(row.get('real_action_count', -1))} "
+            f"belief_actions={int(row.get('belief_action_count', -1))}"
+        )
+        if missing:
+            details += " missing_from_belief=[" + ", ".join(missing) + "]"
+        if extra:
+            details += " extra_in_belief=[" + ", ".join(extra) + "]"
+        if row.get("error"):
+            details += f" error={row['error']}"
+        tqdm.write("belief reset: " + details)
+
+
 def train_self_play_pool(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -300,6 +362,7 @@ def train_self_play_pool(
     belief_reset_rows = 0
     belief_fallback_rows = 0
     belief_rejections: Dict[str, int] = {}
+    belief_reset_reasons: Dict[str, int] = {}
     model.eval()
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -378,6 +441,13 @@ def train_self_play_pool(
                 except ValueError as error:
                     kind = _belief_rejection_kind(error)
                     belief_rejections[kind] = belief_rejections.get(kind, 0) + num_envs
+                    _log_belief_reset_diagnostics(
+                        pool,
+                        state_ids,
+                        fallback[np.arange(num_envs), actors, 0],
+                        error,
+                        belief_reset_reasons,
+                    )
                     rows = np.arange(num_envs, dtype=np.int32)
                     pool.reset_slots(rows)
                     pool.belief_requests_into(request)
@@ -514,6 +584,8 @@ def train_self_play_pool(
     }
     summary.update({f"self_play_pool_belief_rejection_{kind}": float(count)
                     for kind, count in sorted(belief_rejections.items())})
+    summary.update({f"self_play_pool_belief_reset_reason_{kind}": float(count)
+                    for kind, count in sorted(belief_reset_reasons.items())})
     if losses:
         summary.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
     return summary

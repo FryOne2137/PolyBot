@@ -51,3 +51,33 @@ python scripts/evaluate.py `
   --mcts-max-actions 1024 `
   --max-moves 400 `
   --device cuda
+
+# 4. Liga: jeden kandydat na raz, stała bramka przeciw championowi.
+# Zapisane zostaną wyłącznie checkpointy po promocji w models\league\.
+# Każda runda ma nowy seed self-play, a wszystkie bramki ten sam zestaw
+# seedów ewaluacyjnych. Wznów następny run od ostatniego champion-XXX.pt.
+python scripts/train_league.py `
+  --champion-in models\belief-structured-v1.pt `
+  --checkpoint-dir models\league `
+  --checkpoint-prefix champion `
+  --rounds 10 `
+  --promotion-games 100 `
+  --promotion-score 0.55 `
+  --evaluation-seed 91337 `
+  --num-envs 128 `
+  --steps 1000 `
+  --updates 500 `
+  --num-threads 16 `
+  --max-pending-leaves 4 `
+  --visible-action-history 64 `
+  --belief-retries 4 `
+  --simulations 32 `
+  --particles 2 `
+  --mcts-max-actions 1024 `
+  --batch-size 64 `
+  --learning-rate 3e-5 `
+  --max-moves 400 `
+  --map-size 11 `
+  --map-type lakes `
+  --random-seed `
+  --device cuda

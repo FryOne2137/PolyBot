@@ -71,6 +71,8 @@ def _belief_update(
         batch["action_continuous"],
         batch["action_mask"],
         batch["event_features"],
+        action_history=batch["action_history"],
+        action_history_mask=batch["action_history_mask"],
     )
     loss = belief_loss(
         output.belief_logits,

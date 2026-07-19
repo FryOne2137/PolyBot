@@ -10,6 +10,8 @@ from _bootstrap import add_local_source_root
 add_local_source_root()
 
 from polybot.config import ModelConfig
+from polybot.infrastructure.device import select_device
+from polybot.infrastructure.model_io import load_model
 from polybot.training.belief_warmup import warmup_belief
 from polybot.training.cli import add_environment_options, print_summary, training_config_from_args
 
@@ -19,14 +21,21 @@ def main() -> None:
     add_environment_options(parser)
     parser.add_argument("--positions", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--model-in", type=Path, help="Optional checkpoint whose policy/value weights are preserved")
     parser.add_argument("--model-out", type=Path, default=Path("models/belief.pt"))
     args = parser.parse_args()
+    training = training_config_from_args(args)
+    model, model_config = (
+        load_model(args.model_in, select_device(training.device))
+        if args.model_in is not None else (None, ModelConfig())
+    )
     summary = warmup_belief(
-        training_config_from_args(args),
-        ModelConfig(),
+        training,
+        model_config,
         positions=args.positions,
         batch_size=args.batch_size,
         model_out=args.model_out,
+        model=model,
     )
     print_summary(summary)
 

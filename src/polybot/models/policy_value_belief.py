@@ -619,7 +619,12 @@ class PolicyValueBeliefNet(nn.Module):
         city_candidates = torch.nonzero(hidden & (sampled[14] == 2), as_tuple=False).flatten().tolist()
         city_rows = completed[:, 14] == 2
         references = torch.cat((completed[:, 6], completed[:, 22]))
-        used_ids = [int(value) for value in completed[city_rows, 15].tolist() if int(value) >= 0]
+        # Settlement IDs are map-wide, not city-centre-only.  A visible
+        # village already owns the ID of the city that ``found_city`` will
+        # create.  Reusing it for a hidden hypothesis makes the belief engine
+        # see that village as an existing opposing city and removes a public,
+        # legal Found City action.
+        used_ids = [int(value) for value in completed[:, 15].tolist() if int(value) >= 0]
         used_ids.extend(int(value) for value in references.tolist() if int(value) >= 0)
         next_city_id = max(used_ids, default=-1) + 1
 
@@ -795,7 +800,9 @@ class PolicyValueBeliefNet(nn.Module):
         )
         if len(existing_owners) >= player_count:
             return
-        existing_ids = completed[city_rows, 15]
+        # A village's settlement ID is reserved for its future city too.
+        # Never allocate a hypothetical capital with that ID.
+        existing_ids = completed[:, 15]
         next_city_id = max((int(city_id) for city_id in existing_ids.tolist() if city_id >= 0), default=-1) + 1
         candidates = iter(torch.nonzero(hidden & ~city_rows, as_tuple=False).flatten().tolist())
         for owner in range(player_count):

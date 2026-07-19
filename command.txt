@@ -1,382 +1,58 @@
+# Windows PowerShell. Backtick (`) musi być ostatnim znakiem w linii.
+# Najpierw przebuduj/reinstaluj lokalne PolyEnv po zmianie GiantSuper:
+# cd <sciezka-do-game_engine>
+# python -m pip install --no-build-isolation --no-deps --force-reinstall .
+# cd <sciezka-do-PolyBot>
 
-python scripts/train_pipeline.py `
-  --model-in models\selfplay-pool-1.pt `
-  --model-out models\candidate-v4.pt `
-  --belief-positions 0 `
-  --teacher-games 0 `
-  --vector-teacher-steps 0 `
-  --flat-steps 0 `
-  --self-play-games 800 `
-  --refinement-games 400 `
-  --updates-per-game 8 `
-  --refinement-updates-per-game 8 `
-  --simulations 32 `
-  --particles 4 `
-  --workers 32 `
-  --mcts-threads 1 `
-  --mcts-max-actions 1024 `
-  --teacher-prior-weight 0.20 `
-  --teacher-policy-target-weight 0.08 `
-  --teacher-replay-fraction 0.25 `
-  --td-lambda 0.80 `
-  --batch-size 64 `
-  --learning-rate 2e-5 `
-  --max-moves 400 `
+# 1. Krótki belief warm-up od zera.
+python scripts/train_belief.py `
+  --model-out models\belief-structured-smoke.pt `
+  --positions 1000 `
+  --batch-size 8 `
   --map-size 11 `
   --map-type lakes `
   --random-seed `
-  --device cuda `
-  --champion-model models\champion-v3.pt `
-  --promotion-games 100 `
-  --promotion-score 0.55
+  --device cuda
 
-
-
-
-
+# 2. Test poprawności pełnego ISMCTS i belief world.
 python scripts/train_self_play_pool.py `
-  --model-in models\champion-v3.pt `
-  --model-out models\selfplay-pool-1.pt `
-  --num-envs 128 `
-  --steps 5000 `
-  --updates 2500 `
-  --num-threads 16 `
-  --max-pending-leaves 4 `
-  --belief-retries 4 `
-  --simulations 32 `
-  --mcts-max-actions 1024 `
-  --batch-size 64 `
-  --learning-rate 3e-5 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda
-
-
-
-python scripts/evaluate.py `
-  --model-a models\selfplay-pool-1.pt `
-  --model-b models\champion-v3.pt `
-  --games 50 `
-  --simulations 32 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --max-moves 400 `
-  --device cuda
-
-
-
-
-
-
-# Windows PowerShell: generacja v4 od potwierdzonego championa v3.
-# Pierwszy champion-model jest punktem promocji; drugi rozszerza pulę
-# przeciwników o wcześniejszy, odmienny styl. Wynik zapisze się jako v4 tylko
-# po score >= 0.55 w 200 grach przeciw champion-v3.
-python scripts/train_pipeline.py `
-  --model-in models\champion-v3.pt `
-  --belief-positions 0 `
-  --teacher-games 0 `
-  --vector-teacher-steps 0 `
-  --flat-steps 0 `
-  --self-play-games 600 `
-  --refinement-games 300 `
-  --updates-per-game 8 `
-  --refinement-updates-per-game 8 `
-  --simulations 32 `
-  --particles 4 `
-  --workers 32 `
-  --mcts-threads 1 `
-  --mcts-max-actions 1024 `
-  --teacher-prior-weight 0.20 `
-  --teacher-policy-target-weight 0.08 `
-  --teacher-replay-fraction 0.25 `
-  --td-lambda 0.80 `
-  --batch-size 64 `
-  --learning-rate 3e-5 `
-  --max-moves 400 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda `
-  --champion-model models\champion-v3.pt `
-  --champion-model models\teacher-v1.pt `
-  --promotion-games 200 `
-  --promotion-score 0.55 `
-  --model-out models\champion-v4.pt
-
-
-# Windows PowerShell: szybki, trwały SelfPlayPool. C++ utrzymuje wszystkie
-# gry i drzewa MCTS, a CUDA dostaje batche do 128 * 4 liści. To jest dobry
-# smoke test nowej ścieżki; zapisuje wyłącznie model.
-python scripts/train_self_play_pool.py `
-  --model-in models\champion-v3.pt `
-  --model-out models\selfplay-pool-smoke.pt `
-  --num-envs 128 `
-  --steps 1000 `
-  --updates 500 `
-  --num-threads 16 `
-  --max-pending-leaves 4 `
-  --belief-retries 4 `
-  --simulations 32 `
-  --mcts-max-actions 1024 `
-  --batch-size 64 `
-  --learning-rate 3e-5 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda
-
-
-  python scripts/train_self_play_pool.py `
-  --model-in models\champion-v3.pt `
-  --model-out models\selfplay-pool-test.pt `
-  --num-envs 16 `
+  --model-in models\belief-structured-smoke.pt `
+  --model-out models\selfplay-structured-smoke.pt `
+  --num-envs 8 `
   --steps 20 `
   --updates 10 `
   --num-threads 4 `
   --max-pending-leaves 2 `
-  --belief-retries 4 `
+  --visible-action-history 32 `
+  --belief-retries 2 `
+  --simulations 4 `
+  --particles 2 `
+  --mcts-max-actions 1024 `
+  --batch-size 8 `
+  --learning-rate 3e-5 `
+  --map-size 11 `
+  --map-type lakes `
+  --random-seed `
+  --device cuda
+
+# 3. Test stabilności. Nie zaczynaj długiego treningu, jeśli
+# self_play_pool_belief_reset_rows / self_play_pool_env_steps jest większe niż 0.05.
+python scripts/train_self_play_pool.py `
+  --model-in models\belief-structured-smoke.pt `
+  --model-out models\selfplay-structured-test.pt `
+  --num-envs 16 `
+  --steps 200 `
+  --updates 100 `
+  --num-threads 8 `
+  --max-pending-leaves 2 `
+  --visible-action-history 32 `
+  --belief-retries 2 `
   --simulations 8 `
+  --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 16 `
   --learning-rate 3e-5 `
   --map-size 11 `
   --map-type lakes `
-  --device cuda
-
-
-# Windows PowerShell: champion-gated pipeline z szybkim etapem SelfPlayPool
-# przed dokładniejszym particle MCTS przeciw zamrożonemu championowi.
-python scripts/train_pipeline.py `
-  --model-in models\champion-v3.pt `
-  --belief-positions 0 --teacher-games 0 `
-  --vector-teacher-steps 0 --flat-steps 0 `
-  --self-play-pool-envs 128 `
-  --self-play-pool-steps 4000 `
-  --self-play-pool-updates 2000 `
-  --self-play-pool-threads 16 `
-  --self-play-pool-pending-leaves 4 `
-  --self-play-games 300 --refinement-games 150 `
-  --updates-per-game 8 --refinement-updates-per-game 8 `
-  --simulations 32 --particles 4 --workers 32 --mcts-threads 1 `
-  --mcts-max-actions 1024 --batch-size 64 --learning-rate 3e-5 `
-  --max-moves 400 --map-size 11 --map-type lakes --device cuda `
-  --champion-model models\champion-v3.pt `
-  --champion-model models\teacher-v1.pt `
-  --promotion-games 200 --promotion-score 0.55 `
-  --model-out models\champion-v5.pt
-
-
-# Windows PowerShell: kontynuacja od najlepszego modelu.
-# Kandydat gra z MCTS przeciw zamrożonemu championowi, a wynikowy plik jest
-# podmieniany tylko, gdy wygrywa bramkę promocji. Zero zapisanych gier/replayów.
-python scripts/train_pipeline.py `
-  --model-in models\teacher-v1.pt `
-  --belief-positions 0 `
-  --teacher-games 0 `
-  --vector-teacher-steps 0 `
-  --flat-steps 0 `
-  --self-play-games 600 `
-  --refinement-games 300 `
-  --updates-per-game 8 `
-  --refinement-updates-per-game 8 `
-  --simulations 32 `
-  --particles 4 `
-  --workers 32 `
-  --mcts-threads 1 `
-  --mcts-max-actions 1024 `
-  --teacher-prior-weight 0.20 `
-  --teacher-policy-target-weight 0.08 `
-  --teacher-replay-fraction 0.25 `
-  --td-lambda 0.80 `
-  --batch-size 64 `
-  --learning-rate 3e-5 `
-  --max-moves 400 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda `
-  --champion-model models\teacher-v1.pt `
-  --promotion-games 40 `
-  --promotion-score 0.55 `
-  --model-out models\champion-v2.pt
-
-
-# Windows PowerShell: pełny, jednoplikowy pipeline nowej polityki faktoryzowanej.
-# W trakcie nie zapisuje gier, replayów ani checkpointów pośrednich.
-python scripts/train_pipeline.py `
-  --belief-positions 50000 `
-  --belief-batch-size 32 `
-  --teacher-games 300 `
-  --teacher-updates-per-game 16 `
-  --vector-teacher-envs 128 `
-  --vector-teacher-steps 30000 `
-  --flat-envs 64 `
-  --flat-steps 40000 `
-  --self-play-games 600 `
-  --refinement-games 300 `
-  --updates-per-game 8 `
-  --refinement-updates-per-game 8 `
-  --simulations 32 `
-  --particles 4 `
-  --workers 32 `
-  --mcts-threads 1 `
-  --mcts-max-actions 1024 `
-  --teacher-prior-weight 0.35 `
-  --teacher-policy-target-weight 0.15 `
-  --teacher-replay-fraction 0.35 `
-  --td-lambda 0.80 `
-  --batch-size 64 `
-  --learning-rate 5e-5 `
-  --max-moves 300 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda `
-  --model-out models\polybot-factorized-v1.pt
-
-
-# Windows PowerShell: one global native MctsPool over all active games and particles.
-# It produces large CUDA batches while the C++ engine performs PUCT and backup.
-python scripts/train_self_play.py `
-  --model-in models\teacher-v1.pt `
-  --model-out models\candidate-fast.pt `
-  --games 200 `
-  --updates-per-game 8 `
-  --opponent mixed `
-  --mixed-opponent heuristic `
-  --random-opponent-rate 0.25 `
-  --teacher-replay-fraction 0.25 `
-  --learning-rate 5e-5 `
-  --exploration-rate 0.05 `
-  --priority-replay-fraction 0.35 `
-  --simulations 64 `
-  --particles 8 `
-  --mcts-max-actions 1024 `
-  --workers 32 `
-  --max-moves 300 `
-  --batch-size 64 `
-  --device cuda
-
-
-# Szybki etap gradientowy bez MCTS. Najpierw uruchom go jako smoke test
-# (np. 2 000 kroków), sprawdź flat_reward/flat_entropy, potem zwiększ kroki.
-python scripts/train_flat_actor_critic.py `
-  --model-in models\teacher-v1.pt `
-  --model-out models\flat-ac-smoke.pt `
-  --num-envs 64 `
-  --steps 2000 `
-  --max-actions 1024 `
-  --learning-rate 5e-5 `
-  --teacher-weight 0.25 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda
-
-
-# Po udanym flat actor-critic użyj jego modelu jako wejścia do globalnego MCTS.
-# Podmień --model-in w pierwszej komendzie na models\flat-ac-smoke.pt.
-
-
-python scripts/train_flat_actor_critic.py `
-  --model-in models\flat-ac-smoke.pt `
-  --model-out models\flat-ac-10k.pt `
-  --num-envs 64 `
-  --steps 10000 `
-  --max-actions 1024 `
-  --learning-rate 5e-5 `
-  --teacher-weight 0.25 `
-  --map-size 11 `
-  --map-type lakes `
-  --device cuda
-
-
-
-  python scripts/train_self_play.py `
-  --model-in models\flat-ac-10k.pt `
-  --model-out models\mcts-curriculum-1.pt `
-  --games 100 `
-  --updates-per-game 8 `
-  --opponent mixed `
-  --mixed-opponent heuristic `
-  --random-opponent-rate 0.25 `
-  --teacher-replay-fraction 0.30 `
-  --learning-rate 3e-5 `
-  --exploration-rate 0.10 `
-  --priority-replay-fraction 0.35 `
-  --simulations 16 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --workers 32 `
-  --max-moves 250 `
-  --batch-size 64 `
-  --device cuda
-
-
-  python scripts/evaluate.py `
-  --model-a models\mcts-curriculum-1.pt `
-  --model-b models\flat-ac-10k.pt `
-  --games 20 `
-  --simulations 16 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --max-moves 300 `
-  --device cuda
-
-
-  python scripts/evaluate.py `
-  --model-a models\mcts-curriculum-1.pt `
-  --model-b models\teacher-v1.pt `
-  --games 20 `
-  --simulations 16 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --max-moves 300 `
-  --device cuda
-
-
-python scripts/evaluate.py `
-  --model-a models\flat-ac-10k.pt `
-  --model-b models\teacher-v1.pt `
-  --games 20 `
-  --simulations 16 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --max-moves 300 `
-  --device cuda
-
-
-
-
-python scripts/train_pipeline.py `
-  --belief-positions 256 `
-  --teacher-games 2 `
-  --vector-teacher-steps 20 `
-  --flat-steps 20 `
-  --self-play-games 4 `
-  --refinement-games 0 `
-  --updates-per-game 1 `
-  --simulations 4 `
-  --particles 1 `
-  --workers 4 `
-  --mcts-threads 1 `
-  --batch-size 8 `
-  --device cuda `
-  --model-out models\pipeline-smoke.pt
-
-
-python scripts/evaluate.py `
-  --model-a models\polybot-factorized-v1.pt `
-  --games 30 `
-  --simulations 32 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --max-moves 400 `
-  --device cuda
-
-
-  python scripts/evaluate.py `
-  --model-a models\polybot-factorized-v1.pt `
-  --model-b models\teacher-v1.pt `
-  --games 30 `
-  --simulations 32 `
-  --particles 4 `
-  --mcts-max-actions 1024 `
-  --max-moves 400 `
+  --random-seed `
   --device cuda

@@ -22,6 +22,8 @@ class TrainingExample:
     full_map_target: np.ndarray
     hidden_mask: np.ndarray
     player_id: int
+    action_history: np.ndarray | None = None  # [history, 12], public action memory
+    action_history_mask: np.ndarray | None = None
     shaped_reward: float = 0.0
     value_target: float = 0.0
     # Mean root value returned by fog-safe particle MCTS.  It is a training

@@ -18,6 +18,7 @@ from ..data.polyenv_features import (
 from ..planning.belief_mcts import BeliefMCTS
 from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .rewards import RewardShaper
+from .economy_value import economy_value
 from .replay_buffer import TrainingExample
 
 
@@ -193,7 +194,10 @@ class SelfPlayRunner:
                 )
             if example is None:
                 continue
-            terminal_value = _winner_to_value(winner, example.player_id)
+            terminal_value = (
+                _winner_to_value(winner, example.player_id)
+                if winner >= 0 else economy_value(env, example.player_id)
+            )
             example.value_target = float(np.clip(
                 terminal_value + self.training.shaping_target_weight * future_advantage[example.player_id],
                 -1.0,

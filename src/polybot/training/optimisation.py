@@ -18,13 +18,31 @@ def belief_loss(
     full_map_target: torch.Tensor,
     hidden_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Cross-entropy for hidden tiles only; observed rows train nothing here."""
+    """Cross-entropy for hidden tiles, including rare structural entities.
+
+    City/unit attributes are undefined outside their owning entity.  Training
+    them there would teach the decoder that ``-1`` is the only useful answer.
+    Their losses are therefore evaluated only on hidden city/unit rows; the
+    presence heads get a moderate rare-class weight so a belief world can learn
+    to place actual cities and units instead of only terrain.
+    """
     feature_losses = []
-    hidden_count = hidden_mask.sum().clamp_min(1)
     for column, (logits, largest_value) in enumerate(zip(belief_logits, MAP_FEATURE_MAX)):
         labels = (full_map_target[..., column] + 1).clamp(0, largest_value + 1)
         per_tile = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
-        feature_losses.append((per_tile * hidden_mask).sum() / hidden_count)
+        loss_mask = hidden_mask.bool()
+        if column in (9, 10, 11, 12, 13, 16, 17):
+            loss_mask = loss_mask & (full_map_target[..., 14] == 2)
+        elif column in (2, 3, 5, 21, 22):
+            loss_mask = loss_mask & (full_map_target[..., 4] >= 1)
+
+        weights = torch.ones_like(per_tile)
+        if column == 14:
+            weights = torch.where(full_map_target[..., 14] != 0, weights * 4.0, weights)
+        elif column == 4:
+            weights = torch.where(full_map_target[..., 4] >= 1, weights * 6.0, weights)
+        denominator = (weights * loss_mask).sum().clamp_min(1.0)
+        feature_losses.append((per_tile * weights * loss_mask).sum() / denominator)
     return torch.stack(feature_losses).mean()
 
 
@@ -43,6 +61,8 @@ def train_batch(
         batch["action_continuous"],
         batch["action_mask"],
         batch["event_features"],
+        action_history=batch["action_history"],
+        action_history_mask=batch["action_history_mask"],
     )
     policy_log_probabilities = F.log_softmax(output.policy_logits, dim=-1)
     # Padded actions intentionally have a -inf logit.  Replace their log

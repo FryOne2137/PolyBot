@@ -17,6 +17,7 @@ from .token_schema import (
     ACTION_CONTINUOUS_FIELDS,
     EVENT_SUMMARY_SIZE,
     MAP_FEATURE_MAX,
+    VISIBLE_ACTION_HISTORY_FEATURES,
 )
 
 # Dense action layout used by PolyEnv's VectorGameEnv and MctsPool.  Keeping
@@ -33,6 +34,8 @@ class PacketTensors:
     map_tokens: torch.Tensor
     global_features: torch.Tensor
     event_features: torch.Tensor
+    action_history: torch.Tensor
+    action_history_mask: torch.Tensor
     action_categorical: torch.Tensor
     action_continuous: torch.Tensor
     action_mask: torch.Tensor
@@ -72,6 +75,8 @@ def native_batch_to_tensors(
     raw_features = torch.as_tensor(features).to(device=device, non_blocking=non_blocking)
     categorical_columns = torch.as_tensor(NATIVE_ACTION_CATEGORICAL_COLUMNS, dtype=torch.long, device=device)
     continuous_columns = torch.as_tensor(NATIVE_ACTION_CONTINUOUS_COLUMNS, dtype=torch.long, device=device)
+    history = np.asarray(batch.get("visible_action_history", np.empty((count, 0, VISIBLE_ACTION_HISTORY_FEATURES), dtype=np.int32)))
+    history_mask = np.asarray(batch.get("visible_action_history_mask", np.empty((count, 0), dtype=np.uint8)), dtype=bool)
     return PacketTensors(
         map_tokens=map_tokens,
         global_features=torch.as_tensor(global_features, dtype=torch.float32).to(
@@ -80,6 +85,8 @@ def native_batch_to_tensors(
         # MctsPool intentionally omits journals from its hot path. Zero is the
         # neutral representation and never introduces hidden information.
         event_features=torch.zeros((count, EVENT_SUMMARY_SIZE), dtype=torch.float32, device=device),
+        action_history=torch.as_tensor(history).to(device=device, non_blocking=non_blocking).float(),
+        action_history_mask=torch.as_tensor(history_mask).to(device=device, non_blocking=non_blocking).bool(),
         action_categorical=raw_features.index_select(-1, categorical_columns).long(),
         action_continuous=raw_features.index_select(-1, continuous_columns).float(),
         action_mask=torch.as_tensor(batch["action_mask"]).to(
@@ -283,6 +290,8 @@ def packet_to_tensors(
         map_tokens=torch.as_tensor(map_tokens[None], dtype=torch.long, device=device),
         global_features=torch.as_tensor(global_features_from_obs(packet["obs"])[None], device=device),
         event_features=torch.as_tensor(event_summary(events)[None], dtype=torch.float32, device=device),
+        action_history=torch.empty((1, 0, VISIBLE_ACTION_HISTORY_FEATURES), dtype=torch.float32, device=device),
+        action_history_mask=torch.empty((1, 0), dtype=torch.bool, device=device),
         action_categorical=torch.as_tensor(categorical[None], dtype=torch.long, device=device),
         action_continuous=torch.as_tensor(continuous[None], dtype=torch.float32, device=device),
         action_mask=torch.ones((1, categorical.shape[0]), dtype=torch.bool, device=device),
@@ -340,6 +349,8 @@ def packets_to_tensors(
             dtype=torch.float32,
             device=device,
         ),
+        action_history=torch.empty((len(rows), 0, VISIBLE_ACTION_HISTORY_FEATURES), dtype=torch.float32, device=device),
+        action_history_mask=torch.empty((len(rows), 0), dtype=torch.bool, device=device),
         action_categorical=torch.as_tensor(categorical, dtype=torch.long, device=device),
         action_continuous=torch.as_tensor(continuous, dtype=torch.float32, device=device),
         action_mask=torch.as_tensor(mask, dtype=torch.bool, device=device),
@@ -367,17 +378,29 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
     conts = np.zeros((batch_size, max_actions, cont_dim), dtype=np.float32)
     masks = np.zeros((batch_size, max_actions), dtype=bool)
     policies = np.zeros((batch_size, max_actions), dtype=np.float32)
+    max_history = max(0 if row.action_history is None else int(row.action_history.shape[0]) for row in rows)
+    histories = np.zeros((batch_size, max_history, VISIBLE_ACTION_HISTORY_FEATURES), dtype=np.float32)
+    history_masks = np.zeros((batch_size, max_history), dtype=bool)
     for index, row in enumerate(rows):
         length = row.action_categorical.shape[0]
         cats[index, :length] = row.action_categorical
         conts[index, :length] = row.action_continuous
         masks[index, :length] = True
         policies[index, :length] = row.policy_target
+        if row.action_history is not None:
+            history_length = min(max_history, row.action_history.shape[0])
+            histories[index, :history_length] = row.action_history[:history_length]
+            if row.action_history_mask is None:
+                history_masks[index, :history_length] = True
+            else:
+                history_masks[index, :history_length] = row.action_history_mask[:history_length]
 
     return {
         "map_tokens": torch.as_tensor(maps, dtype=torch.long, device=device),
         "global_features": torch.as_tensor(globals_, dtype=torch.float32, device=device),
         "event_features": torch.as_tensor(events_, dtype=torch.float32, device=device),
+        "action_history": torch.as_tensor(histories, dtype=torch.float32, device=device),
+        "action_history_mask": torch.as_tensor(history_masks, dtype=torch.bool, device=device),
         "action_categorical": torch.as_tensor(cats, dtype=torch.long, device=device),
         "action_continuous": torch.as_tensor(conts, dtype=torch.float32, device=device),
         "action_mask": torch.as_tensor(masks, dtype=torch.bool, device=device),

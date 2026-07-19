@@ -112,13 +112,14 @@ do GPU. PolyBot używa też buforów `*_into()` (na CUDA przypiętych w RAM) ora
 `max_pending_leaves_per_tree`, więc jeden forward GPU może ocenić do
 `num_envs × pending_leaves` różnych liści.
 
-To jest szybki etap **czystego self-play**. API przyjmuje jedną poprawną
-hipotezę belief na żywą grę, dlatego parametr `--particles` tu nie ma sensu;
-dotychczasowy globalny MCTS z particle worlds zostaje dla meczów z championem
-i bramki promocji. Po zakończeniu MCTS PolyEnv udostępnia wyłącznie dla lossu
-belief etykiety `belief_targets_numpy()`: nie są one przekazywane do
-`submit_beliefs`, policy ani MCTS, więc nie mogą wpłynąć na zagrany ruch.
-Policy/value nadal uczą się z visit counts MCTS i terminal/TD targets.
+To jest szybki etap **pełnego ISMCTS**. Dla każdej żywej gry PolyEnv przyjmuje
+oddzielne particle worlds dla każdego gracza (`[env, player, particle, tile,
+23]`) i przy zmianie aktora re-determinizuje drzewo z jego własnej obserwacji.
+`--particles` określa więc liczbę tych hipotez. Bounded
+`visible_action_history` jest przekazywana zarówno do belief requestów, jak i
+liści MCTS. Po zakończeniu MCTS PolyEnv udostępnia wyłącznie dla lossu belief
+etykiety `belief_targets_numpy()`: nie są one przekazywane do `submit_beliefs`,
+policy ani MCTS, więc nie mogą wpłynąć na zagrany ruch.
 
 Szybki samodzielny test na CUDA:
 

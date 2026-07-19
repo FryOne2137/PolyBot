@@ -194,6 +194,11 @@ class BeliefMCTS:
                 particles=self.config.particles,
                 temperature=max(self.config.temperature, 0.35),
                 event_features=tensors.event_features,
+                action_categorical=tensors.action_categorical,
+                action_continuous=tensors.action_continuous,
+                action_mask=tensors.action_mask,
+                action_history=tensors.action_history,
+                action_history_mask=tensors.action_history_mask,
             )
 
         particles = self.inference.exclusive(sample) if self.inference is not None else sample()
@@ -223,6 +228,8 @@ class BeliefMCTS:
             tensors.action_continuous,
             tensors.action_mask,
             tensors.event_features,
+            action_history=tensors.action_history,
+            action_history_mask=tensors.action_history_mask,
         )
         priors, _ = self._decode_evaluations([packet], output.policy_logits, output.value)[0]
         particles = self.model.sample_completed_maps_from_belief_logits(

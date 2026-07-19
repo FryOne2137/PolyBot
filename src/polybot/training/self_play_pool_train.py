@@ -86,6 +86,8 @@ def _root_examples(
     action_mask = np.asarray(request["action_mask"], dtype=bool)
     player_ids = np.asarray(request["to_play"], dtype=np.int64)
     policies = np.asarray(root["policy"], dtype=np.float32)
+    histories = np.asarray(request.get("visible_action_history", np.empty((maps.shape[0], 0, 12), dtype=np.int32)))
+    history_masks = np.asarray(request.get("visible_action_history_mask", np.empty((maps.shape[0], 0), dtype=bool)), dtype=bool)
     examples: List[TrainingExample] = []
     globals_ = _native_globals(state, training.map_size, training.map_type)
     for index in range(maps.shape[0]):
@@ -111,6 +113,8 @@ def _root_examples(
             full_map_target=belief_targets[index].copy(),
             hidden_mask=maps[index, :, 0] == 0,
             player_id=int(player_ids[index]),
+            action_history=histories[index].astype(np.float32, copy=True),
+            action_history_mask=history_masks[index].copy(),
         ))
     return examples
 
@@ -137,6 +141,45 @@ def _sample_root_rows(
     return rows
 
 
+@torch.inference_mode()
+def _all_player_particles(
+    request: Dict[str, np.ndarray],
+    model: PolicyValueBeliefNet,
+    device: torch.device,
+    training: TrainingConfig,
+    temperature: float,
+) -> np.ndarray:
+    """Sample one fog-safe hypothesis for every player of every live game."""
+    maps = np.asarray(request["map_tokens"], dtype=np.int32)
+    states = np.asarray(request["state"], dtype=np.int32)
+    history = np.asarray(request["visible_action_history"], dtype=np.int32)
+    history_mask = np.asarray(request["visible_action_history_mask"], dtype=bool)
+    envs, players, tiles, fields = maps.shape
+    flat_maps = maps.reshape(envs * players, tiles, fields)
+    flat_states = states.reshape(envs * players, states.shape[-1])
+    flat_history = history.reshape(envs * players, history.shape[-2], history.shape[-1])
+    flat_history_mask = history_mask.reshape(envs * players, history_mask.shape[-1])
+    # Per-player packets intentionally contain no action list. A masked dummy
+    # action means the belief receives only that player's map/history here;
+    # the actual actor's completion is overwritten below with its legal-action
+    # conditioned inference from the ordinary current-player packet.
+    count = flat_maps.shape[0]
+    categorical = torch.full((count, 1, 12), -1, dtype=torch.long, device=device)
+    continuous = torch.zeros((count, 1, 4), dtype=torch.float32, device=device)
+    action_mask = torch.zeros((count, 1), dtype=torch.bool, device=device)
+    output = model(
+        torch.as_tensor(flat_maps, dtype=torch.long, device=device),
+        torch.as_tensor(_native_globals(flat_states, training.map_size, training.map_type), dtype=torch.float32, device=device),
+        categorical, continuous, action_mask,
+        action_history=torch.as_tensor(flat_history, dtype=torch.float32, device=device),
+        action_history_mask=torch.as_tensor(flat_history_mask, dtype=torch.bool, device=device),
+    )
+    completed = model.sample_completed_map_batch_from_belief_logits(
+        torch.as_tensor(flat_maps, dtype=torch.long, device=device), output.belief_logits, temperature=temperature,
+    )
+    return completed.numpy().astype(np.int32, copy=False).reshape(envs, players, tiles, fields)
+
+
 def train_self_play_pool(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -147,6 +190,7 @@ def train_self_play_pool(
     updates: int,
     num_threads: Optional[int] = None,
     max_pending_leaves: int = 4,
+    visible_action_history: int = 64,
     belief_retries: int = 4,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
@@ -166,11 +210,13 @@ def train_self_play_pool(
         raise ValueError("max_pending_leaves must be between one and eight")
     if belief_retries < 0:
         raise ValueError("belief_retries must not be negative")
+    if not 0 <= visible_action_history <= 1024:
+        raise ValueError("visible_action_history must be between 0 and 1024")
     try:
         from PolyEnv import Bardur, Imperius, MapType, SelfPlayPool
     except ImportError as error:
         raise RuntimeError("Update PolyEnv to a version exposing SelfPlayPool.") from error
-    required_pool_api = ("belief_acceptance_mask", "belief_targets_numpy", "reset_slots")
+    required_pool_api = ("all_player_belief_requests", "belief_targets_numpy", "reset_slots")
     missing_pool_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
     if missing_pool_api:
         raise RuntimeError(
@@ -193,13 +239,16 @@ def train_self_play_pool(
         max_actions=mcts.native_max_actions,
         auto_reset=True,
         c_puct=mcts.c_puct,
+        visible_action_history=visible_action_history,
+        require_all_actions=True,
     )
     # The persistent native scheduler can safely use a handful of in-flight
     # leaves per tree; virtual loss prevents duplicate branch work.
     pool.configure_search(max_pending_leaves, 1.0, 0, 0)
     request, request_owners = _allocate_native_buffers(pool, "belief_batch_spec", device)
     root, root_owners = _allocate_native_buffers(pool, "root_policy_spec", device)
-    leaf_capacity = num_envs * max_pending_leaves
+    # Full ISMCTS has a detached tree per live env, player belief and particle.
+    leaf_capacity = num_envs * int(pool.player_count) * max(1, mcts.particles) * max_pending_leaves
     leaves, leaf_owners = _allocate_native_buffers(pool, "leaf_batch_spec", device, leaf_capacity)
     # Keep pinned tensor owners alive while C++ writes into their NumPy views.
     _ = (request_owners, root_owners, leaf_owners)
@@ -212,15 +261,7 @@ def train_self_play_pool(
     completed_targets = 0
     leaf_counts: List[int] = []
     belief_retries_used = 0
-    belief_fallback_rows = 0
     belief_reset_rows = 0
-    # One accepted fog hypothesis per live slot and player. Visibility for a
-    # given player only grows, so merging newly visible tiles is a legitimate
-    # belief filter rather than an engine-state leak. Re-sampling an entire
-    # hidden map on every action is both noisy and very likely to alter one
-    # legal root action in a large batch.
-    belief_cache: List[List[np.ndarray | None]] = [[None, None] for _ in range(num_envs)]
-    belief_episode = np.zeros(num_envs, dtype=np.uint64)
     model.eval()
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -231,86 +272,53 @@ def train_self_play_pool(
                     root_tensors.map_tokens, root_tensors.global_features,
                     root_tensors.action_categorical, root_tensors.action_continuous,
                     root_tensors.action_mask, root_tensors.event_features,
-                )
-                completed = model.sample_completed_map_batch_from_belief_logits(
-                    root_tensors.map_tokens, root_output.belief_logits,
-                    temperature=max(mcts.temperature, 0.35),
+                    action_history=root_tensors.action_history,
+                    action_history_mask=root_tensors.action_history_mask,
                 )
             state_ids = np.asarray(request["state_id"], dtype=np.uint64)
-            episode_ids = np.asarray(request["episode_id"], dtype=np.uint64)
             actors = np.asarray(request["to_play"], dtype=np.int64)
-            observed_tokens = np.asarray(request["map_tokens"], dtype=np.int32)
-            candidate = completed.numpy().astype(np.int32, copy=False).copy()
-            for index in range(num_envs):
-                if belief_episode[index] != episode_ids[index]:
-                    belief_cache[index] = [None, None]
-                    belief_episode[index] = episode_ids[index]
-                actor = int(actors[index])
-                if not 0 <= actor < len(belief_cache[index]):
-                    raise RuntimeError(f"SelfPlayPool returned unsupported player id {actor}")
-                cached = belief_cache[index][actor]
-                if cached is None:
-                    continue
-                # Preserve this player's older fog hypothesis but replace all
-                # currently visible tokens exactly with the public request.
-                candidate[index] = cached
-                visible = observed_tokens[index, :, 0] == 1
-                candidate[index, visible] = observed_tokens[index, visible]
-                candidate[index, :, 0] = observed_tokens[index, :, 0]
-            # Validate every detached world before submitting the whole
-            # forest.  The mask exposes no source-map information: it only
-            # tells us whether a row preserves the already public root action
-            # set and remains non-terminal.
-            accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
-            for _ in range(belief_retries):
-                rejected = ~accepted
-                if not rejected.any():
+            particle_count = max(1, int(mcts.particles))
+            actor_particles = np.stack([
+                model.sample_completed_map_batch_from_belief_logits(
+                    root_tensors.map_tokens, root_output.belief_logits,
+                    temperature=max(mcts.temperature, 0.35),
+                ).numpy().astype(np.int32, copy=False)
+                for _ in range(particle_count)
+            ], axis=1)
+            # Full ISMCTS: every player supplies its own fog observation and
+            # particle. The active actor is additionally conditioned on its
+            # actual legal-action list, which is where blocked paths reveal
+            # public information about hidden occupancy.
+            all_players = pool.all_player_belief_requests()
+            particles = np.stack([
+                _all_player_particles(all_players, model, device, training, max(mcts.temperature, 0.35))
+                for _ in range(particle_count)
+            ], axis=2)
+            particles[np.arange(num_envs), actors] = actor_particles
+            submitted = False
+            for attempt in range(belief_retries + 1):
+                try:
+                    pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
+                    submitted = True
                     break
-                # Do not retain a failed proposal as this player's memory.
-                for index in np.flatnonzero(rejected):
-                    belief_cache[int(index)][int(actors[index])] = None
-                with torch.inference_mode():
-                    resampled = model.sample_completed_map_batch_from_belief_logits(
-                        root_tensors.map_tokens, root_output.belief_logits,
-                        temperature=max(mcts.temperature, 0.35),
-                    ).numpy().astype(np.int32, copy=False)
-                candidate[rejected] = resampled[rejected]
-                accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
-                belief_retries_used += int(rejected.sum())
-
-            rejected = ~accepted
-            if rejected.any():
-                # A deliberately empty hidden world is a legal final attempt;
-                # it is constructed in PolyBot exclusively from observation.
-                belief_fallback_rows += int(rejected.sum())
-                conservative = model.conservative_completed_map_batch(root_tensors.map_tokens)
-                candidate[rejected] = conservative.numpy().astype(np.int32, copy=False)[rejected]
-                accepted = np.asarray(pool.belief_acceptance_mask(state_ids, candidate), dtype=bool)
-
-            invalid_rows = np.flatnonzero(~accepted).astype(np.int32, copy=False)
-            if invalid_rows.size:
-                # Reset only unsatisfiable slots and immediately refresh their
-                # public packets. This is a training recovery path, never a
-                # fallback to an authoritative hidden map.
-                pool.reset_slots(invalid_rows)
+                except ValueError:
+                    if attempt == belief_retries:
+                        break
+                    particles = np.stack([
+                        _all_player_particles(all_players, model, device, training, max(mcts.temperature, 0.35))
+                        for _ in range(particle_count)
+                    ], axis=2)
+                    particles[np.arange(num_envs), actors] = actor_particles
+                    belief_retries_used += num_envs
+            if not submitted:
+                # An incompatible hallucination is reset rather than replaced
+                # with authoritative state. The next public batch starts a
+                # fresh full-ISMCTS belief forest.
+                rows = np.arange(num_envs, dtype=np.int32)
+                pool.reset_slots(rows)
                 pool.belief_requests_into(request)
-                for index in invalid_rows:
-                    belief_cache[int(index)] = [None, None]
-                    belief_episode[int(index)] = 0
-                    pending[int(index)] = None
-                belief_reset_rows += int(invalid_rows.size)
-                progress.update(1)
-                progress.set_postfix(
-                    env_steps=(step + 1) * num_envs,
-                    replay=len(replay), terminals=terminal_episodes,
-                    resets=belief_reset_rows,
-                )
+                belief_reset_rows += num_envs
                 continue
-
-            pool.submit_beliefs(state_ids, candidate)
-            # Cache only a hypothesis accepted by the native legality check.
-            for index, actor in enumerate(actors):
-                belief_cache[index][int(actor)] = candidate[index].copy()
 
             # One select call returns up to B * pending leaves. The native
             # virtual-loss scheduler reserves distinct paths in that batch.
@@ -329,6 +337,8 @@ def train_self_play_pool(
                         leaf_tensors.map_tokens, leaf_tensors.global_features,
                         leaf_tensors.action_categorical, leaf_tensors.action_continuous,
                         leaf_tensors.action_mask, leaf_tensors.event_features,
+                        action_history=leaf_tensors.action_history,
+                        action_history_mask=leaf_tensors.action_history_mask,
                         include_belief=False,
                     )
                     logits = leaf_output.policy_logits + _native_leaf_bias(
@@ -428,10 +438,10 @@ def train_self_play_pool(
         "self_play_pool_env_steps": float(num_envs * steps),
         "self_play_pool_threads": float(pool.num_threads),
         "self_play_pool_pending_leaves": float(max_pending_leaves),
+        "self_play_pool_visible_action_history": float(visible_action_history),
         "self_play_pool_terminals": float(terminal_episodes),
         "self_play_pool_completed_targets": float(completed_targets),
         "self_play_pool_belief_retries": float(belief_retries_used),
-        "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
         "self_play_pool_belief_reset_rows": float(belief_reset_rows),
         "self_play_pool_truncated_roots": float(truncated_roots),
         "replay_examples": float(len(replay)),

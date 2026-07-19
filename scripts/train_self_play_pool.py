@@ -32,11 +32,12 @@ def main() -> None:
     parser.add_argument("--updates", type=int, default=1_000, help="Post-rollout optimiser updates")
     parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
+    parser.add_argument("--visible-action-history", type=int, default=64, help="Fog-safe per-actor action history tokens, 0-1024")
     parser.add_argument("--belief-retries", type=int, default=4, help="Fresh belief samples for each rejected environment")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
     parser.add_argument("--simulations", type=int, default=32)
-    parser.add_argument("--particles", type=int, default=1, help="Ignored here: SelfPlayPool validates one belief completion per live game")
+    parser.add_argument("--particles", type=int, default=2, help="Per-player ISMCTS belief particles (K)")
     parser.add_argument("--mcts-threads", type=int, help="Accepted for config compatibility; use --num-threads for this pool")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
@@ -53,6 +54,7 @@ def main() -> None:
         updates=args.updates,
         num_threads=args.num_threads,
         max_pending_leaves=args.max_pending_leaves,
+        visible_action_history=args.visible_action_history,
         belief_retries=args.belief_retries,
         model_out=args.model_out,
         model=model,

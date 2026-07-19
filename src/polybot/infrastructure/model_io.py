@@ -34,5 +34,18 @@ def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, 
     saved_config.setdefault("policy_architecture", "attention")
     config = ModelConfig(**saved_config)
     model = PolicyValueBeliefNet(config).to(device)
-    model.load_state_dict(payload["state_dict"])
+    incompatible = model.load_state_dict(payload["state_dict"], strict=False)
+    # New action-conditioned belief layers are zero-gated initially, so old
+    # checkpoints remain behaviourally identical until subsequent training.
+    unexpected = set(incompatible.unexpected_keys)
+    missing = set(incompatible.missing_keys)
+    allowed_missing = {
+        name for name in missing
+        if name.startswith(("belief_action_", "belief_settlement_context", "belief_unit_context", "history_"))
+    }
+    if unexpected or missing != allowed_missing:
+        raise RuntimeError(
+            "checkpoint architecture is incompatible; unexpected="
+            f"{sorted(unexpected)}, missing={sorted(missing - allowed_missing)}"
+        )
     return model, config

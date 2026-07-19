@@ -252,11 +252,25 @@ def _log_belief_reset_diagnostics(
             f"reason={reason}, error={fallback_error}"
         )
         return
-    try:
-        diagnostics = pool.belief_acceptance_diagnostics(
-            np.ascontiguousarray(state_ids, dtype=np.uint64),
-            np.ascontiguousarray(completed_maps, dtype=np.int32),
+    if completed_maps.ndim == 5 and not hasattr(pool, "ismcts_belief_diagnostics"):
+        reason = "full_ismcts_diagnostics_unavailable"
+        reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
+        emit(
+            "belief reset: installed PolyEnv lacks ismcts_belief_diagnostics; "
+            f"submit_error={fallback_error}"
         )
+        return
+    try:
+        if completed_maps.ndim == 5 and hasattr(pool, "ismcts_belief_diagnostics"):
+            diagnostics = pool.ismcts_belief_diagnostics(
+                np.ascontiguousarray(state_ids, dtype=np.uint64),
+                np.ascontiguousarray(completed_maps, dtype=np.int32),
+            )
+        else:
+            diagnostics = pool.belief_acceptance_diagnostics(
+                np.ascontiguousarray(state_ids, dtype=np.uint64),
+                np.ascontiguousarray(completed_maps, dtype=np.int32),
+            )
     except Exception as error:  # diagnostics must never hide the original reset cause
         reason = "diagnostic_error"
         reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
@@ -276,6 +290,8 @@ def _log_belief_reset_diagnostics(
             f"real_actions={int(row.get('real_action_count', -1))} "
             f"belief_actions={int(row.get('belief_action_count', -1))}"
         )
+        if "player" in row:
+            details += f" player={int(row['player'])} particle={int(row.get('particle', -1))}"
         if missing:
             details += " missing_from_belief=[" + ", ".join(missing) + "]"
         if extra:
@@ -465,7 +481,7 @@ def train_self_play_pool(
                     _log_belief_reset_diagnostics(
                         pool,
                         state_ids,
-                        fallback[np.arange(num_envs), actors, 0],
+                        fallback,
                         error,
                         belief_reset_reasons,
                     )

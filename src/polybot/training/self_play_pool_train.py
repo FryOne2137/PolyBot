@@ -239,10 +239,15 @@ def _log_belief_reset_diagnostics(
     ``missing_from_belief=[move(...)]`` is actionable for debugging while
     remaining safe under fog-of-war.
     """
+    def emit(message: str) -> None:
+        # Do not rely on tqdm.write here: on Windows a rapidly updating native
+        # progress bar can overwrite it before the user sees the reset cause.
+        print(message, flush=True)
+
     if not hasattr(pool, "belief_acceptance_diagnostics"):
         reason = _belief_rejection_kind(fallback_error)
         reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
-        tqdm.write(
+        emit(
             "belief reset: engine lacks belief_acceptance_diagnostics; "
             f"reason={reason}, error={fallback_error}"
         )
@@ -255,7 +260,7 @@ def _log_belief_reset_diagnostics(
     except Exception as error:  # diagnostics must never hide the original reset cause
         reason = "diagnostic_error"
         reset_reasons[reason] = reset_reasons.get(reason, 0) + int(state_ids.size)
-        tqdm.write(f"belief reset: diagnostic failed ({error}); submit error={fallback_error}")
+        emit(f"belief reset: diagnostic failed ({error}); submit error={fallback_error}")
         return
     for row in diagnostics:
         if bool(row.get("accepted", False)):
@@ -275,7 +280,7 @@ def _log_belief_reset_diagnostics(
             details += " extra_in_belief=[" + ", ".join(extra) + "]"
         if row.get("error"):
             details += f" error={row['error']}"
-        tqdm.write("belief reset: " + details)
+        emit("belief reset: " + details)
 
 
 def train_self_play_pool(

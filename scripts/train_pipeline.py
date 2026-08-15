@@ -12,16 +12,19 @@ add_local_source_root()
 from polybot.config import ModelConfig
 from polybot.training.cli import (
     add_environment_options,
+    add_run_options,
     mcts_config_from_args,
     print_summary,
     training_config_from_args,
+    training_run_from_args,
 )
 from polybot.training.pipeline import run_pipeline
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run PolyBot's full no-log curriculum and save final weights only")
+    parser = argparse.ArgumentParser(description="Run the full curriculum with per-stage plots and save final weights")
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--belief-positions", type=int, default=20_000)
     parser.add_argument("--belief-batch-size", type=int, default=16)
     parser.add_argument("--teacher-games", type=int, default=100)
@@ -116,6 +119,7 @@ def main() -> None:
         champion_model_paths=args.champion_model,
         promotion_games=args.promotion_games,
         promotion_score=args.promotion_score,
+        run=training_run_from_args(args, "pipeline"),
     )
     print_summary(summary)
 

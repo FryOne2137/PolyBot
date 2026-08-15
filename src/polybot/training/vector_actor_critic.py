@@ -16,6 +16,7 @@ from ..config import ModelConfig, TrainingConfig
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from .run_artifacts import TrainingRun
 from .vector_teacher import _teacher_targets, _vector_tensors
 
 
@@ -63,7 +64,8 @@ def train_vector_actor_critic(
     gamma: float = 0.995,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
-) -> Dict[str, float]:
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
     """Train policy/value directly from native vector rollouts in RAM only."""
     if num_envs < 1 or steps < 1 or max_actions < 1:
         raise ValueError("num_envs, steps and max_actions must be positive")
@@ -75,6 +77,22 @@ def train_vector_actor_critic(
         raise RuntimeError("Update PolyEnv to a version exposing VectorGameEnv.") from error
 
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "actor_critic")
+    run.write_config(
+        training=training,
+        model=model_config,
+        stage={
+            "num_envs": num_envs,
+            "steps": steps,
+            "num_threads": num_threads,
+            "max_actions": max_actions,
+            "entropy_weight": entropy_weight,
+            "value_weight": value_weight,
+            "teacher_weight": teacher_weight,
+            "gamma": gamma,
+            "model_out": model_out,
+        },
+    )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     cuda_amp = device.type == "cuda"
@@ -165,6 +183,17 @@ def train_vector_actor_critic(
             totals["teacher_loss"] += float(teacher_loss.detach().cpu())
             totals["entropy"] += float(entropy.detach().cpu())
             totals["reward"] += float(reward.mean())
+            run.log(
+                step=step + 1,
+                environment_step=(step + 1) * num_envs,
+                loss=float(loss.detach().cpu()),
+                policy_loss=float(policy_loss.detach().cpu()),
+                value_loss=float(critic_loss.detach().cpu()),
+                teacher_loss=float(teacher_loss.detach().cpu()),
+                entropy=float(entropy.detach().cpu()),
+                reward=float(reward.mean()),
+                terminal_episodes=terminals,
+            )
             progress.update(1)
             if (step + 1) % 20 == 0 or step == 0:
                 progress.set_postfix(
@@ -174,8 +203,10 @@ def train_vector_actor_critic(
 
     if model_out is not None:
         save_model(model_out, model, model_config)
-    return {
+    summary: Dict[str, float | str] = {
         "flat_envs": float(num_envs), "flat_steps": float(steps),
         "environment_steps": float(num_envs * steps), "terminal_episodes": float(terminals),
         **{"flat_" + key: value / steps for key, value in totals.items()},
     }
+    summary["run_dir"] = str(run.finish(summary))
+    return summary

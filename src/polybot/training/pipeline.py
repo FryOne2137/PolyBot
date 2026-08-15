@@ -12,6 +12,7 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .belief_warmup import warmup_belief
+from .run_artifacts import TrainingRun
 from .self_play_pool_train import train_self_play_pool
 from .self_play_train import train_self_play
 from .teacher_bootstrap import train_teacher_bootstrap
@@ -48,7 +49,8 @@ def run_pipeline(
     champion_model_paths: Sequence[Path] = (),
     promotion_games: int = 30,
     promotion_score: float = 0.55,
-) -> Dict[str, Dict[str, float]]:
+    run: TrainingRun | None = None,
+) -> Dict[str, object]:
     """Run all stages in RAM and write exactly one final model checkpoint.
 
     The order intentionally gives the MCTS stage a competent prior:
@@ -64,10 +66,34 @@ def run_pipeline(
         raise ValueError("promotion_games must not be negative")
 
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "pipeline")
+
+    def record_stage(stage_index: int, summary: Dict[str, object]) -> None:
+        run.log(stage=stage_index, **summary)
+
     if model_in is None:
         model = PolicyValueBeliefNet(model_config).to(device)
     else:
         model, model_config = load_model(model_in, device)
+    run.write_config(
+        training=training,
+        model=model_config,
+        mcts=mcts_config,
+        stage={
+            "belief_positions": belief_positions,
+            "belief_batch_size": belief_batch_size,
+            "teacher_games": teacher_games,
+            "vector_teacher_steps": vector_teacher_steps,
+            "flat_steps": flat_steps,
+            "self_play_pool_steps": self_play_pool_steps,
+            "self_play_games": self_play_games,
+            "refinement_games": refinement_games,
+            "promotion_games": promotion_games,
+            "promotion_score": promotion_score,
+            "model_in": model_in,
+            "model_out": model_out,
+        },
+    )
 
     # A pool can contain the current champion plus older, still-useful styles.
     # They remain frozen for the whole candidate run and are never saved here.
@@ -87,12 +113,16 @@ def run_pipeline(
             batch_size=belief_batch_size,
             model=model,
             preserve_policy_value=model_in is not None,
+            run=run.child("belief"),
         )
+        record_stage(1, belief)
     teacher = {}
     if teacher_games:
         teacher = train_teacher_bootstrap(
-            training, model_config, teacher_games, teacher_updates_per_game, model=model
+            training, model_config, teacher_games, teacher_updates_per_game, model=model,
+            run=run.child("teacher"),
         )
+        record_stage(2, teacher)
     vector_teacher = {}
     if vector_teacher_steps:
         vector_teacher = train_vector_teacher(
@@ -103,7 +133,9 @@ def run_pipeline(
             max_actions=mcts_config.native_max_actions,
             updates_per_step=vector_teacher_updates_per_step,
             model=model,
+            run=run.child("vector_teacher"),
         )
+        record_stage(3, vector_teacher)
     flat = {}
     if flat_steps:
         flat = train_vector_actor_critic(
@@ -113,7 +145,9 @@ def run_pipeline(
             steps=flat_steps,
             max_actions=mcts_config.native_max_actions,
             model=model,
+            run=run.child("actor_critic"),
         )
+        record_stage(4, flat)
     pool_self_play = {}
     if self_play_pool_steps:
         if self_play_pool_envs < 1:
@@ -128,7 +162,9 @@ def run_pipeline(
             num_threads=self_play_pool_threads,
             max_pending_leaves=self_play_pool_pending_leaves,
             model=model,
+            run=run.child("self_play_pool"),
         )
+        record_stage(5, pool_self_play)
     # Keep one recoverable model artifact. With a promotion champion, that
     # file must remain the verified champion until the final gate succeeds;
     # otherwise it is safe to preserve the current candidate as before.
@@ -156,7 +192,9 @@ def run_pipeline(
             workers=mcts_workers,
             model=model,
             opponent_models=frozen_models,
+            run=run.child("mcts_foundation"),
         )
+        record_stage(6, self_play)
         # A failed refinement must never publish an untested candidate over a
         # verified champion. Without a champion keep the existing resume aid.
         if frozen_models:
@@ -193,7 +231,9 @@ def run_pipeline(
             workers=mcts_workers,
             model=model,
             opponent_models=frozen_models,
+            run=run.child("mcts_refinement"),
         )
+        record_stage(7, refinement)
     promotion: Dict[str, float] = {}
     if frozen_models and promotion_games:
         # Evaluation uses fixed seeds and alternate player slots. It writes no
@@ -221,8 +261,12 @@ def run_pipeline(
         # Save the first supplied checkpoint (the champion) back to model_out.
         if not promoted:
             model, model_config = frozen_models[0], frozen_configs[0]
+        promotion_run = run.child("promotion")
+        promotion_run.log(**promotion)
+        promotion["run_dir"] = str(promotion_run.finish(promotion))
+        record_stage(8, promotion)
     save_model(model_out, model, model_config)
-    return {
+    summary: Dict[str, object] = {
         "belief_warmup": belief,
         "teacher_bootstrap": teacher,
         "vector_teacher": vector_teacher,
@@ -232,3 +276,5 @@ def run_pipeline(
         "mcts_refinement": refinement,
         "promotion": promotion,
     }
+    summary["run_dir"] = str(run.finish(summary))
+    return summary

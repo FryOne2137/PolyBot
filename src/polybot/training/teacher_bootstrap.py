@@ -25,6 +25,7 @@ from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .rewards import RewardShaper
+from .run_artifacts import TrainingRun
 from .self_play import SelfPlayRunner, _winner_to_value
 
 
@@ -107,9 +108,17 @@ def train_teacher_bootstrap(
     updates_per_game: int,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
-) -> Dict[str, float]:
+    *,
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
     """Clone productive teacher behavior and belief labels without disk replay."""
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "teacher")
+    run.write_config(
+        training=training,
+        model=model_config,
+        stage={"games": games, "updates_per_game": updates_per_game, "model_out": model_out},
+    )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     replay = ReplayBuffer(training.replay_capacity)
@@ -125,18 +134,37 @@ def train_teacher_bootstrap(
             captures += metrics["teacher_city_captures"]
             capitals += metrics["teacher_capital_captures"]
             if len(replay) >= training.batch_size:
+                game_losses: List[Dict[str, float]] = []
                 for _ in range(updates_per_game):
                     examples_batch = replay.sample(
                         training.batch_size, rng, priority_fraction=training.priority_replay_fraction
                     )
                     batch = stack_examples(examples_batch, device)
-                    losses.append(train_batch(model, optimiser, batch, training))
+                    update_loss = train_batch(model, optimiser, batch, training)
+                    losses.append(update_loss)
+                    game_losses.append(update_loss)
+            else:
+                game_losses = []
+            logged = {
+                "game": game + 1,
+                "update": len(losses),
+                "replay_examples": len(replay),
+                "city_captures": captures,
+                "capital_captures": capitals,
+                "game_moves": metrics["moves"],
+            }
+            if game_losses:
+                logged.update({
+                    name: float(np.mean([row[name] for row in game_losses]))
+                    for name in game_losses[0]
+                })
+            run.log(**logged)
             progress.update(1)
             progress.set_postfix(captures=int(captures), examples=len(replay))
 
     if model_out is not None:
         save_model(model_out, model, model_config)
-    summary: Dict[str, float] = {
+    summary: Dict[str, float | str] = {
         "teacher_games": float(games),
         "replay_examples": float(len(replay)),
         "teacher_city_captures": captures,
@@ -145,4 +173,5 @@ def train_teacher_bootstrap(
     if losses:
         for name in losses[0]:
             summary[name] = float(np.mean([loss[name] for loss in losses]))
+    summary["run_dir"] = str(run.finish(summary))
     return summary

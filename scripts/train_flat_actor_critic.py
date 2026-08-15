@@ -11,13 +11,20 @@ add_local_source_root()
 
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
-from polybot.training.cli import add_environment_options, print_summary, training_config_from_args
+from polybot.training.cli import (
+    add_environment_options,
+    add_run_options,
+    print_summary,
+    training_config_from_args,
+    training_run_from_args,
+)
 from polybot.training.vector_actor_critic import train_vector_actor_critic
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RAM-only native VectorGameEnv actor-critic; saves only model weights")
+    parser = argparse.ArgumentParser(description="RAM-only actor-critic with model weights and run plots")
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, default=Path("models/flat_actor_critic.pt"))
     parser.add_argument("--num-envs", type=int, default=64)
@@ -34,7 +41,7 @@ def main() -> None:
     print_summary(train_vector_actor_critic(
         training, model_config, args.num_envs, args.steps, args.num_threads,
         args.max_actions, args.entropy_weight, args.value_weight, args.teacher_weight, args.gamma,
-        args.model_out, model,
+        args.model_out, model, run=training_run_from_args(args, "actor_critic"),
     ))
 
 

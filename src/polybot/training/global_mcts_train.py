@@ -22,6 +22,7 @@ from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .rewards import RewardShaper
+from .run_artifacts import TrainingRun
 from .self_play import _action_bucket, SelfPlayRunner
 from .teacher_bootstrap import _teacher_game
 from .value_targets import assign_td_lambda_targets
@@ -300,9 +301,26 @@ def train_global_mcts_self_play(
     model_out: Optional[Path],
     model: Optional[PolicyValueBeliefNet],
     opponent_models: Sequence[PolicyValueBeliefNet] = (),
-) -> Dict[str, float]:
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
     """High-throughput global-MCTS trainer; writes only final model weights."""
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "self_play")
+    run.write_config(
+        training=training,
+        model=model_config,
+        mcts=mcts,
+        stage={
+            "games": games,
+            "updates_per_game": updates_per_game,
+            "opponent": opponent,
+            "random_opponent_rate": random_opponent_rate,
+            "mixed_opponent": mixed_opponent,
+            "teacher_replay_fraction": teacher_replay_fraction,
+            "active_envs": active_envs,
+            "model_out": model_out,
+        },
+    )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     # These are immutable adversaries.  They never receive gradients or an
     # optimiser and are sampled independently for each anchored game.
@@ -340,8 +358,17 @@ def train_global_mcts_self_play(
             ) if teacher_count else []
             if len(rows) < training.batch_size:
                 break
-            losses.append(train_batch(model, optimiser, stack_examples(rows, device), training))
+            update_loss = train_batch(model, optimiser, stack_examples(rows, device), training)
+            losses.append(update_loss)
             optimisation_updates += 1
+            run.log(
+                game=done,
+                update=optimisation_updates,
+                replay_examples=len(replay),
+                teacher_replay_examples=len(teacher),
+                teacher_replay_fraction=current_teacher_fraction,
+                **update_loss,
+            )
 
     model.eval()
     # Persist only the requested model path before native MCTS begins. It is
@@ -420,10 +447,24 @@ def train_global_mcts_self_play(
                     _apply_action(episode, row, True, policy, training, bootstrap_value)
             completed = [episode for episode in active if episode.env.is_done() or episode.moves >= training.max_moves]
             for episode in completed:
-                _finish(episode, training); replay.extend(episode.examples); active.remove(episode); done += 1; bar.update(1)
-                for key, value in episode.metrics.items(): summaries[key] = summaries.get(key, 0.0) + value
+                _finish(episode, training)
+                replay.extend(episode.examples)
+                active.remove(episode)
+                done += 1
+                bar.update(1)
+                for key, value in episode.metrics.items():
+                    summaries[key] = summaries.get(key, 0.0) + value
                 if teacher_replay_fraction > 0.0:
                     teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + episode.index, training); teacher.extend(teacher_examples)
+                run.log(
+                    game=done,
+                    update=optimisation_updates,
+                    replay_examples=len(replay),
+                    game_moves=episode.moves,
+                    winner=episode.winner,
+                    curriculum_scale=curriculum_scale,
+                    **episode.metrics,
+                )
                 searched_episodes = len(model_turns) + sum(len(rows) for rows in frozen_turns.values())
                 bar.set_postfix(
                     replay=len(replay), active=len(active), updates=optimisation_updates,
@@ -438,7 +479,7 @@ def train_global_mcts_self_play(
     optimise_until(games * updates_per_game, 0.0)
     bootstrap_examples = sum(example.bootstrap_value is not None for example in replay._examples)
     if model_out: save_model(model_out, model, model_config)
-    result = {
+    result: Dict[str, float | str] = {
         "games": float(games), "active_envs": float(active_envs), "replay_examples": float(len(replay)),
         "teacher_replay_examples": float(len(teacher)),
         "mcts_value_bootstrap_fraction": float(bootstrap_examples / max(1, len(replay))),
@@ -451,4 +492,5 @@ def train_global_mcts_self_play(
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
     if losses:
         result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
+    result["run_dir"] = str(run.finish(result))
     return result

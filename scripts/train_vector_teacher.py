@@ -11,13 +11,20 @@ add_local_source_root()
 
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
-from polybot.training.cli import add_environment_options, print_summary, training_config_from_args
+from polybot.training.cli import (
+    add_environment_options,
+    add_run_options,
+    print_summary,
+    training_config_from_args,
+    training_run_from_args,
+)
 from polybot.training.vector_teacher import train_vector_teacher
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a policy curriculum with native PolyEnv VectorGameEnv")
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, default=Path("models/vector_teacher.pt"))
     parser.add_argument("--num-envs", type=int, default=128)
@@ -37,6 +44,7 @@ def main() -> None:
         updates_per_step=args.updates_per_step,
         model_out=args.model_out,
         model=model,
+        run=training_run_from_args(args, "vector_teacher"),
     ))
 
 

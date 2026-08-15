@@ -13,18 +13,21 @@ from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.training.cli import (
     add_environment_options,
+    add_run_options,
     mcts_config_from_args,
     print_summary,
     training_config_from_args,
+    training_run_from_args,
 )
 from polybot.training.self_play_pool_train import train_self_play_pool
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="RAM-only persistent SelfPlayPool belief-MCTS; writes only the requested model checkpoint"
+        description="RAM-only persistent SelfPlayPool belief-MCTS with checkpoint and run plots"
     )
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, default=Path("models/self_play_pool.pt"))
     parser.add_argument("--num-envs", type=int, default=128)
@@ -63,6 +66,7 @@ def main() -> None:
         belief_retries=args.belief_retries,
         model_out=args.model_out,
         model=model,
+        run=training_run_from_args(args, "self_play_pool"),
     ))
 
 

@@ -22,6 +22,7 @@ from ..infrastructure.model_io import save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .optimisation import belief_loss
 from .replay_buffer import TrainingExample
+from .run_artifacts import TrainingRun
 
 
 _BELIEF_ONLY_PREFIXES = (
@@ -117,7 +118,8 @@ def warmup_belief(
     model_out: Optional[Path] = None,
     model: PolicyValueBeliefNet | None = None,
     preserve_policy_value: bool = False,
-) -> Dict[str, float]:
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
     """Learn belief on naturally foggy, action-diverse random positions.
 
     Late random games reveal almost every tile and make map completion a
@@ -130,6 +132,19 @@ def warmup_belief(
     if max_moves_per_world < 1:
         raise ValueError("max_moves_per_world must be positive")
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "belief")
+    run.write_config(
+        training=training,
+        model=model_config,
+        stage={
+            "positions": positions,
+            "batch_size": batch_size,
+            "min_hidden_tiles": min_hidden_tiles,
+            "max_moves_per_world": max_moves_per_world,
+            "preserve_policy_value": preserve_policy_value,
+            "model_out": model_out,
+        },
+    )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     original_trainable = (
         _configure_belief_only_training(model) if preserve_policy_value else None
@@ -180,6 +195,13 @@ def warmup_belief(
                     latest_loss = _belief_update(model, optimiser, pending, device)
                     losses.append(latest_loss)
                     pending.clear()
+                    run.log(
+                        position=position + 1,
+                        update=len(losses),
+                        belief_loss=latest_loss,
+                        hidden_tiles=hidden_tiles,
+                        mean_hidden_tiles=float(np.mean(accepted_hidden_tiles)),
+                    )
                     progress.set_postfix(
                         belief_loss=f"{latest_loss:.4f}",
                         hidden_tiles=hidden_tiles,
@@ -192,16 +214,26 @@ def warmup_belief(
                 position += 1
 
         if pending:
-            losses.append(_belief_update(model, optimiser, pending, device))
+            latest_loss = _belief_update(model, optimiser, pending, device)
+            losses.append(latest_loss)
+            run.log(
+                position=positions,
+                update=len(losses),
+                belief_loss=latest_loss,
+                hidden_tiles=float(np.mean([row.hidden_mask.sum() for row in pending])),
+                mean_hidden_tiles=float(np.mean(accepted_hidden_tiles)),
+            )
     finally:
         if original_trainable is not None:
             _restore_trainable_parameters(model, original_trainable)
     if model_out is not None:
         save_model(model_out, model, model_config)
-    return {
+    summary: Dict[str, float | str] = {
         "positions": float(positions),
         "belief_loss": float(np.mean(losses)) if losses else 0.0,
         "mean_hidden_tiles": float(np.mean(accepted_hidden_tiles)) if accepted_hidden_tiles else 0.0,
         "min_hidden_tiles": float(min_hidden_tiles),
         "preserved_policy_value": float(preserve_policy_value),
     }
+    summary["run_dir"] = str(run.finish(summary))
+    return summary

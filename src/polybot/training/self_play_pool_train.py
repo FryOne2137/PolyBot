@@ -28,6 +28,7 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 from .global_mcts_train import _native_leaf_bias
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
+from .run_artifacts import TrainingRun
 from .value_targets import Transition, assign_td_lambda_targets
 
 
@@ -367,7 +368,8 @@ def train_self_play_pool(
     belief_retries: int = 4,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
-) -> Dict[str, float]:
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
     """Run fully native belief-MCTS rollouts and optimise in RAM.
 
     Per-slot validation/retry/reset keeps invalid detached belief worlds from
@@ -400,6 +402,22 @@ def train_self_play_pool(
             + ". Rebuild/update the local PolyEnv bindings."
         )
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "self_play_pool")
+    run.write_config(
+        training=training,
+        model=model_config,
+        mcts=mcts,
+        stage={
+            "num_envs": num_envs,
+            "steps": steps,
+            "updates": updates,
+            "num_threads": num_threads,
+            "max_pending_leaves": max_pending_leaves,
+            "visible_action_history": visible_action_history,
+            "belief_retries": belief_retries,
+            "model_out": model_out,
+        },
+    )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     native_threads = 0 if num_threads is None else max(1, int(num_threads))
@@ -451,6 +469,25 @@ def train_self_play_pool(
     optimisation_updates = 0
     model.eval()
 
+    def log_rollout(step: int, curriculum_scale: float) -> None:
+        metrics: Dict[str, float] = {
+            "step": float(step),
+            "environment_step": float(step * num_envs),
+            "optimisation_updates": float(optimisation_updates),
+            "replay_examples": float(len(replay)),
+            "terminal_episodes": float(terminal_episodes),
+            "truncated_episodes": float(truncated_episodes),
+            "completed_targets": float(completed_targets),
+            "belief_retries": float(belief_retries_used),
+            "belief_fallback_rows": float(belief_fallback_rows),
+            "belief_reset_rows": float(belief_reset_rows),
+            "curriculum_scale": float(curriculum_scale),
+            "mean_leaf_batch": float(np.mean(leaf_counts)) if leaf_counts else 0.0,
+        }
+        if losses:
+            metrics.update(losses[-1])
+        run.log(**metrics)
+
     def optimise_until(target: int) -> None:
         nonlocal optimisation_updates
         while optimisation_updates < target and len(replay) >= training.batch_size:
@@ -460,6 +497,7 @@ def train_self_play_pool(
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
         for step in range(steps):
+            curriculum_scale = 0.0 if steps == 1 else max(0.0, 1.0 - step / (steps - 1))
             # ``request`` is the successor batch written by the previous
             # ``step_into_checked`` call. With auto-reset it already contains
             # the next episode's root, while ``terminated`` and
@@ -589,6 +627,7 @@ def train_self_play_pool(
                     episode_moves.fill(0)
                     belief_reset_rows += num_envs
                     optimise_until(_scheduled_updates(step + 1, steps, updates))
+                    log_rollout(step + 1, curriculum_scale)
                     progress.update(1)
                     continue
 
@@ -600,7 +639,6 @@ def train_self_play_pool(
             # The hand-written curriculum is useful only while the network is
             # weak. Annealing it to zero forces later MCTS targets to come from
             # the learned policy/value instead of permanently cloning a prior.
-            curriculum_scale = 0.0 if steps == 1 else max(0.0, 1.0 - step / (steps - 1))
             for _ in range(waves):
                 leaf_count = int(pool.select_leaves_into(leaves, max_leaves=leaf_capacity))
                 leaf_counts.append(leaf_count)
@@ -677,6 +715,7 @@ def train_self_play_pool(
             # Release large inference-only tensors before the backward pass.
             del root_output, root_tensors
             optimise_until(_scheduled_updates(step + 1, steps, updates))
+            log_rollout(step + 1, curriculum_scale)
             progress.update(1)
             if (step + 1) % 10 == 0 or step == 0:
                 progress.set_postfix(
@@ -708,10 +747,12 @@ def train_self_play_pool(
     # Catch up only if early rollout steps had too little completed data. In a
     # normal run nearly all updates have already happened between MCTS steps.
     optimise_until(updates)
+    if optimisation_updates:
+        log_rollout(steps, 0.0)
 
     if model_out is not None:
         save_model(model_out, model, model_config)
-    summary: Dict[str, float] = {
+    summary: Dict[str, float | str] = {
         "training_seed": float(training.seed),
         "self_play_pool_envs": float(num_envs),
         "self_play_pool_steps": float(steps),
@@ -739,4 +780,5 @@ def train_self_play_pool(
                     for kind, count in sorted(belief_reset_reasons.items())})
     if losses:
         summary.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
+    summary["run_dir"] = str(run.finish(summary))
     return summary

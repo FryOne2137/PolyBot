@@ -13,16 +13,19 @@ from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.training.cli import (
     add_environment_options,
+    add_run_options,
     mcts_config_from_args,
     print_summary,
     training_config_from_args,
+    training_run_from_args,
 )
 from polybot.training.self_play_train import train_self_play
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run RAM-only MCTS self-play; save only model weights")
+    parser = argparse.ArgumentParser(description="Run RAM-only MCTS self-play; save model weights and run plots")
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, default=Path("models/self_play.pt"))
     parser.add_argument("--games", type=int, default=200)
@@ -94,6 +97,7 @@ def main() -> None:
         model_out=args.model_out,
         model=model,
         opponent_models=frozen_models,
+        run=training_run_from_args(args, "self_play"),
     )
     print_summary(summary)
 

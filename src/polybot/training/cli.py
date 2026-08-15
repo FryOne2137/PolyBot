@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
+from pathlib import Path
 from typing import Dict
 
 from ..config import MCTSConfig, TrainingConfig
+from .run_artifacts import TrainingRun
 
 
 def add_environment_options(parser: argparse.ArgumentParser) -> None:
@@ -21,6 +23,23 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--map-type", default="lakes", choices=["lakes", "drylands"])
     parser.add_argument("--max-moves", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=2.0e-4)
+
+
+def add_run_options(parser: argparse.ArgumentParser) -> None:
+    """Add Ultralytics-style output naming shared by every trainer."""
+    parser.add_argument("--project", type=Path, default=Path("runs"), help="Root directory for training artifacts")
+    parser.add_argument("--name", default="train", help="Run name; existing names increment to train2, train3, ...")
+    parser.add_argument("--exist-ok", action="store_true", help="Reuse --project/TYPE/--name instead of incrementing")
+
+
+def training_run_from_args(args: argparse.Namespace, stage: str) -> TrainingRun:
+    return TrainingRun.create(
+        args.project,
+        stage,
+        args.name,
+        exist_ok=args.exist_ok,
+        arguments=vars(args),
+    )
 
 
 def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:

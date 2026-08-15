@@ -16,6 +16,7 @@ from ..data.token_schema import EVENT_SUMMARY_SIZE
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from .run_artifacts import TrainingRun
 
 
 # VectorGameEnv action_features layout documented by PolyEnv.  These indexes
@@ -112,8 +113,9 @@ def train_vector_teacher(
     updates_per_step: int = 1,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
-) -> Dict[str, float]:
-    """Train policy on native C++ vector environments; save only model weights.
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
+    """Train policy on native C++ vector environments and record scalar plots.
 
     VectorGameEnv intentionally exposes player-view tokens only.  Therefore
     this stage trains the policy curriculum, not the belief decoder; belief
@@ -129,6 +131,20 @@ def train_vector_teacher(
         raise RuntimeError("Update PolyEnv to a version exposing VectorGameEnv.") from error
 
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "vector_teacher")
+    run.write_config(
+        training=training,
+        model=model_config,
+        stage={
+            "num_envs": num_envs,
+            "steps": steps,
+            "num_threads": num_threads,
+            "max_actions": max_actions,
+            "visible_event_history": visible_event_history,
+            "updates_per_step": updates_per_step,
+            "model_out": model_out,
+        },
+    )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     cuda_amp = device.type == "cuda"
@@ -158,6 +174,7 @@ def train_vector_teacher(
             target_tensor = torch.as_tensor(target, dtype=torch.float32, device=device)
 
             model.train()
+            step_losses = []
             for _ in range(updates_per_step):
                 optimiser.zero_grad(set_to_none=True)
                 autocast = torch.autocast(device_type="cuda", dtype=torch.float16) if cuda_amp else nullcontext()
@@ -178,12 +195,21 @@ def train_vector_teacher(
                 scaler.update()
                 loss_sum += policy_loss.detach().float()
                 loss_count += 1
+                step_losses.append(float(policy_loss.detach().cpu()))
 
             rows = target.argmax(axis=1)
             action_ids = np.asarray(batch["action_id"], dtype=np.int32)[np.arange(num_envs), rows]
             batch = env.step(action_ids)
             terminal_count += int(np.asarray(batch["terminated"], dtype=np.uint8).sum())
             invalid_actions += int((np.asarray(batch["action_valid"], dtype=np.uint8) == 0).sum())
+            run.log(
+                step=step + 1,
+                update=loss_count,
+                environment_step=(step + 1) * num_envs,
+                policy_loss=float(np.mean(step_losses)),
+                terminal_episodes=terminal_count,
+                invalid_actions=invalid_actions,
+            )
             progress.update(1)
             # Avoid a CUDA->CPU synchronisation for a cosmetic metric every
             # environment step; it creates visible GPU idle gaps on fast cards.
@@ -196,7 +222,7 @@ def train_vector_teacher(
 
     if model_out is not None:
         save_model(model_out, model, model_config)
-    return {
+    summary: Dict[str, float | str] = {
         "vector_envs": float(num_envs),
         "vector_steps": float(steps),
         "environment_steps": float(num_envs * steps),
@@ -205,3 +231,5 @@ def train_vector_teacher(
         "terminal_episodes": float(terminal_count),
         "invalid_actions": float(invalid_actions),
     }
+    summary["run_dir"] = str(run.finish(summary))
+    return summary

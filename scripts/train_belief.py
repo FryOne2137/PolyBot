@@ -13,12 +13,19 @@ from polybot.config import ModelConfig
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.training.belief_warmup import warmup_belief
-from polybot.training.cli import add_environment_options, print_summary, training_config_from_args
+from polybot.training.cli import (
+    add_environment_options,
+    add_run_options,
+    print_summary,
+    training_config_from_args,
+    training_run_from_args,
+)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Warm up PolyBot's belief model; save only model weights")
+    parser = argparse.ArgumentParser(description="Warm up belief and save model weights plus run plots")
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--positions", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
@@ -47,6 +54,7 @@ def main() -> None:
         model_out=args.model_out,
         model=model,
         preserve_policy_value=args.model_in is not None,
+        run=training_run_from_args(args, "belief"),
     )
     print_summary(summary)
 

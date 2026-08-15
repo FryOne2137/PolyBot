@@ -6,6 +6,7 @@
 
 # 1. Dłuższy warm-up strukturalnego belief world od zera. Smoke checkpoint
 # miał tylko 1000 pozycji; nie zamrażamy po nim losowego jeszcze backbone'u.
+# Wykresy: runs\belief\train (kolejne uruchomienie: train2, train3, ...).
 python scripts/train_belief.py `
   --model-out models\belief-structured-v1.pt `
   --positions 500000 `
@@ -20,6 +21,7 @@ python scripts/train_belief.py `
 
 # 2. Bootstrap policy/value. Uczy m.in. ruchu w stronę widocznej wioski,
 # którego gęsty natywny packet akcji SelfPlayPool nie koduje jako osobnej cechy.
+# Wykresy: runs\teacher\train.
 python scripts/train_teacher.py `
   --model-in models\belief-structured-v1.pt `
   --model-out models\teacher-structured-v1.pt `
@@ -34,6 +36,7 @@ python scripts/train_teacher.py `
 
 # 3. Główny trening: pełny ISMCTS w SelfPlayPool.
 # Jeśli zabraknie VRAM, zmniejsz tylko --num-envs z 128 do 64.
+# Wykresy: runs\self_play_pool\train.
 python scripts/train_self_play_pool.py `
   --model-in models\teacher-structured-v1.pt `
   --model-out models\selfplay-ismcts-v1.pt `
@@ -69,7 +72,8 @@ python scripts/evaluate.py `
   --device cuda
 
 # 5. Liga: jeden kandydat na raz, stała bramka przeciw championowi.
-# Zapisane zostaną wyłącznie checkpointy po promocji w models\league\.
+# Checkpointy po promocji trafią do models\league\, a przebieg i wykresy do
+# runs\league\train\round_001, round_002 itd.
 # Każda runda ma nowy seed self-play, a wszystkie bramki ten sam zestaw
 # seedów ewaluacyjnych. Wznów następny run od ostatniego champion-XXX.pt.
 python scripts/train_league.py `

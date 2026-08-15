@@ -20,6 +20,7 @@ from ..planning.batched_inference import BatchedInference, NativeLeafInference
 from ..planning.belief_mcts import BeliefMCTS
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer
+from .run_artifacts import TrainingRun
 from .self_play import SelfPlayRunner
 from .teacher_bootstrap import _teacher_game
 
@@ -40,7 +41,8 @@ def train_self_play(
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
     opponent_models: Sequence[PolicyValueBeliefNet] = (),
-) -> Dict[str, float]:
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
     """Run independent games concurrently and retain examples only in RAM.
 
     Every worker owns a GameEnv and a MCTS tree. The single inference service
@@ -62,6 +64,24 @@ def train_self_play(
         raise ValueError("workers must be at least one")
     if global_inference_batch_size < 1:
         raise ValueError("global_inference_batch_size must be at least one")
+    run = run or TrainingRun.create("runs", "self_play")
+    run.write_config(
+        training=training,
+        model=model_config,
+        mcts=mcts_config,
+        stage={
+            "games": games,
+            "updates_per_game": updates_per_game,
+            "opponent": opponent,
+            "random_opponent_rate": random_opponent_rate,
+            "mixed_opponent": mixed_opponent,
+            "teacher_replay_fraction": teacher_replay_fraction,
+            "workers": workers,
+            "global_inference_batch_size": global_inference_batch_size,
+            "inference_wait_ms": inference_wait_ms,
+            "model_out": model_out,
+        },
+    )
 
     # Modern PolyEnv exposes a single native MctsPool over all active games.
     # Use it in preference to the legacy Python-worker scheduler below.
@@ -74,7 +94,8 @@ def train_self_play(
         return train_global_mcts_self_play(
             training, model_config, mcts_config, games, updates_per_game,
             opponent, random_opponent_rate, mixed_opponent, teacher_replay_fraction,
-            active_envs=workers, model_out=model_out, model=model, opponent_models=opponent_models,
+            active_envs=workers, model_out=model_out, model=model,
+            opponent_models=opponent_models, run=run,
         )
 
     if opponent == "model" or mixed_opponent == "model":
@@ -145,6 +166,7 @@ def train_self_play(
     opponent_games = 0.0
     reward_totals: Dict[str, float] = {}
     action_totals: Dict[str, float] = {}
+    completed_games = 0
     try:
         # Submitting all seeds gives ThreadPoolExecutor a work queue: an idle
         # worker picks the next game at once; no fixed batch barrier exists.
@@ -153,6 +175,7 @@ def train_self_play(
             with tqdm(total=games, desc=f"parallel MCTS self-play ({device})", unit="env", dynamic_ncols=True) as bar:
                 for future in as_completed(futures):
                     use_anchor, examples, teacher_examples, metrics = future.result()
+                    completed_games += 1
                     replay.extend(examples)
                     teacher_replay.extend(teacher_examples)
                     opponent_games += float(use_anchor)
@@ -163,6 +186,14 @@ def train_self_play(
                             reward_totals[name] = reward_totals.get(name, 0.0) + value
                         if name == "model_actions" or name.startswith("model_action_"):
                             action_totals[name] = action_totals.get(name, 0.0) + value
+                    run.log(
+                        game=completed_games,
+                        replay_examples=len(replay),
+                        teacher_replay_examples=len(teacher_replay),
+                        game_examples=len(examples),
+                        opponent_game=float(use_anchor),
+                        **metrics,
+                    )
                     bar.update(1)
                     bar.set_postfix(examples=len(replay), moves=int(metrics["moves"]), workers=workers)
     finally:
@@ -173,7 +204,7 @@ def train_self_play(
     # inference access to the same model parameters.
     if len(replay) >= training.batch_size:
         update_count = games * updates_per_game
-        for _ in tqdm(range(update_count), desc=f"optimising ({device})", unit="update", dynamic_ncols=True):
+        for update in tqdm(range(update_count), desc=f"optimising ({device})", unit="update", dynamic_ncols=True):
             teacher_count = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher_replay))
             self_play_count = training.batch_size - teacher_count
             if len(replay) < self_play_count:
@@ -184,11 +215,19 @@ def train_self_play(
                 examples_batch.extend(replay.sample(self_play_count, rng, training.priority_replay_fraction))
             if teacher_count:
                 examples_batch.extend(teacher_replay.sample(teacher_count, rng, training.priority_replay_fraction))
-            losses.append(train_batch(model, optimiser, stack_examples(examples_batch, device), training))
+            update_loss = train_batch(model, optimiser, stack_examples(examples_batch, device), training)
+            losses.append(update_loss)
+            run.log(
+                game=games,
+                update=update + 1,
+                replay_examples=len(replay),
+                teacher_replay_examples=len(teacher_replay),
+                **update_loss,
+            )
 
     if model_out is not None:
         save_model(model_out, model, model_config)
-    summary: Dict[str, float] = {
+    summary: Dict[str, float | str] = {
         "games": float(games),
         "workers": float(workers),
         "replay_examples": float(len(replay)),
@@ -210,4 +249,5 @@ def train_self_play(
             summary[name] = float(np.mean([loss[name] for loss in losses]))
     summary.update(inference.stats())
     summary.update(native_leaf_inference.stats())
+    summary["run_dir"] = str(run.finish(summary))
     return summary

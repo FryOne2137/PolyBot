@@ -10,7 +10,14 @@ from _bootstrap import add_local_source_root
 add_local_source_root()
 
 from polybot.infrastructure.device import select_device
-from polybot.training.cli import add_environment_options, mcts_config_from_args, print_summary, training_config_from_args
+from polybot.training.cli import (
+    add_environment_options,
+    add_run_options,
+    mcts_config_from_args,
+    print_summary,
+    training_config_from_args,
+    training_run_from_args,
+)
 from polybot.training.league import train_promotion_league
 
 
@@ -19,6 +26,7 @@ def main() -> None:
         description="Train SelfPlayPool candidates and save only checkpointed promotions"
     )
     add_environment_options(parser)
+    add_run_options(parser)
     parser.add_argument("--champion-in", type=Path, required=True, help="Initial frozen champion checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/league"))
     parser.add_argument("--checkpoint-prefix", default="champion")
@@ -62,6 +70,7 @@ def main() -> None:
         max_pending_leaves=args.max_pending_leaves,
         visible_action_history=args.visible_action_history,
         belief_retries=args.belief_retries,
+        run=training_run_from_args(args, "league"),
     ))
 
 

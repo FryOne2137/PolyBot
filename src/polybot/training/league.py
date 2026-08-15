@@ -17,6 +17,7 @@ from ..config import MCTSConfig, ModelConfig, TrainingConfig
 from ..evaluation.matches import evaluate_matches
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
+from .run_artifacts import TrainingRun
 from .self_play_pool_train import train_self_play_pool
 
 
@@ -53,6 +54,7 @@ def train_promotion_league(
     max_pending_leaves: int,
     visible_action_history: int,
     belief_retries: int,
+    run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train sequential candidates and retain only promotion-approved models.
 
@@ -73,12 +75,33 @@ def train_promotion_league(
         raise FileNotFoundError(f"champion checkpoint does not exist: {champion_in}")
 
     device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "league")
+    run.write_config(
+        training=training,
+        mcts=mcts,
+        stage={
+            "champion_in": champion_in,
+            "checkpoint_dir": checkpoint_dir,
+            "rounds": rounds,
+            "promotion_games": promotion_games,
+            "promotion_score": promotion_score,
+            "evaluation_seed": evaluation_seed,
+            "checkpoint_prefix": checkpoint_prefix,
+            "num_envs": num_envs,
+            "steps": steps,
+            "updates": updates,
+            "num_threads": num_threads,
+            "max_pending_leaves": max_pending_leaves,
+            "visible_action_history": visible_action_history,
+            "belief_retries": belief_retries,
+        },
+    )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     champion_path = champion_in
     next_checkpoint = _next_checkpoint_path(checkpoint_dir, checkpoint_prefix)
     promotions = 0
     last_candidate_score = 0.0
-    last_training: Dict[str, float] = {}
+    last_training: Dict[str, float | str] = {}
     last_match: Dict[str, float] = {}
 
     # Greedy evaluation and an unanchored prior ensure that the gate measures
@@ -109,6 +132,7 @@ def train_promotion_league(
             # Candidates remain only in RAM until the promotion gate passes.
             model_out=None,
             model=candidate,
+            run=run.child(f"round_{round_index:03d}"),
         )
 
         champion, champion_config = load_model(champion_path, device)
@@ -137,6 +161,15 @@ def train_promotion_league(
             print(f"league promotion {promotions}: saved {champion_path}", flush=True)
             next_checkpoint = _next_checkpoint_path(checkpoint_dir, checkpoint_prefix)
 
+        run.log(
+            round=round_index,
+            candidate_score=last_candidate_score,
+            promoted=float(promoted),
+            promotions=promotions,
+            **{f"train_{key}": value for key, value in last_training.items()},
+            **{f"match_{key}": value for key, value in last_match.items()},
+        )
+
         # Drop GPU references before the next candidate is loaded.  This does
         # not persist any rejected model or training state.
         del candidate, champion
@@ -151,4 +184,5 @@ def train_promotion_league(
     }
     summary.update({f"last_train_{key}": value for key, value in last_training.items()})
     summary.update({f"last_match_{key}": value for key, value in last_match.items()})
+    summary["run_dir"] = str(run.finish(summary))
     return summary

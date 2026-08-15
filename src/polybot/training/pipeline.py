@@ -86,6 +86,7 @@ def run_pipeline(
             positions=belief_positions,
             batch_size=belief_batch_size,
             model=model,
+            preserve_policy_value=model_in is not None,
         )
     teacher = {}
     if teacher_games:
@@ -197,7 +198,12 @@ def run_pipeline(
     if frozen_models and promotion_games:
         # Evaluation uses fixed seeds and alternate player slots. It writes no
         # games or metrics: only this compact terminal summary reaches stdout.
-        gate_mcts = replace(mcts_config, temperature=0.0)
+        gate_mcts = replace(
+            mcts_config,
+            temperature=0.0,
+            strategic_prior_weight=0.0,
+            teacher_prior_weight=0.0,
+        )
         match = evaluate_matches(
             model, device, training, gate_mcts, promotion_games, model_b=frozen_models[0],
         )

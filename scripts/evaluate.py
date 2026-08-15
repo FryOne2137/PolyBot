@@ -28,6 +28,10 @@ def main() -> None:
     parser.add_argument("--mcts-threads", type=int, help="C++ threads used by PolyEnv MctsPool; default uses logical cores")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
     parser.add_argument(
+        "--strategic-prior-weight", type=float, default=0.0,
+        help="Keep at 0.0 for a pure checkpoint comparison; nonzero values evaluate a hand-written curriculum.",
+    )
+    parser.add_argument(
         "--teacher-prior-weight", type=float, default=0.0,
         help="Set to a nonzero value only when evaluating the anchored search policy.",
     )
@@ -45,6 +49,7 @@ def main() -> None:
         inference_batch_size=args.inference_batch_size,
         native_threads=args.mcts_threads,
         native_max_actions=args.mcts_max_actions,
+        strategic_prior_weight=args.strategic_prior_weight,
         teacher_prior_weight=args.teacher_prior_weight,
     )
     print_summary(evaluate_matches(model_a, device, training, mcts, args.games, model_b))

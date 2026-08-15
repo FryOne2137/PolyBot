@@ -46,6 +46,7 @@ def main() -> None:
         max_moves_per_world=args.max_moves_per_world,
         model_out=args.model_out,
         model=model,
+        preserve_policy_value=args.model_in is not None,
     )
     print_summary(summary)
 

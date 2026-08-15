@@ -28,6 +28,7 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 from .global_mcts_train import _native_leaf_bias
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
+from .value_targets import Transition, assign_td_lambda_targets
 
 
 def _native_globals(state: np.ndarray, map_size: int, map_type: str) -> np.ndarray:
@@ -139,6 +140,32 @@ def _sample_root_rows(
             weights = weights / total
         rows[index] = int(weights.argmax()) if temperature <= 1e-5 else int(rng.choice(count, p=weights))
     return rows
+
+
+def _winner_from_terminal_values(values: np.ndarray) -> int:
+    """Recover the winning player from an exact zero-sum terminal vector."""
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    winners = np.flatnonzero(values > 0.0)
+    return int(winners[0]) if winners.size == 1 else -1
+
+
+def _finish_trajectory(
+    transitions: List[Transition],
+    training: TrainingConfig,
+    terminal_values: np.ndarray | None,
+) -> List[TrainingExample]:
+    """Backfill one whole episode before making it eligible for replay."""
+    examples = [example for _, _, example in transitions if example is not None]
+    winner = _winner_from_terminal_values(terminal_values) if terminal_values is not None else -1
+    assign_td_lambda_targets(examples, transitions, winner, training)
+    return examples
+
+
+def _scheduled_updates(completed_step: int, steps: int, updates: int) -> int:
+    """Cumulative optimiser budget due after a rollout step."""
+    if steps <= 0 or updates <= 0:
+        return 0
+    return min(updates, (completed_step * updates) // steps)
 
 
 @torch.inference_mode()
@@ -336,7 +363,7 @@ def train_self_play_pool(
     updates: int,
     num_threads: Optional[int] = None,
     max_pending_leaves: int = 4,
-    visible_action_history: int = 64,
+    visible_action_history: int = 0,
     belief_retries: int = 4,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
@@ -345,11 +372,13 @@ def train_self_play_pool(
 
     Per-slot validation/retry/reset keeps invalid detached belief worlds from
     stalling a whole vector. Full-map labels are read only after MCTS and are
-    used solely for the belief loss; terminal rows use native terminal values
-    and other rows a one-step TD target.
+    used solely for the belief loss. Completed trajectories are backfilled
+    from exact native terminal values and optimised between rollout steps.
     """
     if num_envs < 1 or steps < 1 or updates < 0:
         raise ValueError("num_envs and steps must be positive; updates must not be negative")
+    if training.max_moves < 1:
+        raise ValueError("training.max_moves must be positive")
     if mcts.simulations < 1:
         raise ValueError("MCTS simulations must be positive")
     if not 1 <= max_pending_leaves <= 8:
@@ -393,8 +422,11 @@ def train_self_play_pool(
     pool.configure_search(max_pending_leaves, 1.0, 0, 0)
     request, request_owners = _allocate_native_buffers(pool, "belief_batch_spec", device)
     root, root_owners = _allocate_native_buffers(pool, "root_policy_spec", device)
-    # Full ISMCTS has a detached tree per live env, player belief and particle.
-    leaf_capacity = num_envs * int(pool.player_count) * max(1, mcts.particles) * max_pending_leaves
+    # There is exactly one live MCTS tree per environment. Players and belief
+    # particles live *inside* that tree; they do not multiply the number of
+    # simultaneously selectable leaves. Allocating for them did nothing but
+    # pin up to 4x too much host RAM for the [leaf, action, feature] buffers.
+    leaf_capacity = num_envs * max_pending_leaves
     leaves, leaf_owners = _allocate_native_buffers(pool, "leaf_batch_spec", device, leaf_capacity)
     # Keep pinned tensor owners alive while C++ writes into their NumPy views.
     _ = (request_owners, root_owners, leaf_owners)
@@ -402,7 +434,11 @@ def train_self_play_pool(
     replay = ReplayBuffer(training.replay_capacity)
     rng = np.random.default_rng(training.seed ^ 0x51F0A7)
     pending: List[Tuple[TrainingExample, int, float] | None] = [None] * num_envs
+    trajectories: List[List[Transition]] = [[] for _ in range(num_envs)]
+    episode_moves = np.zeros(num_envs, dtype=np.int32)
     terminal_episodes = 0
+    truncated_episodes = 0
+    discarded_episodes = 0
     truncated_roots = 0
     completed_targets = 0
     leaf_counts: List[int] = []
@@ -411,10 +447,54 @@ def train_self_play_pool(
     belief_fallback_rows = 0
     belief_rejections: Dict[str, int] = {}
     belief_reset_reasons: Dict[str, int] = {}
+    losses: List[Dict[str, float]] = []
+    optimisation_updates = 0
     model.eval()
+
+    def optimise_until(target: int) -> None:
+        nonlocal optimisation_updates
+        while optimisation_updates < target and len(replay) >= training.batch_size:
+            batch = replay.sample(training.batch_size, rng, training.priority_replay_fraction)
+            losses.append(train_batch(model, optimiser, stack_examples(batch, device), training))
+            optimisation_updates += 1
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
         for step in range(steps):
+            # ``request`` is the successor batch written by the previous
+            # ``step_into_checked`` call. With auto-reset it already contains
+            # the next episode's root, while ``terminated`` and
+            # ``terminal_values`` still describe the transition just taken.
+            terminal = np.asarray(request["terminated"], dtype=bool)
+            terminal_values = np.asarray(request["terminal_values"], dtype=np.float32)
+            for index, old in enumerate(pending):
+                if old is not None:
+                    example, actor, reward = old
+                    trajectories[index].append((actor, reward, example))
+                    pending[index] = None
+
+            truncated = (~terminal) & (episode_moves >= training.max_moves)
+            finished = terminal | truncated
+            for index in np.flatnonzero(finished):
+                exact_values = terminal_values[index] if terminal[index] else None
+                finished_examples = _finish_trajectory(trajectories[index], training, exact_values)
+                replay.extend(finished_examples)
+                completed_targets += len(finished_examples)
+                trajectories[index].clear()
+                episode_moves[index] = 0
+            terminal_episodes += int(terminal.sum())
+            truncated_episodes += int(truncated.sum())
+
+            # Auto-reset handles genuine terminal games. A trainer-imposed
+            # horizon must explicitly reset only the affected native slots.
+            truncated_rows = np.flatnonzero(truncated).astype(np.int32)
+            if truncated_rows.size:
+                pool.reset_slots(truncated_rows)
+                pool.belief_requests_into(request)
+
+            # ``train_batch`` deliberately leaves the module in train mode.
+            # Search must be deterministic with dropout disabled, and it must
+            # use the weights produced by the most recent online updates.
+            model.eval()
             root_tensors = native_batch_to_tensors(request, device, training.map_size, training.map_type)
             with torch.inference_mode():
                 root_output = model(
@@ -503,7 +583,13 @@ def train_self_play_pool(
                     rows = np.arange(num_envs, dtype=np.int32)
                     pool.reset_slots(rows)
                     pool.belief_requests_into(request)
+                    discarded_episodes += sum(bool(row) for row in trajectories)
+                    trajectories = [[] for _ in range(num_envs)]
+                    pending = [None] * num_envs
+                    episode_moves.fill(0)
                     belief_reset_rows += num_envs
+                    optimise_until(_scheduled_updates(step + 1, steps, updates))
+                    progress.update(1)
                     continue
 
             # One select call returns up to B * pending leaves. The native
@@ -511,6 +597,10 @@ def train_self_play_pool(
             # The first unexpanded root yields only one leaf per tree; after
             # that, each call can reserve ``max_pending_leaves`` paths.
             waves = 1 + int(np.ceil(max(0, mcts.simulations - 1) / max_pending_leaves))
+            # The hand-written curriculum is useful only while the network is
+            # weak. Annealing it to zero forces later MCTS targets to come from
+            # the learned policy/value instead of permanently cloning a prior.
+            curriculum_scale = 0.0 if steps == 1 else max(0.0, 1.0 - step / (steps - 1))
             for _ in range(waves):
                 leaf_count = int(pool.select_leaves_into(leaves, max_leaves=leaf_capacity))
                 leaf_counts.append(leaf_count)
@@ -529,13 +619,16 @@ def train_self_play_pool(
                     )
                     logits = leaf_output.policy_logits + _native_leaf_bias(
                         leaf_tensors.action_categorical, leaf_tensors.action_continuous,
-                        leaf_tensors.action_mask, mcts.teacher_prior_weight,
+                        leaf_tensors.action_mask,
+                        mcts.teacher_prior_weight * curriculum_scale,
+                        mcts.strategic_prior_weight * curriculum_scale,
                     ).to(leaf_output.policy_logits.dtype)
                 pool.expand_and_backup(
                     np.asarray(leaf_batch["leaf_id"], dtype=np.uint64),
                     logits.float().cpu().numpy(),
                     leaf_output.value.float().cpu().numpy(),
                 )
+                del logits, leaf_output, leaf_tensors
 
             pool.root_policy_into(root, temperature=1.0)
             root_action_counts = np.asarray(root["action_mask"], dtype=np.uint8).sum(axis=1)
@@ -556,31 +649,10 @@ def train_self_play_pool(
                 )
             root_values = np.asarray(root["root_value"], dtype=np.float32)
             next_players = np.asarray(request["to_play"], dtype=np.int64)
-            terminal = np.asarray(request["terminated"], dtype=bool)
-            terminal_values = np.asarray(request["terminal_values"], dtype=np.float32)
-            # Complete the prior action only after MCTS has evaluated its
-            # successor state. Auto-reset terminal rows use the exact vector
-            # terminal payoff rather than the next episode's root value.
-            for index, old in enumerate(pending):
-                if old is None:
-                    continue
-                example, actor, reward = old
-                if terminal[index]:
-                    example.value_target = float(terminal_values[index, actor])
-                    terminal_episodes += 1
-                else:
-                    sign = 1.0 if int(next_players[index]) == actor else -1.0
-                    example.value_target = float(np.clip(
-                        training.shaping_target_weight * reward
-                        + training.reward_discount * sign * root_values[index],
-                        -1.0,
-                        1.0,
-                    ))
-                replay.extend([example])
-                completed_targets += 1
-
             belief_targets = np.asarray(pool.belief_targets_numpy(state_ids), dtype=np.int32)
             examples = _root_examples(request, root, training, belief_targets)
+            for index, example in enumerate(examples):
+                example.bootstrap_value = float(root_values[index])
             action_rows = _sample_root_rows(root, rng, mcts.temperature)
             action_features = np.asarray(request["action_features"], dtype=np.int64)
             chosen = action_features[np.arange(num_envs), action_rows]
@@ -601,20 +673,41 @@ def train_self_play_pool(
                 actions.astype(np.int32, copy=False),
                 np.asarray(root["state_id"], dtype=np.uint64), request,
             )
+            episode_moves += 1
+            # Release large inference-only tensors before the backward pass.
+            del root_output, root_tensors
+            optimise_until(_scheduled_updates(step + 1, steps, updates))
             progress.update(1)
             if (step + 1) % 10 == 0 or step == 0:
                 progress.set_postfix(
                     env_steps=(step + 1) * num_envs,
-                    replay=len(replay), terminals=terminal_episodes,
+                    replay=len(replay), terminals=terminal_episodes, updates=optimisation_updates,
                     fallbacks=belief_fallback_rows, resets=belief_reset_rows,
                 )
 
-    losses: List[Dict[str, float]] = []
-    for _ in tqdm(range(updates), desc=f"SelfPlayPool optimising ({device})", unit="update", dynamic_ncols=True):
-        if len(replay) < training.batch_size:
-            break
-        batch = replay.sample(training.batch_size, rng, training.priority_replay_fraction)
-        losses.append(train_batch(model, optimiser, stack_examples(batch, device), training))
+    # Consume the transition produced by the final vector step as well. There
+    # is no following loop iteration to do this automatically.
+    terminal = np.asarray(request["terminated"], dtype=bool)
+    terminal_values = np.asarray(request["terminal_values"], dtype=np.float32)
+    for index, old in enumerate(pending):
+        if old is not None:
+            example, actor, reward = old
+            trajectories[index].append((actor, reward, example))
+    truncated = (~terminal) & (episode_moves >= training.max_moves)
+    finished = terminal | truncated
+    for index in np.flatnonzero(finished):
+        exact_values = terminal_values[index] if terminal[index] else None
+        finished_examples = _finish_trajectory(trajectories[index], training, exact_values)
+        replay.extend(finished_examples)
+        completed_targets += len(finished_examples)
+        trajectories[index].clear()
+    terminal_episodes += int(terminal.sum())
+    truncated_episodes += int(truncated.sum())
+    unfinished_episodes = sum(bool(rows) for rows in trajectories)
+
+    # Catch up only if early rollout steps had too little completed data. In a
+    # normal run nearly all updates have already happened between MCTS steps.
+    optimise_until(updates)
 
     if model_out is not None:
         save_model(model_out, model, model_config)
@@ -627,7 +720,13 @@ def train_self_play_pool(
         "self_play_pool_pending_leaves": float(max_pending_leaves),
         "self_play_pool_visible_action_history": float(visible_action_history),
         "self_play_pool_terminals": float(terminal_episodes),
+        "self_play_pool_truncated_episodes": float(truncated_episodes),
+        "self_play_pool_discarded_episodes": float(discarded_episodes),
+        "self_play_pool_unfinished_episodes": float(unfinished_episodes),
         "self_play_pool_completed_targets": float(completed_targets),
+        "self_play_pool_optimisation_updates": float(optimisation_updates),
+        "self_play_pool_online_updates": 1.0,
+        "self_play_pool_final_curriculum_scale": 0.0,
         "self_play_pool_belief_retries": float(belief_retries_used),
         "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
         "self_play_pool_belief_reset_rows": float(belief_reset_rows),

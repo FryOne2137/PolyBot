@@ -41,7 +41,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--self-play-pool-updates", type=int, default=0,
-        help="Optimiser updates after the SelfPlayPool rollout is collected in RAM.",
+        help="Total optimiser updates interleaved with the SelfPlayPool rollout.",
     )
     parser.add_argument("--self-play-pool-threads", type=int, help="Native worker threads owned by SelfPlayPool")
     parser.add_argument(
@@ -55,13 +55,14 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--exploration-rate", type=float, default=0.20)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
-    parser.add_argument("--td-lambda", type=float, default=0.80)
+    parser.add_argument("--td-lambda", type=float, default=1.0)
     parser.add_argument("--teacher-policy-target-weight", type=float, default=0.10)
     parser.add_argument("--teacher-replay-fraction", type=float, default=0.35)
     parser.add_argument("--simulations", type=int, default=64)
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--mcts-threads", type=int)
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
     parser.add_argument("--workers", type=int, default=32, help="active games in the native global MctsPool")
     parser.add_argument("--model-in", type=Path)

@@ -176,6 +176,7 @@ class BeliefMCTS:
                 attack_bonus=self.config.attack_prior_bonus,
                 end_turn_penalty=self.config.end_turn_prior_penalty,
             )
+            bias *= float(np.clip(self.config.strategic_prior_weight, 0.0, 1.0))
             logits[row, :bias.size] += torch.as_tensor(
                 bias, dtype=logits.dtype, device=logits.device
             )
@@ -294,14 +295,15 @@ class BeliefMCTS:
         action_type = categorical[..., 0]
         tile_action = categorical[..., 9]
         damage = continuous[..., 2].clamp_min(0)
-        bias = torch.zeros_like(action_type, dtype=torch.float32)
-        bias = bias + ((action_type == 8) & (tile_action == 14)).float() * self.config.capture_city_prior_bonus
-        bias = bias + ((action_type == 8) & (tile_action == 11)).float() * self.config.found_city_prior_bonus
-        bias = bias + (action_type == 1).float() * (
+        curriculum = torch.zeros_like(action_type, dtype=torch.float32)
+        curriculum = curriculum + ((action_type == 8) & (tile_action == 14)).float() * self.config.capture_city_prior_bonus
+        curriculum = curriculum + ((action_type == 8) & (tile_action == 11)).float() * self.config.found_city_prior_bonus
+        curriculum = curriculum + (action_type == 1).float() * (
             self.config.attack_prior_bonus + damage.clamp_max(10.0) * 0.12
         )
-        bias = bias + ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
-        bias = bias - (action_type == 3).float() * self.config.end_turn_prior_penalty
+        curriculum = curriculum + ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
+        curriculum = curriculum - (action_type == 3).float() * self.config.end_turn_prior_penalty
+        bias = curriculum * float(np.clip(self.config.strategic_prior_weight, 0.0, 1.0))
         # Keep a small, explicitly configurable teacher anchor during early
         # search.  It only sees the dense legal-action packet, never hidden
         # state, and is gradually reduced by the training pipeline.

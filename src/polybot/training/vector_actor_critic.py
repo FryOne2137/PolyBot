@@ -19,6 +19,15 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 from .vector_teacher import _teacher_targets, _vector_tensors
 
 
+def _normalise_advantage(advantage: torch.Tensor) -> torch.Tensor:
+    """Standardise a rollout batch without producing NaN for one env."""
+    if advantage.numel() < 2:
+        return advantage
+    return (advantage - advantage.mean()) / advantage.std(
+        unbiased=False
+    ).clamp_min(1e-4)
+
+
 def _visible_action_reward(features: np.ndarray, rows: np.ndarray) -> np.ndarray:
     """Dense, visible-only curriculum reward for early flat self-play.
 
@@ -133,7 +142,7 @@ def train_vector_actor_critic(
                 td_target = reward_tensor + gamma * (1.0 - done) * sign * next_output.value
 
             advantage = td_target - output.value
-            normalised_advantage = (advantage - advantage.mean()) / advantage.std().clamp_min(1e-4)
+            normalised_advantage = _normalise_advantage(advantage)
             policy_loss = -(log_probability * normalised_advantage.detach()).mean()
             critic_loss = F.smooth_l1_loss(output.value, td_target)
             log_probabilities = F.log_softmax(output.policy_logits, dim=-1)

@@ -51,6 +51,30 @@ def assign_td_lambda_targets(
     gamma = float(np.clip(training.reward_discount, 0.0, 1.0))
     reward_weight = float(training.shaping_target_weight)
 
+    # With pure Monte Carlo targets the network predicts the eventual game
+    # result, not "a win discounted by how many moves remain".  MCTS backs up
+    # terminal +/-1 without a depth discount too, so decaying that signal here
+    # would make the value head inconsistent with its search consumer.  Keep
+    # gamma only on the deliberately weak shaping return.
+    if lambda_ >= 1.0 - 1e-12:
+        players = {example.player_id for _, example in positions}
+        shaping_returns = {player: 0.0 for player in players}
+        for actor, shaped_reward, example in reversed(transitions):
+            for player in players:
+                sign = 1.0 if int(actor) == player else -1.0
+                shaping_returns[player] = (
+                    reward_weight * sign * float(shaped_reward)
+                    + gamma * shaping_returns[player]
+                )
+            if example is not None:
+                example.value_target = float(np.clip(
+                    _terminal_value(winner, example.player_id)
+                    + shaping_returns[example.player_id],
+                    -1.0,
+                    1.0,
+                ))
+        return
+
     for position_index in range(len(positions) - 1, -1, -1):
         transition_index, example = positions[position_index]
         next_position = positions[position_index + 1] if position_index + 1 < len(positions) else None

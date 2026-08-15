@@ -35,7 +35,7 @@ def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         exploration_rate=getattr(args, "exploration_rate", 0.20),
         priority_replay_fraction=getattr(args, "priority_replay_fraction", 0.35),
         teacher_policy_target_weight=getattr(args, "teacher_policy_target_weight", 0.10),
-        td_lambda=getattr(args, "td_lambda", 0.80),
+        td_lambda=getattr(args, "td_lambda", 1.0),
         learning_rate=args.learning_rate,
     )
 
@@ -47,6 +47,7 @@ def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
         inference_batch_size=getattr(args, "inference_batch_size", 32),
         native_threads=getattr(args, "mcts_threads", None),
         native_max_actions=getattr(args, "mcts_max_actions", 1024),
+        strategic_prior_weight=getattr(args, "strategic_prior_weight", 1.0),
         teacher_prior_weight=getattr(args, "teacher_prior_weight", 0.20),
     )
 

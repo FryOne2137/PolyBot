@@ -54,7 +54,12 @@ def native_batch_to_tensors(
     throughput.
     """
     state = np.asarray(batch["state"], dtype=np.int32)
-    features = np.asarray(batch["action_features"], dtype=np.int64)
+    # PolyEnv already emits compact int32 action features.  Do not widen this
+    # entire [leaves, actions, 17] tensor on CPU: with 512 MCTS leaves and
+    # 1024 actions that transient copy alone costs about 34 MiB (or 68 MiB as
+    # int64) and can exhaust pinned/pageable host memory on Windows.  Only the
+    # selected categorical columns are widened later, directly on the device.
+    features = np.asarray(batch["action_features"], dtype=np.int32)
     count = state.shape[0]
     global_features = np.empty((count, 9), dtype=np.float32)
     global_features[:, 0] = state[:, 0] / 100.0

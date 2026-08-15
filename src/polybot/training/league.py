@@ -83,7 +83,9 @@ def train_promotion_league(
 
     # Greedy evaluation and an unanchored prior ensure that the gate measures
     # the checkpoint rather than stochastic exploration or teacher bias.
-    evaluation_mcts = replace(mcts, temperature=0.0, teacher_prior_weight=0.0)
+    evaluation_mcts = replace(
+        mcts, temperature=0.0, strategic_prior_weight=0.0, teacher_prior_weight=0.0
+    )
 
     for round_index in range(1, rounds + 1):
         round_training = replace(training, seed=training.seed + round_index - 1)

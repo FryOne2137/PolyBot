@@ -24,6 +24,27 @@ from .optimisation import belief_loss
 from .replay_buffer import TrainingExample
 
 
+_BELIEF_ONLY_PREFIXES = (
+    "belief_action_",
+    "belief_settlement_context",
+    "belief_unit_context",
+    "belief_heads",
+)
+
+
+def _configure_belief_only_training(model: PolicyValueBeliefNet) -> Dict[str, bool]:
+    """Freeze every parameter that can change policy/value behaviour."""
+    original = {name: parameter.requires_grad for name, parameter in model.named_parameters()}
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(name.startswith(_BELIEF_ONLY_PREFIXES))
+    return original
+
+
+def _restore_trainable_parameters(model: PolicyValueBeliefNet, original: Dict[str, bool]) -> None:
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(original[name])
+
+
 def _new_environment(seed: int, config: TrainingConfig) -> object:
     try:
         from PolyEnv import Bardur, GameEnv, Imperius
@@ -95,6 +116,7 @@ def warmup_belief(
     max_moves_per_world: int = 96,
     model_out: Optional[Path] = None,
     model: PolicyValueBeliefNet | None = None,
+    preserve_policy_value: bool = False,
 ) -> Dict[str, float]:
     """Learn belief on naturally foggy, action-diverse random positions.
 
@@ -109,8 +131,14 @@ def warmup_belief(
         raise ValueError("max_moves_per_world must be positive")
     device = select_device(training.device)
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
+    original_trainable = (
+        _configure_belief_only_training(model) if preserve_policy_value else None
+    )
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise RuntimeError("belief warm-up has no trainable parameters")
     optimiser = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=training.learning_rate,
         weight_decay=training.weight_decay,
     )
@@ -122,48 +150,52 @@ def warmup_belief(
     moves_in_world = 0
     accepted_hidden_tiles: List[int] = []
     progress_description = f"belief warm-up ({device})"
-    with tqdm(
-        total=positions,
-        desc=progress_description,
-        unit="position",
-        dynamic_ncols=True,
-    ) as progress:
-        position = 0
-        while position < positions:
-            example = _belief_example(env)
-            hidden_tiles = int(example.hidden_mask.sum())
-            # Do not let nearly solved boards dominate supervised completion.
-            # This is a natural curriculum: no previously seen tile is hidden
-            # artificially, so the model still receives a valid player view.
-            if hidden_tiles < min_hidden_tiles or moves_in_world >= max_moves_per_world:
-                environment_index += 1
-                env = _new_environment(training.seed + environment_index, training)
-                moves_in_world = 0
-                continue
+    try:
+        with tqdm(
+            total=positions,
+            desc=progress_description,
+            unit="position",
+            dynamic_ncols=True,
+        ) as progress:
+            position = 0
+            while position < positions:
+                example = _belief_example(env)
+                hidden_tiles = int(example.hidden_mask.sum())
+                # Do not let nearly solved boards dominate supervised completion.
+                # This is a natural curriculum: no previously seen tile is hidden
+                # artificially, so the model still receives a valid player view.
+                if hidden_tiles < min_hidden_tiles or moves_in_world >= max_moves_per_world:
+                    environment_index += 1
+                    env = _new_environment(training.seed + environment_index, training)
+                    moves_in_world = 0
+                    continue
 
-            pending.append(example)
-            accepted_hidden_tiles.append(hidden_tiles)
-            legal_ids = np.asarray(env.model_request_numpy()["actions"]["action_id"], dtype=np.int64)
-            env.step_fast(int(rng.choice(legal_ids)))
-            moves_in_world += 1
+                pending.append(example)
+                accepted_hidden_tiles.append(hidden_tiles)
+                legal_ids = np.asarray(env.model_request_numpy()["actions"]["action_id"], dtype=np.int64)
+                env.step_fast(int(rng.choice(legal_ids)))
+                moves_in_world += 1
 
-            if len(pending) == batch_size:
-                latest_loss = _belief_update(model, optimiser, pending, device)
-                losses.append(latest_loss)
-                pending.clear()
-                progress.set_postfix(
-                    belief_loss=f"{latest_loss:.4f}",
-                    hidden_tiles=hidden_tiles,
-                )
-            progress.update(1)
-            if env.is_done():
-                environment_index += 1
-                env = _new_environment(training.seed + environment_index, training)
-                moves_in_world = 0
-            position += 1
+                if len(pending) == batch_size:
+                    latest_loss = _belief_update(model, optimiser, pending, device)
+                    losses.append(latest_loss)
+                    pending.clear()
+                    progress.set_postfix(
+                        belief_loss=f"{latest_loss:.4f}",
+                        hidden_tiles=hidden_tiles,
+                    )
+                progress.update(1)
+                if env.is_done():
+                    environment_index += 1
+                    env = _new_environment(training.seed + environment_index, training)
+                    moves_in_world = 0
+                position += 1
 
-    if pending:
-        losses.append(_belief_update(model, optimiser, pending, device))
+        if pending:
+            losses.append(_belief_update(model, optimiser, pending, device))
+    finally:
+        if original_trainable is not None:
+            _restore_trainable_parameters(model, original_trainable)
     if model_out is not None:
         save_model(model_out, model, model_config)
     return {
@@ -171,4 +203,5 @@ def warmup_belief(
         "belief_loss": float(np.mean(losses)) if losses else 0.0,
         "mean_hidden_tiles": float(np.mean(accepted_hidden_tiles)) if accepted_hidden_tiles else 0.0,
         "min_hidden_tiles": float(min_hidden_tiles),
+        "preserved_policy_value": float(preserve_policy_value),
     }

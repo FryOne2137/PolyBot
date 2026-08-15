@@ -30,7 +30,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--exploration-rate", type=float, default=0.20)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
-    parser.add_argument("--td-lambda", type=float, default=0.80, help="TD(lambda) mix for MCTS value targets.")
+    parser.add_argument("--td-lambda", type=float, default=1.0, help="1.0 propagates the exact final result through the full game.")
     parser.add_argument(
         "--teacher-policy-target-weight", type=float, default=0.10,
         help="Blend this fraction of the legal-action teacher into each MCTS policy target.",
@@ -56,6 +56,7 @@ def main() -> None:
     parser.add_argument("--inference-batch-size", type=int, default=32)
     parser.add_argument("--mcts-threads", type=int, help="C++ threads used by PolyEnv MctsPool; default uses logical cores")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument(
         "--teacher-prior-weight", type=float, default=0.20,
         help="Legal-action teacher anchor inside MCTS priors; use 0.0 for pure network search.",

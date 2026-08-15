@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -48,16 +48,18 @@ def _native_leaf_bias(
     continuous: torch.Tensor,
     mask: torch.Tensor,
     teacher_prior_weight: float,
+    strategic_prior_weight: float = 1.0,
 ) -> torch.Tensor:
     """Visible-only priors for every native MCTS leaf, not just the root."""
     action_type, tile_action = categorical[..., 0], categorical[..., 9]
     damage = continuous[..., 2].clamp_min(0)
-    bias = torch.zeros_like(action_type, dtype=torch.float32)
-    bias += ((action_type == 8) & (tile_action == 14)).float() * 2.0  # capture city
-    bias += ((action_type == 8) & (tile_action == 11)).float() * 3.0  # found city
-    bias += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
-    bias += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
-    bias -= (action_type == 3).float() * 2.0
+    curriculum = torch.zeros_like(action_type, dtype=torch.float32)
+    curriculum += ((action_type == 8) & (tile_action == 14)).float() * 2.0  # capture city
+    curriculum += ((action_type == 8) & (tile_action == 11)).float() * 3.0  # found city
+    curriculum += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
+    curriculum += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
+    curriculum -= (action_type == 3).float() * 2.0
+    bias = curriculum * float(np.clip(strategic_prior_weight, 0.0, 1.0))
     # The network still supplies every prior.  This decaying additive anchor
     # only stops early self-play from unlearning city capture/founding before
     # terminal games become common.  It is computed entirely from legal,
@@ -146,6 +148,7 @@ def _plan_many(
             found_city_bonus=config.found_city_prior_bonus, attack_bonus=config.attack_prior_bonus,
             end_turn_penalty=config.end_turn_prior_penalty,
         )
+        bias *= float(np.clip(config.strategic_prior_weight, 0.0, 1.0))
         logits[row, :bias.size] += torch.as_tensor(bias, dtype=logits.dtype, device=device)
     probabilities = torch.softmax(logits, dim=-1).cpu().numpy()
     for row, packet in enumerate(packets):
@@ -202,7 +205,7 @@ def _plan_many(
         )
         leaf_logits = leaf_output.policy_logits + _native_leaf_bias(
             leaf_tensors.action_categorical, leaf_tensors.action_continuous, leaf_tensors.action_mask,
-            config.teacher_prior_weight,
+            config.teacher_prior_weight, config.strategic_prior_weight,
         ).to(leaf_output.policy_logits.dtype)
         pool.expand_and_backup(
             leaf_ids, leaf_logits.float().cpu().numpy(),
@@ -313,6 +316,33 @@ def train_global_mcts_self_play(
     active: List[_Episode] = []
     summaries: Dict[str, float] = {}
     frozen_opponent_games = 0
+    losses: List[Dict[str, float]] = []
+    optimisation_updates = 0
+
+    def optimise_until(target: int, current_teacher_fraction: float) -> None:
+        nonlocal optimisation_updates
+        desired_teacher = int(round(
+            training.batch_size * float(np.clip(current_teacher_fraction, 0.0, 1.0))
+        ))
+        while optimisation_updates < target:
+            teacher_count = min(desired_teacher, len(teacher))
+            self_play_count = training.batch_size - teacher_count
+            if self_play_count > len(replay):
+                teacher_count = min(len(teacher), teacher_count + self_play_count - len(replay))
+                self_play_count = training.batch_size - teacher_count
+            if self_play_count > len(replay) or teacher_count > len(teacher):
+                break
+            rows = replay.sample(
+                self_play_count, sample_rng, training.priority_replay_fraction
+            ) if self_play_count else []
+            rows += teacher.sample(
+                teacher_count, sample_rng, training.priority_replay_fraction
+            ) if teacher_count else []
+            if len(rows) < training.batch_size:
+                break
+            losses.append(train_batch(model, optimiser, stack_examples(rows, device), training))
+            optimisation_updates += 1
+
     model.eval()
     # Persist only the requested model path before native MCTS begins. It is
     # overwritten by later stages/final training and never contains replay,
@@ -322,6 +352,13 @@ def train_global_mcts_self_play(
         save_model(model_out, model, model_config)
     with tqdm(total=games, desc=f"global native MCTS ({device})", unit="env", dynamic_ncols=True) as bar:
         while done < games:
+            model.eval()
+            curriculum_scale = 0.0 if games == 1 else max(0.0, 1.0 - done / (games - 1))
+            search_mcts = replace(
+                mcts,
+                strategic_prior_weight=mcts.strategic_prior_weight * curriculum_scale,
+                teacher_prior_weight=mcts.teacher_prior_weight * curriculum_scale,
+            )
             while next_game < games and len(active) < active_envs:
                 anchor = opponent in {"random", "heuristic", "model"} or (
                     opponent == "mixed" and schedule_rng.random() < random_opponent_rate
@@ -358,21 +395,25 @@ def train_global_mcts_self_play(
             # Their positions intentionally never enter the candidate replay.
             for frozen_index, episodes in frozen_turns.items():
                 for index, visits, priors, _ in _plan_many(
-                    episodes, frozen_models[frozen_index], device, training, mcts,
+                    episodes, frozen_models[frozen_index], device, training, search_mcts,
                 ):
-                    row, _ = _search_action(visits, priors, episodes[index].rng, mcts)
+                    row, _ = _search_action(visits, priors, episodes[index].rng, search_mcts)
                     _apply_action(episodes[index], row, False, None, training)
             if model_turns:
-                for index, visits, priors, bootstrap_value in _plan_many(model_turns, model, device, training, mcts):
+                for index, visits, priors, bootstrap_value in _plan_many(
+                    model_turns, model, device, training, search_mcts
+                ):
                     episode = model_turns[index]
-                    _, search_policy = _search_action(visits, priors, episode.rng, mcts)
+                    _, search_policy = _search_action(visits, priors, episode.rng, search_mcts)
                     policy = search_policy
-                    target_anchor = float(np.clip(training.teacher_policy_target_weight, 0.0, 1.0))
+                    target_anchor = float(
+                        np.clip(training.teacher_policy_target_weight * curriculum_scale, 0.0, 1.0)
+                    )
                     if target_anchor:
                         teacher_target = teacher_policy(episode.env.model_request_numpy())
                         policy = (1.0 - target_anchor) * policy + target_anchor * teacher_target
-                    row, _ = _search_action(visits, priors, episode.rng, mcts)
-                    if episode.rng.random() < training.exploration_rate:
+                    row, _ = _search_action(visits, priors, episode.rng, search_mcts)
+                    if episode.rng.random() < training.exploration_rate * curriculum_scale:
                         bias = strategic_action_bias(episode.env.model_request_numpy())
                         weights = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))
                         row = int(episode.rng.choice(len(weights), p=weights / weights.sum()))
@@ -384,15 +425,18 @@ def train_global_mcts_self_play(
                 if teacher_replay_fraction > 0.0:
                     teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + episode.index, training); teacher.extend(teacher_examples)
                 searched_episodes = len(model_turns) + sum(len(rows) for rows in frozen_turns.values())
-                bar.set_postfix(replay=len(replay), active=len(active), trees=searched_episodes * mcts.particles)
-    losses = []
+                bar.set_postfix(
+                    replay=len(replay), active=len(active), updates=optimisation_updates,
+                    trees=searched_episodes * mcts.particles,
+                )
+            update_scale = 0.0 if games == 1 else max(0.0, 1.0 - done / (games - 1))
+            optimise_until(
+                done * updates_per_game,
+                teacher_replay_fraction * update_scale,
+            )
+
+    optimise_until(games * updates_per_game, 0.0)
     bootstrap_examples = sum(example.bootstrap_value is not None for example in replay._examples)
-    for update in tqdm(range(games * updates_per_game), desc=f"optimising ({device})", unit="update", dynamic_ncols=True):
-        if len(replay) < training.batch_size: break
-        tc = min(int(round(training.batch_size * teacher_replay_fraction)), len(teacher)); sc = training.batch_size - tc
-        rows = replay.sample(sc, sample_rng, training.priority_replay_fraction) if sc else []
-        rows += teacher.sample(tc, sample_rng, training.priority_replay_fraction) if tc else []
-        losses.append(train_batch(model, optimiser, stack_examples(rows, device), training))
     if model_out: save_model(model_out, model, model_config)
     result = {
         "games": float(games), "active_envs": float(active_envs), "replay_examples": float(len(replay)),
@@ -400,7 +444,11 @@ def train_global_mcts_self_play(
         "mcts_value_bootstrap_fraction": float(bootstrap_examples / max(1, len(replay))),
         "native_mcts_threads": float(_transient_pool_threads(mcts.native_threads)),
         "frozen_opponent_games": float(frozen_opponent_games),
+        "optimisation_updates": float(optimisation_updates),
+        "online_updates": 1.0,
+        "final_curriculum_scale": 0.0,
     }
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
-    if losses: result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
+    if losses:
+        result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
     return result

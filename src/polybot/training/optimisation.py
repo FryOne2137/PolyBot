@@ -10,7 +10,23 @@ from torch.nn import functional as F
 
 from ..config import TrainingConfig
 from ..data.token_schema import MAP_FEATURE_MAX
-from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..models.policy_value_belief import (
+    CITY_PARTICLE_FEATURES,
+    SAFE_PARTICLE_FEATURES,
+    UNIT_PARTICLE_FEATURES,
+    PolicyValueBeliefNet,
+)
+
+
+# Train exactly the semantic fields consumed by the constrained belief-world
+# decoder.  Columns 6, 15 and 22 are runtime city IDs whose numeric values are
+# arbitrary within one game; treating them as categorical classes teaches no
+# transferable map structure.  Visibility/cloak columns 0 and 1 are omitted as
+# well because completion preserves/derives them instead of sampling them.
+BELIEF_LOSS_FEATURES = frozenset(
+    (*SAFE_PARTICLE_FEATURES, 14, *CITY_PARTICLE_FEATURES, *UNIT_PARTICLE_FEATURES)
+)
+BELIEF_RUNTIME_ID_FEATURES = frozenset((6, 15, 22))
 
 
 def belief_loss(
@@ -18,16 +34,25 @@ def belief_loss(
     full_map_target: torch.Tensor,
     hidden_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Cross-entropy for hidden tiles, including rare structural entities.
+    """Field-aware cross-entropy for semantic values on hidden tiles.
 
     City/unit attributes are undefined outside their owning entity.  Training
     them there would teach the decoder that ``-1`` is the only useful answer.
     Their losses are therefore evaluated only on hidden city/unit rows; the
     presence heads get a moderate rare-class weight so a belief world can learn
-    to place actual cities and units instead of only terrain.
+    to place actual cities and units instead of only terrain. Runtime IDs and
+    fields not sampled by the belief-world decoder contribute no gradient.
     """
+    logits_by_feature = tuple(belief_logits)
+    if len(logits_by_feature) != len(MAP_FEATURE_MAX):
+        raise ValueError(
+            f"belief_loss expected {len(MAP_FEATURE_MAX)} feature heads, "
+            f"got {len(logits_by_feature)}"
+        )
     feature_losses = []
-    for column, (logits, largest_value) in enumerate(zip(belief_logits, MAP_FEATURE_MAX)):
+    for column in sorted(BELIEF_LOSS_FEATURES):
+        logits = logits_by_feature[column]
+        largest_value = MAP_FEATURE_MAX[column]
         labels = (full_map_target[..., column] + 1).clamp(0, largest_value + 1)
         per_tile = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
         loss_mask = hidden_mask.bool()

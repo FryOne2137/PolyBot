@@ -45,6 +45,10 @@ class MCTSConfig:
     found_city_prior_bonus: float = 3.0
     attack_prior_bonus: float = 0.8
     end_turn_prior_penalty: float = 2.0
+    # Scale the hand-written visible-action curriculum independently from the
+    # network. Training starts with this aid and anneals it away; evaluation
+    # sets it to zero so a match measures the checkpoint itself.
+    strategic_prior_weight: float = 1.0
     # Blend a small amount of the legal-action teacher into early MCTS priors.
     # It is a training aid only; the neural network still scores every leaf.
     teacher_prior_weight: float = 0.20
@@ -76,12 +80,14 @@ class TrainingConfig:
     cities_weight: float = 0.12
     city_capture_reward: float = 1.0
     capital_capture_reward: float = 4.0
-    shaping_target_weight: float = 0.20
+    # Keep dense hints well below the exact terminal +/-1 return. Larger
+    # values can make repeated captures outweigh actually winning the game.
+    shaping_target_weight: float = 0.05
     reward_discount: float = 0.997
     # MCTS value targets interpolate between a search bootstrap at the next
     # decision and the later return.  1.0 is Monte Carlo; lower values put
     # more trust in search/value estimates.
-    td_lambda: float = 0.80
+    td_lambda: float = 1.0
     # Preserve a small amount of the productive legal-action teacher in MCTS
     # policy targets while early search is still shallow/noisy.
     teacher_policy_target_weight: float = 0.10

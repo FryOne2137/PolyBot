@@ -4,10 +4,9 @@
 # python -m pip install --no-build-isolation --no-deps --force-reinstall .
 # cd <sciezka-do-PolyBot>
 
-# 1. Dłuższy warm-up strukturalnego belief world.
-# Kontynuuje policy/value z checkpointu, a dodatkowo uczy dekodery mapy.
+# 1. Dłuższy warm-up strukturalnego belief world od zera. Smoke checkpoint
+# miał tylko 1000 pozycji; nie zamrażamy po nim losowego jeszcze backbone'u.
 python scripts/train_belief.py `
-  --model-in models\belief-structured-smoke.pt `
   --model-out models\belief-structured-v1.pt `
   --positions 500000 `
   --batch-size 64 `
@@ -19,45 +18,62 @@ python scripts/train_belief.py `
   --random-seed `
   --device cuda
 
-# 2. Główny trening: pełny ISMCTS w SelfPlayPool.
+# 2. Bootstrap policy/value. Uczy m.in. ruchu w stronę widocznej wioski,
+# którego gęsty natywny packet akcji SelfPlayPool nie koduje jako osobnej cechy.
+python scripts/train_teacher.py `
+  --model-in models\belief-structured-v1.pt `
+  --model-out models\teacher-structured-v1.pt `
+  --games 300 `
+  --updates-per-game 8 `
+  --batch-size 64 `
+  --learning-rate 5e-5 `
+  --map-size 11 `
+  --map-type lakes `
+  --random-seed `
+  --device cuda
+
+# 3. Główny trening: pełny ISMCTS w SelfPlayPool.
 # Jeśli zabraknie VRAM, zmniejsz tylko --num-envs z 128 do 64.
 python scripts/train_self_play_pool.py `
-  --model-in models\belief-structured-v1.pt `
+  --model-in models\teacher-structured-v1.pt `
   --model-out models\selfplay-ismcts-v1.pt `
   --num-envs 128 `
   --steps 10000 `
   --updates 5000 `
   --num-threads 16 `
   --max-pending-leaves 4 `
-  --visible-action-history 64 `
+  --visible-action-history 0 `
   --belief-retries 4 `
   --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 64 `
+  --td-lambda 1.0 `
   --learning-rate 3e-5 `
   --map-size 11 `
   --map-type lakes `
   --random-seed `
   --device cuda
 
-# 3. Uczciwa ewaluacja kandydata przeciw checkpointowi wejściowemu.
+# 4. Uczciwa ewaluacja kandydata przeciw checkpointowi wejściowemu.
 python scripts/evaluate.py `
   --model-a models\selfplay-ismcts-v1.pt `
-  --model-b models\belief-structured-v1.pt `
+  --model-b models\teacher-structured-v1.pt `
   --games 100 `
   --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
+  --strategic-prior-weight 0.0 `
+  --teacher-prior-weight 0.0 `
   --max-moves 400 `
   --device cuda
 
-# 4. Liga: jeden kandydat na raz, stała bramka przeciw championowi.
+# 5. Liga: jeden kandydat na raz, stała bramka przeciw championowi.
 # Zapisane zostaną wyłącznie checkpointy po promocji w models\league\.
 # Każda runda ma nowy seed self-play, a wszystkie bramki ten sam zestaw
 # seedów ewaluacyjnych. Wznów następny run od ostatniego champion-XXX.pt.
 python scripts/train_league.py `
-  --champion-in models\belief-structured-v1.pt `
+  --champion-in models\teacher-structured-v1.pt `
   --checkpoint-dir models\league `
   --checkpoint-prefix champion `
   --rounds 10 `
@@ -69,12 +85,13 @@ python scripts/train_league.py `
   --updates 500 `
   --num-threads 16 `
   --max-pending-leaves 4 `
-  --visible-action-history 64 `
+  --visible-action-history 0 `
   --belief-retries 4 `
   --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 64 `
+  --td-lambda 1.0 `
   --learning-rate 3e-5 `
   --max-moves 400 `
   --map-size 11 `

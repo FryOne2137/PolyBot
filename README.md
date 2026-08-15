@@ -121,6 +121,22 @@ liści MCTS. Po zakończeniu MCTS PolyEnv udostępnia wyłącznie dla lossu beli
 etykiety `belief_targets_numpy()`: nie są one przekazywane do `submit_beliefs`,
 policy ani MCTS, więc nie mogą wpłynąć na zagrany ruch.
 
+Optymalizacja jest przeplatana z rolloutami: gdy kończy się partia, jej wynik
+jest propagowany przez wszystkie decyzje (`TD(1)`), model dostaje zaplanowaną
+porcję aktualizacji, a kolejne ruchy są już generowane nowszym checkpointem.
+Ręczny prior strategiczny i teacher są liniowo wygaszane do zera. Ewaluacja
+domyślnie ustawia oba priory na zero, więc porównuje same sieci, nie wspólną
+heurystykę.
+
+Checkpoint tworzony wyłącznie przez belief warm-up nie ma jeszcze kompetentnej
+policy/value. Przed pierwszym SelfPlayPool trzeba wykonać bootstrap
+`train_teacher.py`; self-play zaczyna wtedy od zachowania „idź do celu”, po
+czym wygaszanie curriculum pozwala zastąpić je strategią wynikającą z wygranych.
+
+Domyślne `--visible-action-history 0` utrzymuje identyczne wejścia policy/value
+w szybkim treningu i w ewaluacji `GameEnv`. Historię należy włączyć dopiero,
+gdy używany evaluator przekazuje ten sam tensor historii co `SelfPlayPool`.
+
 Szybki samodzielny test na CUDA:
 
 ```powershell
@@ -207,10 +223,14 @@ Never use `env.clone()` to branch directly from the real game under fog. `clone(
 ```text
 loss = policy cross-entropy(MCTS visits)
      + value Huber loss(TD(lambda) return / final win-loss)
-     + 0.35 × belief cross-entropy(hidden map tokens)
+     + 0.35 × belief cross-entropy(hidden semantic map fields)
 ```
 
-The terminal objective is win `+1` / loss `-1`. Small logged shaping terms make early exploration less sparse; they do not replace the terminal objective.
+The belief objective excludes per-game runtime city IDs and decoder-owned
+visibility fields. The terminal objective is win `+1` / loss `-1`; with the
+default Monte Carlo target it is not discounted by game length. Small logged
+shaping terms make early exploration less sparse; they do not replace the
+terminal objective.
 
 ## Factorized legal-action policy
 

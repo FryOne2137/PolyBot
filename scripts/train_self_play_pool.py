@@ -29,17 +29,22 @@ def main() -> None:
     parser.add_argument("--model-out", type=Path, default=Path("models/self_play_pool.pt"))
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--steps", type=int, default=2_000, help="Vector decisions; each step advances every live game once")
-    parser.add_argument("--updates", type=int, default=1_000, help="Post-rollout optimiser updates")
+    parser.add_argument("--updates", type=int, default=1_000, help="Total optimiser updates interleaved with rollout steps")
     parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
-    parser.add_argument("--visible-action-history", type=int, default=64, help="Fog-safe per-actor action history tokens, 0-1024")
+    parser.add_argument(
+        "--visible-action-history", type=int, default=0,
+        help="Keep at 0 until direct GameEnv evaluation exposes the same history tensor.",
+    )
     parser.add_argument("--belief-retries", type=int, default=4, help="Fresh belief samples for each rejected environment")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
+    parser.add_argument("--td-lambda", type=float, default=1.0, help="1.0 propagates the exact final result through the full game.")
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2, help="Per-player ISMCTS belief particles (K)")
     parser.add_argument("--mcts-threads", type=int, help="Accepted for config compatibility; use --num-threads for this pool")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
     args = parser.parse_args()
 

@@ -52,6 +52,8 @@ python scripts/train_self_play_pool.py `
   --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
+  --strategic-prior-weight 1.0 `
+  --teacher-prior-weight 0.20 `
   --batch-size 64 `
   --replay-capacity 100000 `
   --belief-weight 0.10 `
@@ -67,6 +69,10 @@ python scripts/evaluate.py `
   --model-a models\selfplay-ismcts-v1.pt `
   --model-b models\teacher-structured-v1.pt `
   --games 100 `
+  --num-envs 128 `
+  --mcts-threads 16 `
+  --max-pending-leaves 4 `
+  --belief-retries 4 `
   --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
@@ -75,9 +81,12 @@ python scripts/evaluate.py `
   --max-moves 400 `
   --device cuda
 
-# 5. Liga: jeden kandydat na raz, stała bramka przeciw championowi.
-# Checkpointy po promocji trafią do models\league\, a przebieg i wykresy do
-# runs\league\train\round_001, round_002 itd.
+# 5. Liga populacyjna: wszystkie trzy fazy (self-play kandydata, gry PFSP
+# przeciw populacji i sparowane bramki) działają w szybkim SelfPlayPool.
+# Modele są routowane przez agent_id bez wolnego GameEnv/MctsPool. Checkpointy
+# po promocji trafią
+# do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
+# do runs\league\train\round_001, round_002 itd.
 # Stały --seed jest bazą wielu map, nie jednej mapy. Każda runda ma odległy
 # seed self-play, a bramka osobny, nieużywany w treningu zestaw map. Wznów
 # następny run od ostatniego champion-XXX.pt.
@@ -85,14 +94,25 @@ python scripts/train_league.py `
   --champion-in models\teacher-structured-v1.pt `
   --checkpoint-dir models\league `
   --checkpoint-prefix champion `
-  --rounds 10 `
+  --league-db models\league\league.sqlite3 `
+  --population-size 6 `
+  --population-games 64 `
+  --population-updates-per-game 2 `
+  --population-workers 16 `
+  --pfsp-alpha 2.0 `
+  --champion-probability 0.40 `
+  --minimum-sampling-probability 0.05 `
+  --rounds 3 `
   --promotion-games 100 `
   --promotion-score 0.55 `
   --promotion-lower-bound 0.50 `
+  --historical-games 20 `
+  --population-score 0.52 `
+  --historical-score-floor 0.45 `
+  --elo-k 32 `
   --evaluation-seed 1500000007 `
   --evaluation-seed-stride 20000033 `
   --round-seed-stride 10000019 `
-  --anchor-policy-weight 0.20 `
   --num-envs 128 `
   --steps 1000 `
   --updates 500 `
@@ -104,15 +124,21 @@ python scripts/train_league.py `
   --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 64 `
-  --replay-capacity 100000 `
+  --replay-capacity 50000 `
   --belief-weight 0.10 `
-  --td-lambda 0.95 `
+  --exploration-rate 0.10 `
+  --teacher-policy-target-weight 0.10 `
+  --td-lambda 1.0 `
   --learning-rate 1e-5 `
-  --max-moves 400 `
+  --max-moves 500 `
   --map-size 11 `
   --map-type lakes `
-  --random-seed `
+  --seed 91337 `
   --device cuda
+
+# Podgląd rankingu Elo, populacji i ostatnich bramek po runie ligi.
+python scripts/league_report.py `
+  --league-db models\league\league.sqlite3
 
 # 6. Zalecany bezpieczny upgrade teachera pełnym pipeline. Model wyjściowy
 # zostanie kandydatem tylko po wygraniu sparowanego testu; przy porażce nadal
@@ -134,7 +160,7 @@ python scripts/train_pipeline.py `
   --teacher-policy-target-weight 0.15 `
   --exploration-rate 0.10 `
   --priority-replay-fraction 0.50 `
-  --td-lambda 0.95 `
+  --td-lambda 1.0 `
   --simulations 32 `
   --particles 2 `
   --workers 32 `

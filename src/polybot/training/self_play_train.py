@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -41,6 +41,8 @@ def train_self_play(
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
     opponent_models: Sequence[PolicyValueBeliefNet] = (),
+    opponent_model_weights: Sequence[float] = (),
+    game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Run independent games concurrently and retain examples only in RAM.
@@ -79,6 +81,7 @@ def train_self_play(
             "workers": workers,
             "global_inference_batch_size": global_inference_batch_size,
             "inference_wait_ms": inference_wait_ms,
+            "opponent_model_weights": list(opponent_model_weights),
             "model_out": model_out,
         },
     )
@@ -95,7 +98,10 @@ def train_self_play(
             training, model_config, mcts_config, games, updates_per_game,
             opponent, random_opponent_rate, mixed_opponent, teacher_replay_fraction,
             active_envs=workers, model_out=model_out, model=model,
-            opponent_models=opponent_models, run=run,
+            opponent_models=opponent_models,
+            opponent_model_weights=opponent_model_weights,
+            game_callback=game_callback,
+            run=run,
         )
 
     if opponent == "model" or mixed_opponent == "model":

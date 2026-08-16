@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Callable, Dict, Mapping, Sequence
 
 
 _AXIS_FIELDS = {
@@ -63,11 +63,20 @@ def increment_path(base: Path, exist_ok: bool = False) -> Path:
         index += 1
 
 
+MetricSink = Callable[[Path, Mapping[str, Any]], None]
+
+
 class TrainingRun:
     """Collect lightweight scalar history and render final run artifacts."""
 
-    def __init__(self, directory: Path, arguments: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        arguments: Mapping[str, Any] | None = None,
+        metric_sink: MetricSink | None = None,
+    ) -> None:
         self.directory = Path(directory)
+        self._metric_sink = metric_sink
         self.directory.mkdir(parents=True, exist_ok=True)
         self._rows: list[Dict[str, Any]] = []
         self._jsonl_path = self.directory / "metrics.jsonl"
@@ -98,7 +107,15 @@ class TrainingRun:
         """Create one named stage inside a unique parent pipeline/league run."""
         if not stage:
             raise ValueError("child run stage must not be empty")
-        return TrainingRun(self.directory / stage, arguments=arguments)
+        return TrainingRun(
+            self.directory / stage,
+            arguments=arguments,
+            metric_sink=self._metric_sink,
+        )
+
+    def set_metric_sink(self, sink: MetricSink | None) -> None:
+        """Mirror future scalar rows to an external store such as SQLite."""
+        self._metric_sink = sink
 
     def write_config(self, **configs: Any) -> None:
         self._write_json("config.json", configs)
@@ -113,6 +130,8 @@ class TrainingRun:
         self._rows.append(row)
         with self._jsonl_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+        if self._metric_sink is not None:
+            self._metric_sink(self.directory, row)
 
     def finish(self, summary: Mapping[str, Any]) -> Path:
         """Write final CSV/JSON and PNG plots; return the absolute run path."""

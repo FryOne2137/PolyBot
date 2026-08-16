@@ -14,6 +14,7 @@ from polybot.evaluation.matches import evaluate_matches
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.training.cli import add_environment_options, print_summary, training_config_from_args
+from polybot.training.routed_self_play_pool import evaluate_matches_pool
 
 
 def main() -> None:
@@ -25,8 +26,15 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
     parser.add_argument("--inference-batch-size", type=int, default=32)
-    parser.add_argument("--mcts-threads", type=int, help="C++ threads used by PolyEnv MctsPool; default uses logical cores")
+    parser.add_argument(
+        "--mcts-threads", type=int,
+        help="Persistent native worker threads (SelfPlayPool for model-vs-model)",
+    )
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument("--num-envs", type=int, default=128, help="Maximum parallel model-vs-model games")
+    parser.add_argument("--max-pending-leaves", type=int, default=4)
+    parser.add_argument("--visible-action-history", type=int, default=0)
+    parser.add_argument("--belief-retries", type=int, default=4)
     parser.add_argument(
         "--strategic-prior-weight", type=float, default=0.0,
         help="Keep at 0.0 for a pure checkpoint comparison; nonzero values evaluate a hand-written curriculum.",
@@ -52,7 +60,25 @@ def main() -> None:
         strategic_prior_weight=args.strategic_prior_weight,
         teacher_prior_weight=args.teacher_prior_weight,
     )
-    print_summary(evaluate_matches(model_a, device, training, mcts, args.games, model_b))
+    if model_b is None:
+        # A random opponent is not a neural agent and retains the small scalar
+        # diagnostic path. Checkpoint-vs-checkpoint evaluation uses the fast,
+        # routed native pool below.
+        summary = evaluate_matches(model_a, device, training, mcts, args.games, None)
+    else:
+        summary = evaluate_matches_pool(
+            model_a,
+            model_b,
+            training,
+            mcts,
+            args.games,
+            num_threads=args.mcts_threads,
+            max_pending_leaves=args.max_pending_leaves,
+            visible_action_history=args.visible_action_history,
+            belief_retries=args.belief_retries,
+            max_envs=args.num_envs,
+        )
+    print_summary(summary)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -305,6 +305,8 @@ def train_global_mcts_self_play(
     model_out: Optional[Path],
     model: Optional[PolicyValueBeliefNet],
     opponent_models: Sequence[PolicyValueBeliefNet] = (),
+    opponent_model_weights: Sequence[float] = (),
+    game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """High-throughput global-MCTS trainer; writes only final model weights."""
@@ -323,6 +325,7 @@ def train_global_mcts_self_play(
             "mixed_opponent": mixed_opponent,
             "teacher_replay_fraction": teacher_replay_fraction,
             "active_envs": active_envs,
+            "opponent_model_weights": list(opponent_model_weights),
             "model_out": model_out,
         },
     )
@@ -332,6 +335,17 @@ def train_global_mcts_self_play(
     frozen_models = [opponent_model.to(device).eval() for opponent_model in opponent_models]
     if (opponent == "model" or mixed_opponent == "model") and not frozen_models:
         raise ValueError("opponent model mode requires at least one --opponent-model checkpoint")
+    if opponent_model_weights:
+        if len(opponent_model_weights) != len(frozen_models):
+            raise ValueError("opponent_model_weights must match opponent_models")
+        frozen_weights = np.asarray(opponent_model_weights, dtype=np.float64)
+        if not np.isfinite(frozen_weights).all() or (frozen_weights < 0.0).any():
+            raise ValueError("opponent_model_weights must be finite and non-negative")
+        if float(frozen_weights.sum()) <= 0.0:
+            raise ValueError("opponent_model_weights must contain a positive value")
+        frozen_weights /= frozen_weights.sum()
+    else:
+        frozen_weights = np.full(len(frozen_models), 1.0 / max(1, len(frozen_models)))
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     replay, teacher = ReplayBuffer(training.replay_capacity), ReplayBuffer(training.replay_capacity)
     schedule_rng, sample_rng = np.random.default_rng(training.seed ^ 0xA17C0), np.random.default_rng(training.seed)
@@ -339,6 +353,7 @@ def train_global_mcts_self_play(
     active: List[_Episode] = []
     summaries: Dict[str, float] = {}
     frozen_opponent_games = 0
+    opponent_results: Dict[int, Dict[str, float]] = {}
     losses: List[Dict[str, float]] = []
     optimisation_updates = 0
 
@@ -397,7 +412,8 @@ def train_global_mcts_self_play(
                 )
                 opponent_agent = (mixed_opponent if opponent == "mixed" else opponent) if anchor else None
                 opponent_model_index = (
-                    int(schedule_rng.integers(len(frozen_models))) if opponent_agent == "model" else None
+                    int(schedule_rng.choice(len(frozen_models), p=frozen_weights))
+                    if opponent_agent == "model" else None
                 )
                 frozen_opponent_games += int(opponent_model_index is not None)
                 active.append(_new_episode(
@@ -463,10 +479,41 @@ def train_global_mcts_self_play(
                 bar.update(1)
                 for key, value in episode.metrics.items():
                     summaries[key] = summaries.get(key, 0.0) + value
+                score = (
+                    0.5 if episode.winner < 0
+                    else float(episode.winner == episode.train_player)
+                    if episode.train_player is not None else 0.5
+                )
+                if episode.opponent_model_index is not None:
+                    result = opponent_results.setdefault(
+                        episode.opponent_model_index,
+                        {"games": 0.0, "wins": 0.0, "draws": 0.0, "losses": 0.0, "score": 0.0},
+                    )
+                    result["games"] += 1.0
+                    result["score"] += score
+                    result["wins" if score == 1.0 else "losses" if score == 0.0 else "draws"] += 1.0
+                game_record: Dict[str, Any] = {
+                    "game_index": episode.index,
+                    "map_seed": training.seed + episode.index,
+                    "model_a_player": episode.train_player,
+                    "winner_player": episode.winner,
+                    "score_a": score,
+                    "moves": episode.moves,
+                    "opponent_agent": episode.opponent_agent,
+                    "opponent_model_index": episode.opponent_model_index,
+                    **episode.metrics,
+                }
+                if game_callback is not None:
+                    game_callback(game_record)
                 if teacher_replay_fraction > 0.0:
                     teacher_examples, _ = _teacher_game(training.seed + 1_000_000 + episode.index, training); teacher.extend(teacher_examples)
                 run.log(
                     game=done,
+                    game_index=episode.index,
+                    map_seed=training.seed + episode.index,
+                    model_a_player=episode.train_player,
+                    opponent_model_index=episode.opponent_model_index,
+                    score_a=score,
                     update=optimisation_updates,
                     replay_examples=len(replay),
                     game_moves=episode.moves,
@@ -501,6 +548,15 @@ def train_global_mcts_self_play(
         "final_teacher_policy_target_weight": float(training.teacher_policy_target_weight * 0.25),
     }
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
+    for opponent_index, opponent_result in sorted(opponent_results.items()):
+        games_against = max(1.0, opponent_result["games"])
+        result.update({
+            f"opponent_{opponent_index}_games": opponent_result["games"],
+            f"opponent_{opponent_index}_wins": opponent_result["wins"],
+            f"opponent_{opponent_index}_draws": opponent_result["draws"],
+            f"opponent_{opponent_index}_losses": opponent_result["losses"],
+            f"opponent_{opponent_index}_score": opponent_result["score"] / games_against,
+        })
     if losses:
         result.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
     result["run_dir"] = str(run.finish(result))

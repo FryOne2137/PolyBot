@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import numpy as np
 import torch
@@ -40,6 +40,7 @@ def evaluate_matches(
     mcts: MCTSConfig,
     games: int,
     model_b: Optional[PolicyValueBeliefNet] = None,
+    game_callback: Optional[Callable[[Dict[str, float | int]], None]] = None,
 ) -> Dict[str, float]:
     """Evaluate A against random play or B on fixed seeds with greedy MCTS.
 
@@ -77,6 +78,7 @@ def evaluate_matches(
             # alternating slots across two unrelated maps.
             map_seed, model_a_player = _paired_seed_and_slot(training.seed, game_index)
             env = _new_env(map_seed, training)
+            before = totals.copy()
             moves = 0
             winner = -1
             while not env.is_done() and moves < training.max_moves:
@@ -118,6 +120,34 @@ def evaluate_matches(
             else:
                 totals["draws"] += 1.0
                 game_scores.append(0.5)
+            if game_callback is not None:
+                game_callback({
+                    "game_index": game_index,
+                    "map_seed": map_seed,
+                    "model_a_player": model_a_player,
+                    "winner_player": int(winner),
+                    "score_a": game_scores[-1],
+                    "moves": moves,
+                    "model_a_city_captures": int(
+                        totals["model_a_city_captures"] - before["model_a_city_captures"]
+                    ),
+                    "model_a_capital_captures": int(
+                        totals["model_a_capital_captures"] - before["model_a_capital_captures"]
+                    ),
+                    "opponent_city_captures": int(
+                        totals["opponent_city_captures"] - before["opponent_city_captures"]
+                    ),
+                    "opponent_capital_captures": int(
+                        totals["opponent_capital_captures"] - before["opponent_capital_captures"]
+                    ),
+                    "model_a_decisions": int(
+                        totals["model_a_decisions"] - before["model_a_decisions"]
+                    ),
+                    "model_a_particles": float(
+                        totals["model_a_particles"] - before["model_a_particles"]
+                    ),
+                    "truncated": int(winner < 0 and not env.is_done()),
+                })
             progress.update(1)
             progress.set_postfix(
                 wins=int(totals["model_a_wins"]),

@@ -136,6 +136,8 @@ def _sample_root_rows(
     root: Dict[str, np.ndarray],
     rng: np.random.Generator,
     temperature: float,
+    request: Dict[str, np.ndarray] | None = None,
+    exploration_rate: float = 0.0,
 ) -> np.ndarray:
     policies = np.asarray(root["policy"], dtype=np.float64)
     mask = np.asarray(root["action_mask"], dtype=bool)
@@ -150,7 +152,19 @@ def _sample_root_rows(
             weights = np.full(count, 1.0 / count, dtype=np.float64)
         else:
             weights = weights / total
-        rows[index] = int(weights.argmax()) if temperature <= 1e-5 else int(rng.choice(count, p=weights))
+        row = int(weights.argmax()) if temperature <= 1e-5 else int(rng.choice(count, p=weights))
+        if request is not None and exploration_rate > 0.0 and rng.random() < exploration_rate:
+            actions = np.asarray(request["action_features"], dtype=np.int64)[index, :count]
+            bias = (
+                ((actions[:, 0] == 8) & (actions[:, 8] == 14)).astype(np.float64) * 4.0
+                + ((actions[:, 0] == 8) & (actions[:, 8] == 11)).astype(np.float64) * 2.0
+                + (actions[:, 0] == 1).astype(np.float64)
+                + (actions[:, 0] == 0).astype(np.float64) * 0.25
+                - (actions[:, 0] == 3).astype(np.float64) * 0.75
+            )
+            explore = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))
+            row = int(rng.choice(count, p=explore / explore.sum()))
+        rows[index] = row
     return rows
 
 
@@ -411,7 +425,12 @@ def train_self_play_pool(
         from PolyEnv import Bardur, Imperius, MapType, SelfPlayPool
     except ImportError as error:
         raise RuntimeError("Update PolyEnv to a version exposing SelfPlayPool.") from error
-    required_pool_api = ("all_player_belief_requests", "belief_targets_numpy", "reset_slots")
+    required_pool_api = (
+        "all_player_belief_batch_spec",
+        "all_player_belief_requests_into",
+        "belief_targets_numpy",
+        "reset_slots",
+    )
     missing_pool_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
     if missing_pool_api:
         raise RuntimeError(
@@ -466,6 +485,9 @@ def train_self_play_pool(
     pool.configure_search(max_pending_leaves, 1.0, 0, 0)
     request, request_owners = _allocate_native_buffers(pool, "belief_batch_spec", device)
     root, root_owners = _allocate_native_buffers(pool, "root_policy_spec", device)
+    all_players_buffer, all_player_owners = _allocate_native_buffers(
+        pool, "all_player_belief_batch_spec", device
+    )
     # There is exactly one live MCTS tree per environment. Players and belief
     # particles live *inside* that tree; they do not multiply the number of
     # simultaneously selectable leaves. Allocating for them did nothing but
@@ -473,7 +495,7 @@ def train_self_play_pool(
     leaf_capacity = num_envs * max_pending_leaves
     leaves, leaf_owners = _allocate_native_buffers(pool, "leaf_batch_spec", device, leaf_capacity)
     # Keep pinned tensor owners alive while C++ writes into their NumPy views.
-    _ = (request_owners, root_owners, leaf_owners)
+    _ = (request_owners, root_owners, all_player_owners, leaf_owners)
     pool.reset_into(request, seed=training.seed)
     replay = ReplayBuffer(training.replay_capacity)
     rng = np.random.default_rng(training.seed ^ 0x51F0A7)
@@ -597,7 +619,8 @@ def train_self_play_pool(
             # particle. The active actor is additionally conditioned on its
             # actual legal-action list, which is where blocked paths reveal
             # public information about hidden occupancy.
-            all_players = pool.all_player_belief_requests()
+            pool.all_player_belief_requests_into(all_players_buffer)
+            all_players = all_players_buffer
 
             def learned_particles() -> np.ndarray:
                 particles = np.stack([
@@ -753,7 +776,13 @@ def train_self_play_pool(
             )
             for index, example in enumerate(examples):
                 example.bootstrap_value = float(root_values[index])
-            action_rows = _sample_root_rows(root, rng, mcts.temperature)
+            action_rows = _sample_root_rows(
+                root,
+                rng,
+                mcts.temperature,
+                request=request,
+                exploration_rate=training.exploration_rate * curriculum_scale,
+            )
             action_features = np.asarray(request["action_features"], dtype=np.int64)
             chosen = action_features[np.arange(num_envs), action_rows]
             # Visible, dense curriculum signal; the policy target itself stays

@@ -7,7 +7,7 @@ PolyBot is a fog-of-war self-play agent for [PolyEnv](https://polyenv.readthedoc
 - a value head used by PUCT MCTS,
 - a belief decoder that samples complete map hypotheses,
 - `env.make_belief_env(...)` for detached MCTS particles with no access to the real hidden state,
-- self-play training that keeps games, replay data and metrics in RAM only.
+- self-play training with RAM-only replay and optional durable league history.
 
 `full_map_numpy()` is used only as a **supervised training label** for the belief decoder. It is never sent to the policy, value head or MCTS search.
 
@@ -109,6 +109,39 @@ python scripts/train_self_play.py \
   --max-moves 300
 ```
 
+## Population league and SQLite history
+
+`scripts/train_league.py` prowadzi cały gorący przebieg w jednym typie natywnego
+`SelfPlayPool`: same-network self-play kandydata, gry przeciw populacji oraz
+sparowane bramki ewaluacyjne. `agent_id` wybiera właściwy checkpoint osobno dla
+każdego gracza, a batche belief i liści są grupowane według modelu i składane z
+powrotem w kolejności oczekiwanej przez silnik. Nie ma tu skalarnych pętli
+`GameEnv` ani krótkotrwałych `MctsPool`. Aktualny champion dostaje stałą część
+losowań, a
+pozostała część jest dzielona metodą PFSP: częściej wybierane są historyczne
+modele, z którymi champion miał słabszy wynik albo których jeszcze nie
+zmierzono. Teacher, bieżący champion i najlepsi wcześniejsi championi tworzą
+ograniczoną przez `--population-size` pulę.
+
+Kandydat jest promowany tylko wtedy, gdy jednocześnie pokona aktualnego
+championa, przejdzie dolną granicę ufności, osiągnie wymagany średni wynik
+przeciw populacji i nie spadnie poniżej progu regresji przeciw żadnemu
+zachowanemu stylowi. Odrzucony kandydat nie zastępuje checkpointu championa.
+
+`--league-db models/league/league.sqlite3` zapisuje konfiguracje runów, rundy,
+lineage i sumy SHA-256 checkpointów, dobór przeciwników, wszystkie gry etapu
+populacyjnego i bramek, wyniki, metryki treningowe oraz pomocniczy ranking Elo.
+Ciężkie tensory modeli pozostają w atomowo zapisywanych plikach `.pt`; baza
+przechowuje ich ścieżki i sumy kontrolne, dzięki czemu nie rośnie o setki MB na
+każdy checkpoint. Ranking Elo służy do diagnostyki, nie decyduje o promocji.
+
+Pełna zalecana komenda znajduje się w `command.txt`. Po runie ranking i ostatnie
+bramki można odczytać bez uruchamiania PyTorch:
+
+```powershell
+python scripts/league_report.py --league-db models\league\league.sqlite3
+```
+
 ## Training runs and plots
 
 Każdy skrypt treningowy tworzy katalog w stylu Ultralytics, np.
@@ -124,8 +157,9 @@ Każdy zakończony run zawiera:
 Ścieżkę można zmienić przez `--project`, nazwę przez `--name`, a świadome
 nadpisanie konkretnego katalogu włączyć przez `--exist-ok`. Pipeline trzyma
 wykres każdego etapu w podfolderach jednego runu, natomiast liga tworzy
-`round_001`, `round_002` itd. Logowane są wyłącznie skalary — replay buffer,
-pełne mapy, eventy, partie i stan optymalizera nadal pozostają w RAM.
+`round_001`, `round_002` itd. Replay buffer, pełne mapy, eventy i stan
+optymalizera nadal pozostają w RAM. Liga dodatkowo zapisuje do SQLite zwarte
+rekordy rozegranych partii i ich wyniki, bez tensorów obserwacji.
 
 ## Fast native MCTS: `SelfPlayPool`
 
@@ -182,7 +216,12 @@ wolniejszymi etapami `--self-play-games` i `--refinement-games`.
 
 ## Evaluation
 
-Evaluation uses fixed seeds, greedy MCTS and writes no games or metrics files.
+Samodzielny evaluator używa fixed seeds i greedy MCTS oraz nie zapisuje plików.
+Dla `--model-b` wykonuje wszystkie gry równolegle w wielomodelowym
+`SelfPlayPool`; bramka ligi korzysta z dokładnie tego samego protokołu, a wynik
+każdej gry trafia dodatkowo do SQLite. Tylko diagnostyczny przeciwnik losowy
+pozostaje w skalarnej ścieżce, ponieważ nie jest checkpointem routowanym przez
+`agent_id`.
 Każda mapa jest rozgrywana dwa razy z zamianą slotów graczy, więc wynik nie
 jest obciążony przewagą pierwszego gracza. Zwracane są też `model_a_score` i
 `score_lower_95`. Compare first against random play:
@@ -224,6 +263,9 @@ src/polybot/
 │   └── belief_mcts.py            PUCT over detached belief particles
 ├── training/
 │   ├── self_play.py              games, replay buffer and full-map labels
+│   ├── league.py                 PFSP population training and promotion gates
+│   ├── league_db.py              SQLite games, metrics, lineage and ratings
+│   ├── routed_self_play_pool.py  multi-model native training and paired gates
 │   ├── replay_buffer.py           stored self-play examples
 │   ├── optimisation.py            policy/value/belief loss functions
 │   ├── run_artifacts.py            incremented runs, scalar tables and plots
@@ -240,6 +282,8 @@ scripts/
 ├── train_teacher.py              stage 2: scalar heuristic teacher
 ├── train_vector_teacher.py       stage 3: native C++ vector curriculum
 ├── train_self_play.py            stage 4: scalar MCTS self-play
+├── train_league.py               population league
+├── league_report.py              SQLite standings and recent gates
 └── train_pipeline.py             all curriculum stages, one final model write
 ```
 

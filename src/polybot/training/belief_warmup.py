@@ -19,6 +19,7 @@ from ..data.polyenv_features import (
 )
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
+from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .optimisation import belief_loss
 from .replay_buffer import TrainingExample
@@ -131,6 +132,7 @@ def warmup_belief(
         raise ValueError("min_hidden_tiles must be non-negative")
     if max_moves_per_world < 1:
         raise ValueError("max_moves_per_world must be positive")
+    seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "belief")
     run.write_config(

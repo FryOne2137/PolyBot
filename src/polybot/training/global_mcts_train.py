@@ -17,6 +17,7 @@ from ..data.polyenv_features import (
 )
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
+from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .optimisation import train_batch
@@ -292,6 +293,9 @@ def _apply_action(
 
 def _finish(episode: _Episode, training: TrainingConfig) -> None:
     assign_td_lambda_targets(episode.examples, episode.transitions, episode.winner, training)
+    if not episode.env.is_done():
+        for example in episode.examples:
+            example.value_loss_weight = 0.0
 
 
 def train_global_mcts_self_play(
@@ -304,6 +308,7 @@ def train_global_mcts_self_play(
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """High-throughput global-MCTS trainer; writes only final model weights."""
+    seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "self_play")
     run.write_config(
@@ -433,9 +438,13 @@ def train_global_mcts_self_play(
                     episode = model_turns[index]
                     _, search_policy = _search_action(visits, priors, episode.rng, search_mcts)
                     policy = search_policy
-                    target_anchor = float(
-                        np.clip(training.teacher_policy_target_weight * curriculum_scale, 0.0, 1.0)
-                    )
+                    # Keep a small teacher floor after the exploration/search
+                    # curriculum ends. Otherwise the final online updates are
+                    # precisely the ones most likely to erase the bootstrap.
+                    anchor_scale = 0.25 + 0.75 * curriculum_scale
+                    target_anchor = float(np.clip(
+                        training.teacher_policy_target_weight * anchor_scale, 0.0, 1.0
+                    ))
                     if target_anchor:
                         teacher_target = teacher_policy(episode.env.model_request_numpy())
                         policy = (1.0 - target_anchor) * policy + target_anchor * teacher_target
@@ -473,10 +482,10 @@ def train_global_mcts_self_play(
             update_scale = 0.0 if games == 1 else max(0.0, 1.0 - done / (games - 1))
             optimise_until(
                 done * updates_per_game,
-                teacher_replay_fraction * update_scale,
+                teacher_replay_fraction * (0.25 + 0.75 * update_scale),
             )
 
-    optimise_until(games * updates_per_game, 0.0)
+    optimise_until(games * updates_per_game, teacher_replay_fraction * 0.25)
     bootstrap_examples = sum(example.bootstrap_value is not None for example in replay._examples)
     if model_out: save_model(model_out, model, model_config)
     result: Dict[str, float | str] = {
@@ -488,6 +497,8 @@ def train_global_mcts_self_play(
         "optimisation_updates": float(optimisation_updates),
         "online_updates": 1.0,
         "final_curriculum_scale": 0.0,
+        "final_teacher_replay_fraction": float(teacher_replay_fraction * 0.25),
+        "final_teacher_policy_target_weight": float(training.teacher_policy_target_weight * 0.25),
     }
     result.update({"mean_" + k: v / max(1, len(replay)) for k, v in summaries.items() if k.startswith("reward_")})
     if losses:

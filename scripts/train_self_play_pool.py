@@ -30,6 +30,11 @@ def main() -> None:
     add_run_options(parser)
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, default=Path("models/self_play_pool.pt"))
+    parser.add_argument(
+        "--anchor-model", type=Path,
+        help="Frozen predecessor for conservative policy targets; defaults to --model-in.",
+    )
+    parser.add_argument("--anchor-policy-weight", type=float, default=0.20)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--steps", type=int, default=2_000, help="Vector decisions; each step advances every live game once")
     parser.add_argument("--updates", type=int, default=1_000, help="Total optimiser updates interleaved with rollout steps")
@@ -42,7 +47,7 @@ def main() -> None:
     parser.add_argument("--belief-retries", type=int, default=4, help="Fresh belief samples for each rejected environment")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
-    parser.add_argument("--td-lambda", type=float, default=1.0, help="1.0 propagates the exact final result through the full game.")
+    parser.add_argument("--td-lambda", type=float, default=0.95, help="Blend terminal returns with MCTS value bootstraps.")
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2, help="Per-player ISMCTS belief particles (K)")
     parser.add_argument("--mcts-threads", type=int, help="Accepted for config compatibility; use --num-threads for this pool")
@@ -52,7 +57,13 @@ def main() -> None:
     args = parser.parse_args()
 
     training = training_config_from_args(args)
-    model, model_config = load_model(args.model_in, select_device(training.device))
+    device = select_device(training.device)
+    model, model_config = load_model(args.model_in, device)
+    anchor_model = None
+    if args.anchor_policy_weight > 0.0:
+        anchor_model, anchor_config = load_model(args.anchor_model or args.model_in, device)
+        if anchor_config != model_config:
+            raise RuntimeError("anchor and candidate ModelConfig differ")
     print_summary(train_self_play_pool(
         training,
         model_config,
@@ -66,6 +77,8 @@ def main() -> None:
         belief_retries=args.belief_retries,
         model_out=args.model_out,
         model=model,
+        anchor_model=anchor_model,
+        anchor_policy_weight=args.anchor_policy_weight,
         run=training_run_from_args(args, "self_play_pool"),
     ))
 

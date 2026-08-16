@@ -33,7 +33,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--exploration-rate", type=float, default=0.20)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
-    parser.add_argument("--td-lambda", type=float, default=1.0, help="1.0 propagates the exact final result through the full game.")
+    parser.add_argument("--td-lambda", type=float, default=0.95, help="Blend terminal returns with MCTS value bootstraps.")
     parser.add_argument(
         "--teacher-policy-target-weight", type=float, default=0.10,
         help="Blend this fraction of the legal-action teacher into each MCTS policy target.",

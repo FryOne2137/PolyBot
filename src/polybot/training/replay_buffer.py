@@ -26,6 +26,10 @@ class TrainingExample:
     action_history_mask: np.ndarray | None = None
     shaped_reward: float = 0.0
     value_target: float = 0.0
+    # Trainer-imposed horizons are not game draws. Their value targets are
+    # masked until a genuine terminal result (or an explicit bootstrap) is
+    # available, while their policy and belief targets remain useful.
+    value_loss_weight: float = 1.0
     # Mean root value returned by fog-safe particle MCTS.  It is a training
     # target bootstrap, never an additional observation exposed to the model.
     bootstrap_value: float | None = None

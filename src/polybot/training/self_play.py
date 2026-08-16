@@ -203,6 +203,8 @@ class SelfPlayRunner:
                 -1.0,
                 1.0,
             ))
+            if not env.is_done():
+                example.value_loss_weight = 0.0
         metrics: Dict[str, float] = {
             "moves": float(moves),
             "winner": float(winner),

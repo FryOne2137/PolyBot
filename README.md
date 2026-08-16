@@ -68,8 +68,11 @@ Po pierwszym dobrym checkpointcie nie trenuj kandydata wyłącznie przeciw
 heurystyce. Podaj obecnego championa jako zamrożony model przeciwnika. Pierwszy
 `--champion-model` jest punktem odniesienia dla bramki promocji, a kolejne
 tworzą pulę, z której przeciwnik jest losowany. Jeżeli kandydat nie uzyska na
-stałych seedach wyniku `win + 0.5 * draw >= --promotion-score`, `--model-out`
-zostanie nadpisany championem — nie słabszym kandydatem.
+osobnych, sparowanych mapach wyniku `win + 0.5 * draw >= --promotion-score`
+oraz dolnej granicy ufności `>= --promotion-lower-bound`, `--model-out`
+pozostanie championem — słabszy kandydat nigdy go nie nadpisze.
+Liga obraca zestaw testowych map przez `--evaluation-seed-stride`, aby kolejne
+promocje nie przeuczyły się do jednego, stale powtarzanego benchmarku.
 
 ```powershell
 python scripts/train_pipeline.py `
@@ -79,10 +82,12 @@ python scripts/train_pipeline.py `
   --self-play-games 600 --refinement-games 300 `
   --updates-per-game 8 --refinement-updates-per-game 8 `
   --simulations 32 --particles 4 --workers 32 --mcts-threads 1 `
-  --mcts-max-actions 1024 --batch-size 64 --learning-rate 3e-5 `
+  --mcts-max-actions 1024 --batch-size 64 --learning-rate 1e-5 `
+  --replay-capacity 100000 --belief-weight 0.10 --td-lambda 0.95 `
   --max-moves 400 --device cuda `
   --champion-model models\teacher-v1.pt `
-  --promotion-games 40 --promotion-score 0.55 `
+  --promotion-games 100 --promotion-score 0.55 `
+  --promotion-lower-bound 0.50 --evaluation-seed 1500000007 `
   --model-out models\champion-v2.pt
 ```
 
@@ -141,11 +146,12 @@ etykiety `belief_targets_numpy()`: nie są one przekazywane do `submit_beliefs`,
 policy ani MCTS, więc nie mogą wpłynąć na zagrany ruch.
 
 Optymalizacja jest przeplatana z rolloutami: gdy kończy się partia, jej wynik
-jest propagowany przez wszystkie decyzje (`TD(1)`), model dostaje zaplanowaną
-porcję aktualizacji, a kolejne ruchy są już generowane nowszym checkpointem.
-Ręczny prior strategiczny i teacher są liniowo wygaszane do zera. Ewaluacja
-domyślnie ustawia oba priory na zero, więc porównuje same sieci, nie wspólną
-heurystykę.
+jest propagowany przez decyzje z bootstrapem MCTS (`TD(0.95)`), model dostaje
+zaplanowaną porcję aktualizacji, a kolejne ruchy generuje nowszy kandydat.
+Partia przerwana przez `--max-moves` nadal uczy policy i belief, ale nie udaje
+już remisu w lossie value. Zamrożony `--anchor-model` zachowuje część policy
+poprzednika w targetach. Ręczne priory wyszukiwania są wygaszane do zera, a
+ewaluacja porównuje same checkpointy bez wspólnej heurystyki.
 
 Checkpoint tworzony wyłącznie przez belief warm-up nie ma jeszcze kompetentnej
 policy/value. Przed pierwszym SelfPlayPool trzeba wykonać bootstrap
@@ -161,6 +167,7 @@ Szybki samodzielny test na CUDA:
 ```powershell
 python scripts/train_self_play_pool.py `
   --model-in models\champion-v3.pt `
+  --anchor-model models\champion-v3.pt --anchor-policy-weight 0.20 `
   --model-out models\pool-smoke.pt `
   --num-envs 128 --steps 1000 --updates 500 `
   --num-threads 16 --max-pending-leaves 4 `
@@ -176,8 +183,9 @@ wolniejszymi etapami `--self-play-games` i `--refinement-games`.
 ## Evaluation
 
 Evaluation uses fixed seeds, greedy MCTS and writes no games or metrics files.
-The checkpoint alternates player slots, so the result is not biased toward the
-first player. Compare first against random play:
+Każda mapa jest rozgrywana dwa razy z zamianą slotów graczy, więc wynik nie
+jest obciążony przewagą pierwszego gracza. Zwracane są też `model_a_score` i
+`score_lower_95`. Compare first against random play:
 
 ```bash
 python scripts/evaluate.py \
@@ -191,8 +199,9 @@ Postęp nadal jest widoczny w terminalu, a skalarne metryki i wykresy trafiają
 do katalogu runu. Self-play pokazuje wybrane urządzenie (`mps`, `cuda` albo
 `cpu`), numer gry/ruchu oraz płynny pasek bieżącego MCTS. `--max-moves`
 ogranicza długość jednej gry (domyślnie 300); po przekroczeniu limitu wynik
-jest traktowany jako remis. Replay buffer, gry, pełne mapy, eventy i stan
-optymalizera nie są zapisywane na dysk. Pipeline nadpisuje wskazany plik modelu
+jest remisem w ewaluacji, natomiast w treningu nie uczestniczy w lossie value.
+Replay buffer, gry, pełne mapy, eventy i stan optymalizera nie są zapisywane
+na dysk. Pipeline nadpisuje wskazany plik modelu
 po bezpiecznych granicach etapów, dzięki czemu po awarii natywnego MCTS
 pozostaje poprawny model do wznowienia.
 

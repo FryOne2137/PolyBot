@@ -64,8 +64,9 @@ class TrainingConfig:
     map_type: str = "lakes"
     batch_size: int = 16
     replay_capacity: int = 20_000
-    # Safety cap for one self-play game. A game that reaches it is a draw.
-    # Keeps early smoke runs bounded when an untrained policy loops.
+    # Safety cap for one self-play game. A truncated training game keeps its
+    # policy/belief labels but is masked from value loss; evaluation counts it
+    # as a draw. This keeps early runs bounded without inventing value labels.
     max_moves: int = 300
     learning_rate: float = 2.0e-4
     weight_decay: float = 1.0e-4

@@ -51,6 +51,10 @@ def main() -> None:
         "--self-play-pool-pending-leaves", type=int, default=4,
         help="Concurrent virtual-loss leaves per tree (1-8); 4 batches GPU inference efficiently.",
     )
+    parser.add_argument(
+        "--self-play-pool-anchor-weight", type=float, default=0.20,
+        help="Frozen predecessor share in native pool policy targets.",
+    )
     parser.add_argument("--self-play-games", type=int, default=200, help="anchored MCTS foundation games")
     parser.add_argument("--refinement-games", type=int, default=100, help="lower-noise MCTS games after the foundation")
     parser.add_argument("--updates-per-game", type=int, default=8)
@@ -58,7 +62,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--exploration-rate", type=float, default=0.20)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
-    parser.add_argument("--td-lambda", type=float, default=1.0)
+    parser.add_argument("--td-lambda", type=float, default=0.95)
     parser.add_argument("--teacher-policy-target-weight", type=float, default=0.10)
     parser.add_argument("--teacher-replay-fraction", type=float, default=0.35)
     parser.add_argument("--simulations", type=int, default=64)
@@ -89,6 +93,20 @@ def main() -> None:
         default=0.55,
         help="Required win=1/draw=0.5 match score to replace the champion.",
     )
+    parser.add_argument(
+        "--promotion-lower-bound",
+        type=float,
+        default=0.50,
+        help="Required lower 95%% confidence bound; prevents lucky regressions from promotion.",
+    )
+    parser.add_argument(
+        "--refinement-seed-offset", type=int, default=10_000_019,
+        help="Offset separating refinement maps from foundation maps.",
+    )
+    parser.add_argument(
+        "--evaluation-seed", type=int, default=1_500_000_007,
+        help="Held-out paired-map seed schedule used only by the promotion gate.",
+    )
     args = parser.parse_args()
     summary = run_pipeline(
         training_config_from_args(args),
@@ -112,6 +130,7 @@ def main() -> None:
         vector_teacher_updates_per_step=args.vector_teacher_updates_per_step,
         self_play_pool_threads=args.self_play_pool_threads,
         self_play_pool_pending_leaves=args.self_play_pool_pending_leaves,
+        self_play_pool_anchor_weight=args.self_play_pool_anchor_weight,
         mcts_workers=args.workers,
         teacher_replay_fraction=args.teacher_replay_fraction,
         refinement_games=args.refinement_games,
@@ -119,6 +138,9 @@ def main() -> None:
         champion_model_paths=args.champion_model,
         promotion_games=args.promotion_games,
         promotion_score=args.promotion_score,
+        promotion_lower_bound=args.promotion_lower_bound,
+        refinement_seed_offset=args.refinement_seed_offset,
+        evaluation_seed=args.evaluation_seed,
         run=training_run_from_args(args, "pipeline"),
     )
     print_summary(summary)

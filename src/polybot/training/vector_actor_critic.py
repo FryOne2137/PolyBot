@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from ..config import ModelConfig, TrainingConfig
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
+from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .run_artifacts import TrainingRun
 from .vector_teacher import _teacher_targets, _vector_tensors
@@ -76,6 +77,7 @@ def train_vector_actor_critic(
     except ImportError as error:
         raise RuntimeError("Update PolyEnv to a version exposing VectorGameEnv.") from error
 
+    seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "actor_critic")
     run.write_config(

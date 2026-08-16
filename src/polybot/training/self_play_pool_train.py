@@ -24,6 +24,7 @@ from ..data.polyenv_features import (
 from ..data.token_schema import EVENT_SUMMARY_SIZE
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
+from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .global_mcts_train import _native_leaf_bias
 from .optimisation import train_batch
@@ -75,6 +76,8 @@ def _root_examples(
     root: Dict[str, np.ndarray],
     training: TrainingConfig,
     belief_targets: np.ndarray,
+    anchor_policy: np.ndarray | None = None,
+    anchor_policy_weight: float = 0.0,
 ) -> List[TrainingExample]:
     """Create records from public MCTS roots plus training-only belief labels.
 
@@ -102,6 +105,14 @@ def _root_examples(
             policy.fill(1.0 / count)
         else:
             policy /= total
+        if anchor_policy is not None and anchor_policy_weight > 0.0:
+            anchor = np.asarray(anchor_policy[index, :count], dtype=np.float32).copy()
+            anchor_total = float(anchor.sum())
+            if np.isfinite(anchor_total) and anchor_total > 0.0:
+                anchor /= anchor_total
+                weight = float(np.clip(anchor_policy_weight, 0.0, 1.0))
+                policy = (1.0 - weight) * policy + weight * anchor
+                policy /= max(float(policy.sum()), 1e-8)
         examples.append(TrainingExample(
             map_tokens=maps[index].copy(),
             global_features=globals_[index].copy(),
@@ -159,6 +170,9 @@ def _finish_trajectory(
     examples = [example for _, _, example in transitions if example is not None]
     winner = _winner_from_terminal_values(terminal_values) if terminal_values is not None else -1
     assign_td_lambda_targets(examples, transitions, winner, training)
+    if terminal_values is None:
+        for example in examples:
+            example.value_loss_weight = 0.0
     return examples
 
 
@@ -368,6 +382,8 @@ def train_self_play_pool(
     belief_retries: int = 4,
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
+    anchor_model: Optional[PolicyValueBeliefNet] = None,
+    anchor_policy_weight: float = 0.20,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Run fully native belief-MCTS rollouts and optimise in RAM.
@@ -389,6 +405,8 @@ def train_self_play_pool(
         raise ValueError("belief_retries must not be negative")
     if not 0 <= visible_action_history <= 1024:
         raise ValueError("visible_action_history must be between 0 and 1024")
+    if not 0.0 <= anchor_policy_weight <= 1.0:
+        raise ValueError("anchor_policy_weight must be between zero and one")
     try:
         from PolyEnv import Bardur, Imperius, MapType, SelfPlayPool
     except ImportError as error:
@@ -401,6 +419,7 @@ def train_self_play_pool(
             + ", ".join(missing_pool_api)
             + ". Rebuild/update the local PolyEnv bindings."
         )
+    seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "self_play_pool")
     run.write_config(
@@ -415,10 +434,17 @@ def train_self_play_pool(
             "max_pending_leaves": max_pending_leaves,
             "visible_action_history": visible_action_history,
             "belief_retries": belief_retries,
+            "anchor_policy_weight": anchor_policy_weight,
             "model_out": model_out,
         },
     )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
+    if anchor_model is model:
+        raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
+    if anchor_model is not None:
+        anchor_model = anchor_model.to(device).eval()
+        for parameter in anchor_model.parameters():
+            parameter.requires_grad_(False)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     native_threads = 0 if num_threads is None else max(1, int(num_threads))
     map_type = MapType.Drylands if training.map_type == "drylands" else MapType.Lakes
@@ -467,6 +493,9 @@ def train_self_play_pool(
     belief_reset_reasons: Dict[str, int] = {}
     losses: List[Dict[str, float]] = []
     optimisation_updates = 0
+    anchor_decisions = 0
+    anchor_agreements = 0
+    anchor_l1_sum = 0.0
     model.eval()
 
     def log_rollout(step: int, curriculum_scale: float) -> None:
@@ -688,7 +717,40 @@ def train_self_play_pool(
             root_values = np.asarray(root["root_value"], dtype=np.float32)
             next_players = np.asarray(request["to_play"], dtype=np.int64)
             belief_targets = np.asarray(pool.belief_targets_numpy(state_ids), dtype=np.int32)
-            examples = _root_examples(request, root, training, belief_targets)
+            anchor_policy = None
+            if anchor_model is not None and anchor_policy_weight > 0.0:
+                with torch.inference_mode():
+                    anchor_output = anchor_model(
+                        root_tensors.map_tokens, root_tensors.global_features,
+                        root_tensors.action_categorical, root_tensors.action_continuous,
+                        root_tensors.action_mask, root_tensors.event_features,
+                        action_history=root_tensors.action_history,
+                        action_history_mask=root_tensors.action_history_mask,
+                        include_belief=False,
+                    )
+                    anchor_policy = torch.softmax(anchor_output.policy_logits, dim=-1).float().cpu().numpy()
+                mcts_policy = np.asarray(root["policy"], dtype=np.float32)
+                root_mask = np.asarray(root["action_mask"], dtype=bool)
+                for index in range(num_envs):
+                    count = int(root_mask[index].sum())
+                    if count <= 0:
+                        continue
+                    candidate_row = mcts_policy[index, :count]
+                    anchor_row = anchor_policy[index, :count]
+                    candidate_row = candidate_row / max(float(candidate_row.sum()), 1e-8)
+                    anchor_row = anchor_row / max(float(anchor_row.sum()), 1e-8)
+                    anchor_agreements += int(candidate_row.argmax() == anchor_row.argmax())
+                    anchor_l1_sum += float(np.abs(candidate_row - anchor_row).sum())
+                    anchor_decisions += 1
+                del anchor_output
+            examples = _root_examples(
+                request,
+                root,
+                training,
+                belief_targets,
+                anchor_policy=anchor_policy,
+                anchor_policy_weight=anchor_policy_weight,
+            )
             for index, example in enumerate(examples):
                 example.bootstrap_value = float(root_values[index])
             action_rows = _sample_root_rows(root, rng, mcts.temperature)
@@ -772,6 +834,9 @@ def train_self_play_pool(
         "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
         "self_play_pool_belief_reset_rows": float(belief_reset_rows),
         "self_play_pool_truncated_roots": float(truncated_roots),
+        "self_play_pool_anchor_policy_weight": float(anchor_policy_weight if anchor_model is not None else 0.0),
+        "self_play_pool_anchor_agreement": float(anchor_agreements / max(1, anchor_decisions)),
+        "self_play_pool_anchor_mean_l1": float(anchor_l1_sum / max(1, anchor_decisions)),
         "replay_examples": float(len(replay)),
     }
     summary.update({f"self_play_pool_belief_rejection_{kind}": float(count)

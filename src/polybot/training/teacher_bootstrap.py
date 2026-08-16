@@ -20,6 +20,7 @@ from ..data.polyenv_features import (
 )
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
+from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .optimisation import train_batch
@@ -95,6 +96,9 @@ def _teacher_game(seed: int, training: TrainingConfig) -> Tuple[List[TrainingExa
         moves += 1
 
     _assign_value_targets(examples, transitions, winner, training)
+    if not env.is_done():
+        for example in examples:
+            example.value_loss_weight = 0.0
     metrics["moves"] = float(moves)
     metrics["examples"] = float(len(examples))
     metrics["winner"] = float(winner)
@@ -112,6 +116,7 @@ def train_teacher_bootstrap(
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Clone productive teacher behavior and belief labels without disk replay."""
+    seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "teacher")
     run.write_config(

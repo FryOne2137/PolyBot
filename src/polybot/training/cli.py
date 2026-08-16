@@ -23,6 +23,10 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--map-type", default="lakes", choices=["lakes", "drylands"])
     parser.add_argument("--max-moves", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=2.0e-4)
+    parser.add_argument("--replay-capacity", type=int, default=20_000)
+    parser.add_argument("--training-policy-weight", type=float, default=1.0)
+    parser.add_argument("--training-value-weight", type=float, default=1.0)
+    parser.add_argument("--belief-weight", type=float, default=0.35)
 
 
 def add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -44,18 +48,23 @@ def training_run_from_args(args: argparse.Namespace, stage: str) -> TrainingRun:
 
 def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
     seed = secrets.randbelow(2**31 - 1) + 1 if getattr(args, "random_seed", False) else args.seed
+    seed = (int(seed) - 1) % (2**31 - 1) + 1
     return TrainingConfig(
         seed=seed,
         device=args.device,
         map_size=args.map_size,
         map_type=args.map_type,
         max_moves=args.max_moves,
+        replay_capacity=args.replay_capacity,
         batch_size=getattr(args, "batch_size", 16),
         exploration_rate=getattr(args, "exploration_rate", 0.20),
         priority_replay_fraction=getattr(args, "priority_replay_fraction", 0.35),
         teacher_policy_target_weight=getattr(args, "teacher_policy_target_weight", 0.10),
         td_lambda=getattr(args, "td_lambda", 1.0),
         learning_rate=args.learning_rate,
+        policy_weight=args.training_policy_weight,
+        value_weight=args.training_value_weight,
+        belief_weight=args.belief_weight,
     )
 
 

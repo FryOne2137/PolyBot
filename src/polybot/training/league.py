@@ -21,11 +21,6 @@ from .run_artifacts import TrainingRun
 from .self_play_pool_train import train_self_play_pool
 
 
-def _match_score(result: Dict[str, float]) -> float:
-    games = max(1.0, float(result["games"]))
-    return (float(result["model_a_wins"]) + 0.5 * float(result["draws"])) / games
-
-
 def _next_checkpoint_path(directory: Path, prefix: str) -> Path:
     """Return an unused, monotonically numbered champion checkpoint path."""
     index = 1
@@ -44,7 +39,10 @@ def train_promotion_league(
     rounds: int,
     promotion_games: int,
     promotion_score: float,
+    promotion_lower_bound: float,
     evaluation_seed: int,
+    evaluation_seed_stride: int,
+    round_seed_stride: int,
     checkpoint_prefix: str,
     mcts: MCTSConfig,
     num_envs: int,
@@ -54,6 +52,7 @@ def train_promotion_league(
     max_pending_leaves: int,
     visible_action_history: int,
     belief_retries: int,
+    anchor_policy_weight: float = 0.20,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train sequential candidates and retain only promotion-approved models.
@@ -69,11 +68,22 @@ def train_promotion_league(
         raise ValueError("promotion_games must be positive")
     if not 0.0 <= promotion_score <= 1.0:
         raise ValueError("promotion_score must be between 0 and 1")
+    if not 0.0 <= promotion_lower_bound <= 1.0:
+        raise ValueError("promotion_lower_bound must be between 0 and 1")
+    if promotion_games % 2:
+        raise ValueError("promotion_games must be even so maps can be evaluated from both player slots")
+    if round_seed_stride == 0:
+        raise ValueError("round_seed_stride must not be zero")
+    if rounds > 1 and evaluation_seed_stride == 0:
+        raise ValueError("evaluation_seed_stride must rotate held-out maps between rounds")
+    if not 0.0 <= anchor_policy_weight <= 1.0:
+        raise ValueError("anchor_policy_weight must be between zero and one")
     if not checkpoint_prefix:
         raise ValueError("checkpoint_prefix must not be empty")
     if not champion_in.is_file():
         raise FileNotFoundError(f"champion checkpoint does not exist: {champion_in}")
 
+    resolved_evaluation_seed = (int(evaluation_seed) - 1) % (2**31 - 1) + 1
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "league")
     run.write_config(
@@ -85,7 +95,11 @@ def train_promotion_league(
             "rounds": rounds,
             "promotion_games": promotion_games,
             "promotion_score": promotion_score,
-            "evaluation_seed": evaluation_seed,
+            "promotion_lower_bound": promotion_lower_bound,
+            "evaluation_seed": resolved_evaluation_seed,
+            "evaluation_seed_stride": evaluation_seed_stride,
+            "round_seed_stride": round_seed_stride,
+            "anchor_policy_weight": anchor_policy_weight,
             "checkpoint_prefix": checkpoint_prefix,
             "num_envs": num_envs,
             "steps": steps,
@@ -111,13 +125,27 @@ def train_promotion_league(
     )
 
     for round_index in range(1, rounds + 1):
-        round_training = replace(training, seed=training.seed + round_index - 1)
+        round_training = replace(
+            training,
+            seed=(training.seed - 1 + (round_index - 1) * round_seed_stride) % (2**31 - 1) + 1,
+        )
+        round_evaluation_seed = (
+            resolved_evaluation_seed - 1 + (round_index - 1) * evaluation_seed_stride
+        ) % (2**31 - 1) + 1
+        if round_training.seed in {
+            (round_evaluation_seed - 1 + index) % (2**31 - 1) + 1
+            for index in range((promotion_games + 1) // 2)
+        }:
+            raise ValueError("league collection seed overlaps the held-out evaluation schedule")
         print(
             f"league round {round_index}/{rounds} | champion: {champion_path} | "
             f"collection seed: {round_training.seed}",
             flush=True,
         )
         candidate, model_config = load_model(champion_path, device)
+        champion, champion_config = load_model(champion_path, device)
+        if champion_config != model_config:
+            raise RuntimeError("candidate and champion ModelConfig differ")
         last_training = train_self_play_pool(
             round_training,
             model_config,
@@ -132,13 +160,12 @@ def train_promotion_league(
             # Candidates remain only in RAM until the promotion gate passes.
             model_out=None,
             model=candidate,
+            anchor_model=champion,
+            anchor_policy_weight=anchor_policy_weight,
             run=run.child(f"round_{round_index:03d}"),
         )
 
-        champion, champion_config = load_model(champion_path, device)
-        if champion_config != model_config:
-            raise RuntimeError("candidate and champion ModelConfig differ")
-        evaluation_training = replace(training, seed=evaluation_seed)
+        evaluation_training = replace(training, seed=round_evaluation_seed)
         last_match = evaluate_matches(
             candidate,
             device,
@@ -147,11 +174,16 @@ def train_promotion_league(
             promotion_games,
             champion,
         )
-        last_candidate_score = _match_score(last_match)
-        promoted = last_candidate_score >= promotion_score
+        last_candidate_score = float(last_match["model_a_score"])
+        lower_95 = float(last_match["score_lower_95"])
+        promoted = (
+            last_candidate_score >= promotion_score
+            and lower_95 >= promotion_lower_bound
+        )
         print(
             f"league gate {round_index}/{rounds} | score={last_candidate_score:.4f} | "
-            f"threshold={promotion_score:.4f} | promoted={int(promoted)}",
+            f"lower95={lower_95:.4f} | threshold={promotion_score:.4f} | "
+            f"promoted={int(promoted)}",
             flush=True,
         )
         if promoted:
@@ -179,8 +211,11 @@ def train_promotion_league(
         "league_promotions": float(promotions),
         "league_last_candidate_score": last_candidate_score,
         "league_promotion_threshold": promotion_score,
+        "league_promotion_lower_bound": promotion_lower_bound,
+        "league_anchor_policy_weight": anchor_policy_weight,
         "league_champion_path": str(champion_path),
-        "league_evaluation_seed": float(evaluation_seed),
+        "league_evaluation_seed": float(resolved_evaluation_seed),
+        "league_evaluation_seed_stride": float(evaluation_seed_stride),
     }
     summary.update({f"last_train_{key}": value for key, value in last_training.items()})
     summary.update({f"last_match_{key}": value for key, value in last_match.items()})

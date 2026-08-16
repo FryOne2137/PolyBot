@@ -6,6 +6,8 @@ memory.  A saved file contains only PyTorch model weights and model settings.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -16,12 +18,21 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 
 
 def save_model(path: Path, model: PolicyValueBeliefNet, config: ModelConfig) -> None:
-    """Write the one allowed training artifact: model weights."""
+    """Atomically write the one allowed training artifact: model weights."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {"model_config": asdict(config), "state_dict": model.state_dict()},
-        path,
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(
+            {"model_config": asdict(config), "state_dict": model.state_dict()},
+            temporary_path,
+        )
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, ModelConfig]:

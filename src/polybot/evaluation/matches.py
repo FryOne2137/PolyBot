@@ -10,8 +10,14 @@ from tqdm.auto import tqdm
 
 from ..config import MCTSConfig, TrainingConfig
 from ..data.polyenv_features import capture_flags
+from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.belief_mcts import BeliefMCTS
+
+
+def _paired_seed_and_slot(base_seed: int, game_index: int) -> tuple[int, int]:
+    """Use the same map for consecutive games and swap the candidate slot."""
+    return int(base_seed) + int(game_index) // 2, int(game_index) % 2
 
 
 def _new_env(seed: int, training: TrainingConfig) -> object:
@@ -41,6 +47,7 @@ def evaluate_matches(
     bias.  The function keeps all game state in memory and only returns a
     compact terminal summary.
     """
+    seed_everything(training.seed)
     model_a.eval()
     if model_b is not None:
         model_b.eval()
@@ -62,10 +69,14 @@ def evaluate_matches(
     }
     opponent_name = "model_b" if model_b is not None else "random"
 
+    game_scores = []
     with tqdm(total=games, desc=f"evaluate A vs {opponent_name}", unit="game", dynamic_ncols=True) as progress:
         for game_index in range(games):
-            env = _new_env(training.seed + game_index, training)
-            model_a_player = game_index % 2
+            # Evaluate every generated map twice with player slots swapped.
+            # This controls map-specific first-player bias instead of merely
+            # alternating slots across two unrelated maps.
+            map_seed, model_a_player = _paired_seed_and_slot(training.seed, game_index)
+            env = _new_env(map_seed, training)
             moves = 0
             winner = -1
             while not env.is_done() and moves < training.max_moves:
@@ -100,10 +111,13 @@ def evaluate_matches(
             totals["moves"] += moves
             if winner == model_a_player:
                 totals["model_a_wins"] += 1.0
+                game_scores.append(1.0)
             elif winner >= 0:
                 totals["model_a_losses"] += 1.0
+                game_scores.append(0.0)
             else:
                 totals["draws"] += 1.0
+                game_scores.append(0.5)
             progress.update(1)
             progress.set_postfix(
                 wins=int(totals["model_a_wins"]),
@@ -111,6 +125,22 @@ def evaluate_matches(
             )
 
     totals["model_a_win_rate"] = totals["model_a_wins"] / max(1, games)
+    totals["evaluation_seed"] = float(training.seed)
+    totals["model_a_score"] = float(np.mean(game_scores)) if game_scores else 0.0
+    # The two slot-swapped games share a map and are therefore not independent.
+    # Estimate uncertainty across map pairs rather than individual games.
+    map_scores = [
+        float(np.mean(game_scores[index:index + 2]))
+        for index in range(0, len(game_scores), 2)
+    ]
+    totals["evaluation_maps"] = float(len(map_scores))
+    totals["score_standard_error"] = (
+        float(np.std(map_scores, ddof=1) / np.sqrt(len(map_scores)))
+        if len(map_scores) > 1 else 0.0
+    )
+    totals["score_lower_95"] = max(
+        0.0, totals["model_a_score"] - 1.96 * totals["score_standard_error"]
+    )
     totals["mean_moves"] = totals["moves"] / max(1, games)
     totals["mean_model_a_particles"] = (
         totals["model_a_particles"] / max(1, totals["model_a_decisions"])

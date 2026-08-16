@@ -39,6 +39,8 @@ python scripts/train_teacher.py `
 # Wykresy: runs\self_play_pool\train.
 python scripts/train_self_play_pool.py `
   --model-in models\teacher-structured-v1.pt `
+  --anchor-model models\teacher-structured-v1.pt `
+  --anchor-policy-weight 0.20 `
   --model-out models\selfplay-ismcts-v1.pt `
   --num-envs 128 `
   --steps 10000 `
@@ -51,8 +53,10 @@ python scripts/train_self_play_pool.py `
   --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 64 `
-  --td-lambda 1.0 `
-  --learning-rate 3e-5 `
+  --replay-capacity 100000 `
+  --belief-weight 0.10 `
+  --td-lambda 0.95 `
+  --learning-rate 1e-5 `
   --map-size 11 `
   --map-type lakes `
   --random-seed `
@@ -74,8 +78,9 @@ python scripts/evaluate.py `
 # 5. Liga: jeden kandydat na raz, stała bramka przeciw championowi.
 # Checkpointy po promocji trafią do models\league\, a przebieg i wykresy do
 # runs\league\train\round_001, round_002 itd.
-# Każda runda ma nowy seed self-play, a wszystkie bramki ten sam zestaw
-# seedów ewaluacyjnych. Wznów następny run od ostatniego champion-XXX.pt.
+# Stały --seed jest bazą wielu map, nie jednej mapy. Każda runda ma odległy
+# seed self-play, a bramka osobny, nieużywany w treningu zestaw map. Wznów
+# następny run od ostatniego champion-XXX.pt.
 python scripts/train_league.py `
   --champion-in models\teacher-structured-v1.pt `
   --checkpoint-dir models\league `
@@ -83,7 +88,11 @@ python scripts/train_league.py `
   --rounds 10 `
   --promotion-games 100 `
   --promotion-score 0.55 `
-  --evaluation-seed 91337 `
+  --promotion-lower-bound 0.50 `
+  --evaluation-seed 1500000007 `
+  --evaluation-seed-stride 20000033 `
+  --round-seed-stride 10000019 `
+  --anchor-policy-weight 0.20 `
   --num-envs 128 `
   --steps 1000 `
   --updates 500 `
@@ -95,10 +104,51 @@ python scripts/train_league.py `
   --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 64 `
-  --td-lambda 1.0 `
-  --learning-rate 3e-5 `
+  --replay-capacity 100000 `
+  --belief-weight 0.10 `
+  --td-lambda 0.95 `
+  --learning-rate 1e-5 `
   --max-moves 400 `
   --map-size 11 `
   --map-type lakes `
   --random-seed `
+  --device cuda
+
+# 6. Zalecany bezpieczny upgrade teachera pełnym pipeline. Model wyjściowy
+# zostanie kandydatem tylko po wygraniu sparowanego testu; przy porażce nadal
+# będzie poprawnym checkpointem championa.
+python scripts/train_pipeline.py `
+  --model-in models\teacher-structured-v1.pt `
+  --model-out models\champion-v2.pt `
+  --champion-model models\teacher-structured-v1.pt `
+  --belief-positions 0 `
+  --teacher-games 0 `
+  --vector-teacher-steps 0 `
+  --flat-steps 0 `
+  --self-play-pool-steps 0 `
+  --self-play-games 200 `
+  --refinement-games 100 `
+  --updates-per-game 4 `
+  --refinement-updates-per-game 4 `
+  --teacher-replay-fraction 0.35 `
+  --teacher-policy-target-weight 0.15 `
+  --exploration-rate 0.10 `
+  --priority-replay-fraction 0.50 `
+  --td-lambda 0.95 `
+  --simulations 32 `
+  --particles 2 `
+  --workers 32 `
+  --mcts-threads 1 `
+  --mcts-max-actions 1024 `
+  --batch-size 64 `
+  --replay-capacity 100000 `
+  --belief-weight 0.10 `
+  --learning-rate 1e-5 `
+  --max-moves 500 `
+  --promotion-games 100 `
+  --promotion-score 0.55 `
+  --promotion-lower-bound 0.50 `
+  --evaluation-seed 1500000007 `
+  --refinement-seed-offset 10000019 `
+  --seed 91337 `
   --device cuda

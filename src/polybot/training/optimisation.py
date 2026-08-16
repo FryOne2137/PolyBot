@@ -100,7 +100,15 @@ def train_batch(
     policy = -(
         batch["policy_target"] * valid_log_probabilities
     ).sum(dim=-1).mean()
-    value = F.smooth_l1_loss(output.value, batch["value_target"])
+    per_example_value = F.smooth_l1_loss(
+        output.value, batch["value_target"], reduction="none"
+    )
+    value_weights = batch.get("value_loss_weight")
+    if value_weights is None:
+        value = per_example_value.mean()
+    else:
+        value_weights = value_weights.to(per_example_value.dtype)
+        value = (per_example_value * value_weights).sum() / value_weights.sum().clamp_min(1.0)
     belief = belief_loss(output.belief_logits, batch["full_map_target"], batch["hidden_mask"])
     total = (
         config.policy_weight * policy

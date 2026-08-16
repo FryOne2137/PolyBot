@@ -620,6 +620,29 @@ class LeagueDatabase:
         )
         self.connection.commit()
 
+    def invalidate_evaluation(
+        self,
+        evaluation_id: int,
+        summary: Mapping[str, Any],
+    ) -> None:
+        """Finish an infrastructure-invalid gate without changing ratings."""
+        exists = self.connection.execute(
+            "SELECT 1 FROM evaluations WHERE id = ?", (evaluation_id,)
+        ).fetchone()
+        if exists is None:
+            raise KeyError(f"unknown evaluation {evaluation_id}")
+        payload = dict(summary)
+        payload["valid"] = 0.0
+        payload["invalid_evaluations"] = max(
+            1.0, float(payload.get("invalid_evaluations", 0.0))
+        )
+        self.connection.execute(
+            """UPDATE evaluations SET score_a = NULL, lower_95 = NULL,
+               summary_json = ?, finished_at = ? WHERE id = ?""",
+            (_json(payload), _utc_now(), evaluation_id),
+        )
+        self.connection.commit()
+
     def record_metric_row(
         self,
         run_id: int,

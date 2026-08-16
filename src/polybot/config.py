@@ -98,3 +98,7 @@ class TrainingConfig:
     # Fraction of each training batch reserved for rare strategic/terminal
     # examples, while the rest stays uniformly sampled for stability.
     priority_replay_fraction: float = 0.35
+    # Bound repeated sampling when belief failures leave only a small replay.
+    # Six means that, on average, one newly collected example can contribute
+    # to at most six optimiser-batch exposures in this training phase.
+    max_replay_epochs: float = 6.0

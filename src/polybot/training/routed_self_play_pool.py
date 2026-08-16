@@ -20,6 +20,17 @@ from ..infrastructure.device import select_device
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .global_mcts_train import _native_leaf_bias
+from .belief_recovery import (
+    BeliefQualityError,
+    BeliefRecoveryRequired,
+    capped_update_target,
+    effective_replay_epochs,
+    ismcts_rejected_envs,
+    particle_temperature,
+    recovery_rate_exceeded,
+    replace_rejected_particles,
+    replacement_seeds,
+)
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .run_artifacts import TrainingRun
@@ -85,6 +96,14 @@ class SearchCounters:
     belief_retries: int = 0
     belief_fallback_rows: int = 0
     belief_rejections: int = 0
+    belief_rejected_particles: int = 0
+    belief_rejected_envs: int = 0
+    belief_resampled_envs: int = 0
+    belief_retry_successes: int = 0
+    belief_conservative_attempts: int = 0
+    belief_slot_resets: int = 0
+    belief_discarded_prefixes: int = 0
+    root_env_decisions: int = 0
 
 
 class RoutedPoolSearch:
@@ -179,19 +198,22 @@ class RoutedPoolSearch:
     def _actor_particles(
         self,
         request: Mapping[str, np.ndarray],
-        active: np.ndarray,
+        rows: np.ndarray,
         particle_count: int,
+        base_temperature: float,
+        attempt: int,
     ) -> np.ndarray:
         maps = np.asarray(request["map_tokens"], dtype=np.int32)
         result = np.empty(
-            (self.num_envs, particle_count, maps.shape[1], maps.shape[2]),
+            (len(rows), particle_count, maps.shape[1], maps.shape[2]),
             dtype=np.int32,
         )
         agents = np.asarray(request["agent_id"], dtype=np.int32)
-        _validate_agents(agents[active], len(self.models), "root packet")
-        for agent in np.unique(agents[active]):
-            rows = np.flatnonzero(active & (agents == agent))
-            batch = _slice_rows(request, rows)
+        _validate_agents(agents[rows], len(self.models), "root packet")
+        for agent in np.unique(agents[rows]):
+            local = np.flatnonzero(agents[rows] == agent)
+            selected_rows = rows[local]
+            batch = _slice_rows(request, selected_rows)
             tensors = native_batch_to_tensors(
                 batch, self.device, self.training.map_size, self.training.map_type
             )
@@ -220,11 +242,11 @@ class RoutedPoolSearch:
                 completed = model.sample_completed_map_batch_from_belief_logits(
                     tensors.map_tokens,
                     output.belief_logits,
-                    temperature=0.0,
+                    temperature=particle_temperature(base_temperature, attempt, particle),
                     perspective_players=perspectives,
                     known_city_counts=city_counts,
                 )
-                result[rows, particle] = completed.numpy().astype(np.int32, copy=False)
+                result[local, particle] = completed.numpy().astype(np.int32, copy=False)
         return result
 
     @torch.inference_mode()
@@ -232,7 +254,8 @@ class RoutedPoolSearch:
         self,
         request: Mapping[str, np.ndarray],
         particle_count: int,
-        temperature: float,
+        base_temperature: float,
+        attempt: int,
     ) -> np.ndarray:
         maps = np.asarray(request["map_tokens"], dtype=np.int32)
         states = np.asarray(request["state"], dtype=np.int32)
@@ -296,7 +319,7 @@ class RoutedPoolSearch:
                 completed = model.sample_completed_map_batch_from_belief_logits(
                     map_tensor,
                     output.belief_logits,
-                    temperature=temperature,
+                    temperature=particle_temperature(base_temperature, attempt, particle),
                     perspective_players=perspective_tensor,
                     known_city_counts=city_counts,
                 )
@@ -391,43 +414,129 @@ class RoutedPoolSearch:
         particle_count = max(1, int(self.mcts.particles))
         self.pool.all_player_belief_requests_into(self.all_players)
         all_players = self.all_players
+        active = np.asarray(active, dtype=bool)
+        self.counters.root_env_decisions += int(active.sum())
 
-        def learned() -> np.ndarray:
-            particles = self._all_player_particles(
-                all_players, particle_count, belief_temperature
+        def learned_rows(rows: np.ndarray, attempt: int) -> np.ndarray:
+            rows = np.asarray(rows, dtype=np.int32)
+            local_all_players = _slice_rows(all_players, rows)
+            local_particles = self._all_player_particles(
+                local_all_players, particle_count, belief_temperature, attempt
             )
-            actor_particles = self._actor_particles(request, active, particle_count)
-            active_rows = np.flatnonzero(active)
-            particles[active_rows, actors[active_rows]] = actor_particles[active_rows]
-            return np.ascontiguousarray(particles)
+            actor_local = np.flatnonzero(active[rows])
+            if actor_local.size:
+                actor_rows = rows[actor_local]
+                completed = self._actor_particles(
+                    request,
+                    actor_rows,
+                    particle_count,
+                    belief_temperature,
+                    attempt,
+                )
+                local_particles[actor_local, actors[actor_rows]] = completed
+            return local_particles
 
-        particles = learned()
+        all_rows = np.arange(self.num_envs, dtype=np.int32)
+        particles = np.ascontiguousarray(learned_rows(all_rows, 0))
         submitted = False
         last_error: ValueError | None = None
+        rejected_rows = all_rows
+        retry_pending_envs = 0
+        diagnostics: tuple[Mapping[str, Any], ...] = ()
+        has_acceptance_mask = callable(
+            getattr(self.pool, "ismcts_belief_acceptance_mask", None)
+        )
         for attempt in range(self.belief_retries + 1):
+            if has_acceptance_mask:
+                rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
+                    self.pool, state_ids, particles, submit_failed=False
+                )
+                if rejected_rows.size:
+                    retry_pending_envs = int(rejected_rows.size)
+                    last_error = ValueError(
+                        "ismcts_belief_acceptance_mask rejected learned particles"
+                    )
+                    self.counters.belief_rejections += int(rejected_rows.size)
+                    self.counters.belief_rejected_envs += int(rejected_rows.size)
+                    self.counters.belief_rejected_particles += int(rejected_particles)
+                    if attempt < self.belief_retries:
+                        self.counters.belief_retries += int(rejected_rows.size)
+                        self.counters.belief_resampled_envs += int(rejected_rows.size)
+                        fresh = learned_rows(rejected_rows, attempt + 1)
+                        replace_rejected_particles(
+                            particles, rejected_rows, rejected_mask, fresh
+                        )
+                        continue
+                    break
             try:
                 self.pool.submit_beliefs(state_ids, particles)
                 submitted = True
+                if attempt:
+                    self.counters.belief_retry_successes += retry_pending_envs
                 break
             except ValueError as error:
                 last_error = error
-                self.counters.belief_rejections += self.num_envs
+                rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
+                    self.pool, state_ids, particles
+                )
+                retry_pending_envs = int(rejected_rows.size)
+                self.counters.belief_rejections += int(rejected_rows.size)
+                self.counters.belief_rejected_envs += int(rejected_rows.size)
+                self.counters.belief_rejected_particles += int(rejected_particles)
                 if attempt < self.belief_retries:
-                    self.counters.belief_retries += self.num_envs
-                    particles = learned()
+                    self.counters.belief_retries += int(rejected_rows.size)
+                    self.counters.belief_resampled_envs += int(rejected_rows.size)
+                    fresh = learned_rows(rejected_rows, attempt + 1)
+                    replace_rejected_particles(
+                        particles, rejected_rows, rejected_mask, fresh
+                    )
         if not submitted:
-            fallback = np.ascontiguousarray(
-                self._conservative_particles(all_players, particle_count)
+            fallback_target_rows = rejected_rows.copy()
+            fallback_target_count = int(fallback_target_rows.size)
+            self.counters.belief_conservative_attempts += fallback_target_count
+            fallback_rows = self._conservative_particles(
+                _slice_rows(all_players, fallback_target_rows), particle_count
             )
-            try:
-                self.pool.submit_beliefs(state_ids, fallback)
-                self.counters.belief_fallback_rows += self.num_envs
-            except ValueError as error:
+            replace_rejected_particles(
+                particles, fallback_target_rows, rejected_mask, fallback_rows
+            )
+            fallback_error: ValueError | None = None
+            fallback_preflight_rejected = False
+            if has_acceptance_mask:
+                rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
+                    self.pool, state_ids, particles, submit_failed=False
+                )
+                if rejected_rows.size:
+                    fallback_preflight_rejected = True
+                    fallback_error = ValueError(
+                        "ismcts_belief_acceptance_mask rejected conservative particles"
+                    )
+                    self.counters.belief_rejections += int(rejected_rows.size)
+                    self.counters.belief_rejected_envs += int(rejected_rows.size)
+                    self.counters.belief_rejected_particles += int(rejected_particles)
+            if fallback_error is None:
+                try:
+                    self.pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
+                    submitted = True
+                    self.counters.belief_fallback_rows += fallback_target_count
+                except ValueError as error:
+                    fallback_error = error
+            if fallback_error is not None:
+                error = fallback_error
+                if not fallback_preflight_rejected:
+                    rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
+                        self.pool, state_ids, particles
+                    )
+                    self.counters.belief_rejections += int(rejected_rows.size)
+                    self.counters.belief_rejected_envs += int(rejected_rows.size)
+                    self.counters.belief_rejected_particles += int(rejected_particles)
                 kind = _belief_rejection_kind(error)
                 original = f"; learned error={last_error}" if last_error is not None else ""
-                raise RuntimeError(
+                raise BeliefRecoveryRequired(
+                    rejected_rows,
                     "Routed SelfPlayPool rejected both learned and conservative "
-                    f"beliefs ({kind}): {error}{original}"
+                    f"beliefs ({kind}): {error}{original}",
+                    diagnostics,
                 ) from error
 
         waves = 1 + int(
@@ -564,13 +673,16 @@ def evaluate_matches_pool(
     belief_retries: int = 4,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """Run deterministic, paired candidate evaluation entirely in native pools."""
     if games < 2 or games % 2:
         raise ValueError("games must be positive and even for paired evaluation")
     if max_envs < 2:
         raise ValueError("max_envs must be at least two")
     seed_everything(training.seed)
+    # Keep the paired map and player slots fixed. Evaluation gets extra
+    # independent stochastic belief attempts before it is declared invalid.
+    evaluation_belief_retries = max(8, int(belief_retries))
     totals: Dict[str, float] = {
         "games": float(games),
         "model_a_wins": 0.0,
@@ -586,6 +698,7 @@ def evaluate_matches_pool(
         "evaluation_seed": float(training.seed),
     }
     scores: list[float] = []
+    completed_game_rows: list[Dict[str, Any]] = []
     routing = SearchCounters()
     chunk_limit = max(2, int(max_envs) - int(max_envs) % 2)
     with tqdm(total=games, desc="evaluate A vs model_b (SelfPlayPool)", unit="game", dynamic_ncols=True) as progress:
@@ -603,7 +716,7 @@ def evaluate_matches_pool(
                 num_threads=num_threads,
                 max_pending_leaves=max_pending_leaves,
                 visible_action_history=visible_action_history,
-                belief_retries=belief_retries,
+                belief_retries=evaluation_belief_retries,
                 seed=int(seeds[0]),
             )
             request = search.reset(seeds, assignments)
@@ -622,13 +735,63 @@ def evaluate_matches_pool(
                 active = ~done
                 if not active.any():
                     break
-                root = search.search(
-                    request,
-                    active,
-                    root_temperature=0.0,
-                    belief_temperature=0.0,
-                    prior_scale=0.0,
-                )
+                try:
+                    root = search.search(
+                        request,
+                        active,
+                        root_temperature=0.0,
+                        belief_temperature=0.0,
+                        prior_scale=0.0,
+                    )
+                except BeliefRecoveryRequired as error:
+                    progress.set_description("invalid belief evaluation")
+                    rejected_particles = (
+                        routing.belief_rejected_particles
+                        + search.counters.belief_rejected_particles
+                    )
+                    rejected_envs = (
+                        routing.belief_rejected_envs
+                        + search.counters.belief_rejected_envs
+                    )
+                    resampled_envs = (
+                        routing.belief_resampled_envs
+                        + search.counters.belief_resampled_envs
+                    )
+                    retry_successes = (
+                        routing.belief_retry_successes
+                        + search.counters.belief_retry_successes
+                    )
+                    conservative_attempts = (
+                        routing.belief_conservative_attempts
+                        + search.counters.belief_conservative_attempts
+                    )
+                    return {
+                        "valid": 0.0,
+                        "invalid_evaluations": 1.0,
+                        "requested_games": float(games),
+                        "games": 0.0,
+                        "evaluation_seed": float(training.seed),
+                        "invalid_envs": float(error.env_ids.size),
+                        "invalid_env_ids": error.env_ids.tolist(),
+                        "invalid_reason": str(error),
+                        "invalid_diagnostics": list(error.diagnostics),
+                        "belief_rejected_particles": float(rejected_particles),
+                        "belief_rejected_envs": float(rejected_envs),
+                        "belief_resampled_envs": float(resampled_envs),
+                        "belief_retry_successes": float(retry_successes),
+                        "belief_conservative_attempts": float(conservative_attempts),
+                        "belief_slot_resets": 0.0,
+                        "belief_discarded_prefixes": 0.0,
+                        "self_play_pool_belief_rejected_particles": float(
+                            rejected_particles
+                        ),
+                        "self_play_pool_belief_rejected_envs": float(rejected_envs),
+                        "self_play_pool_belief_resampled_envs": float(resampled_envs),
+                        "self_play_pool_belief_retry_successes": float(retry_successes),
+                        "self_play_pool_belief_conservative_attempts": float(
+                            conservative_attempts
+                        ),
+                    }
                 active_rows = np.flatnonzero(active)
                 action_rows = _sample_active_rows(
                     root,
@@ -715,8 +878,7 @@ def evaluate_matches_pool(
                     "model_a_particles": float(candidate_particles[env]),
                     "truncated": int(record is None),
                 }
-                if game_callback is not None:
-                    game_callback(game)
+                completed_game_rows.append(game)
             unfinished = count - len(records)
             if unfinished:
                 progress.update(unfinished)
@@ -725,15 +887,44 @@ def evaluate_matches_pool(
             routing.belief_retries += search.counters.belief_retries
             routing.belief_fallback_rows += search.counters.belief_fallback_rows
             routing.belief_rejections += search.counters.belief_rejections
+            routing.belief_rejected_particles += search.counters.belief_rejected_particles
+            routing.belief_rejected_envs += search.counters.belief_rejected_envs
+            routing.belief_resampled_envs += search.counters.belief_resampled_envs
+            routing.belief_retry_successes += search.counters.belief_retry_successes
+            routing.belief_conservative_attempts += search.counters.belief_conservative_attempts
+            routing.root_env_decisions += search.counters.root_env_decisions
             progress.set_postfix(
                 wins=int(totals["model_a_wins"]), draws=int(totals["draws"])
             )
     _paired_uncertainty(totals, scores)
+    totals["valid"] = 1.0
+    totals["invalid_evaluations"] = 0.0
     totals["self_play_pool_leaf_rows"] = float(routing.leaf_rows)
     totals["self_play_pool_leaf_waves"] = float(routing.leaf_waves)
     totals["self_play_pool_belief_retries"] = float(routing.belief_retries)
     totals["self_play_pool_belief_fallback_rows"] = float(routing.belief_fallback_rows)
     totals["self_play_pool_belief_rejections"] = float(routing.belief_rejections)
+    totals["self_play_pool_belief_rejected_particles"] = float(
+        routing.belief_rejected_particles
+    )
+    totals["self_play_pool_belief_rejected_envs"] = float(routing.belief_rejected_envs)
+    totals["self_play_pool_belief_resampled_envs"] = float(routing.belief_resampled_envs)
+    totals["self_play_pool_belief_retry_successes"] = float(routing.belief_retry_successes)
+    totals["self_play_pool_belief_conservative_attempts"] = float(
+        routing.belief_conservative_attempts
+    )
+    totals["belief_rejected_particles"] = float(routing.belief_rejected_particles)
+    totals["belief_rejected_envs"] = float(routing.belief_rejected_envs)
+    totals["belief_resampled_envs"] = float(routing.belief_resampled_envs)
+    totals["belief_retry_successes"] = float(routing.belief_retry_successes)
+    totals["belief_conservative_attempts"] = float(
+        routing.belief_conservative_attempts
+    )
+    totals["belief_slot_resets"] = 0.0
+    totals["belief_discarded_prefixes"] = 0.0
+    if game_callback is not None:
+        for game in completed_game_rows:
+            game_callback(game)
     return totals
 
 
@@ -753,6 +944,7 @@ def train_population_pool(
     belief_retries: int = 4,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
+    reserved_seeds: Sequence[int] = (),
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train candidate agent 0 against a PFSP population in native batches."""
@@ -764,6 +956,8 @@ def train_population_pool(
         raise ValueError("population training requires at least one opponent model")
     if max_envs < 1:
         raise ValueError("max_envs must be positive")
+    if training.max_replay_epochs <= 0.0:
+        raise ValueError("max_replay_epochs must be positive")
     weights = np.asarray(opponent_weights, dtype=np.float64)
     if weights.shape != (len(opponent_models),) or np.any(weights < 0) or not np.isfinite(weights).all():
         raise ValueError("opponent_weights must be finite, non-negative and match opponents")
@@ -816,10 +1010,19 @@ def train_population_pool(
         for _ in frozen
     ]
     routing = SearchCounters()
+    recovery_seed_cursor = 0
+    reserved_seed_set = {int(value) for value in reserved_seeds}
+    recovery_seed_history: set[int] = set()
 
     def optimise_until(target: int) -> None:
         nonlocal updates
-        while updates < target and len(replay) >= training.batch_size:
+        capped = capped_update_target(
+            target,
+            examples_count,
+            training.batch_size,
+            training.max_replay_epochs,
+        )
+        while updates < capped and len(replay) >= training.batch_size:
             batch = replay.sample(
                 training.batch_size, rng, training.priority_replay_fraction
             )
@@ -867,36 +1070,103 @@ def train_population_pool(
                         trajectories[env].append((actor, reward, example))
                         pending[env] = None
 
-            for move_index in range(training.max_moves):
+            vector_iteration = 0
+            while True:
                 consume_pending()
                 terminal = np.asarray(request["terminated"], dtype=bool)
                 newly_terminal = terminal & ~done
+                horizon = (~terminal) & (~done) & (moves >= training.max_moves)
                 drained = search.drain_completed()
                 for row in range(len(drained.get("env_id", []))):
                     env = int(drained["env_id"][row])
                     records[env] = {name: value[row] for name, value in drained.items()}
-                for env in np.flatnonzero(newly_terminal):
-                    exact = np.asarray(request["terminal_values"][env], dtype=np.float32)
+                for env in np.flatnonzero(newly_terminal | horizon):
+                    exact = (
+                        np.asarray(request["terminal_values"][env], dtype=np.float32)
+                        if newly_terminal[env]
+                        else None
+                    )
                     finished = _finish_trajectory(trajectories[env], training, exact)
                     replay.extend(finished)
                     examples_count += len(finished)
                     trajectories[env].clear()
                     done[env] = True
                     completed_count += 1
-                    terminal_count += 1
+                    if exact is None:
+                        truncated_count += 1
+                    else:
+                        terminal_count += 1
                     optimise_until(completed_count * updates_per_game)
                     progress.update(1)
                 active = ~done
                 if not active.any():
                     break
                 curriculum = max(0.0, 1.0 - completed_count / max(1, games))
-                root = search.search(
-                    request,
-                    active,
-                    root_temperature=1.0,
-                    belief_temperature=max(mcts.temperature, 0.35),
-                    prior_scale=curriculum,
-                )
+                try:
+                    root = search.search(
+                        request,
+                        active,
+                        root_temperature=1.0,
+                        belief_temperature=max(mcts.temperature, 0.35),
+                        prior_scale=curriculum,
+                    )
+                except BeliefRecoveryRequired as error:
+                    reset_rows = np.asarray(
+                        [env for env in error.env_ids if active[int(env)]], dtype=np.int32
+                    )
+                    if reset_rows.size == 0:
+                        raise
+                    discarded_prefixes = 0
+                    for env in reset_rows:
+                        discarded_prefixes += int(bool(trajectories[int(env)]))
+                        finished = _finish_trajectory(trajectories[int(env)], training, None)
+                        replay.extend(finished)
+                        examples_count += len(finished)
+                        trajectories[int(env)].clear()
+                        pending[int(env)] = None
+                        records.pop(int(env), None)
+                    search.counters.belief_discarded_prefixes += discarded_prefixes
+                    search.counters.belief_slot_resets += int(reset_rows.size)
+                    new_seeds = replacement_seeds(
+                        training.seed,
+                        recovery_seed_cursor,
+                        int(reset_rows.size),
+                        excluded=reserved_seed_set | recovery_seed_history,
+                    )
+                    recovery_seed_cursor += int(reset_rows.size)
+                    recovery_seed_history.update(int(seed) for seed in new_seeds)
+                    seeds[reset_rows] = new_seeds
+                    moves[reset_rows] = 0
+                    search.pool.reset_slots_into(
+                        reset_rows,
+                        new_seeds,
+                        np.ascontiguousarray(assignments[reset_rows], dtype=np.int32),
+                        request,
+                    )
+                    optimise_until(completed_count * updates_per_game)
+                    if recovery_rate_exceeded(
+                        search.counters.belief_slot_resets,
+                        search.counters.root_env_decisions,
+                    ):
+                        run.log(
+                            belief_quality_failed=1,
+                            belief_slot_resets=search.counters.belief_slot_resets,
+                            belief_root_decisions=search.counters.root_env_decisions,
+                            replay_examples=len(replay),
+                        )
+                        raise BeliefQualityError(
+                            "population belief slot reset rate exceeded 1%; "
+                            "candidate was not safe to continue",
+                            {
+                                "belief_slot_resets": search.counters.belief_slot_resets,
+                                "belief_root_decisions": search.counters.root_env_decisions,
+                                "belief_rejected_envs": search.counters.belief_rejected_envs,
+                                "belief_rejected_particles": search.counters.belief_rejected_particles,
+                                "replay_examples": len(replay),
+                                "optimisation_updates": updates,
+                            },
+                        ) from error
+                    continue
                 active_rows = np.flatnonzero(active)
                 action_rows = _sample_active_rows(
                     root,
@@ -942,35 +1212,11 @@ def train_population_pool(
                     request,
                 )
                 moves[active] += 1
-                if move_index == 0 or (move_index + 1) % 25 == 0:
+                vector_iteration += 1
+                if vector_iteration == 1 or vector_iteration % 25 == 0:
                     progress.set_postfix(
                         active=int(active.sum()), replay=len(replay), updates=updates
                     )
-
-            consume_pending()
-            terminal = np.asarray(request["terminated"], dtype=bool)
-            drained = search.drain_completed()
-            for row in range(len(drained.get("env_id", []))):
-                env = int(drained["env_id"][row])
-                records[env] = {name: value[row] for name, value in drained.items()}
-            for env in np.flatnonzero(~done):
-                exact = (
-                    np.asarray(request["terminal_values"][env], dtype=np.float32)
-                    if terminal[env]
-                    else None
-                )
-                finished = _finish_trajectory(trajectories[env], training, exact)
-                replay.extend(finished)
-                examples_count += len(finished)
-                trajectories[env].clear()
-                done[env] = True
-                completed_count += 1
-                if exact is None:
-                    truncated_count += 1
-                else:
-                    terminal_count += 1
-                optimise_until(completed_count * updates_per_game)
-                progress.update(1)
 
             for env, game_index in enumerate(game_indices):
                 record = records.get(env)
@@ -1003,12 +1249,35 @@ def train_population_pool(
                 optimisation_updates=updates,
                 candidate_decisions=decisions,
                 mean_score=score_sum / max(1, completed_count),
+                belief_rejected_particles=search.counters.belief_rejected_particles,
+                belief_rejected_envs=search.counters.belief_rejected_envs,
+                belief_resampled_envs=search.counters.belief_resampled_envs,
+                belief_retry_successes=search.counters.belief_retry_successes,
+                belief_conservative_attempts=search.counters.belief_conservative_attempts,
+                belief_slot_resets=search.counters.belief_slot_resets,
+                belief_discarded_prefixes=search.counters.belief_discarded_prefixes,
+                belief_reset_rate=(
+                    search.counters.belief_slot_resets
+                    / max(1, search.counters.root_env_decisions)
+                ),
+                completion_rate=completed_count / max(1, games),
+                effective_replay_epochs=effective_replay_epochs(
+                    updates, training.batch_size, examples_count
+                ),
             )
             routing.leaf_rows += search.counters.leaf_rows
             routing.leaf_waves += search.counters.leaf_waves
             routing.belief_retries += search.counters.belief_retries
             routing.belief_fallback_rows += search.counters.belief_fallback_rows
             routing.belief_rejections += search.counters.belief_rejections
+            routing.belief_rejected_particles += search.counters.belief_rejected_particles
+            routing.belief_rejected_envs += search.counters.belief_rejected_envs
+            routing.belief_resampled_envs += search.counters.belief_resampled_envs
+            routing.belief_retry_successes += search.counters.belief_retry_successes
+            routing.belief_conservative_attempts += search.counters.belief_conservative_attempts
+            routing.belief_slot_resets += search.counters.belief_slot_resets
+            routing.belief_discarded_prefixes += search.counters.belief_discarded_prefixes
+            routing.root_env_decisions += search.counters.root_env_decisions
 
     optimise_until(games * updates_per_game)
     summary: Dict[str, float | str] = {
@@ -1017,6 +1286,7 @@ def train_population_pool(
         "population_pool_truncated": float(truncated_count),
         "population_pool_updates": float(updates),
         "population_pool_examples": float(examples_count),
+        "population_pool_completion_rate": float(completed_count / max(1, games)),
         "population_pool_candidate_decisions": float(decisions),
         "population_pool_score": float(score_sum / max(1, games)),
         "population_pool_mean_moves": float(total_moves / max(1, games)),
@@ -1025,6 +1295,20 @@ def train_population_pool(
         "population_pool_belief_retries": float(routing.belief_retries),
         "population_pool_belief_fallback_rows": float(routing.belief_fallback_rows),
         "population_pool_belief_rejections": float(routing.belief_rejections),
+        "belief_rejected_particles": float(routing.belief_rejected_particles),
+        "belief_rejected_envs": float(routing.belief_rejected_envs),
+        "belief_resampled_envs": float(routing.belief_resampled_envs),
+        "belief_retry_successes": float(routing.belief_retry_successes),
+        "belief_conservative_attempts": float(routing.belief_conservative_attempts),
+        "belief_slot_resets": float(routing.belief_slot_resets),
+        "belief_discarded_prefixes": float(routing.belief_discarded_prefixes),
+        "belief_reset_rate": float(
+            routing.belief_slot_resets / max(1, routing.root_env_decisions)
+        ),
+        "effective_replay_epochs": effective_replay_epochs(
+            updates, training.batch_size, examples_count
+        ),
+        "requested_optimisation_updates": float(games * updates_per_game),
         "replay_examples": float(len(replay)),
     }
     for index, stats in enumerate(opponent_stats):

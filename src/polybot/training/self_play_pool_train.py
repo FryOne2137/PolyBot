@@ -8,7 +8,7 @@ MCTS forest and persistent C++ workers; PyTorch receives only dense batches.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -27,6 +27,16 @@ from ..infrastructure.model_io import save_model
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .global_mcts_train import _native_leaf_bias
+from .belief_recovery import (
+    BeliefQualityError,
+    capped_update_target,
+    effective_replay_epochs,
+    ismcts_rejected_envs,
+    particle_temperature,
+    recovery_rate_exceeded,
+    replace_rejected_particles,
+    replacement_seeds,
+)
 from .optimisation import train_batch
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .run_artifacts import TrainingRun
@@ -398,6 +408,7 @@ def train_self_play_pool(
     model: Optional[PolicyValueBeliefNet] = None,
     anchor_model: Optional[PolicyValueBeliefNet] = None,
     anchor_policy_weight: float = 0.20,
+    reserved_seeds: Sequence[int] = (),
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Run fully native belief-MCTS rollouts and optimise in RAM.
@@ -421,6 +432,8 @@ def train_self_play_pool(
         raise ValueError("visible_action_history must be between 0 and 1024")
     if not 0.0 <= anchor_policy_weight <= 1.0:
         raise ValueError("anchor_policy_weight must be between zero and one")
+    if training.max_replay_epochs <= 0.0:
+        raise ValueError("max_replay_epochs must be positive")
     try:
         from PolyEnv import Bardur, Imperius, MapType, SelfPlayPool
     except ImportError as error:
@@ -430,6 +443,7 @@ def train_self_play_pool(
         "all_player_belief_requests_into",
         "belief_targets_numpy",
         "reset_slots",
+        "reset_slots_into",
     )
     missing_pool_api = [name for name in required_pool_api if not hasattr(SelfPlayPool, name)]
     if missing_pool_api:
@@ -513,6 +527,17 @@ def train_self_play_pool(
     belief_fallback_rows = 0
     belief_rejections: Dict[str, int] = {}
     belief_reset_reasons: Dict[str, int] = {}
+    belief_rejected_particles = 0
+    belief_rejected_envs = 0
+    belief_resampled_envs = 0
+    belief_retry_successes = 0
+    belief_conservative_attempts = 0
+    belief_slot_resets = 0
+    belief_discarded_prefixes = 0
+    belief_root_decisions = 0
+    recovery_seed_cursor = 0
+    reserved_seed_set = {int(value) for value in reserved_seeds}
+    recovery_seed_history: set[int] = set()
     losses: List[Dict[str, float]] = []
     optimisation_updates = 0
     anchor_decisions = 0
@@ -532,6 +557,19 @@ def train_self_play_pool(
             "belief_retries": float(belief_retries_used),
             "belief_fallback_rows": float(belief_fallback_rows),
             "belief_reset_rows": float(belief_reset_rows),
+            "belief_rejected_particles": float(belief_rejected_particles),
+            "belief_rejected_envs": float(belief_rejected_envs),
+            "belief_resampled_envs": float(belief_resampled_envs),
+            "belief_retry_successes": float(belief_retry_successes),
+            "belief_conservative_attempts": float(belief_conservative_attempts),
+            "belief_slot_resets": float(belief_slot_resets),
+            "belief_discarded_prefixes": float(belief_discarded_prefixes),
+            "belief_reset_rate": float(
+                belief_slot_resets / max(1, belief_root_decisions)
+            ),
+            "effective_replay_epochs": effective_replay_epochs(
+                optimisation_updates, training.batch_size, completed_targets
+            ),
             "curriculum_scale": float(curriculum_scale),
             "mean_leaf_batch": float(np.mean(leaf_counts)) if leaf_counts else 0.0,
         }
@@ -541,44 +579,55 @@ def train_self_play_pool(
 
     def optimise_until(target: int) -> None:
         nonlocal optimisation_updates
-        while optimisation_updates < target and len(replay) >= training.batch_size:
+        capped = capped_update_target(
+            target,
+            completed_targets,
+            training.batch_size,
+            training.max_replay_epochs,
+        )
+        while optimisation_updates < capped and len(replay) >= training.batch_size:
             batch = replay.sample(training.batch_size, rng, training.priority_replay_fraction)
             losses.append(train_batch(model, optimiser, stack_examples(batch, device), training))
             optimisation_updates += 1
 
     with tqdm(total=steps, desc=f"SelfPlayPool MCTS ({device})", unit="step", dynamic_ncols=True) as progress:
-        for step in range(steps):
+        step = 0
+        retrying_step = False
+        while step < steps:
             curriculum_scale = 0.0 if steps == 1 else max(0.0, 1.0 - step / (steps - 1))
             # ``request`` is the successor batch written by the previous
             # ``step_into_checked`` call. With auto-reset it already contains
             # the next episode's root, while ``terminated`` and
             # ``terminal_values`` still describe the transition just taken.
-            terminal = np.asarray(request["terminated"], dtype=bool)
-            terminal_values = np.asarray(request["terminal_values"], dtype=np.float32)
-            for index, old in enumerate(pending):
-                if old is not None:
-                    example, actor, reward = old
-                    trajectories[index].append((actor, reward, example))
-                    pending[index] = None
+            if not retrying_step:
+                terminal = np.asarray(request["terminated"], dtype=bool)
+                terminal_values = np.asarray(request["terminal_values"], dtype=np.float32)
+                for index, old in enumerate(pending):
+                    if old is not None:
+                        example, actor, reward = old
+                        trajectories[index].append((actor, reward, example))
+                        pending[index] = None
 
-            truncated = (~terminal) & (episode_moves >= training.max_moves)
-            finished = terminal | truncated
-            for index in np.flatnonzero(finished):
-                exact_values = terminal_values[index] if terminal[index] else None
-                finished_examples = _finish_trajectory(trajectories[index], training, exact_values)
-                replay.extend(finished_examples)
-                completed_targets += len(finished_examples)
-                trajectories[index].clear()
-                episode_moves[index] = 0
-            terminal_episodes += int(terminal.sum())
-            truncated_episodes += int(truncated.sum())
+                truncated = (~terminal) & (episode_moves >= training.max_moves)
+                finished = terminal | truncated
+                for index in np.flatnonzero(finished):
+                    exact_values = terminal_values[index] if terminal[index] else None
+                    finished_examples = _finish_trajectory(trajectories[index], training, exact_values)
+                    replay.extend(finished_examples)
+                    completed_targets += len(finished_examples)
+                    trajectories[index].clear()
+                    episode_moves[index] = 0
+                terminal_episodes += int(terminal.sum())
+                truncated_episodes += int(truncated.sum())
 
-            # Auto-reset handles genuine terminal games. A trainer-imposed
-            # horizon must explicitly reset only the affected native slots.
-            truncated_rows = np.flatnonzero(truncated).astype(np.int32)
-            if truncated_rows.size:
-                pool.reset_slots(truncated_rows)
-                pool.belief_requests_into(request)
+                # Auto-reset handles genuine terminal games. A trainer-imposed
+                # horizon must explicitly reset only the affected native slots.
+                truncated_rows = np.flatnonzero(truncated).astype(np.int32)
+                if truncated_rows.size:
+                    pool.reset_slots(truncated_rows)
+                    pool.belief_requests_into(request)
+            retrying_step = False
+            belief_root_decisions += num_envs
 
             # ``train_batch`` deliberately leaves the module in train mode.
             # Search must be deterministic with dropout disabled, and it must
@@ -597,24 +646,6 @@ def train_self_play_pool(
             actors = np.asarray(request["to_play"], dtype=np.int64)
             particle_count = max(1, int(mcts.particles))
 
-            def actor_particle_batch() -> np.ndarray:
-                return np.stack([
-                    model.sample_completed_map_batch_from_belief_logits(
-                        root_tensors.map_tokens, root_output.belief_logits,
-                        # The active root must reproduce the already public
-                        # legal-action set exactly. Greedy decoding is far more
-                        # action-stable than sampling an early, uncertain
-                        # belief distribution; uncertainty remains in the
-                        # non-active player particles below.
-                        temperature=0.0,
-                        perspective_players=torch.as_tensor(actors, dtype=torch.long, device=device),
-                        known_city_counts=torch.as_tensor(
-                            np.asarray(request["state"], dtype=np.int32)[:, 6], dtype=torch.long, device=device
-                        ),
-                    ).numpy().astype(np.int32, copy=False)
-                    for _ in range(particle_count)
-                ], axis=1)
-
             # Full ISMCTS: every player supplies its own fog observation and
             # particle. The active actor is additionally conditioned on its
             # actual legal-action list, which is where blocked paths reveal
@@ -622,65 +653,211 @@ def train_self_play_pool(
             pool.all_player_belief_requests_into(all_players_buffer)
             all_players = all_players_buffer
 
-            def learned_particles() -> np.ndarray:
-                particles = np.stack([
-                    _all_player_particles(all_players, model, device, training, max(mcts.temperature, 0.35))
-                    for _ in range(particle_count)
+            def learned_rows(rows: np.ndarray, attempt: int) -> np.ndarray:
+                rows = np.asarray(rows, dtype=np.int32)
+                local_all_players = {
+                    name: np.asarray(value)[rows] for name, value in all_players.items()
+                }
+                local_particles = np.stack([
+                    _all_player_particles(
+                        local_all_players,
+                        model,
+                        device,
+                        training,
+                        particle_temperature(max(mcts.temperature, 0.35), attempt, particle),
+                    )
+                    for particle in range(particle_count)
                 ], axis=2)
-                # Re-sample this tensor on *every* retry. The active player's
-                # completion alone is required to preserve the public legal
-                # root action set, so retaining a rejected copy made retries
-                # deterministic failures.
-                particles[np.arange(num_envs), actors] = actor_particle_batch()
-                return particles
+                torch_rows = torch.as_tensor(rows, dtype=torch.long, device=device)
+                local_maps = root_tensors.map_tokens.index_select(0, torch_rows)
+                local_logits = tuple(
+                    logits.index_select(0, torch_rows) for logits in root_output.belief_logits
+                )
+                local_actors = actors[rows]
+                local_city_counts = np.asarray(request["state"], dtype=np.int32)[rows, 6]
+                for particle in range(particle_count):
+                    actor_completed = model.sample_completed_map_batch_from_belief_logits(
+                        local_maps,
+                        local_logits,
+                        temperature=particle_temperature(0.0, attempt, particle),
+                        perspective_players=torch.as_tensor(
+                            local_actors, dtype=torch.long, device=device
+                        ),
+                        known_city_counts=torch.as_tensor(
+                            local_city_counts, dtype=torch.long, device=device
+                        ),
+                    ).numpy().astype(np.int32, copy=False)
+                    local_particles[np.arange(rows.size), local_actors, particle] = actor_completed
+                return local_particles
 
-            particles = learned_particles()
+            all_rows = np.arange(num_envs, dtype=np.int32)
+            particles = np.ascontiguousarray(learned_rows(all_rows, 0))
             submitted = False
+            rejected_rows = all_rows
+            retry_pending_envs = 0
+            rejection_diagnostics: tuple[Dict[str, Any], ...] = ()
+            has_acceptance_mask = callable(
+                getattr(pool, "ismcts_belief_acceptance_mask", None)
+            )
             for attempt in range(belief_retries + 1):
+                if has_acceptance_mask:
+                    rejected_rows, rejected_mask, rejected_particles, rejection_diagnostics = ismcts_rejected_envs(
+                        pool, state_ids, particles, submit_failed=False
+                    )
+                    if rejected_rows.size:
+                        retry_pending_envs = int(rejected_rows.size)
+                        belief_rejections["acceptance_mask"] = (
+                            belief_rejections.get("acceptance_mask", 0)
+                            + int(rejected_rows.size)
+                        )
+                        belief_rejected_envs += int(rejected_rows.size)
+                        belief_rejected_particles += int(rejected_particles)
+                        if attempt < belief_retries:
+                            fresh = learned_rows(rejected_rows, attempt + 1)
+                            replace_rejected_particles(
+                                particles, rejected_rows, rejected_mask, fresh
+                            )
+                            belief_retries_used += int(rejected_rows.size)
+                            belief_resampled_envs += int(rejected_rows.size)
+                            continue
+                        break
                 try:
-                    pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
+                    pool.submit_beliefs(state_ids, particles)
                     submitted = True
+                    if attempt:
+                        belief_retry_successes += retry_pending_envs
                     break
                 except ValueError as error:
+                    rejected_rows, rejected_mask, rejected_particles, rejection_diagnostics = ismcts_rejected_envs(
+                        pool, state_ids, particles
+                    )
+                    retry_pending_envs = int(rejected_rows.size)
                     kind = _belief_rejection_kind(error)
-                    belief_rejections[kind] = belief_rejections.get(kind, 0) + num_envs
+                    belief_rejections[kind] = (
+                        belief_rejections.get(kind, 0) + int(rejected_rows.size)
+                    )
+                    belief_rejected_envs += int(rejected_rows.size)
+                    belief_rejected_particles += int(rejected_particles)
                     if attempt == belief_retries:
                         break
-                    particles = learned_particles()
-                    belief_retries_used += num_envs
+                    fresh = learned_rows(rejected_rows, attempt + 1)
+                    replace_rejected_particles(
+                        particles, rejected_rows, rejected_mask, fresh
+                    )
+                    belief_retries_used += int(rejected_rows.size)
+                    belief_resampled_envs += int(rejected_rows.size)
             if not submitted:
                 # Bootstrap safely rather than throw away the whole batch. The
                 # fallback is a low-information *hypothesis*, not a copy of
                 # the engine's hidden map. It also gives the belief head more
                 # labelled positions until learned structured particles begin
                 # satisfying the action-equivalence test on their own.
-                fallback = _conservative_all_player_particles(all_players, model, device)
-                fallback = np.repeat(fallback[:, :, None], particle_count, axis=2)
-                try:
-                    pool.submit_beliefs(state_ids, np.ascontiguousarray(fallback))
-                    submitted = True
-                    belief_fallback_rows += num_envs
-                except ValueError as error:
-                    kind = _belief_rejection_kind(error)
-                    belief_rejections[kind] = belief_rejections.get(kind, 0) + num_envs
+                fallback_target_rows = rejected_rows.copy()
+                fallback_target_count = int(fallback_target_rows.size)
+                belief_conservative_attempts += fallback_target_count
+                fallback_request = {
+                    name: np.asarray(value)[fallback_target_rows]
+                    for name, value in all_players.items()
+                }
+                fallback = _conservative_all_player_particles(
+                    fallback_request, model, device
+                )
+                fallback_particles = np.repeat(
+                    fallback[:, :, None], particle_count, axis=2
+                )
+                replace_rejected_particles(
+                    particles, fallback_target_rows, rejected_mask, fallback_particles
+                )
+                fallback_error: ValueError | None = None
+                fallback_preflight_rejected = False
+                if has_acceptance_mask:
+                    rejected_rows, rejected_mask, rejected_particles, rejection_diagnostics = ismcts_rejected_envs(
+                        pool, state_ids, particles, submit_failed=False
+                    )
+                    if rejected_rows.size:
+                        fallback_preflight_rejected = True
+                        fallback_error = ValueError(
+                            "ismcts_belief_acceptance_mask rejected conservative particles"
+                        )
+                        belief_rejections["acceptance_mask"] = (
+                            belief_rejections.get("acceptance_mask", 0)
+                            + int(rejected_rows.size)
+                        )
+                        belief_rejected_envs += int(rejected_rows.size)
+                        belief_rejected_particles += int(rejected_particles)
+                if fallback_error is None:
+                    try:
+                        pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
+                        submitted = True
+                        belief_fallback_rows += fallback_target_count
+                    except ValueError as error:
+                        fallback_error = error
+                if fallback_error is not None:
+                    error = fallback_error
+                    if not fallback_preflight_rejected:
+                        rejected_rows, rejected_mask, rejected_particles, rejection_diagnostics = ismcts_rejected_envs(
+                            pool, state_ids, particles
+                        )
+                        kind = _belief_rejection_kind(error)
+                        belief_rejections[kind] = (
+                            belief_rejections.get(kind, 0) + int(rejected_rows.size)
+                        )
+                        belief_rejected_envs += int(rejected_rows.size)
+                        belief_rejected_particles += int(rejected_particles)
                     _log_belief_reset_diagnostics(
                         pool,
                         state_ids,
-                        fallback,
+                        particles,
                         error,
                         belief_reset_reasons,
                     )
-                    rows = np.arange(num_envs, dtype=np.int32)
-                    pool.reset_slots(rows)
-                    pool.belief_requests_into(request)
-                    discarded_episodes += sum(bool(row) for row in trajectories)
-                    trajectories = [[] for _ in range(num_envs)]
-                    pending = [None] * num_envs
-                    episode_moves.fill(0)
-                    belief_reset_rows += num_envs
-                    optimise_until(_scheduled_updates(step + 1, steps, updates))
-                    log_rollout(step + 1, curriculum_scale)
-                    progress.update(1)
+                    prefix_count = 0
+                    for index in rejected_rows:
+                        finished_examples = _finish_trajectory(
+                            trajectories[int(index)], training, None
+                        )
+                        replay.extend(finished_examples)
+                        completed_targets += len(finished_examples)
+                        prefix_count += int(bool(trajectories[int(index)]))
+                        trajectories[int(index)].clear()
+                        pending[int(index)] = None
+                    discarded_episodes += prefix_count
+                    belief_discarded_prefixes += prefix_count
+                    belief_slot_resets += int(rejected_rows.size)
+                    belief_reset_rows += int(rejected_rows.size)
+                    new_seeds = replacement_seeds(
+                        training.seed,
+                        recovery_seed_cursor,
+                        int(rejected_rows.size),
+                        excluded=reserved_seed_set | recovery_seed_history,
+                    )
+                    recovery_seed_cursor += int(rejected_rows.size)
+                    recovery_seed_history.update(int(seed) for seed in new_seeds)
+                    agent_ids = np.zeros((rejected_rows.size, 2), dtype=np.int32)
+                    pool.reset_slots_into(
+                        rejected_rows,
+                        new_seeds,
+                        agent_ids,
+                        request,
+                    )
+                    episode_moves[rejected_rows] = 0
+                    del root_output, root_tensors
+                    if recovery_rate_exceeded(
+                        belief_slot_resets, belief_root_decisions
+                    ):
+                        raise BeliefQualityError(
+                            "SelfPlayPool belief slot reset rate exceeded 1%; "
+                            "stopping before the candidate can overfit corrupted collection",
+                            {
+                                "belief_slot_resets": belief_slot_resets,
+                                "belief_root_decisions": belief_root_decisions,
+                                "belief_rejected_envs": belief_rejected_envs,
+                                "belief_rejected_particles": belief_rejected_particles,
+                                "replay_examples": len(replay),
+                                "optimisation_updates": optimisation_updates,
+                            },
+                        ) from error
+                    retrying_step = True
                     continue
 
             # One select call returns up to B * pending leaves. The native
@@ -805,12 +982,14 @@ def train_self_play_pool(
             episode_moves += 1
             # Release large inference-only tensors before the backward pass.
             del root_output, root_tensors
-            optimise_until(_scheduled_updates(step + 1, steps, updates))
-            log_rollout(step + 1, curriculum_scale)
+            completed_step = step + 1
+            optimise_until(_scheduled_updates(completed_step, steps, updates))
+            log_rollout(completed_step, curriculum_scale)
+            step = completed_step
             progress.update(1)
-            if (step + 1) % 10 == 0 or step == 0:
+            if step % 10 == 0 or step == 1:
                 progress.set_postfix(
-                    env_steps=(step + 1) * num_envs,
+                    env_steps=step * num_envs,
                     replay=len(replay), terminals=terminal_episodes, updates=optimisation_updates,
                     fallbacks=belief_fallback_rows, resets=belief_reset_rows,
                 )
@@ -841,8 +1020,10 @@ def train_self_play_pool(
     if optimisation_updates:
         log_rollout(steps, 0.0)
 
-    if model_out is not None:
-        save_model(model_out, model, model_config)
+    expected_completed_episodes = float(num_envs * steps / max(1, training.max_moves))
+    completion_rate = float(
+        (terminal_episodes + truncated_episodes) / max(1.0, expected_completed_episodes)
+    )
     summary: Dict[str, float | str] = {
         "training_seed": float(training.seed),
         "self_play_pool_envs": float(num_envs),
@@ -862,6 +1043,23 @@ def train_self_play_pool(
         "self_play_pool_belief_retries": float(belief_retries_used),
         "self_play_pool_belief_fallback_rows": float(belief_fallback_rows),
         "self_play_pool_belief_reset_rows": float(belief_reset_rows),
+        "belief_rejected_particles": float(belief_rejected_particles),
+        "belief_rejected_envs": float(belief_rejected_envs),
+        "belief_resampled_envs": float(belief_resampled_envs),
+        "belief_retry_successes": float(belief_retry_successes),
+        "belief_conservative_attempts": float(belief_conservative_attempts),
+        "belief_slot_resets": float(belief_slot_resets),
+        "belief_discarded_prefixes": float(belief_discarded_prefixes),
+        "belief_reset_rate": float(
+            belief_slot_resets / max(1, belief_root_decisions)
+        ),
+        "belief_root_decisions": float(belief_root_decisions),
+        "effective_replay_epochs": effective_replay_epochs(
+            optimisation_updates, training.batch_size, completed_targets
+        ),
+        "requested_optimisation_updates": float(updates),
+        "expected_completed_episodes": expected_completed_episodes,
+        "completion_rate": completion_rate,
         "self_play_pool_truncated_roots": float(truncated_roots),
         "self_play_pool_anchor_policy_weight": float(anchor_policy_weight if anchor_model is not None else 0.0),
         "self_play_pool_anchor_agreement": float(anchor_agreements / max(1, anchor_decisions)),
@@ -874,5 +1072,15 @@ def train_self_play_pool(
                     for kind, count in sorted(belief_reset_reasons.items())})
     if losses:
         summary.update({key: float(np.mean([loss[key] for loss in losses])) for key in losses[0]})
+    quality_failure = expected_completed_episodes >= num_envs and completion_rate < 0.25
+    summary["belief_quality_failed"] = float(quality_failure)
     summary["run_dir"] = str(run.finish(summary))
+    if quality_failure:
+        raise BeliefQualityError(
+            "SelfPlayPool episode completion rate fell below 25% of the expected "
+            "horizon rate; candidate was not saved",
+            summary,
+        )
+    if model_out is not None:
+        save_model(model_out, model, model_config)
     return summary

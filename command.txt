@@ -125,6 +125,7 @@ python scripts/train_league.py `
   --mcts-max-actions 1024 `
   --batch-size 64 `
   --replay-capacity 50000 `
+  --max-replay-epochs 6 `
   --belief-weight 0.10 `
   --exploration-rate 0.10 `
   --teacher-policy-target-weight 0.10 `

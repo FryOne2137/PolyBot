@@ -10,6 +10,7 @@ from ..config import MCTSConfig, TrainingConfig
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from .league_db import LeagueDatabase
+from .belief_recovery import BeliefQualityError
 from .routed_self_play_pool import (
     evaluate_matches_pool,
     require_routed_self_play_pool,
@@ -282,6 +283,7 @@ def train_promotion_league(
                 )
                 current_round_id[0] = round_id
                 candidate_id: int | None = None
+                round_training_summary: Dict[str, Any] = {}
                 try:
                     print(
                         f"league round {round_index}/{rounds} | champion: {champion_path} | "
@@ -370,8 +372,10 @@ def train_promotion_league(
                         # targets produced by a different played position.
                         anchor_model=None,
                         anchor_policy_weight=0.0,
+                        reserved_seeds=evaluation_map_seeds,
                         run=run.child(f"round_{round_index:03d}/pool_self_play"),
                     )
+                    round_training_summary["pool"] = pool_summary
 
                     frozen_models = []
                     for population_path in population_paths:
@@ -422,12 +426,15 @@ def train_promotion_league(
                             belief_retries=belief_retries,
                             max_envs=num_envs,
                             game_callback=record_training_game,
+                            reserved_seeds=evaluation_map_seeds,
                             run=run.child(f"round_{round_index:03d}/population_training"),
                         )
+                    round_training_summary["population"] = population_summary
                     database.flush()
-                    last_training = {"pool": pool_summary, "population": population_summary}
+                    last_training = dict(round_training_summary)
 
                     evaluation_results: list[Dict[str, Any]] = []
+                    invalid_evaluation = False
                     for opponent_index, (
                         opponent_id,
                         opponent_path,
@@ -481,7 +488,6 @@ def train_promotion_league(
                             max_envs=num_envs,
                             game_callback=record_evaluation_game,
                         )
-                        database.finish_evaluation(evaluation_id, match, elo_k=elo_k)
                         result = {
                             "opponent_id": opponent_id,
                             "opponent_path": str(opponent_path),
@@ -490,6 +496,22 @@ def train_promotion_league(
                             **match,
                         }
                         evaluation_results.append(result)
+                        if not bool(match.get("valid", 1.0)):
+                            invalid_evaluation = True
+                            database.invalidate_evaluation(evaluation_id, match)
+                            run.log(
+                                round=round_index,
+                                invalid_evaluations=1,
+                                invalid_evaluation_envs=match.get("invalid_envs", 0),
+                                promoted=0,
+                            )
+                            print(
+                                f"league gate vs {opponent_path.stem} invalid | "
+                                f"candidate rejected | reason={match.get('invalid_reason', 'belief recovery exhausted')}",
+                                flush=True,
+                            )
+                            break
+                        database.finish_evaluation(evaluation_id, match, elo_k=elo_k)
                         print(
                             f"league gate vs {opponent_path.stem} | "
                             f"score={float(match['model_a_score']):.4f} | "
@@ -497,28 +519,38 @@ def train_promotion_league(
                             flush=True,
                         )
 
-                    champion_result = next(
-                        result for result in evaluation_results
-                        if int(result["opponent_id"]) == champion_id
-                    )
-                    last_candidate_score = float(champion_result["model_a_score"])
-                    last_population_score = sum(
-                        float(result["sampling_probability"]) * float(result["model_a_score"])
-                        for result in evaluation_results
-                    )
-                    minimum_historical_score = min(
-                        float(result["model_a_score"]) for result in evaluation_results
-                    )
-                    promoted = (
-                        last_candidate_score >= promotion_score
-                        and float(champion_result["score_lower_95"]) >= promotion_lower_bound
-                        and last_population_score >= population_score
-                        and minimum_historical_score >= historical_score_floor
-                    )
+                    if invalid_evaluation:
+                        last_candidate_score = 0.0
+                        last_population_score = 0.0
+                        minimum_historical_score = 0.0
+                        champion_lower_95 = 0.0
+                        promoted = False
+                    else:
+                        champion_result = next(
+                            result for result in evaluation_results
+                            if int(result["opponent_id"]) == champion_id
+                        )
+                        last_candidate_score = float(champion_result["model_a_score"])
+                        last_population_score = sum(
+                            float(result["sampling_probability"]) * float(result["model_a_score"])
+                            for result in evaluation_results
+                        )
+                        minimum_historical_score = min(
+                            float(result["model_a_score"]) for result in evaluation_results
+                        )
+                        champion_lower_95 = float(champion_result["score_lower_95"])
+                        promoted = (
+                            last_candidate_score >= promotion_score
+                            and champion_lower_95 >= promotion_lower_bound
+                            and last_population_score >= population_score
+                            and minimum_historical_score >= historical_score_floor
+                        )
                     gate_summary = {
                         "promoted": float(promoted),
+                        "valid": float(not invalid_evaluation),
+                        "invalid_evaluations": float(invalid_evaluation),
                         "candidate_score": last_candidate_score,
-                        "champion_lower_95": float(champion_result["score_lower_95"]),
+                        "champion_lower_95": champion_lower_95,
                         "population_score": last_population_score,
                         "minimum_historical_score": minimum_historical_score,
                         "evaluations": evaluation_results,
@@ -558,11 +590,40 @@ def train_promotion_league(
                         candidate_score=last_candidate_score,
                         population_score=last_population_score,
                         minimum_historical_score=minimum_historical_score,
+                        invalid_evaluations=float(invalid_evaluation),
                         promoted=float(promoted),
                         promotions=promotions,
                     )
                     database.flush()
                     del candidate, champion, frozen_models
+                except BeliefQualityError as error:
+                    if candidate_id is not None:
+                        database.finalise_candidate(candidate_id, promoted_path=None)
+                    rejection_summary = {
+                        "promoted": 0.0,
+                        "valid": 0.0,
+                        "belief_quality_failed": 1.0,
+                        "error": str(error),
+                        "diagnostics": error.metrics,
+                    }
+                    database.finish_round(
+                        round_id,
+                        champion_id,
+                        False,
+                        round_training_summary,
+                        rejection_summary,
+                    )
+                    run.log(
+                        round=round_index,
+                        promoted=0.0,
+                        belief_quality_failed=1.0,
+                        promotions=promotions,
+                    )
+                    database.flush()
+                    print(
+                        f"league round {round_index} rejected by belief circuit breaker: {error}",
+                        flush=True,
+                    )
                 except BaseException as error:
                     if candidate_id is not None:
                         database.finalise_candidate(candidate_id, promoted_path=None)

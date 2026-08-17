@@ -153,6 +153,66 @@ def _slice_rows(batch: Mapping[str, np.ndarray], rows: np.ndarray) -> Dict[str, 
     return {name: np.asarray(value)[rows] for name, value in batch.items()}
 
 
+def _freeze_reference_model(
+    model: PolicyValueBeliefNet,
+    device: torch.device,
+) -> PolicyValueBeliefNet:
+    """Move a league reference to the device and make mutation impossible."""
+    model.to(device).eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def _reference_policy(
+    model: PolicyValueBeliefNet,
+    batch: Mapping[str, np.ndarray],
+    device: torch.device,
+    training: TrainingConfig,
+) -> np.ndarray:
+    """Return a frozen checkpoint's legal policy for public root packets."""
+    tensors = native_batch_to_tensors(
+        dict(batch), device, training.map_size, training.map_type
+    )
+    with torch.inference_mode():
+        output = model(
+            tensors.map_tokens,
+            tensors.global_features,
+            tensors.action_categorical,
+            tensors.action_continuous,
+            tensors.action_mask,
+            tensors.event_features,
+            action_history=tensors.action_history,
+            action_history_mask=tensors.action_history_mask,
+            include_belief=False,
+        )
+        policy = torch.softmax(output.policy_logits, dim=-1).float().cpu().numpy()
+    return policy
+
+
+def _policy_distance(
+    search_policy: np.ndarray,
+    reference_policy: np.ndarray,
+    action_mask: np.ndarray,
+) -> tuple[int, int, float]:
+    """Return decisions, top-action agreements and summed L1 distance."""
+    decisions = 0
+    agreements = 0
+    l1_sum = 0.0
+    for index in range(search_policy.shape[0]):
+        count = int(action_mask[index].sum())
+        if count <= 0:
+            continue
+        search_row = np.asarray(search_policy[index, :count], dtype=np.float32)
+        reference_row = np.asarray(reference_policy[index, :count], dtype=np.float32)
+        search_row = search_row / max(float(search_row.sum()), 1e-8)
+        reference_row = reference_row / max(float(reference_row.sum()), 1e-8)
+        agreements += int(search_row.argmax() == reference_row.argmax())
+        l1_sum += float(np.abs(search_row - reference_row).sum())
+        decisions += 1
+    return decisions, agreements, l1_sum
+
+
 def _validate_agents(agent_ids: np.ndarray, model_count: int, label: str) -> None:
     if agent_ids.size == 0:
         return
@@ -1143,6 +1203,8 @@ def train_population_pool(
     candidate: PolicyValueBeliefNet,
     opponent_models: Sequence[PolicyValueBeliefNet],
     opponent_weights: Sequence[float],
+    anchor_model: PolicyValueBeliefNet | None = None,
+    anchor_policy_weight: float = 0.0,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
@@ -1152,7 +1214,7 @@ def train_population_pool(
     reserved_seeds: Sequence[int] = (),
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
-    """Train candidate agent 0 against a PFSP population in native batches."""
+    """Train candidate agent 0 against PFSP with frozen-policy retention."""
     if games < 0 or updates_per_game < 0:
         raise ValueError("games and updates_per_game must not be negative")
     if games == 0:
@@ -1161,6 +1223,10 @@ def train_population_pool(
         raise ValueError("population training requires at least one opponent model")
     if max_envs < 1:
         raise ValueError("max_envs must be positive")
+    if not 0.0 <= anchor_policy_weight <= 1.0:
+        raise ValueError("anchor_policy_weight must be between zero and one")
+    if anchor_model is candidate:
+        raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
     if training.max_replay_epochs <= 0.0:
         raise ValueError("max_replay_epochs must be positive")
     weights = np.asarray(opponent_weights, dtype=np.float64)
@@ -1185,15 +1251,15 @@ def train_population_pool(
             "visible_action_history": visible_action_history,
             "belief_retries": belief_retries,
             "opponent_weights": weights.tolist(),
+            "anchor_policy_weight": anchor_policy_weight,
         },
     )
     candidate.to(device)
     frozen = []
     for model in opponent_models:
-        model.to(device).eval()
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        frozen.append(model)
+        frozen.append(_freeze_reference_model(model, device))
+    if anchor_model is not None:
+        anchor_model = _freeze_reference_model(anchor_model, device)
     optimiser = torch.optim.AdamW(
         candidate.parameters(),
         lr=training.learning_rate,
@@ -1208,6 +1274,9 @@ def train_population_pool(
     truncated_count = 0
     examples_count = 0
     decisions = 0
+    anchor_decisions = 0
+    anchor_agreements = 0
+    anchor_l1_sum = 0.0
     total_moves = 0
     score_sum = 0.0
     opponent_stats = [
@@ -1406,15 +1475,35 @@ def train_population_pool(
                 candidate_rows = active_rows[root_agents[active_rows] == 0]
                 examples_by_env: dict[int, TrainingExample] = {}
                 if candidate_rows.size:
+                    candidate_request = _slice_rows(request, candidate_rows)
+                    candidate_root = _slice_rows(root, candidate_rows)
                     state_ids = np.asarray(request["state_id"], dtype=np.uint64)
                     belief_targets = np.asarray(
                         search.pool.belief_targets_numpy(state_ids), dtype=np.int32
                     )
+                    anchor_policy = None
+                    if anchor_model is not None and anchor_policy_weight > 0.0:
+                        anchor_policy = _reference_policy(
+                            anchor_model,
+                            candidate_request,
+                            device,
+                            training,
+                        )
+                        measured = _policy_distance(
+                            np.asarray(candidate_root["policy"], dtype=np.float32),
+                            anchor_policy,
+                            np.asarray(candidate_root["action_mask"], dtype=bool),
+                        )
+                        anchor_decisions += measured[0]
+                        anchor_agreements += measured[1]
+                        anchor_l1_sum += measured[2]
                     candidate_examples = _root_examples(
-                        _slice_rows(request, candidate_rows),
-                        _slice_rows(root, candidate_rows),
+                        candidate_request,
+                        candidate_root,
                         training,
                         belief_targets[candidate_rows],
+                        anchor_policy=anchor_policy,
+                        anchor_policy_weight=anchor_policy_weight,
                     )
                     root_values = np.asarray(root["root_value"], dtype=np.float32)
                     for env, example in zip(candidate_rows, candidate_examples):
@@ -1474,6 +1563,13 @@ def train_population_pool(
                 replay_examples=len(replay),
                 optimisation_updates=updates,
                 candidate_decisions=decisions,
+                champion_anchor_weight=(
+                    anchor_policy_weight if anchor_model is not None else 0.0
+                ),
+                champion_anchor_agreement=(
+                    anchor_agreements / max(1, anchor_decisions)
+                ),
+                champion_anchor_mean_l1=(anchor_l1_sum / max(1, anchor_decisions)),
                 mean_score=score_sum / max(1, completed_count),
                 belief_rejected_particles=search.counters.belief_rejected_particles,
                 belief_rejected_envs=search.counters.belief_rejected_envs,
@@ -1520,6 +1616,15 @@ def train_population_pool(
         "population_pool_examples": float(examples_count),
         "population_pool_completion_rate": float(completed_count / max(1, games)),
         "population_pool_candidate_decisions": float(decisions),
+        "population_pool_anchor_policy_weight": float(
+            anchor_policy_weight if anchor_model is not None else 0.0
+        ),
+        "population_pool_anchor_agreement": float(
+            anchor_agreements / max(1, anchor_decisions)
+        ),
+        "population_pool_anchor_mean_l1": float(
+            anchor_l1_sum / max(1, anchor_decisions)
+        ),
         "population_pool_score": float(score_sum / max(1, games)),
         "population_pool_mean_moves": float(total_moves / max(1, games)),
         "population_pool_leaf_rows": float(routing.leaf_rows),

@@ -55,6 +55,7 @@ def _validate_options(
     pfsp_alpha: float,
     champion_probability: float,
     minimum_sampling_probability: float,
+    champion_anchor_weight: float,
     elo_k: float,
 ) -> None:
     if rounds < 1:
@@ -70,6 +71,7 @@ def _validate_options(
         "historical_score_floor": historical_score_floor,
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
+        "champion_anchor_weight": champion_anchor_weight,
     }.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be between zero and one")
@@ -123,6 +125,7 @@ def train_promotion_league(
     population_score: float = 0.52,
     historical_score_floor: float = 0.45,
     elo_k: float = 32.0,
+    champion_anchor_weight: float = 0.30,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train candidates against a PFSP population and promote robust winners.
@@ -150,6 +153,7 @@ def train_promotion_league(
         pfsp_alpha=pfsp_alpha,
         champion_probability=champion_probability,
         minimum_sampling_probability=minimum_sampling_probability,
+        champion_anchor_weight=champion_anchor_weight,
         elo_k=elo_k,
     )
     if not checkpoint_prefix:
@@ -200,6 +204,7 @@ def train_promotion_league(
         "pfsp_alpha": pfsp_alpha,
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
+        "champion_anchor_weight": champion_anchor_weight,
         "elo_k": elo_k,
         "checkpoint_prefix": checkpoint_prefix,
         "num_envs": num_envs,
@@ -367,11 +372,11 @@ def train_promotion_league(
                         belief_retries=belief_retries,
                         model_out=None,
                         model=candidate,
-                        # Historical/champion checkpoints now play their own
-                        # routed moves below.  Do not mix an anchor policy into
-                        # targets produced by a different played position.
-                        anchor_model=None,
-                        anchor_policy_weight=0.0,
+                        # Shallow MCTS can be much noisier than the teacher on
+                        # wide roots. Keep a frozen champion contribution in
+                        # every policy target to prevent catastrophic drift.
+                        anchor_model=champion,
+                        anchor_policy_weight=champion_anchor_weight,
                         reserved_seeds=evaluation_map_seeds,
                         run=run.child(f"round_{round_index:03d}/pool_self_play"),
                     )
@@ -420,6 +425,8 @@ def train_promotion_league(
                             candidate=candidate,
                             opponent_models=frozen_models,
                             opponent_weights=probabilities,
+                            anchor_model=champion,
+                            anchor_policy_weight=champion_anchor_weight,
                             num_threads=population_workers,
                             max_pending_leaves=max_pending_leaves,
                             visible_action_history=visible_action_history,
@@ -651,6 +658,7 @@ def train_promotion_league(
                 "league_champion_path": str(champion_path),
                 "league_database_path": str(database_path.resolve()),
                 "league_population_size": float(population_size),
+                "league_champion_anchor_weight": float(champion_anchor_weight),
                 "league_evaluation_seed": float(resolved_evaluation_seed),
                 "league_evaluation_seed_stride": float(evaluation_seed_stride),
             }
@@ -662,6 +670,16 @@ def train_promotion_league(
                 )
                 summary["league_last_population_games"] = float(
                     last_training.get("population", {}).get("population_pool_games", 0.0)
+                )
+                summary["league_last_pool_anchor_mean_l1"] = float(
+                    last_training.get("pool", {}).get(
+                        "self_play_pool_anchor_mean_l1", 0.0
+                    )
+                )
+                summary["league_last_population_anchor_mean_l1"] = float(
+                    last_training.get("population", {}).get(
+                        "population_pool_anchor_mean_l1", 0.0
+                    )
                 )
             run_directory = run.finish(summary)
             summary["run_dir"] = str(run_directory)

@@ -123,6 +123,12 @@ modele, z którymi champion miał słabszy wynik albo których jeszcze nie
 zmierzono. Teacher, bieżący champion i najlepsi wcześniejsi championi tworzą
 ograniczoną przez `--population-size` pulę.
 
+W obu fazach uczących zamrożony champion kotwiczy część targetu policy
+(`--champion-anchor-weight`, domyślnie `0.30`). MCTS nadal wnosi nowe ruchy,
+ale pojedyncza runda z płytkim lub zaszumionym wyszukiwaniem nie może już tak
+łatwo nadpisać dobrej polityki wejściowej. Kotwica jest używana wyłącznie do
+inferencji i nigdy nie trafia do optymalizatora kandydata.
+
 Kandydat jest promowany tylko wtedy, gdy jednocześnie pokona aktualnego
 championa, przejdzie dolną granicę ufności, osiągnie wymagany średni wynik
 przeciw populacji i nie spadnie poniżej progu regresji przeciw żadnemu

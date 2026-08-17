@@ -26,6 +26,10 @@ def main() -> None:
         description="Train against a historical population and save only robust promotions"
     )
     add_environment_options(parser)
+    # The league adds a separate geometry curriculum on top of policy/value
+    # learning. A conservative default keeps that auxiliary head from
+    # dominating the shared representation of an already competent champion.
+    parser.set_defaults(bridge_constraint_weight=0.10)
     add_run_options(parser)
     parser.add_argument("--champion-in", type=Path, required=True, help="Initial frozen champion checkpoint")
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/league"))
@@ -51,6 +55,10 @@ def main() -> None:
     parser.add_argument("--pfsp-alpha", type=float, default=2.0)
     parser.add_argument("--champion-probability", type=float, default=0.40)
     parser.add_argument("--minimum-sampling-probability", type=float, default=0.05)
+    parser.add_argument(
+        "--champion-anchor-weight", type=float, default=0.30,
+        help="Frozen champion fraction blended into policy targets in both training phases",
+    )
     parser.add_argument("--rounds", type=int, default=10, help="Candidate train-and-gate cycles")
     parser.add_argument("--promotion-games", type=int, default=100, help="Fixed-seed MCTS games per gate")
     parser.add_argument("--promotion-score", type=float, default=0.55, help="Win=1 / draw=0.5 score required")
@@ -115,6 +123,7 @@ def main() -> None:
         pfsp_alpha=args.pfsp_alpha,
         champion_probability=args.champion_probability,
         minimum_sampling_probability=args.minimum_sampling_probability,
+        champion_anchor_weight=args.champion_anchor_weight,
         historical_games=args.historical_games,
         population_score=args.population_score,
         historical_score_floor=args.historical_score_floor,

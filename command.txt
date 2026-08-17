@@ -104,6 +104,7 @@ python scripts/train_league.py `
   --pfsp-alpha 2.0 `
   --champion-probability 0.40 `
   --minimum-sampling-probability 0.05 `
+  --champion-anchor-weight 0.30 `
   --rounds 3 `
   --promotion-games 100 `
   --promotion-score 0.55 `
@@ -129,10 +130,9 @@ python scripts/train_league.py `
   --replay-capacity 50000 `
   --max-replay-epochs 6 `
   --belief-weight 0.25 `
-  --bridge-constraint-weight 1.0 `
+  --bridge-constraint-weight 0.10 `
   --bridge-replay-fraction 0.25 `
   --exploration-rate 0.10 `
-  --teacher-policy-target-weight 0.10 `
   --td-lambda 1.0 `
   --learning-rate 1e-5 `
   --max-moves 500 `

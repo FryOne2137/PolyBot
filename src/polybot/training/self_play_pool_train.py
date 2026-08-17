@@ -612,6 +612,15 @@ def train_self_play_pool(
             "effective_replay_epochs": effective_replay_epochs(
                 optimisation_updates, training.batch_size, completed_targets
             ),
+            "champion_anchor_weight": float(
+                anchor_policy_weight if anchor_model is not None else 0.0
+            ),
+            "champion_anchor_agreement": float(
+                anchor_agreements / max(1, anchor_decisions)
+            ),
+            "champion_anchor_mean_l1": float(
+                anchor_l1_sum / max(1, anchor_decisions)
+            ),
             "curriculum_scale": float(curriculum_scale),
             "mean_leaf_batch": float(np.mean(leaf_counts)) if leaf_counts else 0.0,
         }

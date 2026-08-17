@@ -151,6 +151,18 @@ def replace_rejected_particles(
     particles[rows] = selected
 
 
+def partition_recovery_envs(
+    env_ids: Sequence[int] | np.ndarray,
+    active: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep valid rejected slots, including already completed native rows."""
+    active_mask = np.asarray(active, dtype=bool).reshape(-1)
+    rows = np.unique(np.asarray([
+        int(env) for env in env_ids if 0 <= int(env) < active_mask.size
+    ], dtype=np.int32))
+    return rows, rows[active_mask[rows]], rows[~active_mask[rows]]
+
+
 def effective_replay_epochs(updates: int, batch_size: int, example_count: int) -> float:
     return float(updates * batch_size / max(1, example_count))
 

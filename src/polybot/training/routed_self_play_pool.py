@@ -27,6 +27,7 @@ from .belief_recovery import (
     effective_replay_epochs,
     ismcts_rejected_envs,
     particle_temperature,
+    partition_recovery_envs,
     recovery_rate_exceeded,
     replace_rejected_particles,
     replacement_seeds,
@@ -1111,13 +1112,21 @@ def train_population_pool(
                         prior_scale=curriculum,
                     )
                 except BeliefRecoveryRequired as error:
-                    reset_rows = np.asarray(
-                        [env for env in error.env_ids if active[int(env)]], dtype=np.int32
+                    reset_rows, active_reset_rows, inactive_reset_rows = partition_recovery_envs(
+                        error.env_ids, active
                     )
                     if reset_rows.size == 0:
-                        raise
+                        raise BeliefQualityError(
+                            "population belief recovery returned no valid slot ids",
+                            {
+                                "invalid_recovery_env_ids": error.env_ids.tolist(),
+                                "belief_root_decisions": search.counters.root_env_decisions,
+                                "belief_rejected_envs": search.counters.belief_rejected_envs,
+                                "belief_rejected_particles": search.counters.belief_rejected_particles,
+                            },
+                        ) from error
                     discarded_prefixes = 0
-                    for env in reset_rows:
+                    for env in active_reset_rows:
                         discarded_prefixes += int(bool(trajectories[int(env)]))
                         finished = _finish_trajectory(trajectories[int(env)], training, None)
                         replay.extend(finished)
@@ -1135,13 +1144,23 @@ def train_population_pool(
                     )
                     recovery_seed_cursor += int(reset_rows.size)
                     recovery_seed_history.update(int(seed) for seed in new_seeds)
-                    seeds[reset_rows] = new_seeds
-                    moves[reset_rows] = 0
+                    if active_reset_rows.size:
+                        active_positions = np.flatnonzero(active[reset_rows])
+                        seeds[active_reset_rows] = new_seeds[active_positions]
+                        moves[active_reset_rows] = 0
                     search.pool.reset_slots_into(
                         reset_rows,
                         new_seeds,
                         np.ascontiguousarray(assignments[reset_rows], dtype=np.int32),
                         request,
+                    )
+                    run.log(
+                        belief_recovery_event=1,
+                        belief_slot_resets=search.counters.belief_slot_resets,
+                        belief_active_slot_resets=int(active_reset_rows.size),
+                        belief_inactive_slot_resets=int(inactive_reset_rows.size),
+                        belief_discarded_prefixes=search.counters.belief_discarded_prefixes,
+                        belief_root_decisions=search.counters.root_env_decisions,
                     )
                     optimise_until(completed_count * updates_per_game)
                     if recovery_rate_exceeded(

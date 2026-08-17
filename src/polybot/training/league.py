@@ -10,7 +10,7 @@ from ..config import MCTSConfig, TrainingConfig
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from .league_db import LeagueDatabase
-from .belief_recovery import BeliefQualityError
+from .belief_recovery import BeliefQualityError, BeliefRecoveryRequired
 from .routed_self_play_pool import (
     evaluate_matches_pool,
     require_routed_self_play_pool,
@@ -596,15 +596,23 @@ def train_promotion_league(
                     )
                     database.flush()
                     del candidate, champion, frozen_models
-                except BeliefQualityError as error:
+                except (BeliefQualityError, BeliefRecoveryRequired) as error:
                     if candidate_id is not None:
                         database.finalise_candidate(candidate_id, promoted_path=None)
+                    diagnostics = (
+                        error.metrics
+                        if isinstance(error, BeliefQualityError)
+                        else {
+                            "belief_recovery_env_ids": error.env_ids.tolist(),
+                            "belief_recovery_diagnostics": list(error.diagnostics),
+                        }
+                    )
                     rejection_summary = {
                         "promoted": 0.0,
                         "valid": 0.0,
                         "belief_quality_failed": 1.0,
                         "error": str(error),
-                        "diagnostics": error.metrics,
+                        "diagnostics": diagnostics,
                     }
                     database.finish_round(
                         round_id,

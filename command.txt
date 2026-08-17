@@ -120,7 +120,7 @@ python scripts/train_league.py `
   --steps 1000 `
   --updates 500 `
   --num-threads 16 `
-  --max-pending-leaves 4 `
+  --max-pending-leaves 6 `
   --visible-action-history 0 `
   --belief-retries 4 `
   --simulations 32 `

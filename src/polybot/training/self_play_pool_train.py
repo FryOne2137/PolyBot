@@ -8,7 +8,7 @@ MCTS forest and persistent C++ workers; PyTorch receives only dense batches.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -299,9 +299,15 @@ def _conservative_all_player_particles(
     return completed.numpy().astype(np.int32, copy=False).reshape(envs, players, tiles, fields)
 
 
-def _belief_rejection_kind(error: ValueError) -> str:
+def _belief_rejection_kind(
+    error: ValueError,
+    diagnostics: Sequence[Mapping[str, Any]] = (),
+) -> str:
     """Keep rejection diagnostics compact and stable in training summaries."""
-    message = str(error).lower()
+    message = " ".join(
+        [str(error)]
+        + [f"{row.get('reason', '')} {row.get('error', '')}" for row in diagnostics]
+    ).lower()
     if "legal action" in message:
         return "legal_actions"
     if "unit" in message:
@@ -401,6 +407,15 @@ def _log_belief_reset_diagnostics(
                 details += " belief_at_difference=" + _format_belief_action(row["belief_action_at_difference"])
         if row.get("error"):
             details += f" error={row['error']}"
+        if "invalid_unit_tile" in row:
+            details += (
+                f" invalid_unit_tile={int(row['invalid_unit_tile'])}"
+                f" hp={int(row.get('unit_health', -1))}"
+                f" owner={int(row.get('unit_owner', -1))}"
+                f" type={int(row.get('unit_type', -1))}"
+                f" max_hp={int(row.get('unit_max_health', -1))}"
+                f" origin_city={int(row.get('unit_origin_city', -1))}"
+            )
         emit("belief reset: " + details)
     if rejected_rows == 0:
         # This should be unreachable: the full diagnostic mirrors the same
@@ -764,7 +779,7 @@ def train_self_play_pool(
                         pool, state_ids, particles
                     )
                     retry_pending_envs = int(rejected_rows.size)
-                    kind = _belief_rejection_kind(error)
+                    kind = _belief_rejection_kind(error, rejection_diagnostics)
                     belief_rejections[kind] = (
                         belief_rejections.get(kind, 0) + int(rejected_rows.size)
                     )
@@ -851,7 +866,7 @@ def train_self_play_pool(
                         rejected_rows, rejected_mask, rejected_particles, rejection_diagnostics = ismcts_rejected_envs(
                             pool, state_ids, particles
                         )
-                        kind = _belief_rejection_kind(error)
+                        kind = _belief_rejection_kind(error, rejection_diagnostics)
                         belief_rejections[kind] = (
                             belief_rejections.get(kind, 0) + int(rejected_rows.size)
                         )

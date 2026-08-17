@@ -583,7 +583,7 @@ class RoutedPoolSearch:
                     self.counters.belief_rejections += int(rejected_rows.size)
                     self.counters.belief_rejected_envs += int(rejected_rows.size)
                     self.counters.belief_rejected_particles += int(rejected_particles)
-                kind = _belief_rejection_kind(error)
+                kind = _belief_rejection_kind(error, diagnostics)
                 original = f"; learned error={last_error}" if last_error is not None else ""
                 raise BeliefRecoveryRequired(
                     rejected_rows,

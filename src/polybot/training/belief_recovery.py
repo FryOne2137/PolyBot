@@ -9,6 +9,129 @@ import numpy as np
 
 RETRY_TEMPERATURES = (0.0, 0.15, 0.30, 0.60, 1.0)
 _MAX_SEED = 2**31 - 1
+# Must mirror PolyEnv's UnitType::GiantSuper. Keeping the local diagnostic
+# stricter than the model vocabulary ensures it explains every native
+# ``invalid unit state`` rejection instead of accepting unused token ids.
+_UNIT_TYPE_MAX = 90
+
+
+def _invalid_unit_token_details(
+    completed_map: np.ndarray,
+    player_count: int,
+) -> dict[str, int] | None:
+    """Describe the first locally invalid unit row without source-map access."""
+    tokens = np.asarray(completed_map, dtype=np.int32)
+    if tokens.ndim != 2 or tokens.shape[1] < 23:
+        return None
+    for tile, token in enumerate(tokens):
+        unit_type = int(token[4])
+        health = int(token[2])
+        owner = int(token[3])
+        max_health = int(token[21])
+        origin_city = int(token[22])
+        if unit_type == -1:
+            if any(value != -1 for value in (health, owner, max_health, origin_city)):
+                return {
+                    "invalid_unit_tile": tile,
+                    "unit_health": health,
+                    "unit_owner": owner,
+                    "unit_type": unit_type,
+                    "unit_max_health": max_health,
+                    "unit_origin_city": origin_city,
+                    "unit_validation_code": 2,
+                }
+            continue
+        if (
+            not 1 <= unit_type <= _UNIT_TYPE_MAX
+            or not 0 <= owner < player_count
+            or health < 0
+            or max_health < health
+            or origin_city < -1
+        ):
+            return {
+                "invalid_unit_tile": tile,
+                "unit_health": health,
+                "unit_owner": owner,
+                "unit_type": unit_type,
+                "unit_max_health": max_health,
+                "unit_origin_city": origin_city,
+                "unit_validation_code": 1,
+            }
+    return None
+
+
+def _enrich_rejection_diagnostics(
+    diagnostics: Sequence[Mapping[str, Any]],
+    completed: np.ndarray,
+    rejection_mask: np.ndarray,
+) -> tuple[Mapping[str, Any], ...]:
+    """Attach actionable unit fields and synthesize rows missing from PolyEnv."""
+    enriched: list[dict[str, Any]] = []
+    represented: set[tuple[int, int, int]] = set()
+    for raw in diagnostics:
+        row = dict(raw)
+        env = int(row.get("env_id", -1))
+        player = int(row.get("player", -1))
+        particle = int(row.get("particle", -1))
+        if (
+            0 <= env < completed.shape[0]
+            and 0 <= player < completed.shape[1]
+            and 0 <= particle < completed.shape[2]
+        ):
+            represented.add((env, player, particle))
+            details = _invalid_unit_token_details(
+                completed[env, player, particle], completed.shape[1]
+            )
+            if details is not None:
+                row.update(details)
+        enriched.append(row)
+
+    for env, player, particle in np.argwhere(rejection_mask):
+        key = (int(env), int(player), int(particle))
+        if key in represented:
+            continue
+        details = _invalid_unit_token_details(
+            completed[key[0], key[1], key[2]], completed.shape[1]
+        )
+        if details is None:
+            continue
+        enriched.append({
+            "accepted": False,
+            "env_id": key[0],
+            "player": key[1],
+            "particle": key[2],
+            "reason": "belief_build_error",
+            "error": "completed_map_tokens contains an invalid unit state",
+            **details,
+        })
+    return tuple(enriched)
+
+
+def _refine_env_rejection_mask(
+    rejection_mask: np.ndarray,
+    diagnostics: Sequence[Mapping[str, Any]],
+) -> np.ndarray:
+    """Narrow an env-level verdict to exact rejected particles when possible."""
+    refined = np.asarray(rejection_mask, dtype=bool).copy()
+    detailed = np.zeros_like(refined)
+    covered_envs: set[int] = set()
+    for row in diagnostics:
+        if bool(row.get("accepted", False)):
+            continue
+        env = int(row.get("env_id", -1))
+        if not 0 <= env < refined.shape[0] or not refined[env].any():
+            continue
+        covered_envs.add(env)
+        player = int(row.get("player", -1))
+        particle = int(row.get("particle", -1))
+        if 0 <= player < refined.shape[1] and 0 <= particle < refined.shape[2]:
+            detailed[env, player, particle] = True
+        else:
+            # An env-only diagnostic cannot prove which particle is safe.
+            detailed[env] = True
+    for env in covered_envs:
+        refined[env] = detailed[env]
+    return refined
 
 
 class BeliefRecoveryRequired(RuntimeError):
@@ -63,15 +186,18 @@ def ismcts_rejected_envs(
     if mask_method is not None:
         try:
             accepted = np.asarray(mask_method(ids, completed), dtype=bool)
+            env_level_verdict = False
             if accepted.shape == completed.shape[:3]:
                 rejection_mask = ~accepted
             elif accepted.shape == ids.shape:
                 rejection_mask[~accepted] = True
+                env_level_verdict = True
             elif accepted.ndim >= 1 and accepted.shape[0] == ids.size:
                 # Be forward-compatible with a mask that omits one of the
                 # player/particle axes by reducing it to an env-level verdict.
                 rejected_env_mask = ~accepted.reshape(ids.size, -1).all(axis=1)
                 rejection_mask[rejected_env_mask] = True
+                env_level_verdict = True
             else:
                 raise ValueError("unexpected ISMCTS acceptance-mask shape")
             rejected = np.flatnonzero(rejection_mask.any(axis=(1, 2))).astype(np.int32)
@@ -81,7 +207,28 @@ def ismcts_rejected_envs(
                 # closed rather than turn the following retry into a no-op.
                 rejection_mask[:] = True
                 rejected = np.arange(ids.size, dtype=np.int32)
-            return rejected, rejection_mask, int(rejection_mask.sum()), ()
+            diagnostics: tuple[Mapping[str, Any], ...] = ()
+            diagnostic_method = getattr(pool, "ismcts_belief_diagnostics", None)
+            if rejected.size and callable(diagnostic_method):
+                try:
+                    diagnostics = tuple(diagnostic_method(ids, completed))
+                except Exception:
+                    diagnostics = ()
+            if env_level_verdict and diagnostics:
+                # Current PolyEnv returns one acceptance bit per environment,
+                # while diagnostics identify the precise player/particle.
+                # Use that detail so a single bad particle does not cause all
+                # otherwise valid hypotheses in the slot to be regenerated.
+                rejection_mask = _refine_env_rejection_mask(
+                    rejection_mask, diagnostics
+                )
+                rejected = np.flatnonzero(
+                    rejection_mask.any(axis=(1, 2))
+                ).astype(np.int32)
+            diagnostics = _enrich_rejection_diagnostics(
+                diagnostics, completed, rejection_mask
+            )
+            return rejected, rejection_mask, int(rejection_mask.sum()), diagnostics
         except (TypeError, ValueError, RuntimeError):
             # A partially upgraded binding may expose a different prototype.
             # Fall back to the existing safe diagnostics API.
@@ -119,7 +266,12 @@ def ismcts_rejected_envs(
         # unsafe even if an older diagnostic binding returned no rows.
         rejected = np.arange(ids.size, dtype=np.int32)
         rejection_mask[:] = True
-    return rejected, rejection_mask, int(rejection_mask.sum()), diagnostics
+    return (
+        rejected,
+        rejection_mask,
+        int(rejection_mask.sum()),
+        _enrich_rejection_diagnostics(diagnostics, completed, rejection_mask),
+    )
 
 
 def capped_update_target(

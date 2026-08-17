@@ -307,13 +307,17 @@ def _belief_rejection_kind(
     message = " ".join(
         [str(error)]
         + [f"{row.get('reason', '')} {row.get('error', '')}" for row in diagnostics]
-    ).lower()
+    ).lower().replace("_", " ")
     if "legal action" in message:
         return "legal_actions"
     if "unit" in message:
         return "unit_state"
     if "city" in message:
         return "city_state"
+    if "terminal" in message:
+        return "terminal_state"
+    if "build error" in message or "construction error" in message:
+        return "build_error"
     if "revealed" in message or "visible" in message:
         return "visible_rows"
     return "other"

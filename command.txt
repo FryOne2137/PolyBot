@@ -98,14 +98,14 @@ python scripts/train_league.py `
   --checkpoint-prefix champion `
   --league-db models\league\league.sqlite3 `
   --population-size 6 `
-  --population-games 64 `
-  --population-updates-per-game 2 `
+  --population-games 128 `
+  --population-updates-per-game 1 `
   --population-workers 16 `
   --pfsp-alpha 2.0 `
   --champion-probability 0.40 `
   --minimum-sampling-probability 0.05 `
-  --champion-anchor-weight 0.30 `
-  --rounds 3 `
+  --champion-anchor-weight 0.50 `
+  --rounds 1 `
   --promotion-games 100 `
   --promotion-score 0.55 `
   --promotion-lower-bound 0.50 `
@@ -120,10 +120,10 @@ python scripts/train_league.py `
   --steps 1000 `
   --updates 500 `
   --num-threads 16 `
-  --max-pending-leaves 6 `
+  --max-pending-leaves 8 `
   --visible-action-history 0 `
   --belief-retries 4 `
-  --simulations 32 `
+  --simulations 64 `
   --particles 2 `
   --mcts-max-actions 1024 `
   --batch-size 64 `

@@ -123,6 +123,28 @@ def _root_examples(
                 weight = float(np.clip(anchor_policy_weight, 0.0, 1.0))
                 policy = (1.0 - weight) * policy + weight * anchor
                 policy /= max(float(policy.sum()), 1e-8)
+        categorical = features[index, :count][:, NATIVE_ACTION_CATEGORICAL_COLUMNS].copy()
+        bridge_priority = bool(
+            np.any((categorical[:, 0] == 8) & (categorical[:, 9] == 9))
+        )
+        if not bridge_priority and training.map_size * training.map_size == maps.shape[1]:
+            known = maps[index, :, 0] == 1
+            water = known & (maps[index, :, 19] == 1)
+            target_terrain = belief_targets[index, :, 19]
+            for tile in np.flatnonzero(water):
+                row, column = divmod(int(tile), training.map_size)
+                pairs = []
+                if row > 0 and row + 1 < training.map_size:
+                    pairs.append((tile - training.map_size, tile + training.map_size))
+                if column > 0 and column + 1 < training.map_size:
+                    pairs.append((tile - 1, tile + 1))
+                if any(
+                    np.any(~known[np.asarray(pair, dtype=np.int64)])
+                    and all(int(target_terrain[neighbour]) in (2, 3, 4) for neighbour in pair)
+                    for pair in pairs
+                ):
+                    bridge_priority = True
+                    break
         examples.append(TrainingExample(
             map_tokens=maps[index].copy(),
             global_features=globals_[index].copy(),
@@ -130,7 +152,7 @@ def _root_examples(
             # Index columns after slicing actions. NumPy advanced indexing in
             # one expression moves the feature axis to the front, producing
             # [fields, actions] and corrupting variable-length replay rows.
-            action_categorical=features[index, :count][:, NATIVE_ACTION_CATEGORICAL_COLUMNS].copy(),
+            action_categorical=categorical,
             action_continuous=features[index, :count][:, NATIVE_ACTION_CONTINUOUS_COLUMNS].astype(np.float32, copy=True),
             policy_target=policy,
             full_map_target=belief_targets[index].copy(),
@@ -138,6 +160,7 @@ def _root_examples(
             player_id=int(player_ids[index]),
             action_history=histories[index].astype(np.float32, copy=True),
             action_history_mask=history_masks[index].copy(),
+            bridge_priority=bridge_priority,
         ))
     return examples
 
@@ -586,7 +609,12 @@ def train_self_play_pool(
             training.max_replay_epochs,
         )
         while optimisation_updates < capped and len(replay) >= training.batch_size:
-            batch = replay.sample(training.batch_size, rng, training.priority_replay_fraction)
+            batch = replay.sample(
+                training.batch_size,
+                rng,
+                training.priority_replay_fraction,
+                training.bridge_replay_fraction,
+            )
             losses.append(train_batch(model, optimiser, stack_examples(batch, device), training))
             optimisation_updates += 1
 
@@ -686,6 +714,10 @@ def train_self_play_pool(
                         known_city_counts=torch.as_tensor(
                             local_city_counts, dtype=torch.long, device=device
                         ),
+                        action_categorical=root_tensors.action_categorical.index_select(
+                            0, torch_rows
+                        ),
+                        action_mask=root_tensors.action_mask.index_select(0, torch_rows),
                     ).numpy().astype(np.int32, copy=False)
                     local_particles[np.arange(rows.size), local_actors, particle] = actor_completed
                 return local_particles
@@ -762,6 +794,27 @@ def train_self_play_pool(
                 fallback = _conservative_all_player_particles(
                     fallback_request, model, device
                 )
+                torch_rows = torch.as_tensor(
+                    fallback_target_rows, dtype=torch.long, device=device
+                )
+                actor_fallback = model.conservative_completed_map_batch(
+                    root_tensors.map_tokens.index_select(0, torch_rows),
+                    player_count=2,
+                    perspective_players=torch.as_tensor(
+                        actors[fallback_target_rows], dtype=torch.long, device=device
+                    ),
+                    known_city_counts=torch.as_tensor(
+                        np.asarray(request["state"], dtype=np.int32)[fallback_target_rows, 6],
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    action_categorical=root_tensors.action_categorical.index_select(
+                        0, torch_rows
+                    ),
+                    action_mask=root_tensors.action_mask.index_select(0, torch_rows),
+                    suppress_unlisted_bridges=True,
+                ).numpy().astype(np.int32, copy=False)
+                fallback[np.arange(fallback_target_count), actors[fallback_target_rows]] = actor_fallback
                 fallback_particles = np.repeat(
                     fallback[:, :, None], particle_count, axis=2
                 )

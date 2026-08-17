@@ -170,6 +170,8 @@ def _plan_many(
         particles = model.sample_completed_maps_from_belief_logits(
             tensors.map_tokens[row:row + 1], belief_logits, config.particles,
             max(config.temperature, 0.35),
+            action_categorical=tensors.action_categorical[row:row + 1],
+            action_mask=tensors.action_mask[row:row + 1],
         )
         for particle in particles:
             try:
@@ -371,10 +373,12 @@ def train_global_mcts_self_play(
             if self_play_count > len(replay) or teacher_count > len(teacher):
                 break
             rows = replay.sample(
-                self_play_count, sample_rng, training.priority_replay_fraction
+                self_play_count, sample_rng, training.priority_replay_fraction,
+                training.bridge_replay_fraction,
             ) if self_play_count else []
             rows += teacher.sample(
-                teacher_count, sample_rng, training.priority_replay_fraction
+                teacher_count, sample_rng, training.priority_replay_fraction,
+                training.bridge_replay_fraction,
             ) if teacher_count else []
             if len(rows) < training.batch_size:
                 break

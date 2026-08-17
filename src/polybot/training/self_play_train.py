@@ -218,9 +218,15 @@ def train_self_play(
                 self_play_count = 0
             examples_batch = []
             if self_play_count:
-                examples_batch.extend(replay.sample(self_play_count, rng, training.priority_replay_fraction))
+                examples_batch.extend(replay.sample(
+                    self_play_count, rng, training.priority_replay_fraction,
+                    training.bridge_replay_fraction,
+                ))
             if teacher_count:
-                examples_batch.extend(teacher_replay.sample(teacher_count, rng, training.priority_replay_fraction))
+                examples_batch.extend(teacher_replay.sample(
+                    teacher_count, rng, training.priority_replay_fraction,
+                    training.bridge_replay_fraction,
+                ))
             update_loss = train_batch(model, optimiser, stack_examples(examples_batch, device), training)
             losses.append(update_loss)
             run.log(

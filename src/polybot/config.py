@@ -73,6 +73,11 @@ class TrainingConfig:
     policy_weight: float = 1.0
     value_weight: float = 1.0
     belief_weight: float = 0.35
+    # Geometry-aware auxiliary belief objective.  In particular, a visible
+    # Build Bridge action constrains the hidden cardinal neighbours of its
+    # water tile; learning the relation directly is much more sample-efficient
+    # than treating every terrain token as independent.
+    bridge_constraint_weight: float = 1.0
 
     # Small economy shaping plus explicit strategic capture bonuses. Terminal
     # win/loss always remains +/-1 and is the dominant value target.
@@ -98,6 +103,9 @@ class TrainingConfig:
     # Fraction of each training batch reserved for rare strategic/terminal
     # examples, while the rest stays uniformly sampled for stability.
     priority_replay_fraction: float = 0.35
+    # Positions containing a legal bridge or supervised hidden bridge geometry
+    # are rare but disproportionately important for action-safe ISMCTS.
+    bridge_replay_fraction: float = 0.25
     # Bound repeated sampling when belief failures leave only a small replay.
     # Six means that, on average, one newly collected example can contribute
     # to at most six optimiser-batch exposures in this training phase.

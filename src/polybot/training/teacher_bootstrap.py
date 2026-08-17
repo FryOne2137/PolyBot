@@ -142,7 +142,10 @@ def train_teacher_bootstrap(
                 game_losses: List[Dict[str, float]] = []
                 for _ in range(updates_per_game):
                     examples_batch = replay.sample(
-                        training.batch_size, rng, priority_fraction=training.priority_replay_fraction
+                        training.batch_size,
+                        rng,
+                        priority_fraction=training.priority_replay_fraction,
+                        bridge_fraction=training.bridge_replay_fraction,
                     )
                     batch = stack_examples(examples_batch, device)
                     update_loss = train_batch(model, optimiser, batch, training)

@@ -264,6 +264,8 @@ class BeliefMCTS:
             max(self.config.temperature, 0.35),
             perspective_player=perspective,
             known_city_count=city_count,
+            action_categorical=tensors.action_categorical,
+            action_mask=tensors.action_mask,
         )
         return priors, [particle.cpu().numpy().astype(np.int32) for particle in particles]
 

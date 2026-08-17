@@ -33,6 +33,10 @@ class TrainingExample:
     # Mean root value returned by fog-safe particle MCTS.  It is a training
     # target bootstrap, never an additional observation exposed to the model.
     bootstrap_value: float | None = None
+    # Reserve replay capacity in optimisation batches for positions where the
+    # bridge/terrain relation can be learned.  This is metadata only and is
+    # never exposed as a model input.
+    bridge_priority: bool = False
 
 
 class ReplayBuffer:
@@ -49,11 +53,13 @@ class ReplayBuffer:
         batch_size: int,
         rng: np.random.Generator,
         priority_fraction: float = 0.0,
+        bridge_fraction: float = 0.0,
     ) -> List[TrainingExample]:
         if len(self._examples) < batch_size:
             raise ValueError("not enough replay examples for this batch")
         rows = list(self._examples)
         priority_count = int(round(batch_size * float(np.clip(priority_fraction, 0.0, 1.0))))
+        bridge_count = int(round(batch_size * float(np.clip(bridge_fraction, 0.0, 1.0))))
         priority_indices = np.asarray(
             [
                 index
@@ -62,10 +68,23 @@ class ReplayBuffer:
             ],
             dtype=np.int64,
         )
+        bridge_indices = np.asarray(
+            [index for index, row in enumerate(rows) if row.bridge_priority],
+            dtype=np.int64,
+        )
         chosen: List[int] = []
+        if bridge_indices.size:
+            count = min(bridge_count, bridge_indices.size, batch_size)
+            chosen.extend(int(index) for index in rng.choice(bridge_indices, size=count, replace=False))
         if priority_indices.size:
-            count = min(priority_count, priority_indices.size)
-            chosen.extend(int(index) for index in rng.choice(priority_indices, size=count, replace=False))
+            available_priority = np.setdiff1d(
+                priority_indices, np.asarray(chosen, dtype=np.int64)
+            )
+            count = min(priority_count, available_priority.size, batch_size - len(chosen))
+            chosen.extend(
+                int(index)
+                for index in rng.choice(available_priority, size=count, replace=False)
+            )
         remaining = batch_size - len(chosen)
         available = np.setdiff1d(np.arange(len(rows), dtype=np.int64), np.asarray(chosen, dtype=np.int64))
         chosen.extend(int(index) for index in rng.choice(available, size=remaining, replace=False))

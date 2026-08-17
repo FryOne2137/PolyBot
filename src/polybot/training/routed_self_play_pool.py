@@ -246,6 +246,8 @@ class RoutedPoolSearch:
                     temperature=particle_temperature(base_temperature, attempt, particle),
                     perspective_players=perspectives,
                     known_city_counts=city_counts,
+                    action_categorical=tensors.action_categorical,
+                    action_mask=tensors.action_mask,
                 )
                 result[local, particle] = completed.numpy().astype(np.int32, copy=False)
         return result
@@ -359,6 +361,47 @@ class RoutedPoolSearch:
             single[rows] = completed.numpy().astype(np.int32, copy=False)
         single = single.reshape(envs, players, tiles, fields)
         return np.repeat(single[:, :, None], particle_count, axis=2)
+
+    @torch.inference_mode()
+    def _actor_conservative_particles(
+        self,
+        request: Mapping[str, np.ndarray],
+        rows: np.ndarray,
+        particle_count: int,
+    ) -> np.ndarray:
+        """Action-conditioned conservative fallback for the active player."""
+        maps = np.asarray(request["map_tokens"], dtype=np.int32)
+        result = np.empty(
+            (len(rows), particle_count, maps.shape[1], maps.shape[2]), dtype=np.int32
+        )
+        agents = np.asarray(request["agent_id"], dtype=np.int32)
+        _validate_agents(agents[rows], len(self.models), "fallback root packet")
+        for agent in np.unique(agents[rows]):
+            local = np.flatnonzero(agents[rows] == agent)
+            selected_rows = rows[local]
+            batch = _slice_rows(request, selected_rows)
+            tensors = native_batch_to_tensors(
+                batch, self.device, self.training.map_size, self.training.map_type
+            )
+            completed = self.models[int(agent)].conservative_completed_map_batch(
+                tensors.map_tokens,
+                player_count=2,
+                perspective_players=torch.as_tensor(
+                    np.asarray(batch["to_play"], dtype=np.int64),
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                known_city_counts=torch.as_tensor(
+                    np.asarray(batch["state"], dtype=np.int32)[:, 6],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+                action_categorical=tensors.action_categorical,
+                action_mask=tensors.action_mask,
+                suppress_unlisted_bridges=True,
+            ).numpy().astype(np.int32, copy=False)
+            result[local] = np.repeat(completed[:, None], particle_count, axis=1)
+        return result
 
     @torch.inference_mode()
     def _expand_leaves(self, leaf_count: int, prior_scale: float) -> None:
@@ -498,6 +541,15 @@ class RoutedPoolSearch:
             fallback_rows = self._conservative_particles(
                 _slice_rows(all_players, fallback_target_rows), particle_count
             )
+            active_fallback = self._actor_conservative_particles(
+                request, fallback_target_rows, particle_count
+            )
+            fallback_actors = np.asarray(request["to_play"], dtype=np.int64)[
+                fallback_target_rows
+            ]
+            fallback_rows[
+                np.arange(fallback_target_count), fallback_actors
+            ] = active_fallback
             replace_rejected_particles(
                 particles, fallback_target_rows, rejected_mask, fallback_rows
             )
@@ -1025,7 +1077,10 @@ def train_population_pool(
         )
         while updates < capped and len(replay) >= training.batch_size:
             batch = replay.sample(
-                training.batch_size, rng, training.priority_replay_fraction
+                training.batch_size,
+                rng,
+                training.priority_replay_fraction,
+                training.bridge_replay_fraction,
             )
             losses.append(
                 train_batch(candidate, optimiser, stack_examples(batch, device), training)
@@ -1284,6 +1339,12 @@ def train_population_pool(
                     updates, training.batch_size, examples_count
                 ),
             )
+            if losses:
+                run.log(
+                    completed_games=completed_count,
+                    optimisation_updates=updates,
+                    **losses[-1],
+                )
             routing.leaf_rows += search.counters.leaf_rows
             routing.leaf_waves += search.counters.leaf_waves
             routing.belief_retries += search.counters.belief_retries

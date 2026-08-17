@@ -27,6 +27,8 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--training-policy-weight", type=float, default=1.0)
     parser.add_argument("--training-value-weight", type=float, default=1.0)
     parser.add_argument("--belief-weight", type=float, default=0.35)
+    parser.add_argument("--bridge-constraint-weight", type=float, default=1.0)
+    parser.add_argument("--bridge-replay-fraction", type=float, default=0.25)
     parser.add_argument("--max-replay-epochs", type=float, default=6.0)
 
 
@@ -66,6 +68,8 @@ def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         policy_weight=args.training_policy_weight,
         value_weight=args.training_value_weight,
         belief_weight=args.belief_weight,
+        bridge_constraint_weight=getattr(args, "bridge_constraint_weight", 1.0),
+        bridge_replay_fraction=getattr(args, "bridge_replay_fraction", 0.25),
         max_replay_epochs=getattr(args, "max_replay_epochs", 6.0),
     )
 

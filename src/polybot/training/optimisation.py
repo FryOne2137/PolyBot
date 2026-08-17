@@ -29,6 +29,84 @@ BELIEF_LOSS_FEATURES = frozenset(
 BELIEF_RUNTIME_ID_FEATURES = frozenset((6, 15, 22))
 
 
+def bridge_constraint_loss(
+    terrain_logits: torch.Tensor,
+    map_tokens: torch.Tensor,
+    full_map_target: torch.Tensor,
+    hidden_mask: torch.Tensor,
+    action_categorical: torch.Tensor,
+    action_mask: torch.Tensor,
+    map_size: int,
+) -> torch.Tensor:
+    """Teach the hidden terrain relation implied by bridge geometry.
+
+    The full map is used only as a supervised label.  At inference time the
+    model and particle projection receive public observations and legal actions
+    only.  Positive and negative visible-water examples are both included, so
+    the model learns not to invent bridges as well as not to remove real ones.
+    """
+    batch, tiles, classes = terrain_logits.shape
+    if map_size * map_size != tiles or classes < 6:
+        return terrain_logits.sum() * 0.0
+    probabilities = torch.softmax(terrain_logits, dim=-1)
+    # Categorical labels are shifted by +1: terrain enums 2/3/4 occupy heads
+    # 3/4/5, while zero is the -1/unknown class.
+    predicted_landish = probabilities[..., 3:6].sum(dim=-1)
+    known = map_tokens[..., 0] == 1
+    observed_landish = (map_tokens[..., 19] >= 2) & (map_tokens[..., 19] <= 4)
+    landish = torch.where(known, observed_landish.to(predicted_landish.dtype), predicted_landish)
+    target_landish = (full_map_target[..., 19] >= 2) & (full_map_target[..., 19] <= 4)
+
+    # Compute every target in one accelerator operation.  Avoiding a Python
+    # loop here matters in the large CUDA batches used by SelfPlayPool.
+    target_indices = torch.arange(tiles, device=terrain_logits.device)
+    rows = torch.div(target_indices, map_size, rounding_mode="floor")
+    columns = target_indices.remainder(map_size)
+    north_south_available = (rows > 0) & (rows + 1 < map_size)
+    east_west_available = (columns > 0) & (columns + 1 < map_size)
+    north = (target_indices - map_size).clamp(0, tiles - 1)
+    south = (target_indices + map_size).clamp(0, tiles - 1)
+    west = (target_indices - 1).clamp(0, tiles - 1)
+    east = (target_indices + 1).clamp(0, tiles - 1)
+
+    ns_probability = landish[:, north] * landish[:, south]
+    ew_probability = landish[:, west] * landish[:, east]
+    ns_probability = ns_probability * north_south_available.to(ns_probability.dtype)
+    ew_probability = ew_probability * east_west_available.to(ew_probability.dtype)
+    predicted_valid = 1.0 - (1.0 - ns_probability) * (1.0 - ew_probability)
+    predicted_valid = predicted_valid.clamp(1e-6, 1.0 - 1e-6)
+    target_valid = (
+        (target_landish[:, north] & target_landish[:, south] & north_south_available)
+        | (target_landish[:, west] & target_landish[:, east] & east_west_available)
+    )
+    hidden_neighbour = (
+        ((hidden_mask[:, north] | hidden_mask[:, south]) & north_south_available)
+        | ((hidden_mask[:, west] | hidden_mask[:, east]) & east_west_available)
+    )
+    candidate = known & (map_tokens[..., 19] == 1) & hidden_neighbour
+
+    bridge_action = (
+        action_mask
+        & (action_categorical[..., 0] == 8)
+        & (action_categorical[..., 9] == 9)
+    )
+    bridge_targets = action_categorical[..., 2].clamp(0, tiles - 1)
+    legal_counts = torch.zeros(
+        (batch, tiles), dtype=torch.long, device=terrain_logits.device
+    )
+    legal_counts.scatter_add_(1, bridge_targets, bridge_action.to(torch.long))
+    legal_bridge = legal_counts > 0
+    weight = candidate.to(predicted_valid.dtype) * (
+        1.0 + 3.0 * legal_bridge.to(predicted_valid.dtype)
+    )
+    per_target = F.binary_cross_entropy(
+        predicted_valid, target_valid.to(predicted_valid.dtype), reduction="none"
+    )
+    numerator = (per_target * weight).sum()
+    denominator = weight.sum().clamp_min(1.0)
+    return numerator / denominator
+
+
 def belief_loss(
     belief_logits: Iterable[torch.Tensor],
     full_map_target: torch.Tensor,
@@ -78,6 +156,8 @@ def train_batch(
     config: TrainingConfig,
 ) -> Dict[str, float]:
     """Optimise policy, value and belief objectives on one padded batch."""
+    if config.bridge_constraint_weight < 0.0:
+        raise ValueError("bridge_constraint_weight must not be negative")
     model.train()
     output = model(
         batch["map_tokens"],
@@ -110,10 +190,20 @@ def train_batch(
         value_weights = value_weights.to(per_example_value.dtype)
         value = (per_example_value * value_weights).sum() / value_weights.sum().clamp_min(1.0)
     belief = belief_loss(output.belief_logits, batch["full_map_target"], batch["hidden_mask"])
+    bridge = bridge_constraint_loss(
+        output.belief_logits[19],
+        batch["map_tokens"],
+        batch["full_map_target"],
+        batch["hidden_mask"],
+        batch["action_categorical"],
+        batch["action_mask"],
+        config.map_size,
+    )
     total = (
         config.policy_weight * policy
         + config.value_weight * value
         + config.belief_weight * belief
+        + config.bridge_constraint_weight * bridge
     )
 
     optimiser.zero_grad(set_to_none=True)
@@ -126,4 +216,5 @@ def train_batch(
         "policy_loss": float(policy.detach().cpu()),
         "value_loss": float(value.detach().cpu()),
         "belief_loss": float(belief.detach().cpu()),
+        "bridge_constraint_loss": float(bridge.detach().cpu()),
     }

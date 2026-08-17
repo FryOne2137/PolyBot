@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isqrt
 from typing import List, Sequence, Tuple
 
 import torch
@@ -43,6 +44,114 @@ VALID_BELIEF_UNIT_TYPES = frozenset(
     (*range(1, 14), *range(20, 27), *range(30, 42), *range(50, 54),
      *range(60, 65), *range(70, 82), 90)
 )
+
+BRIDGE_ACTION_TYPE = 8
+BUILD_BRIDGE_TILE_ACTION = 9
+TERRAIN_FEATURE = 19
+WATER_TERRAIN = 1
+LAND_TERRAIN = 2
+LANDISH_TERRAINS = frozenset((2, 3, 4))
+
+
+def _bridge_neighbour_pairs(tile: int, width: int, tiles: int) -> tuple[tuple[int, int], ...]:
+    """Return complete N/S and E/W pairs around a row-major board tile."""
+    row, column = divmod(int(tile), int(width))
+    result: list[tuple[int, int]] = []
+    if row > 0 and row + 1 < width:
+        result.append((tile - width, tile + width))
+    if column > 0 and column + 1 < width:
+        result.append((tile - 1, tile + 1))
+    return tuple(result)
+
+
+def apply_public_bridge_constraints(
+    completed: torch.Tensor,
+    observed: torch.Tensor,
+    action_categorical: torch.Tensor | None,
+    action_mask: torch.Tensor | None,
+    *,
+    suppress_unlisted: bool = False,
+) -> None:
+    """Project one detached belief onto public Build Bridge constraints.
+
+    A legal bridge action proves that its water tile has a landish N/S or E/W
+    pair.  This routine changes hidden terrain only; visible tokens are never
+    touched.  Conservative fallback may additionally break land pairs around
+    visible water tiles whose bridge action is absent, preventing an all-land
+    fallback from inventing public actions.
+    """
+    if completed.ndim != 2 or observed.shape != completed.shape:
+        raise ValueError("bridge projection expects matching [tiles, features] tensors")
+    tiles = int(completed.shape[0])
+    width = isqrt(tiles)
+    if width * width != tiles:
+        return
+    known = observed[:, 0] == 1
+    legal_targets: set[int] = set()
+    if action_categorical is not None:
+        actions = action_categorical.detach().to(device="cpu", dtype=torch.long)
+        if actions.ndim != 2 or actions.shape[1] < 10:
+            raise ValueError("action_categorical must have shape [actions, >=10]")
+        if action_mask is None:
+            valid = torch.ones(actions.shape[0], dtype=torch.bool)
+        else:
+            valid = action_mask.detach().to(device="cpu", dtype=torch.bool).reshape(-1)
+            if valid.numel() != actions.shape[0]:
+                raise ValueError("action_mask must match action_categorical")
+        bridge_rows = valid & (actions[:, 0] == BRIDGE_ACTION_TYPE) & (
+            actions[:, 9] == BUILD_BRIDGE_TILE_ACTION
+        )
+        for target in actions[bridge_rows, 2].tolist():
+            if 0 <= int(target) < tiles:
+                legal_targets.add(int(target))
+
+    def is_landish(index: int) -> bool:
+        return int(completed[index, TERRAIN_FEATURE]) in LANDISH_TERRAINS
+
+    if suppress_unlisted:
+        for target in range(tiles):
+            if target in legal_targets:
+                continue
+            # Only a visible water target can expose a bridge action.  Other
+            # prerequisites remain in the submitted public state.
+            if (
+                not bool(known[target])
+                or int(observed[target, TERRAIN_FEATURE]) != WATER_TERRAIN
+                or int(observed[target, 7]) != 0
+                or int(observed[target, 4]) >= 1
+            ):
+                continue
+            for first, second in _bridge_neighbour_pairs(target, width, tiles):
+                if not (is_landish(first) and is_landish(second)):
+                    continue
+                hidden_member = next(
+                    (index for index in (first, second) if not bool(known[index])),
+                    None,
+                )
+                if hidden_member is not None:
+                    completed[hidden_member, TERRAIN_FEATURE] = WATER_TERRAIN
+
+    # Apply positive constraints last.  If neighbouring water targets interact,
+    # an actual public legal action always takes precedence over suppression.
+    for target in sorted(legal_targets):
+        candidates: list[tuple[int, tuple[int, int]]] = []
+        for pair in _bridge_neighbour_pairs(target, width, tiles):
+            if any(
+                bool(known[index])
+                and int(observed[index, TERRAIN_FEATURE]) not in LANDISH_TERRAINS
+                for index in pair
+            ):
+                continue
+            score = sum(is_landish(index) for index in pair)
+            candidates.append((score, pair))
+        if not candidates:
+            # A real legal action cannot contradict two visible axes.  Leave
+            # the particle unchanged so PolyEnv diagnostics can reject it.
+            continue
+        _, selected = max(candidates, key=lambda item: item[0])
+        for index in selected:
+            if not bool(known[index]):
+                completed[index, TERRAIN_FEATURE] = LAND_TERRAIN
 
 
 def _indices(values: torch.Tensor, largest_value: int) -> torch.Tensor:
@@ -436,6 +545,8 @@ class PolicyValueBeliefNet(nn.Module):
             map_tokens, belief_logits, particles, temperature,
             perspective_player=perspective_player,
             known_city_count=known_city_count,
+            action_categorical=action_categorical,
+            action_mask=action_mask,
         )
 
     @torch.no_grad()
@@ -448,6 +559,8 @@ class PolicyValueBeliefNet(nn.Module):
         *,
         perspective_player: int | None = None,
         known_city_count: int | None = None,
+        action_categorical: torch.Tensor | None = None,
+        action_mask: torch.Tensor | None = None,
     ) -> List[torch.Tensor]:
         """Sample particles from belief logits computed during root inference."""
         if map_tokens.shape[0] != 1:
@@ -484,6 +597,9 @@ class PolicyValueBeliefNet(nn.Module):
                 )
 
         result: List[torch.Tensor] = []
+        observed_cpu = observed.to(device="cpu")
+        action_rows = None if action_categorical is None else action_categorical.detach().to(device="cpu")
+        action_masks = None if action_mask is None else action_mask.detach().to(device="cpu")
         for particle_index in range(particles):
             completed = empty_tile.expand_as(observed).clone()
             for feature_index in SAFE_PARTICLE_FEATURES:
@@ -492,6 +608,12 @@ class PolicyValueBeliefNet(nn.Module):
             completed[:, 0] = observed[:, 0]
             completed_cpu = completed.to(device="cpu")
             hidden_cpu = hidden.to(device="cpu")
+            apply_public_bridge_constraints(
+                completed_cpu,
+                observed_cpu,
+                None if action_rows is None else action_rows[0],
+                None if action_masks is None else action_masks[0],
+            )
             # ``sampled_features`` contains only the compact hidden rows for
             # efficient multinomial sampling.  The structural repair below
             # works in absolute tile coordinates, so expand every field back
@@ -534,6 +656,8 @@ class PolicyValueBeliefNet(nn.Module):
         *,
         perspective_players: torch.Tensor | None = None,
         known_city_counts: torch.Tensor | None = None,
+        action_categorical: torch.Tensor | None = None,
+        action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Create one valid detached belief completion for every batch row.
 
@@ -577,12 +701,21 @@ class PolicyValueBeliefNet(nn.Module):
         # small structured-city repair: doing ``tolist()`` for every GPU row
         # would otherwise synchronise CUDA once per live environment.
         completed_cpu = completed.to(device="cpu")
+        observed_cpu = observed.to(device="cpu")
         hidden_cpu = hidden.to(device="cpu")
         perspectives = self._batch_constraint_values(perspective_players, batch, "perspective_players")
         city_counts = self._batch_constraint_values(known_city_counts, batch, "known_city_counts")
+        action_rows = None if action_categorical is None else action_categorical.detach().to(device="cpu")
+        action_masks = None if action_mask is None else action_mask.detach().to(device="cpu")
         # Referenced city IDs must still have a centre. The placement is a
         # deterministic hypothesis built solely from the submitted observation.
         for row in range(batch):
+            apply_public_bridge_constraints(
+                completed_cpu[row],
+                observed_cpu[row],
+                None if action_rows is None else action_rows[row],
+                None if action_masks is None else action_masks[row],
+            )
             self._place_structured_entities(
                 completed_cpu[row], hidden_cpu[row],
                 {field: values[row].to(device="cpu") for field, values in sampled_features.items()},
@@ -701,6 +834,9 @@ class PolicyValueBeliefNet(nn.Module):
         *,
         perspective_players: torch.Tensor | None = None,
         known_city_counts: torch.Tensor | None = None,
+        action_categorical: torch.Tensor | None = None,
+        action_mask: torch.Tensor | None = None,
+        suppress_unlisted_bridges: bool = False,
     ) -> torch.Tensor:
         """Return a legal low-information fallback for rejected belief rows.
 
@@ -723,6 +859,7 @@ class PolicyValueBeliefNet(nn.Module):
         completed[known] = observed[known]
         completed[..., 0] = observed[..., 0]
         completed_cpu = completed.to(device="cpu")
+        observed_cpu = observed.to(device="cpu")
         hidden_cpu = (~known).to(device="cpu")
         perspectives = self._batch_constraint_values(
             perspective_players, observed.shape[0], "perspective_players"
@@ -730,7 +867,16 @@ class PolicyValueBeliefNet(nn.Module):
         city_counts = self._batch_constraint_values(
             known_city_counts, observed.shape[0], "known_city_counts"
         )
+        action_rows = None if action_categorical is None else action_categorical.detach().to(device="cpu")
+        action_masks = None if action_mask is None else action_mask.detach().to(device="cpu")
         for row in range(observed.shape[0]):
+            apply_public_bridge_constraints(
+                completed_cpu[row],
+                observed_cpu[row],
+                None if action_rows is None else action_rows[row],
+                None if action_masks is None else action_masks[row],
+                suppress_unlisted=suppress_unlisted_bridges,
+            )
             self._add_referenced_city_placeholders(
                 completed_cpu[row], hidden_cpu[row],
                 player_count=player_count, perspective_player=perspectives[row],

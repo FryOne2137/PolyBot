@@ -81,6 +81,8 @@ def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
         inference_batch_size=getattr(args, "inference_batch_size", 32),
         native_threads=getattr(args, "mcts_threads", None),
         native_max_actions=getattr(args, "mcts_max_actions", 1024),
+        search_top_actions=getattr(args, "mcts_top_actions", 0),
+        search_random_actions=getattr(args, "mcts_random_actions", 0),
         strategic_prior_weight=getattr(args, "strategic_prior_weight", 1.0),
         teacher_prior_weight=getattr(args, "teacher_prior_weight", 0.20),
     )

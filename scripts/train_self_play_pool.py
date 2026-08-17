@@ -52,6 +52,11 @@ def main() -> None:
     parser.add_argument("--particles", type=int, default=2, help="Per-player ISMCTS belief particles (K)")
     parser.add_argument("--mcts-threads", type=int, help="Accepted for config compatibility; use --num-threads for this pool")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument(
+        "--mcts-top-actions", type=int, default=0,
+        help="PolyBot-only quality experiment: top-K policy priors plus mandatory tactics.",
+    )
+    parser.add_argument("--mcts-random-actions", type=int, default=0)
     parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
     args = parser.parse_args()

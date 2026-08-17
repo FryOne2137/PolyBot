@@ -83,6 +83,32 @@ python scripts/evaluate.py `
   --max-moves 400 `
   --device cuda
 
+# 4a. Izolowany test jakości filtra z etapu 1. Obie strony używają dokładnie
+# tego samego checkpointu i tych samych sparowanych map. Model A ma top 48 +
+# 8 losowych + obowiązkowe ruchy taktyczne, a model B pełny policy prior.
+# Wynik A bliski 0.50 oznacza brak istotnej utraty jakości; <0.45 sugeruje
+# zwiększenie --mcts-top-actions. Ten test mierzy jakość, nie przyspieszenie.
+python scripts/evaluate.py `
+  --model-a models\teacher-structured-v1.pt `
+  --model-b models\teacher-structured-v1.pt `
+  --games 100 `
+  --num-envs 128 `
+  --mcts-threads 16 `
+  --max-pending-leaves 8 `
+  --belief-retries 4 `
+  --simulations 64 `
+  --particles 2 `
+  --mcts-max-actions 1024 `
+  --mcts-top-actions 48 `
+  --mcts-random-actions 8 `
+  --model-b-mcts-top-actions 0 `
+  --model-b-mcts-random-actions 0 `
+  --strategic-prior-weight 0.0 `
+  --teacher-prior-weight 0.0 `
+  --max-moves 500 `
+  --seed 1500000007 `
+  --device cuda
+
 # 5. Liga populacyjna: wszystkie trzy fazy (self-play kandydata, gry PFSP
 # przeciw populacji i sparowane bramki) działają w szybkim SelfPlayPool.
 # Modele są routowane przez agent_id bez wolnego GameEnv/MctsPool. Checkpointy
@@ -126,6 +152,8 @@ python scripts/train_league.py `
   --simulations 64 `
   --particles 2 `
   --mcts-max-actions 1024 `
+  --mcts-top-actions 48 `
+  --mcts-random-actions 8 `
   --batch-size 64 `
   --replay-capacity 50000 `
   --max-replay-epochs 6 `

@@ -39,6 +39,12 @@ class MCTSConfig:
     # repeatedly creating a hardware-sized native worker pool.
     native_threads: Optional[int] = None
     native_max_actions: int = 1024
+    # PolyBot-only candidate-filtering experiment. Zero keeps the old full
+    # policy. A positive value submits top-K policy actions plus tactical
+    # mandatory actions and a small random legal sample. PolyEnv still owns
+    # and validates the full legal-action list.
+    search_top_actions: int = 0
+    search_random_actions: int = 0
     # Applied only to already legal, visible capture actions in MCTS.
     capture_city_prior_bonus: float = 2.0
     capture_capital_prior_bonus: float = 4.0

@@ -31,6 +31,16 @@ def main() -> None:
         help="Persistent native worker threads (SelfPlayPool for model-vs-model)",
     )
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument(
+        "--mcts-top-actions", type=int, default=0,
+        help="PolyBot-only candidate-prior experiment; applies to both neural players.",
+    )
+    parser.add_argument("--mcts-random-actions", type=int, default=0)
+    parser.add_argument(
+        "--model-b-mcts-top-actions", type=int,
+        help="Override model B only; use 0 to compare filtered A against full-search B.",
+    )
+    parser.add_argument("--model-b-mcts-random-actions", type=int)
     parser.add_argument("--num-envs", type=int, default=128, help="Maximum parallel model-vs-model games")
     parser.add_argument("--max-pending-leaves", type=int, default=4)
     parser.add_argument("--visible-action-history", type=int, default=0)
@@ -57,6 +67,8 @@ def main() -> None:
         inference_batch_size=args.inference_batch_size,
         native_threads=args.mcts_threads,
         native_max_actions=args.mcts_max_actions,
+        search_top_actions=args.mcts_top_actions,
+        search_random_actions=args.mcts_random_actions,
         strategic_prior_weight=args.strategic_prior_weight,
         teacher_prior_weight=args.teacher_prior_weight,
     )
@@ -77,6 +89,8 @@ def main() -> None:
             visible_action_history=args.visible_action_history,
             belief_retries=args.belief_retries,
             max_envs=args.num_envs,
+            model_b_search_top_actions=args.model_b_mcts_top_actions,
+            model_b_search_random_actions=args.model_b_mcts_random_actions,
         )
     print_summary(summary)
 

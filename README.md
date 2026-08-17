@@ -202,6 +202,26 @@ Domyślne `--visible-action-history 0` utrzymuje identyczne wejścia policy/valu
 w szybkim treningu i w ewaluacji `GameEnv`. Historię należy włączyć dopiero,
 gdy używany evaluator przekazuje ten sam tensor historii co `SelfPlayPool`.
 
+### Eksperymentalne top-K tylko w PolyBot
+
+`--mcts-top-actions K` włącza pierwszy, jakościowy etap ograniczania policy
+MCTS. W priorach zachowywane jest top-K sieci, `--mcts-random-actions N`
+losowych legalnych ruchów oraz wszystkie ataki, end-turn, budowa mostu, ruiny,
+eksploracja, zakładanie i zdobywanie miast. Pełny `action_mask` nadal trafia do
+walidacji belief i PolyEnv, więc eksperyment nie ukrywa legalnych ruchów przed
+silnikiem. PolyBot ponownie projektuje zwróconą policy korzenia na zapamiętany
+zbiór kandydatów, dlatego wykonany ruch i target treningowy naprawdę respektują
+filtr. Z tego powodu etap mierzy przede wszystkim jakość; rzeczywiste
+usunięcie krawędzi i pełny zysk wydajności wymagają późniejszego API PolyEnv.
+
+Logi, wykresy i SQLite zawierają `search_mean_legal_actions`,
+`search_mean_selected_actions`, `search_action_reduction` oraz
+`search_prior_mass_retained`. Dodatkowe metryki zgłaszają wizyty PolyEnv poza
+kandydatami i brak zapamiętanego zbioru dla korzenia. W `command.txt` test
+`4a` porównuje ten sam checkpoint na sparowanych mapach: filtrowany model A
+przeciw pełnemu modelowi B. Wartość `0` jest dokładnym przełącznikiem
+wyłączającym stare zachowanie.
+
 Szybki samodzielny test na CUDA:
 
 ```powershell

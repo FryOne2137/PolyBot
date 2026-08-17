@@ -19,6 +19,11 @@ from ..data.polyenv_features import native_batch_to_tensors, stack_examples
 from ..infrastructure.device import select_device
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..planning.action_pruning import (
+    ActionPruningStats,
+    prune_search_logits,
+    restrict_root_policy_to_candidates,
+)
 from .global_mcts_train import _native_leaf_bias
 from .belief_recovery import (
     BeliefQualityError,
@@ -240,6 +245,67 @@ class SearchCounters:
     belief_slot_resets: int = 0
     belief_discarded_prefixes: int = 0
     root_env_decisions: int = 0
+    search_policy_rows: int = 0
+    search_pruned_rows: int = 0
+    search_legal_actions: int = 0
+    search_selected_actions: int = 0
+    search_mandatory_actions: int = 0
+    search_random_actions: int = 0
+    search_prior_mass_retained_sum: float = 0.0
+    search_restricted_roots: int = 0
+    search_missing_root_candidates: int = 0
+    search_root_visits: int = 0
+    search_outside_candidate_visits: int = 0
+    search_unfiltered_choices_outside: int = 0
+
+    def add_action_pruning(self, stats: ActionPruningStats) -> None:
+        self.search_policy_rows += int(stats.rows)
+        self.search_pruned_rows += int(stats.pruned_rows)
+        self.search_legal_actions += int(stats.legal_actions)
+        self.search_selected_actions += int(stats.selected_actions)
+        self.search_mandatory_actions += int(stats.mandatory_actions)
+        self.search_random_actions += int(stats.random_actions)
+        self.search_prior_mass_retained_sum += float(stats.prior_mass_retained_sum)
+
+    def add(self, other: "SearchCounters") -> None:
+        """Merge counters from one short-lived routed pool."""
+        for name in self.__dataclass_fields__:
+            if name == "search_prior_mass_retained_sum":
+                setattr(self, name, float(getattr(self, name)) + float(getattr(other, name)))
+            else:
+                setattr(self, name, int(getattr(self, name)) + int(getattr(other, name)))
+
+
+def _action_pruning_metrics(counters: SearchCounters) -> Dict[str, float]:
+    """Return stable aggregate metrics for logs, summaries and SQLite."""
+    rows = max(1, int(counters.search_policy_rows))
+    legal = max(1, int(counters.search_legal_actions))
+    return {
+        "search_policy_rows": float(counters.search_policy_rows),
+        "search_pruned_rows": float(counters.search_pruned_rows),
+        "search_mean_legal_actions": float(counters.search_legal_actions / rows),
+        "search_mean_selected_actions": float(counters.search_selected_actions / rows),
+        "search_action_reduction": float(
+            1.0 - counters.search_selected_actions / legal
+        ),
+        "search_prior_mass_retained": float(
+            counters.search_prior_mass_retained_sum / rows
+        ),
+        "search_mandatory_actions": float(counters.search_mandatory_actions),
+        "search_random_actions": float(counters.search_random_actions),
+        "search_restricted_roots": float(counters.search_restricted_roots),
+        "search_missing_root_candidates": float(
+            counters.search_missing_root_candidates
+        ),
+        "search_outside_candidate_visit_rate": float(
+            counters.search_outside_candidate_visits
+            / max(1, counters.search_root_visits)
+        ),
+        "search_unfiltered_choices_outside_rate": float(
+            counters.search_unfiltered_choices_outside
+            / max(1, counters.search_restricted_roots)
+        ),
+    }
 
 
 class RoutedPoolSearch:
@@ -257,6 +323,8 @@ class RoutedPoolSearch:
         visible_action_history: int,
         belief_retries: int,
         seed: int,
+        search_top_actions_by_agent: Sequence[int] | None = None,
+        search_random_actions_by_agent: Sequence[int] | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
@@ -266,15 +334,46 @@ class RoutedPoolSearch:
             raise ValueError("max_pending_leaves must be between one and eight")
         if belief_retries < 0:
             raise ValueError("belief_retries must not be negative")
+        if mcts.search_top_actions < 0 or mcts.search_random_actions < 0:
+            raise ValueError("MCTS action candidate counts must not be negative")
         Bardur, Imperius, MapType, SelfPlayPool = _pool_types()
         self.training = training
         self.mcts = mcts
         self.models = list(models)
+        self.search_top_actions_by_agent = tuple(
+            int(value) for value in (
+                search_top_actions_by_agent
+                if search_top_actions_by_agent is not None
+                else (mcts.search_top_actions,) * len(self.models)
+            )
+        )
+        self.search_random_actions_by_agent = tuple(
+            int(value) for value in (
+                search_random_actions_by_agent
+                if search_random_actions_by_agent is not None
+                else (mcts.search_random_actions,) * len(self.models)
+            )
+        )
+        if (
+            len(self.search_top_actions_by_agent) != len(self.models)
+            or len(self.search_random_actions_by_agent) != len(self.models)
+        ):
+            raise ValueError("per-agent MCTS candidate counts must match routed models")
+        if min(self.search_top_actions_by_agent, default=0) < 0 or min(
+            self.search_random_actions_by_agent, default=0
+        ) < 0:
+            raise ValueError("per-agent MCTS candidate counts must not be negative")
         self.device = select_device(training.device)
         self.num_envs = int(num_envs)
         self.max_pending_leaves = int(max_pending_leaves)
         self.belief_retries = int(belief_retries)
         self.counters = SearchCounters()
+        self._action_generator: torch.Generator | None = None
+        if self.device.type in ("cpu", "cuda"):
+            self._action_generator = torch.Generator(device=self.device)
+            self._action_generator.manual_seed(int(seed) ^ 0x5EA2C11)
+        self._capture_root_candidates = False
+        self._root_candidate_action_ids: dict[int, np.ndarray] = {}
         for model in self.models:
             model.to(self.device).eval()
         map_type = MapType.Drylands if training.map_type == "drylands" else MapType.Lakes
@@ -570,6 +669,24 @@ class RoutedPoolSearch:
                 self.mcts.teacher_prior_weight * prior_scale,
                 self.mcts.strategic_prior_weight * prior_scale,
             ).to(output.policy_logits.dtype)
+            routed_logits, selected, pruning = prune_search_logits(
+                routed_logits,
+                tensors.action_categorical,
+                tensors.action_mask,
+                top_actions=self.search_top_actions_by_agent[int(agent)],
+                random_actions=self.search_random_actions_by_agent[int(agent)],
+                generator=self._action_generator,
+            )
+            self.counters.add_action_pruning(pruning)
+            if self._capture_root_candidates:
+                env_ids = np.asarray(batch["env_id"], dtype=np.int32)[rows]
+                action_ids = np.asarray(batch["action_id"], dtype=np.int32)[rows]
+                selected_cpu = selected.detach().cpu().numpy()
+                for local, env in enumerate(env_ids):
+                    if self.search_top_actions_by_agent[int(agent)] > 0:
+                        self._root_candidate_action_ids[int(env)] = action_ids[
+                            local, selected_cpu[local]
+                        ].copy()
             logits[rows] = routed_logits.float().cpu().numpy()
             values[rows] = output.value.float().cpu().numpy()
         self.pool.expand_and_backup(
@@ -732,7 +849,9 @@ class RoutedPoolSearch:
         waves = 1 + int(
             np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)
         )
-        for _ in range(waves):
+        self._root_candidate_action_ids = {}
+        for wave in range(waves):
+            self._capture_root_candidates = wave == 0
             leaf_count = int(
                 self.pool.select_leaves_into(
                     self.leaves, max_leaves=self.leaf_capacity
@@ -743,6 +862,7 @@ class RoutedPoolSearch:
             if leaf_count == 0:
                 break
             self._expand_leaves(leaf_count, prior_scale)
+        self._capture_root_candidates = False
         self.pool.root_policy_into(self.root, temperature=root_temperature)
         action_counts = np.asarray(self.root["action_mask"], dtype=np.uint8).sum(axis=1)
         empty_live = np.flatnonzero(active & (action_counts == 0))
@@ -751,6 +871,24 @@ class RoutedPoolSearch:
                 "SelfPlayPool returned unexpanded live roots: "
                 f"{empty_live[:8].tolist()}; stats={self.pool.search_stats()}"
             )
+        root_agents = np.asarray(self.root["agent_id"], dtype=np.int32)
+        enabled = np.zeros(self.num_envs, dtype=bool)
+        for env in np.flatnonzero(active):
+            agent = int(root_agents[env])
+            if 0 <= agent < len(self.search_top_actions_by_agent):
+                enabled[env] = self.search_top_actions_by_agent[agent] > 0
+        restriction = restrict_root_policy_to_candidates(
+            self.root, self._root_candidate_action_ids, enabled
+        )
+        self.counters.search_restricted_roots += restriction.roots
+        self.counters.search_missing_root_candidates += restriction.missing_roots
+        self.counters.search_root_visits += restriction.visits
+        self.counters.search_outside_candidate_visits += (
+            restriction.outside_candidate_visits
+        )
+        self.counters.search_unfiltered_choices_outside += (
+            restriction.unfiltered_choices_outside
+        )
         return self.root
 
     def drain_completed(self) -> Dict[str, np.ndarray]:
@@ -893,12 +1031,26 @@ def evaluate_matches_pool(
     belief_retries: int = 4,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
+    model_b_search_top_actions: int | None = None,
+    model_b_search_random_actions: int | None = None,
 ) -> Dict[str, Any]:
     """Run deterministic, paired candidate evaluation entirely in native pools."""
     if games < 2 or games % 2:
         raise ValueError("games must be positive and even for paired evaluation")
     if max_envs < 2:
         raise ValueError("max_envs must be at least two")
+    model_b_top = (
+        mcts.search_top_actions
+        if model_b_search_top_actions is None
+        else int(model_b_search_top_actions)
+    )
+    model_b_random = (
+        mcts.search_random_actions
+        if model_b_search_random_actions is None
+        else int(model_b_search_random_actions)
+    )
+    if model_b_top < 0 or model_b_random < 0:
+        raise ValueError("model B MCTS candidate counts must not be negative")
     seed_everything(training.seed)
     # Keep the paired map and player slots fixed during recovery. Evaluation
     # gets extra independent stochastic belief attempts before an exhausted
@@ -954,6 +1106,8 @@ def evaluate_matches_pool(
                 visible_action_history=visible_action_history,
                 belief_retries=evaluation_belief_retries,
                 seed=int(seeds[0]),
+                search_top_actions_by_agent=(mcts.search_top_actions, model_b_top),
+                search_random_actions_by_agent=(mcts.search_random_actions, model_b_random),
             )
             request = search.reset(seeds, assignments)
             done = np.zeros(count, dtype=bool)
@@ -1140,18 +1294,7 @@ def evaluate_matches_pool(
             if unfinished:
                 progress.update(unfinished)
                 progress_counted[:] = True
-            routing.leaf_rows += search.counters.leaf_rows
-            routing.leaf_waves += search.counters.leaf_waves
-            routing.belief_retries += search.counters.belief_retries
-            routing.belief_fallback_rows += search.counters.belief_fallback_rows
-            routing.belief_rejections += search.counters.belief_rejections
-            routing.belief_rejected_particles += search.counters.belief_rejected_particles
-            routing.belief_rejected_envs += search.counters.belief_rejected_envs
-            routing.belief_resampled_envs += search.counters.belief_resampled_envs
-            routing.belief_retry_successes += search.counters.belief_retry_successes
-            routing.belief_conservative_attempts += search.counters.belief_conservative_attempts
-            routing.belief_slot_resets += search.counters.belief_slot_resets
-            routing.root_env_decisions += search.counters.root_env_decisions
+            routing.add(search.counters)
             progress.set_postfix(
                 wins=int(totals["model_a_wins"]), draws=int(totals["draws"])
             )
@@ -1187,6 +1330,11 @@ def evaluate_matches_pool(
     )
     totals["belief_slot_resets"] = float(routing.belief_slot_resets)
     totals["belief_discarded_prefixes"] = 0.0
+    totals["mcts_top_actions"] = float(mcts.search_top_actions)
+    totals["mcts_random_actions"] = float(mcts.search_random_actions)
+    totals["model_b_mcts_top_actions"] = float(model_b_top)
+    totals["model_b_mcts_random_actions"] = float(model_b_random)
+    totals.update(_action_pruning_metrics(routing))
     if game_callback is not None:
         for game in completed_game_rows:
             game_callback(game)
@@ -1586,6 +1734,7 @@ def train_population_pool(
                 effective_replay_epochs=effective_replay_epochs(
                     updates, training.batch_size, examples_count
                 ),
+                **_action_pruning_metrics(search.counters),
             )
             if losses:
                 run.log(
@@ -1593,19 +1742,7 @@ def train_population_pool(
                     optimisation_updates=updates,
                     **losses[-1],
                 )
-            routing.leaf_rows += search.counters.leaf_rows
-            routing.leaf_waves += search.counters.leaf_waves
-            routing.belief_retries += search.counters.belief_retries
-            routing.belief_fallback_rows += search.counters.belief_fallback_rows
-            routing.belief_rejections += search.counters.belief_rejections
-            routing.belief_rejected_particles += search.counters.belief_rejected_particles
-            routing.belief_rejected_envs += search.counters.belief_rejected_envs
-            routing.belief_resampled_envs += search.counters.belief_resampled_envs
-            routing.belief_retry_successes += search.counters.belief_retry_successes
-            routing.belief_conservative_attempts += search.counters.belief_conservative_attempts
-            routing.belief_slot_resets += search.counters.belief_slot_resets
-            routing.belief_discarded_prefixes += search.counters.belief_discarded_prefixes
-            routing.root_env_decisions += search.counters.root_env_decisions
+            routing.add(search.counters)
 
     optimise_until(games * updates_per_game)
     summary: Dict[str, float | str] = {
@@ -1647,7 +1784,10 @@ def train_population_pool(
         ),
         "requested_optimisation_updates": float(games * updates_per_game),
         "replay_examples": float(len(replay)),
+        "mcts_top_actions": float(mcts.search_top_actions),
+        "mcts_random_actions": float(mcts.search_random_actions),
     }
+    summary.update(_action_pruning_metrics(routing))
     for index, stats in enumerate(opponent_stats):
         summary[f"opponent_{index}_games"] = float(stats["games"])
         summary[f"opponent_{index}_score"] = float(

@@ -26,6 +26,12 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..planning.action_pruning import (
+    ActionPruningStats,
+    RootRestrictionStats,
+    prune_search_logits,
+    restrict_root_policy_to_candidates,
+)
 from .global_mcts_train import _native_leaf_bias
 from .belief_recovery import (
     BeliefQualityError,
@@ -466,6 +472,8 @@ def train_self_play_pool(
         raise ValueError("training.max_moves must be positive")
     if mcts.simulations < 1:
         raise ValueError("MCTS simulations must be positive")
+    if mcts.search_top_actions < 0 or mcts.search_random_actions < 0:
+        raise ValueError("MCTS action candidate counts must not be negative")
     if not 1 <= max_pending_leaves <= 8:
         raise ValueError("max_pending_leaves must be between one and eight")
     if belief_retries < 0:
@@ -555,6 +563,10 @@ def train_self_play_pool(
     pool.reset_into(request, seed=training.seed)
     replay = ReplayBuffer(training.replay_capacity)
     rng = np.random.default_rng(training.seed ^ 0x51F0A7)
+    action_generator: torch.Generator | None = None
+    if device.type in ("cpu", "cuda"):
+        action_generator = torch.Generator(device=device)
+        action_generator.manual_seed(training.seed ^ 0x5EA2C11)
     pending: List[Tuple[TrainingExample, int, float] | None] = [None] * num_envs
     trajectories: List[List[Transition]] = [[] for _ in range(num_envs)]
     episode_moves = np.zeros(num_envs, dtype=np.int32)
@@ -585,7 +597,67 @@ def train_self_play_pool(
     anchor_decisions = 0
     anchor_agreements = 0
     anchor_l1_sum = 0.0
+    action_pruning = ActionPruningStats()
+    root_restriction = RootRestrictionStats()
     model.eval()
+
+    def add_action_pruning(stats: ActionPruningStats) -> None:
+        nonlocal action_pruning
+        action_pruning = ActionPruningStats(
+            rows=action_pruning.rows + stats.rows,
+            pruned_rows=action_pruning.pruned_rows + stats.pruned_rows,
+            legal_actions=action_pruning.legal_actions + stats.legal_actions,
+            selected_actions=action_pruning.selected_actions + stats.selected_actions,
+            mandatory_actions=action_pruning.mandatory_actions + stats.mandatory_actions,
+            random_actions=action_pruning.random_actions + stats.random_actions,
+            prior_mass_retained_sum=(
+                action_pruning.prior_mass_retained_sum + stats.prior_mass_retained_sum
+            ),
+        )
+
+    def action_pruning_metrics() -> Dict[str, float]:
+        rows = max(1, action_pruning.rows)
+        legal = max(1, action_pruning.legal_actions)
+        return {
+            "search_policy_rows": float(action_pruning.rows),
+            "search_pruned_rows": float(action_pruning.pruned_rows),
+            "search_mean_legal_actions": float(action_pruning.legal_actions / rows),
+            "search_mean_selected_actions": float(action_pruning.selected_actions / rows),
+            "search_action_reduction": float(
+                1.0 - action_pruning.selected_actions / legal
+            ),
+            "search_prior_mass_retained": float(
+                action_pruning.prior_mass_retained_sum / rows
+            ),
+            "search_mandatory_actions": float(action_pruning.mandatory_actions),
+            "search_random_actions": float(action_pruning.random_actions),
+            "search_restricted_roots": float(root_restriction.roots),
+            "search_missing_root_candidates": float(root_restriction.missing_roots),
+            "search_outside_candidate_visit_rate": float(
+                root_restriction.outside_candidate_visits
+                / max(1, root_restriction.visits)
+            ),
+            "search_unfiltered_choices_outside_rate": float(
+                root_restriction.unfiltered_choices_outside
+                / max(1, root_restriction.roots)
+            ),
+        }
+
+    def add_root_restriction(stats: RootRestrictionStats) -> None:
+        nonlocal root_restriction
+        root_restriction = RootRestrictionStats(
+            roots=root_restriction.roots + stats.roots,
+            missing_roots=root_restriction.missing_roots + stats.missing_roots,
+            visits=root_restriction.visits + stats.visits,
+            outside_candidate_visits=(
+                root_restriction.outside_candidate_visits
+                + stats.outside_candidate_visits
+            ),
+            unfiltered_choices_outside=(
+                root_restriction.unfiltered_choices_outside
+                + stats.unfiltered_choices_outside
+            ),
+        )
 
     def log_rollout(step: int, curriculum_scale: float) -> None:
         metrics: Dict[str, float] = {
@@ -624,6 +696,7 @@ def train_self_play_pool(
             "curriculum_scale": float(curriculum_scale),
             "mean_leaf_batch": float(np.mean(leaf_counts)) if leaf_counts else 0.0,
         }
+        metrics.update(action_pruning_metrics())
         if losses:
             metrics.update(losses[-1])
         run.log(**metrics)
@@ -949,7 +1022,8 @@ def train_self_play_pool(
             # The hand-written curriculum is useful only while the network is
             # weak. Annealing it to zero forces later MCTS targets to come from
             # the learned policy/value instead of permanently cloning a prior.
-            for _ in range(waves):
+            root_candidate_action_ids: dict[int, np.ndarray] = {}
+            for wave in range(waves):
                 leaf_count = int(pool.select_leaves_into(leaves, max_leaves=leaf_capacity))
                 leaf_counts.append(leaf_count)
                 if leaf_count == 0:
@@ -971,6 +1045,23 @@ def train_self_play_pool(
                         mcts.teacher_prior_weight * curriculum_scale,
                         mcts.strategic_prior_weight * curriculum_scale,
                     ).to(leaf_output.policy_logits.dtype)
+                    logits, selected, pruning = prune_search_logits(
+                        logits,
+                        leaf_tensors.action_categorical,
+                        leaf_tensors.action_mask,
+                        top_actions=mcts.search_top_actions,
+                        random_actions=mcts.search_random_actions,
+                        generator=action_generator,
+                    )
+                    add_action_pruning(pruning)
+                    if wave == 0 and mcts.search_top_actions > 0:
+                        env_ids = np.asarray(leaf_batch["env_id"], dtype=np.int32)
+                        action_ids = np.asarray(leaf_batch["action_id"], dtype=np.int32)
+                        selected_cpu = selected.detach().cpu().numpy()
+                        for local, env in enumerate(env_ids):
+                            root_candidate_action_ids[int(env)] = action_ids[
+                                local, selected_cpu[local]
+                            ].copy()
                 pool.expand_and_backup(
                     np.asarray(leaf_batch["leaf_id"], dtype=np.uint64),
                     logits.float().cpu().numpy(),
@@ -995,6 +1086,13 @@ def train_self_play_pool(
                     f"search_stats={stats}. This indicates a SelfPlayPool/MCTS API mismatch "
                     "or a native engine issue, not an action-selection failure."
                 )
+            add_root_restriction(
+                restrict_root_policy_to_candidates(
+                    root,
+                    root_candidate_action_ids,
+                    np.full(num_envs, mcts.search_top_actions > 0, dtype=bool),
+                )
+            )
             root_values = np.asarray(root["root_value"], dtype=np.float32)
             next_players = np.asarray(request["to_play"], dtype=np.int64)
             belief_targets = np.asarray(pool.belief_targets_numpy(state_ids), dtype=np.int32)
@@ -1146,7 +1244,10 @@ def train_self_play_pool(
         "self_play_pool_anchor_agreement": float(anchor_agreements / max(1, anchor_decisions)),
         "self_play_pool_anchor_mean_l1": float(anchor_l1_sum / max(1, anchor_decisions)),
         "replay_examples": float(len(replay)),
+        "mcts_top_actions": float(mcts.search_top_actions),
+        "mcts_random_actions": float(mcts.search_random_actions),
     }
+    summary.update(action_pruning_metrics())
     summary.update({f"self_play_pool_belief_rejection_{kind}": float(count)
                     for kind, count in sorted(belief_rejections.items())})
     summary.update({f"self_play_pool_belief_reset_reason_{kind}": float(count)

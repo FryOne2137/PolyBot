@@ -88,6 +88,14 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument(
+        "--mcts-top-actions", type=int, default=0,
+        help="PolyBot-only leaf prior filter; 0 disables, 48 is a conservative experiment.",
+    )
+    parser.add_argument(
+        "--mcts-random-actions", type=int, default=0,
+        help="Extra random legal candidates per leaf in addition to top-K and mandatory tactics.",
+    )
     parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
     args = parser.parse_args()

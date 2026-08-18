@@ -85,21 +85,66 @@ def main() -> None:
     )
     parser.add_argument("--direct-teacher-envs", type=int, default=128)
     parser.add_argument(
-        "--direct-teacher-steps", type=int, default=500,
+        "--direct-teacher-steps", type=int, default=2_000,
         help="Fast visible-objective imitation steps before MCTS",
     )
     parser.add_argument("--direct-actor-envs", type=int, default=128)
     parser.add_argument(
-        "--direct-actor-steps", type=int, default=1_000,
+        "--direct-actor-steps", type=int, default=5_000,
         help="On-policy direct-play steps before MCTS",
     )
-    parser.add_argument("--direct-actor-block-steps", type=int, default=250)
-    parser.add_argument("--direct-gate-games", type=int, default=20)
+    parser.add_argument("--direct-actor-block-steps", type=int, default=1_000)
+    parser.add_argument(
+        "--direct-actor-max-steps", type=int, default=20_000,
+        help="Maximum direct-play steps before a round defers MCTS",
+    )
+    parser.add_argument("--direct-gate-games", type=int, default=10)
+    parser.add_argument(
+        "--direct-gate-max-moves", type=int, default=700,
+        help="Longer raw-policy games used by direct and population gates",
+    )
     parser.add_argument("--direct-gate-score", type=float, default=0.50)
     parser.add_argument("--direct-policy-anchor-weight", type=float, default=0.75)
     parser.add_argument("--direct-value-anchor-weight", type=float, default=0.50)
     parser.add_argument("--direct-teacher-weight", type=float, default=0.50)
     parser.add_argument("--direct-shaping-weight", type=float, default=0.20)
+    parser.add_argument("--direct-readiness-score", type=float, default=0.50)
+    parser.add_argument(
+        "--direct-readiness-city-captures-per-game", type=float, default=0.05,
+    )
+    parser.add_argument(
+        "--direct-readiness-completion-rate", type=float, default=0.05,
+    )
+    parser.add_argument("--direct-readiness-patience", type=int, default=2)
+    parser.add_argument("--direct-population-envs", type=int, default=128)
+    parser.add_argument(
+        "--direct-population-steps", type=int, default=2_000,
+        help="Minimum fast population steps without MCTS",
+    )
+    parser.add_argument(
+        "--direct-population-max-steps", type=int, default=10_000,
+        help="Maximum fast population steps before MCTS is deferred",
+    )
+    parser.add_argument(
+        "--direct-population-block-steps", type=int, default=1_000,
+    )
+    parser.add_argument("--direct-population-gate-games", type=int, default=10)
+    parser.add_argument("--direct-population-gate-score", type=float, default=0.50)
+    parser.add_argument(
+        "--direct-population-historical-floor", type=float, default=0.45,
+    )
+    parser.add_argument(
+        "--direct-population-readiness-patience", type=int, default=2,
+    )
+    parser.add_argument(
+        "--direct-population-opponent-policy-weight", type=float, default=0.50,
+    )
+    parser.add_argument(
+        "--direct-population-teacher-weight", type=float, default=0.25,
+    )
+    parser.add_argument(
+        "--direct-population-shaping-weight", type=float, default=0.20,
+    )
     parser.add_argument(
         "--mcts-simulation-ladder", type=_simulation_ladder,
         default=(4, 8, 16, 32),
@@ -193,12 +238,43 @@ def main() -> None:
         direct_actor_envs=args.direct_actor_envs,
         direct_actor_steps=args.direct_actor_steps,
         direct_actor_block_steps=args.direct_actor_block_steps,
+        direct_actor_max_steps=args.direct_actor_max_steps,
         direct_gate_games=args.direct_gate_games,
+        direct_gate_max_moves=args.direct_gate_max_moves,
         direct_gate_score=args.direct_gate_score,
         direct_policy_anchor_weight=args.direct_policy_anchor_weight,
         direct_value_anchor_weight=args.direct_value_anchor_weight,
         direct_teacher_weight=args.direct_teacher_weight,
         direct_shaping_weight=args.direct_shaping_weight,
+        direct_readiness_score=args.direct_readiness_score,
+        direct_readiness_city_captures_per_game=(
+            args.direct_readiness_city_captures_per_game
+        ),
+        direct_readiness_completion_rate=(
+            args.direct_readiness_completion_rate
+        ),
+        direct_readiness_patience=args.direct_readiness_patience,
+        direct_population_envs=args.direct_population_envs,
+        direct_population_steps=args.direct_population_steps,
+        direct_population_max_steps=args.direct_population_max_steps,
+        direct_population_block_steps=args.direct_population_block_steps,
+        direct_population_gate_games=args.direct_population_gate_games,
+        direct_population_gate_score=args.direct_population_gate_score,
+        direct_population_historical_floor=(
+            args.direct_population_historical_floor
+        ),
+        direct_population_readiness_patience=(
+            args.direct_population_readiness_patience
+        ),
+        direct_population_opponent_policy_weight=(
+            args.direct_population_opponent_policy_weight
+        ),
+        direct_population_teacher_weight=(
+            args.direct_population_teacher_weight
+        ),
+        direct_population_shaping_weight=(
+            args.direct_population_shaping_weight
+        ),
         mcts_simulation_ladder=args.mcts_simulation_ladder,
         mcts_gate_games=args.mcts_gate_games,
         mcts_gate_score=args.mcts_gate_score,

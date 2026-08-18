@@ -225,6 +225,8 @@ def evaluate_direct_matches(
         "opponent_capital_captures": 0.0,
         "model_a_decisions": 0.0,
         "moves": 0.0,
+        "terminated_games": 0.0,
+        "truncated_games": 0.0,
         "evaluation_seed": float(training.seed),
     }
     scores: list[float] = []
@@ -266,6 +268,9 @@ def evaluate_direct_matches(
                 totals["model_a_decisions"] += float(is_a_turn)
                 moves += 1
             totals["moves"] += float(moves)
+            truncated = bool(winner < 0 and not env.is_done())
+            totals["truncated_games"] += float(truncated)
+            totals["terminated_games"] += float(env.is_done())
             score = 0.5 if winner < 0 else float(winner == model_a_player)
             scores.append(score)
             if score == 1.0:
@@ -298,7 +303,7 @@ def evaluate_direct_matches(
                         totals["opponent_capital_captures"]
                         - before["opponent_capital_captures"]
                     ),
-                    "truncated": int(winner < 0 and not env.is_done()),
+                    "truncated": int(truncated),
                 })
             progress.update(1)
             progress.set_postfix(
@@ -322,4 +327,10 @@ def evaluate_direct_matches(
         totals["model_a_score"] - 1.96 * totals["score_standard_error"],
     )
     totals["mean_moves"] = totals["moves"] / max(1.0, float(games))
+    totals["completion_rate"] = totals["terminated_games"] / max(
+        1.0, float(games)
+    )
+    totals["model_a_city_captures_per_game"] = totals[
+        "model_a_city_captures"
+    ] / max(1.0, float(games))
     return totals

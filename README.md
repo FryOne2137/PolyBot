@@ -115,8 +115,28 @@ python scripts/train_self_play.py \
 `VectorGameEnv`. Nauczyciel visible-only pokazuje przejmowanie wiosek, ruch do
 widocznych celów, ekonomię i walkę, a następnie actor-critic uczy się z własnych
 akcji. Krótkie, sparowane bramki cofają każdy blok, który pogorszył grę względem
-zamrożonego championa. Dopiero potem kandydat przechodzi szczeble MCTS, np.
-`4,8,16,32,64`; nieudany szczebel jest atomowo cofany.
+zamrożonego championa. Direct-play trwa co najmniej
+`--direct-actor-steps`, a w razie potrzeby rośnie do
+`--direct-actor-max-steps`. MCTS pozostaje wyłączone, dopóki surowa polityka
+nie osiągnie progów wyniku, przejęć miast/wiosek i completion rate przez
+`--direct-readiness-patience` kolejnych bramek. Niegotowy model jest zachowany
+jako challenger i kontynuuje direct curriculum w następnej rundzie.
+
+Następnie działa drugi szybki etap bez MCTS: kandydat gra surową polityką
+przeciw championowi i historycznym checkpointom dobranym przez PFSP. Tury
+przeciwników wykonują zamrożone modele, a kandydat uczy się własnych akcji,
+wartości pozycji i destyluje zachowanie populacji. Etap może rosnąć od
+`--direct-population-steps` do `--direct-population-max-steps`; każdy blok ma
+osobną bramkę przeciw całej populacji i rollback. Gry treningowe w natywnym
+`VectorGameEnv` nie mają sztucznego limitu ruchów, a bramki direct używają
+`--direct-gate-max-moves`.
+
+Dopiero kandydat gotowy w obu etapach bez MCTS przechodzi szczeble MCTS, np.
+`4,8,16,32,64`.
+Po każdym szczeblu sprawdzany jest zarówno wynik z wyszukiwaniem, jak i surowa
+sieć bez MCTS. Wyższy szczebel jest dostępny tylko wtedy, gdy sieć przyswoiła
+targety search bez utraty wcześniejszego wyniku, przejęć i completion rate;
+nieudany szczebel jest atomowo cofany.
 
 Gry MCTS przeciw populacji i końcowe sparowane bramki korzystają z natywnego
 `SelfPlayPool`. `agent_id` wybiera właściwy checkpoint osobno dla każdego
@@ -302,6 +322,7 @@ src/polybot/
 │   ├── self_play.py              games, replay buffer and full-map labels
 │   ├── league.py                 PFSP population training and promotion gates
 │   ├── league_db.py              SQLite games, metrics, lineage and ratings
+│   ├── vector_population.py      raw-policy population play without MCTS
 │   ├── routed_self_play_pool.py  multi-model native training and paired gates
 │   ├── replay_buffer.py           stored self-play examples
 │   ├── optimisation.py            policy/value/belief loss functions

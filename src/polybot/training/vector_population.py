@@ -40,6 +40,19 @@ def _model_rows(
     )
 
 
+def _index_copy_policy_rows_(
+    target: torch.Tensor,
+    index: torch.Tensor,
+    source: torch.Tensor,
+) -> None:
+    """Copy policy rows without depending on the active AMP dtype."""
+    target.index_copy_(
+        0,
+        index.to(device=target.device, dtype=torch.long),
+        source.to(device=target.device, dtype=target.dtype),
+    )
+
+
 def train_vector_population(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -224,7 +237,12 @@ def train_vector_population(
                 action_rows = distribution.sample()
                 entropy_rows = distribution.entropy()
 
-            opponent_target = torch.zeros_like(output.policy_logits)
+            # Keep distillation targets in fp32 even when the candidate
+            # forward pass is autocast to fp16. Frozen opponents run outside
+            # autocast and may otherwise produce an incompatible dtype.
+            opponent_target = torch.zeros_like(
+                output.policy_logits, dtype=torch.float32
+            )
             for opponent_index, opponent in enumerate(frozen):
                 rows = opponent_rows[
                     opponent_indices[opponent_rows] == opponent_index
@@ -240,7 +258,9 @@ def train_vector_population(
                 row_tensor = torch.as_tensor(
                     rows, dtype=torch.long, device=device
                 )
-                opponent_target.index_copy_(0, row_tensor, opponent_policy)
+                _index_copy_policy_rows_(
+                    opponent_target, row_tensor, opponent_policy
+                )
                 action_rows.index_copy_(0, row_tensor, selected)
 
             selected_rows = action_rows.detach().cpu().numpy().astype(np.int64)

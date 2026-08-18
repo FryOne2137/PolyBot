@@ -114,8 +114,10 @@ python scripts/evaluate.py `
 # surowej sieci przeciw całej populacji. MCTS uruchamia się jednocześnie we
 # wszystkich etapach dopiero, gdy surowa sieć przejmuje miasta/wioski, kończy
 # gry i nie cofa się przeciw żadnemu historycznemu modelowi. Szybkie etapy
-# mogą wykorzystać do 20000 + 10000 kroków na rundę. Potem model przechodzi
-# adaptacyjne szczeble 4,8,16,32,64; każdy ma bramkę i rollback. Checkpointy
+# mogą wykorzystać do 5000 + 10000 kroków na rundę, ale dwie kolejne regresje
+# kończą etap wcześniej na najlepszym bezpiecznym checkpointcie. Potem model
+# przechodzi adaptacyjne szczeble 4,8,16,32,64; każdy ma bramkę i rollback.
+# Checkpointy
 # po promocji trafią
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
 # do runs\league\train\round_001, round_002 itd.
@@ -141,9 +143,9 @@ python scripts/train_league.py `
   --direct-teacher-envs 128 `
   --direct-teacher-steps 2000 `
   --direct-actor-envs 128 `
-  --direct-actor-steps 5000 `
-  --direct-actor-block-steps 1000 `
-  --direct-actor-max-steps 20000 `
+  --direct-actor-steps 1000 `
+  --direct-actor-block-steps 500 `
+  --direct-actor-max-steps 5000 `
   --direct-gate-games 10 `
   --direct-gate-max-moves 700 `
   --direct-gate-score 0.50 `
@@ -155,6 +157,7 @@ python scripts/train_league.py `
   --direct-readiness-city-captures-per-game 0.05 `
   --direct-readiness-completion-rate 0.05 `
   --direct-readiness-patience 2 `
+  --direct-regression-patience 2 `
   --direct-population-envs 128 `
   --direct-population-steps 2000 `
   --direct-population-block-steps 1000 `
@@ -163,6 +166,7 @@ python scripts/train_league.py `
   --direct-population-gate-score 0.50 `
   --direct-population-historical-floor 0.45 `
   --direct-population-readiness-patience 2 `
+  --direct-population-regression-patience 2 `
   --direct-population-opponent-policy-weight 0.50 `
   --direct-population-teacher-weight 0.25 `
   --direct-population-shaping-weight 0.20 `

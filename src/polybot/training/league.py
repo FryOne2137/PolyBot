@@ -154,6 +154,7 @@ def train_promotion_league(
     direct_readiness_city_captures_per_game: float = 0.05,
     direct_readiness_completion_rate: float = 0.05,
     direct_readiness_patience: int = 2,
+    direct_regression_patience: int = 2,
     direct_population_envs: int = 128,
     direct_population_steps: int = 0,
     direct_population_max_steps: int = 10_000,
@@ -162,6 +163,7 @@ def train_promotion_league(
     direct_population_gate_score: float = 0.50,
     direct_population_historical_floor: float = 0.45,
     direct_population_readiness_patience: int = 2,
+    direct_population_regression_patience: int = 2,
     direct_population_opponent_policy_weight: float = 0.50,
     direct_population_teacher_weight: float = 0.25,
     direct_population_shaping_weight: float = 0.20,
@@ -248,6 +250,8 @@ def train_promotion_league(
         )
     if direct_readiness_patience < 1:
         raise ValueError("direct_readiness_patience must be positive")
+    if direct_regression_patience < 1:
+        raise ValueError("direct_regression_patience must be positive")
     if direct_population_steps < 0:
         raise ValueError("direct_population_steps must not be negative")
     if direct_population_max_steps < direct_population_steps:
@@ -263,6 +267,10 @@ def train_promotion_league(
     if direct_population_readiness_patience < 1:
         raise ValueError(
             "direct_population_readiness_patience must be positive"
+        )
+    if direct_population_regression_patience < 1:
+        raise ValueError(
+            "direct_population_regression_patience must be positive"
         )
     ladder = tuple(int(value) for value in mcts_simulation_ladder)
     if any(value < 1 for value in ladder) or tuple(sorted(set(ladder))) != ladder:
@@ -352,6 +360,7 @@ def train_promotion_league(
         ),
         "direct_readiness_completion_rate": direct_readiness_completion_rate,
         "direct_readiness_patience": direct_readiness_patience,
+        "direct_regression_patience": direct_regression_patience,
         "direct_population_envs": direct_population_envs,
         "direct_population_steps": direct_population_steps,
         "direct_population_max_steps": direct_population_max_steps,
@@ -363,6 +372,9 @@ def train_promotion_league(
         ),
         "direct_population_readiness_patience": (
             direct_population_readiness_patience
+        ),
+        "direct_population_regression_patience": (
+            direct_population_regression_patience
         ),
         "direct_population_opponent_policy_weight": (
             direct_population_opponent_policy_weight
@@ -637,6 +649,7 @@ def train_promotion_league(
                                 direct_readiness_completion_rate
                             ),
                             readiness_patience=direct_readiness_patience,
+                            regression_patience=direct_regression_patience,
                             gate_game_callback=record_direct_gate_game,
                             run=run.child(
                                 f"round_{round_index:03d}/direct_curriculum"
@@ -826,6 +839,9 @@ def train_promotion_league(
                                 ),
                                 readiness_patience=(
                                     direct_population_readiness_patience
+                                ),
+                                regression_patience=(
+                                    direct_population_regression_patience
                                 ),
                                 policy_anchor_weight=(
                                     direct_policy_anchor_weight

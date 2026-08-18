@@ -561,6 +561,7 @@ def train_direct_population_curriculum(
     opponent_policy_weight: float,
     teacher_weight: float,
     shaping_weight: float,
+    regression_patience: int = 2,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -576,6 +577,8 @@ def train_direct_population_curriculum(
         raise ValueError("direct population gate games must be positive and even")
     if readiness_patience < 1:
         raise ValueError("readiness_patience must be positive")
+    if regression_patience < 1:
+        raise ValueError("regression_patience must be positive")
     weights = np.asarray(opponent_weights, dtype=np.float64)
     if (
         weights.shape != (len(opponent_models),)
@@ -605,6 +608,7 @@ def train_direct_population_curriculum(
             ),
             "readiness_completion_rate": readiness_completion_rate,
             "readiness_patience": readiness_patience,
+            "regression_patience": regression_patience,
             "opponent_weights": weights.tolist(),
             "policy_anchor_weight": policy_anchor_weight,
             "value_anchor_weight": value_anchor_weight,
@@ -620,13 +624,18 @@ def train_direct_population_curriculum(
     best_completion_rate = 0.0
     readiness_streak = 0
     ready = False
+    best_meets_readiness = False
     accepted_blocks = rollback_blocks = 0
+    consecutive_regressions = 0
+    maximum_consecutive_regressions = 0
     gate_rows: list[Dict[str, Any]] = []
 
     def gate(label: str, block: int, baseline: bool = False) -> bool:
         nonlocal best_state, best_score, best_worst_score
         nonlocal best_capture_rate, best_completion_rate
         nonlocal readiness_streak, ready, accepted_blocks, rollback_blocks
+        nonlocal best_meets_readiness
+        nonlocal consecutive_regressions, maximum_consecutive_regressions
         evaluation = evaluate_direct_population_matches(
             training,
             candidate,
@@ -669,13 +678,18 @@ def train_direct_population_curriculum(
                 and capture_rate >= readiness_city_captures_per_game
                 and completion_rate >= readiness_completion_rate
             )
+            best_meets_readiness = meets
             readiness_streak = readiness_streak + 1 if meets else 0
             ready = readiness_streak >= readiness_patience
+            consecutive_regressions = 0
         else:
             restore_model_state(candidate, best_state)
             rollback_blocks += 1
-            readiness_streak = 0
-            ready = False
+            consecutive_regressions += 1
+            maximum_consecutive_regressions = max(
+                maximum_consecutive_regressions,
+                consecutive_regressions,
+            )
         row = {
             "stage": label,
             "block": float(block),
@@ -685,7 +699,9 @@ def train_direct_population_curriculum(
             "completion_rate": completion_rate,
             "accepted": float(accepted),
             "ready": float(ready),
+            "best_meets_readiness": float(best_meets_readiness),
             "readiness_streak": float(readiness_streak),
+            "consecutive_regressions": float(consecutive_regressions),
             "opponents": results,
         }
         gate_rows.append(row)
@@ -696,14 +712,26 @@ def train_direct_population_curriculum(
             direct_population_gate_completion=completion_rate,
             direct_population_gate_accepted=float(accepted),
             direct_population_ready=float(ready),
+            direct_population_best_meets_readiness=float(
+                best_meets_readiness
+            ),
+            direct_population_consecutive_regressions=float(
+                consecutive_regressions
+            ),
         )
         return accepted
 
     gate("baseline", -1, baseline=True)
     completed = 0
     block = 0
+    early_stopped = False
+    early_stop_reason = ""
     training_rows: list[Dict[str, Any]] = []
-    while completed < maximum_steps and (completed < minimum_steps or not ready):
+    while completed < maximum_steps and (
+        completed < minimum_steps
+        or not ready
+        or 0 < consecutive_regressions < regression_patience
+    ):
         block += 1
         current_steps = min(block_steps, maximum_steps - completed)
         block_training = replace(
@@ -737,7 +765,16 @@ def train_direct_population_curriculum(
         )
         training_rows.append(result)
         completed += current_steps
-        gate("population", block)
+        accepted = gate("population", block)
+        if (
+            not accepted
+            and best_meets_readiness
+            and consecutive_regressions >= regression_patience
+        ):
+            ready = True
+            early_stopped = True
+            early_stop_reason = "persistent_population_regression"
+            break
 
     restore_model_state(candidate, best_state)
     summary: Dict[str, Any] = {
@@ -746,12 +783,26 @@ def train_direct_population_curriculum(
         "direct_population_steps": float(completed),
         "direct_population_blocks": float(block),
         "direct_population_ready": float(ready),
+        "direct_population_best_meets_readiness": float(
+            best_meets_readiness
+        ),
         "direct_population_best_score": float(best_score),
         "direct_population_best_worst_score": float(best_worst_score),
         "direct_population_best_city_captures_per_game": float(best_capture_rate),
         "direct_population_best_completion_rate": float(best_completion_rate),
         "direct_population_accepted_blocks": float(accepted_blocks),
         "direct_population_rollback_blocks": float(rollback_blocks),
+        "direct_population_regression_patience": float(
+            regression_patience
+        ),
+        "direct_population_consecutive_regressions": float(
+            consecutive_regressions
+        ),
+        "direct_population_max_consecutive_regressions": float(
+            maximum_consecutive_regressions
+        ),
+        "direct_population_early_stopped": float(early_stopped),
+        "direct_population_early_stop_reason": early_stop_reason,
         "direct_population_gate_rows": gate_rows,
         "direct_population_training_rows": training_rows,
     }

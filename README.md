@@ -121,6 +121,9 @@ zamrożonego championa. Direct-play trwa co najmniej
 nie osiągnie progów wyniku, przejęć miast/wiosek i completion rate przez
 `--direct-readiness-patience` kolejnych bramek. Niegotowy model jest zachowany
 jako challenger i kontynuuje direct curriculum w następnej rundzie.
+Gotowość należy do najlepszego zapisanego stanu, więc rollback złej próby jej
+nie kasuje. Po `--direct-regression-patience` kolejnych odrzuconych blokach
+faza kończy się wcześniej i przekazuje najlepszy gotowy checkpoint dalej.
 
 Następnie działa drugi szybki etap bez MCTS: kandydat gra surową polityką
 przeciw championowi i historycznym checkpointom dobranym przez PFSP. Tury
@@ -129,7 +132,10 @@ wartości pozycji i destyluje zachowanie populacji. Etap może rosnąć od
 `--direct-population-steps` do `--direct-population-max-steps`; każdy blok ma
 osobną bramkę przeciw całej populacji i rollback. Gry treningowe w natywnym
 `VectorGameEnv` nie mają sztucznego limitu ruchów, a bramki direct używają
-`--direct-gate-max-moves`.
+`--direct-gate-max-moves`. Analogicznie,
+`--direct-population-regression-patience` zatrzymuje trwałe pogarszanie i
+przechodzi do MCTS na najlepszym checkpointcie, o ile przeszedł on progi
+gotowości całej populacji.
 
 Dopiero kandydat gotowy w obu etapach bez MCTS przechodzi szczeble MCTS, np.
 `4,8,16,32,64`.

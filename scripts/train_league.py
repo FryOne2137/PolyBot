@@ -90,12 +90,12 @@ def main() -> None:
     )
     parser.add_argument("--direct-actor-envs", type=int, default=128)
     parser.add_argument(
-        "--direct-actor-steps", type=int, default=5_000,
+        "--direct-actor-steps", type=int, default=1_000,
         help="On-policy direct-play steps before MCTS",
     )
-    parser.add_argument("--direct-actor-block-steps", type=int, default=1_000)
+    parser.add_argument("--direct-actor-block-steps", type=int, default=500)
     parser.add_argument(
-        "--direct-actor-max-steps", type=int, default=20_000,
+        "--direct-actor-max-steps", type=int, default=5_000,
         help="Maximum direct-play steps before a round defers MCTS",
     )
     parser.add_argument("--direct-gate-games", type=int, default=10)
@@ -116,6 +116,10 @@ def main() -> None:
         "--direct-readiness-completion-rate", type=float, default=0.05,
     )
     parser.add_argument("--direct-readiness-patience", type=int, default=2)
+    parser.add_argument(
+        "--direct-regression-patience", type=int, default=2,
+        help="Advance with the best ready checkpoint after this many bad actor blocks",
+    )
     parser.add_argument("--direct-population-envs", type=int, default=128)
     parser.add_argument(
         "--direct-population-steps", type=int, default=2_000,
@@ -135,6 +139,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--direct-population-readiness-patience", type=int, default=2,
+    )
+    parser.add_argument(
+        "--direct-population-regression-patience", type=int, default=2,
+        help="Advance with the best ready checkpoint after persistent population regression",
     )
     parser.add_argument(
         "--direct-population-opponent-policy-weight", type=float, default=0.50,
@@ -254,6 +262,7 @@ def main() -> None:
             args.direct_readiness_completion_rate
         ),
         direct_readiness_patience=args.direct_readiness_patience,
+        direct_regression_patience=args.direct_regression_patience,
         direct_population_envs=args.direct_population_envs,
         direct_population_steps=args.direct_population_steps,
         direct_population_max_steps=args.direct_population_max_steps,
@@ -265,6 +274,9 @@ def main() -> None:
         ),
         direct_population_readiness_patience=(
             args.direct_population_readiness_patience
+        ),
+        direct_population_regression_patience=(
+            args.direct_population_regression_patience
         ),
         direct_population_opponent_policy_weight=(
             args.direct_population_opponent_policy_weight

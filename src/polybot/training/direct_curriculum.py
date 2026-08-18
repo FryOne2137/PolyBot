@@ -96,6 +96,7 @@ def train_direct_policy_curriculum(
     readiness_city_captures_per_game: float = 0.05,
     readiness_completion_rate: float = 0.05,
     readiness_patience: int = 2,
+    regression_patience: int = 2,
     gate_game_callback: Callable[[str, int, Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, Any]:
@@ -144,6 +145,8 @@ def train_direct_policy_curriculum(
         )
     if readiness_patience < 1:
         raise ValueError("readiness_patience must be positive")
+    if regression_patience < 1:
+        raise ValueError("regression_patience must be positive")
     run = run or TrainingRun.create("runs", "direct_curriculum")
     run.write_config(
         training=training,
@@ -167,6 +170,7 @@ def train_direct_policy_curriculum(
             "readiness_city_captures_per_game": readiness_city_captures_per_game,
             "readiness_completion_rate": readiness_completion_rate,
             "readiness_patience": readiness_patience,
+            "regression_patience": regression_patience,
         },
     )
     device = next(candidate.parameters()).device
@@ -182,12 +186,17 @@ def train_direct_policy_curriculum(
     rollback_blocks = 0
     readiness_streak = 0
     ready = False
+    best_meets_readiness = False
+    consecutive_regressions = 0
+    maximum_consecutive_regressions = 0
     gate_rows: list[Dict[str, float | str]] = []
 
     def gate(label: str, block: int, *, baseline: bool = False) -> bool:
         nonlocal best_state, best_score, best_progress
         nonlocal best_city_capture_rate, best_completion_rate
         nonlocal accepted_blocks, rollback_blocks, readiness_streak, ready
+        nonlocal best_meets_readiness
+        nonlocal consecutive_regressions, maximum_consecutive_regressions
         gate_training = replace(
             training,
             seed=int(gate_seed),
@@ -237,13 +246,21 @@ def train_direct_policy_curriculum(
                 city_captures_per_game=readiness_city_captures_per_game,
                 completion_rate=readiness_completion_rate,
             )
+            best_meets_readiness = is_ready
             readiness_streak = readiness_streak + 1 if is_ready else 0
             ready = readiness_streak >= readiness_patience
+            consecutive_regressions = 0
         else:
             restore_model_state(candidate, best_state)
             rollback_blocks += 1
-            readiness_streak = 0
-            ready = False
+            # Readiness describes the checkpoint restored above. A failed
+            # experiment must not erase evidence already earned by that best
+            # checkpoint; otherwise the loop can retrain it until max_steps.
+            consecutive_regressions += 1
+            maximum_consecutive_regressions = max(
+                maximum_consecutive_regressions,
+                consecutive_regressions,
+            )
         row: Dict[str, float | str] = {
             "curriculum_stage": label,
             "curriculum_block": float(block),
@@ -260,6 +277,10 @@ def train_direct_policy_curriculum(
             "direct_objective_progress": float(progress),
             "direct_readiness_streak": float(readiness_streak),
             "direct_ready": float(ready),
+            "direct_best_meets_readiness": float(best_meets_readiness),
+            "direct_consecutive_regressions": float(
+                consecutive_regressions
+            ),
             "direct_rollbacks": float(rollback_blocks),
         }
         gate_rows.append(row)
@@ -292,8 +313,15 @@ def train_direct_policy_curriculum(
     actor_summaries: list[Dict[str, Any]] = []
     completed = 0
     block = 0
+    early_stopped = False
+    early_stop_reason = ""
+    # The teacher is a separate kind of update. Regression patience below is
+    # deliberately measured across consecutive actor blocks only.
+    consecutive_regressions = 0
     while completed < maximum_actor_steps and (
-        completed < actor_steps or not ready
+        completed < actor_steps
+        or not ready
+        or 0 < consecutive_regressions < regression_patience
     ):
         block += 1
         block_steps = min(actor_block_steps, maximum_actor_steps - completed)
@@ -321,7 +349,16 @@ def train_direct_policy_curriculum(
         )
         actor_summaries.append(summary)
         completed += block_steps
-        gate("actor", block)
+        accepted = gate("actor", block)
+        if (
+            not accepted
+            and best_meets_readiness
+            and consecutive_regressions >= regression_patience
+        ):
+            ready = True
+            early_stopped = True
+            early_stop_reason = "persistent_actor_regression"
+            break
 
     restore_model_state(candidate, best_state)
     summary: Dict[str, Any] = {
@@ -335,8 +372,16 @@ def train_direct_policy_curriculum(
         "direct_best_city_captures_per_game": float(best_city_capture_rate),
         "direct_best_completion_rate": float(best_completion_rate),
         "direct_ready": float(ready),
+        "direct_best_meets_readiness": float(best_meets_readiness),
         "direct_readiness_streak": float(readiness_streak),
         "direct_readiness_patience": float(readiness_patience),
+        "direct_regression_patience": float(regression_patience),
+        "direct_consecutive_regressions": float(consecutive_regressions),
+        "direct_max_consecutive_regressions": float(
+            maximum_consecutive_regressions
+        ),
+        "direct_early_stopped": float(early_stopped),
+        "direct_early_stop_reason": early_stop_reason,
         "direct_accepted_blocks": float(accepted_blocks),
         "direct_rollback_blocks": float(rollback_blocks),
         "direct_policy_anchor_weight": float(policy_anchor_weight),

@@ -24,14 +24,54 @@ def main() -> None:
 
     connection = sqlite3.connect(args.league_db)
     connection.row_factory = sqlite3.Row
+    has_capabilities = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'model_capabilities'"
+    ).fetchone() is not None
+    capability_columns = (
+        {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(model_capabilities)"
+            ).fetchall()
+        }
+        if has_capabilities
+        else set()
+    )
+    evaluation_active_column = (
+        "COALESCE(c.mcts_evaluation_active, 0)"
+        if "mcts_evaluation_active" in capability_columns
+        else "COALESCE(c.mcts_ready, 0)"
+    )
+    standings_query = (
+        f"""SELECT m.id, m.name, m.status, ROUND(m.elo, 2) AS elo,
+                  m.rated_games, m.rated_wins, m.rated_draws,
+                  m.rated_losses, m.in_population, m.protected,
+                  m.checkpoint_path,
+                  COALESCE(c.mcts_probe_streak, 0) AS mcts_probe_streak,
+                  COALESCE(c.mcts_ready, 0) AS mcts_ready,
+                  {evaluation_active_column} AS mcts_evaluation_active,
+                  ROUND(c.mcts_raw_score, 4) AS mcts_raw_score,
+                  ROUND(c.mcts_search_score, 4) AS mcts_search_score
+           FROM models m
+           LEFT JOIN model_capabilities c ON c.model_id = m.id
+           WHERE m.checkpoint_path IS NOT NULL
+           ORDER BY m.elo DESC, m.id DESC LIMIT ?"""
+        if has_capabilities
+        else
+        """SELECT id, name, status, ROUND(elo, 2) AS elo, rated_games,
+                  rated_wins, rated_draws, rated_losses, in_population,
+                  protected, checkpoint_path, 0 AS mcts_probe_streak,
+                  0 AS mcts_ready, 0 AS mcts_evaluation_active,
+                  NULL AS mcts_raw_score,
+                  NULL AS mcts_search_score
+           FROM models WHERE checkpoint_path IS NOT NULL
+           ORDER BY elo DESC, id DESC LIMIT ?"""
+    )
     report = {
         "database": str(args.league_db.resolve()),
         "standings": _rows(connection.execute(
-            """SELECT id, name, status, ROUND(elo, 2) AS elo, rated_games,
-                      rated_wins, rated_draws, rated_losses, in_population,
-                      protected, checkpoint_path
-               FROM models WHERE checkpoint_path IS NOT NULL
-               ORDER BY elo DESC, id DESC LIMIT ?""",
+            standings_query,
             (args.limit,),
         )),
         "recent_rounds": _rows(connection.execute(

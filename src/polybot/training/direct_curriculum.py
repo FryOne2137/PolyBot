@@ -240,15 +240,22 @@ def train_direct_policy_curriculum(
             best_state = model_state_on_cpu(candidate)
             if not baseline:
                 accepted_blocks += 1
-            is_ready = direct_readiness(
-                result,
-                score=readiness_score,
-                city_captures_per_game=readiness_city_captures_per_game,
-                completion_rate=readiness_completion_rate,
-            )
-            best_meets_readiness = is_ready
-            readiness_streak = readiness_streak + 1 if is_ready else 0
-            ready = readiness_streak >= readiness_patience
+            if baseline:
+                # The untouched input model is a reference, not evidence that
+                # this curriculum produced a second good checkpoint.
+                best_meets_readiness = False
+                readiness_streak = 0
+                ready = False
+            else:
+                is_ready = direct_readiness(
+                    result,
+                    score=readiness_score,
+                    city_captures_per_game=readiness_city_captures_per_game,
+                    completion_rate=readiness_completion_rate,
+                )
+                best_meets_readiness = is_ready
+                readiness_streak = readiness_streak + 1 if is_ready else 0
+                ready = readiness_streak >= readiness_patience
             consecutive_regressions = 0
         else:
             restore_model_state(candidate, best_state)
@@ -352,10 +359,8 @@ def train_direct_policy_curriculum(
         accepted = gate("actor", block)
         if (
             not accepted
-            and best_meets_readiness
             and consecutive_regressions >= regression_patience
         ):
-            ready = True
             early_stopped = True
             early_stop_reason = "persistent_actor_regression"
             break

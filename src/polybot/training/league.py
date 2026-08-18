@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 from ..config import MCTSConfig, TrainingConfig
+from ..evaluation.matches import evaluate_direct_matches
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from .league_db import LeagueDatabase
@@ -44,6 +45,61 @@ def _next_checkpoint_path(directory: Path, prefix: str) -> Path:
         if not path.exists():
             return path
         index += 1
+
+
+def _promotion_gate_decision(
+    evaluation_results: Sequence[Mapping[str, Any]],
+    champion_id: int,
+    *,
+    promotion_score: float,
+    promotion_lower_bound: float,
+    population_score: float,
+    historical_score_floor: float,
+) -> Dict[str, float | bool]:
+    """Apply one promotion rule to either raw-policy or MCTS evaluations."""
+    champion_result = next(
+        result
+        for result in evaluation_results
+        if int(result["opponent_id"]) == champion_id
+    )
+    candidate_score = float(champion_result["model_a_score"])
+    weighted_population_score = sum(
+        float(result["sampling_probability"])
+        * float(result["model_a_score"])
+        for result in evaluation_results
+    )
+    minimum_historical_score = min(
+        float(result["model_a_score"])
+        for result in evaluation_results
+    )
+    champion_lower_95 = float(champion_result["score_lower_95"])
+    promoted = (
+        candidate_score >= promotion_score
+        and champion_lower_95 >= promotion_lower_bound
+        and weighted_population_score >= population_score
+        and minimum_historical_score >= historical_score_floor
+    )
+    return {
+        "candidate_score": candidate_score,
+        "champion_lower_95": champion_lower_95,
+        "population_score": weighted_population_score,
+        "minimum_historical_score": minimum_historical_score,
+        "promoted": promoted,
+    }
+
+
+def _mcts_probe_passed(
+    raw_score: float,
+    search_score: float,
+    *,
+    minimum_search_score: float,
+    minimum_improvement: float,
+    valid: bool = True,
+) -> bool:
+    """Return whether search is useful enough to unlock later MCTS training."""
+    return bool(valid) and search_score >= minimum_search_score and (
+        search_score > raw_score + minimum_improvement
+    )
 
 
 def _validate_options(
@@ -125,8 +181,8 @@ def train_promotion_league(
     database_path: Path | None = None,
     population_model_paths: Sequence[Path] = (),
     population_size: int = 6,
-    population_games: int = 64,
-    population_updates_per_game: int = 2,
+    population_games: int = 0,
+    population_updates_per_game: int = 0,
     population_workers: int = 16,
     pfsp_alpha: float = 2.0,
     champion_probability: float = 0.40,
@@ -167,6 +223,12 @@ def train_promotion_league(
     direct_population_opponent_policy_weight: float = 0.50,
     direct_population_teacher_weight: float = 0.25,
     direct_population_shaping_weight: float = 0.20,
+    champion_mode: str = "flat",
+    mcts_probe_games: int = 10,
+    mcts_probe_simulations: int = 32,
+    mcts_probe_score: float = 0.55,
+    mcts_probe_minimum_improvement: float = 0.0,
+    mcts_probe_patience: int = 2,
     mcts_simulation_ladder: Sequence[int] = (),
     mcts_gate_games: int = 20,
     mcts_gate_score: float = 0.50,
@@ -174,11 +236,12 @@ def train_promotion_league(
 ) -> Dict[str, float | str]:
     """Train candidates against a PFSP population and promote robust winners.
 
-    Every round combines high-throughput same-network ISMCTS with games against
-    a weighted mixture of the champion and historical checkpoints. Promotion
-    requires improvement over the champion and no serious population-wide
-    regression. SQLite stores game/metric lineage; tensors remain in ``.pt``
-    files referenced by path and SHA-256 rather than database BLOBs.
+    Flat mode first learns and evaluates the raw policy against a weighted
+    mixture of the champion and historical checkpoints. Search@32 becomes an
+    additional promotion gate only after paired probes prove that it improves
+    the raw result. Legacy MCTS mode keeps the full search ladder. SQLite
+    stores game/metric lineage; tensors remain in ``.pt`` files referenced by
+    path and SHA-256 rather than database BLOBs.
     """
     _validate_options(
         rounds=rounds,
@@ -202,6 +265,8 @@ def train_promotion_league(
     )
     if not checkpoint_prefix:
         raise ValueError("checkpoint_prefix must not be empty")
+    if champion_mode not in {"flat", "mcts"}:
+        raise ValueError("champion_mode must be 'flat' or 'mcts'")
     if num_envs < 2:
         raise ValueError("num_envs must be at least two for paired SelfPlayPool gates")
     if steps < 0 or updates < 0:
@@ -218,6 +283,14 @@ def train_promotion_league(
         raise ValueError("direct_gate_max_moves must be positive")
     if mcts_gate_games < 2 or mcts_gate_games % 2:
         raise ValueError("mcts_gate_games must be positive and even")
+    if mcts_probe_games < 0 or mcts_probe_games % 2:
+        raise ValueError("mcts_probe_games must be non-negative and even")
+    if mcts_probe_games and mcts_probe_games < 2:
+        raise ValueError("mcts_probe_games must be zero or at least two")
+    if mcts_probe_simulations < 1:
+        raise ValueError("mcts_probe_simulations must be positive")
+    if mcts_probe_patience < 1:
+        raise ValueError("mcts_probe_patience must be positive")
     for name, value in {
         "direct_gate_score": direct_gate_score,
         "direct_policy_anchor_weight": direct_policy_anchor_weight,
@@ -236,10 +309,15 @@ def train_promotion_league(
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
         "mcts_gate_score": mcts_gate_score,
+        "mcts_probe_score": mcts_probe_score,
         "champion_value_anchor_weight": champion_value_anchor_weight,
     }.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be between zero and one")
+    if not 0.0 <= mcts_probe_minimum_improvement <= 1.0:
+        raise ValueError(
+            "mcts_probe_minimum_improvement must be between zero and one"
+        )
     if direct_readiness_city_captures_per_game < 0.0:
         raise ValueError(
             "direct_readiness_city_captures_per_game must not be negative"
@@ -281,9 +359,10 @@ def train_promotion_league(
         + int(index < population_games % max(1, len(population_rungs)))
         for index in range(len(population_rungs))
     )
-    # Check the multi-agent binding before spending hours on the first
-    # same-network rollout phase.
-    require_routed_self_play_pool()
+    # Flat-only runs without a readiness probe do not need the native routed
+    # MCTS binding at all.
+    if champion_mode == "mcts" or mcts_probe_games or steps or population_games:
+        require_routed_self_play_pool()
     if not champion_in.is_file():
         raise FileNotFoundError(f"champion checkpoint does not exist: {champion_in}")
     if challenger_in is not None and not challenger_in.is_file():
@@ -381,6 +460,14 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "champion_mode": champion_mode,
+        "mcts_probe_games": mcts_probe_games,
+        "mcts_probe_simulations": mcts_probe_simulations,
+        "mcts_probe_score": mcts_probe_score,
+        "mcts_probe_minimum_improvement": (
+            mcts_probe_minimum_improvement
+        ),
+        "mcts_probe_patience": mcts_probe_patience,
         "mcts_simulation_ladder": list(ladder),
         "population_game_allocations": list(population_game_allocations),
         "mcts_gate_games": mcts_gate_games,
@@ -490,13 +577,14 @@ def train_promotion_league(
                         flush=True,
                     )
                     candidate_source = challenger_path or champion_path
+                    candidate_parent_id = challenger_id or champion_id
                     candidate, model_config = load_model(candidate_source, device)
                     champion, champion_config = load_model(champion_path, device)
                     if champion_config != model_config:
                         raise RuntimeError("candidate and champion ModelConfig differ")
                     candidate_id = database.create_candidate(
                         database_run_id,
-                        challenger_id or champion_id,
+                        candidate_parent_id,
                         f"candidate-round-{round_index:03d}",
                         model_config,
                     )
@@ -557,6 +645,13 @@ def train_promotion_league(
                                 direct_population_gate_games
                             )
                         )
+                    mcts_probe_seed = _offset_seed(
+                        round_evaluation_seed, 375_000_011
+                    )
+                    evaluation_map_seeds.update(
+                        mcts_probe_seed + game_index // 2
+                        for game_index in range(mcts_probe_games)
+                    )
                     # Reuse one development arena across search depths so a
                     # later rung cannot silently erase a score earned by an
                     # earlier rung. The final promotion arena remains separate.
@@ -664,7 +759,7 @@ def train_promotion_league(
                         not direct_enabled
                         or bool(direct_summary.get("direct_ready", 0.0))
                     )
-                    if not direct_ready:
+                    if not direct_ready and champion_mode == "mcts":
                         # MCTS is deliberately unavailable until the raw
                         # network can expand and finish games on held-out maps.
                         # Preserve a non-regressing challenger so the next
@@ -750,6 +845,13 @@ def train_promotion_league(
                         )
                         del candidate, champion
                         continue
+                    if not direct_ready:
+                        print(
+                            "league direct curriculum did not reach its early "
+                            "readiness target | continuing to authoritative "
+                            "flat promotion gate",
+                            flush=True,
+                        )
 
                     frozen_models = []
                     for population_path in population_paths:
@@ -881,7 +983,10 @@ def train_promotion_league(
                             )
                         )
                     )
-                    if not direct_population_ready:
+                    if (
+                        not direct_population_ready
+                        and champion_mode == "mcts"
+                    ):
                         best_population_score = float(
                             direct_population_summary.get(
                                 "direct_population_best_score", 0.0
@@ -962,6 +1067,515 @@ def train_promotion_league(
                             "MCTS skipped | "
                             f"score={best_population_score:.4f} | "
                             f"worst={best_population_worst:.4f}",
+                            flush=True,
+                        )
+                        del candidate, champion, frozen_models
+                        continue
+                    if not direct_population_ready:
+                        print(
+                            "league direct population did not reach its early "
+                            "readiness target | continuing to authoritative "
+                            "flat promotion gate",
+                            flush=True,
+                        )
+
+                    if champion_mode == "flat":
+                        # Flat-policy strength is the only promotion authority
+                        # in this mode. MCTS is a short, read-only capability
+                        # probe and can neither block nor overwrite a champion.
+                        flat_evaluations: list[Dict[str, Any]] = []
+                        flat_invalid = False
+                        champion_before_id = champion_id
+                        for opponent_index, (
+                            opponent_id,
+                            opponent_path,
+                            opponent_model,
+                            probability,
+                        ) in enumerate(zip(
+                            population_ids,
+                            population_paths,
+                            frozen_models,
+                            probabilities,
+                        )):
+                            is_champion = opponent_id == champion_before_id
+                            games = (
+                                promotion_games if is_champion else historical_games
+                            )
+                            purpose = (
+                                "flat_champion_gate"
+                                if is_champion
+                                else "flat_historical_gate"
+                            )
+                            match_seed = _offset_seed(
+                                round_evaluation_seed,
+                                opponent_index * 1_000_003,
+                            )
+                            evaluation_id = database.start_evaluation(
+                                round_id,
+                                candidate_id,
+                                opponent_id,
+                                purpose,
+                                match_seed,
+                                games,
+                            )
+
+                            def record_flat_gate_game(
+                                game: Mapping[str, Any],
+                                *,
+                                selected_evaluation_id: int = evaluation_id,
+                                selected_opponent_id: int = opponent_id,
+                            ) -> None:
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    evaluation_id=selected_evaluation_id,
+                                    phase="flat_evaluation",
+                                    model_a_id=candidate_id,
+                                    model_b_id=selected_opponent_id,
+                                    game=game,
+                                )
+
+                            match = evaluate_direct_matches(
+                                candidate,
+                                opponent_model,
+                                device,
+                                replace(
+                                    training,
+                                    seed=match_seed,
+                                    max_moves=direct_gate_max_moves,
+                                ),
+                                games,
+                                game_callback=record_flat_gate_game,
+                            )
+                            result = {
+                                "opponent_id": opponent_id,
+                                "opponent_path": str(opponent_path),
+                                "sampling_probability": probability,
+                                "purpose": purpose,
+                                **match,
+                            }
+                            flat_evaluations.append(result)
+                            if not bool(match.get("valid", 1.0)):
+                                flat_invalid = True
+                                database.invalidate_evaluation(
+                                    evaluation_id, match
+                                )
+                                break
+                            database.finish_evaluation(
+                                evaluation_id, match, elo_k=elo_k
+                            )
+                            print(
+                                f"league flat gate vs {opponent_path.stem} | "
+                                f"score={float(match['model_a_score']):.4f} | "
+                                f"lower95={float(match['score_lower_95']):.4f}",
+                                flush=True,
+                            )
+
+                        if flat_invalid:
+                            decision: Dict[str, float | bool] = {
+                                "candidate_score": 0.0,
+                                "champion_lower_95": 0.0,
+                                "population_score": 0.0,
+                                "minimum_historical_score": 0.0,
+                                "promoted": False,
+                            }
+                        else:
+                            decision = _promotion_gate_decision(
+                                flat_evaluations,
+                                champion_before_id,
+                                promotion_score=promotion_score,
+                                promotion_lower_bound=promotion_lower_bound,
+                                population_score=population_score,
+                                historical_score_floor=historical_score_floor,
+                            )
+                        last_candidate_score = float(
+                            decision["candidate_score"]
+                        )
+                        last_population_score = float(
+                            decision["population_score"]
+                        )
+                        minimum_historical_score = float(
+                            decision["minimum_historical_score"]
+                        )
+                        champion_lower_95 = float(
+                            decision["champion_lower_95"]
+                        )
+                        flat_promoted = bool(decision["promoted"])
+                        promoted = flat_promoted
+                        retain_challenger = (
+                            not flat_invalid
+                            and last_candidate_score >= 0.50
+                            and last_population_score >= 0.50
+                            and minimum_historical_score
+                            >= historical_score_floor
+                        )
+                        parent_capability = database.model_capability(
+                            candidate_parent_id
+                        )
+                        mcts_gate_active = bool(
+                            parent_capability is not None
+                            and (
+                                int(parent_capability["mcts_ready"])
+                                or int(
+                                    parent_capability.get(
+                                        "mcts_evaluation_active", 0
+                                    )
+                                )
+                            )
+                        )
+                        pending_flat_path: Path | None = None
+
+                        # Persist the raw-policy outcome before touching MCTS.
+                        # A Ctrl+C or belief failure in the diagnostic probe
+                        # must never lose a flat promotion already earned.
+                        if promoted and mcts_gate_active:
+                            # The lineage already proved that search@32 helps.
+                            # Preserve this flat winner as a resumable
+                            # challenger, then require the short search probe
+                            # before it can replace an MCTS-aware champion.
+                            pending_flat_path = _next_checkpoint_path(
+                                checkpoint_dir, checkpoint_prefix
+                            )
+                            save_model(
+                                pending_flat_path, candidate, model_config
+                            )
+                            database.retain_candidate(
+                                candidate_id, pending_flat_path
+                            )
+                            challenger_path = pending_flat_path
+                            challenger_id = candidate_id
+                            promoted = False
+                            print(
+                                "league flat gate passed | MCTS-aware lineage "
+                                "requires search@32 confirmation",
+                                flush=True,
+                            )
+                        elif promoted:
+                            promotions += 1
+                            promoted_path = _next_checkpoint_path(
+                                checkpoint_dir, checkpoint_prefix
+                            )
+                            save_model(promoted_path, candidate, model_config)
+                            database.finalise_candidate(
+                                candidate_id, promoted_path=promoted_path
+                            )
+                            champion_path = promoted_path
+                            champion_id = candidate_id
+                            challenger_path = None
+                            challenger_id = None
+                            print(
+                                f"league flat promotion {promotions}: saved "
+                                f"{champion_path}",
+                                flush=True,
+                            )
+                        elif retain_challenger:
+                            retained_path = _next_checkpoint_path(
+                                checkpoint_dir,
+                                f"{checkpoint_prefix}-challenger",
+                            )
+                            save_model(retained_path, candidate, model_config)
+                            database.retain_candidate(
+                                candidate_id, retained_path
+                            )
+                            challenger_path = retained_path
+                            challenger_id = candidate_id
+                        else:
+                            database.finalise_candidate(
+                                candidate_id, promoted_path=None
+                            )
+                            challenger_path = None
+                            challenger_id = None
+
+                        probe_summary: Dict[str, Any] = {
+                            "enabled": float(bool(mcts_probe_games)),
+                            "performed": 0.0,
+                            "passed": 0.0,
+                            "ready": 0.0,
+                            "streak": 0.0,
+                            "promotion_gate_active": float(
+                                mcts_gate_active
+                            ),
+                            "evaluation_active": float(mcts_gate_active),
+                        }
+                        probe_passed = False
+                        if mcts_probe_games and (
+                            flat_promoted or retain_challenger
+                        ):
+                            raw_probe_id = database.start_evaluation(
+                                round_id,
+                                candidate_id,
+                                champion_before_id,
+                                "mcts_readiness_raw_probe",
+                                mcts_probe_seed,
+                                mcts_probe_games,
+                            )
+
+                            def record_raw_probe_game(
+                                game: Mapping[str, Any],
+                            ) -> None:
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    evaluation_id=raw_probe_id,
+                                    phase="mcts_readiness_raw_probe",
+                                    model_a_id=candidate_id,
+                                    model_b_id=champion_before_id,
+                                    game=game,
+                                )
+
+                            raw_probe = evaluate_direct_matches(
+                                candidate,
+                                champion,
+                                device,
+                                replace(
+                                    training,
+                                    seed=mcts_probe_seed,
+                                    max_moves=direct_gate_max_moves,
+                                ),
+                                mcts_probe_games,
+                                game_callback=record_raw_probe_game,
+                            )
+                            database.finish_evaluation_unrated(
+                                raw_probe_id, raw_probe
+                            )
+                            search_probe_id = database.start_evaluation(
+                                round_id,
+                                candidate_id,
+                                champion_before_id,
+                                "mcts_readiness_search_probe",
+                                mcts_probe_seed,
+                                mcts_probe_games,
+                            )
+
+                            def record_search_probe_game(
+                                game: Mapping[str, Any],
+                            ) -> None:
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    evaluation_id=search_probe_id,
+                                    phase="mcts_readiness_search_probe",
+                                    model_a_id=candidate_id,
+                                    model_b_id=champion_before_id,
+                                    game=game,
+                                )
+
+                            probe_mcts = replace(
+                                evaluation_mcts,
+                                simulations=mcts_probe_simulations,
+                            )
+                            try:
+                                search_probe = evaluate_matches_pool(
+                                    candidate,
+                                    champion,
+                                    replace(training, seed=mcts_probe_seed),
+                                    probe_mcts,
+                                    mcts_probe_games,
+                                    num_threads=num_threads,
+                                    max_pending_leaves=max_pending_leaves,
+                                    visible_action_history=(
+                                        visible_action_history
+                                    ),
+                                    belief_retries=belief_retries,
+                                    max_envs=min(
+                                        num_envs, mcts_probe_games
+                                    ),
+                                    game_callback=record_search_probe_game,
+                                )
+                            except (
+                                BeliefQualityError,
+                                BeliefRecoveryRequired,
+                            ) as error:
+                                search_probe = {
+                                    "games": 0.0,
+                                    "model_a_wins": 0.0,
+                                    "model_a_losses": 0.0,
+                                    "draws": 0.0,
+                                    "model_a_score": 0.0,
+                                    "score_lower_95": 0.0,
+                                    "valid": 0.0,
+                                    "invalid_evaluations": 1.0,
+                                    "invalid_reason": str(error),
+                                }
+                            probe_valid = bool(search_probe.get("valid", 1.0))
+                            if probe_valid:
+                                database.finish_evaluation_unrated(
+                                    search_probe_id, search_probe
+                                )
+                            else:
+                                database.invalidate_evaluation(
+                                    search_probe_id, search_probe
+                                )
+                            raw_probe_score = float(
+                                raw_probe["model_a_score"]
+                            )
+                            search_probe_score = float(
+                                search_probe.get("model_a_score", 0.0)
+                            )
+                            probe_passed = _mcts_probe_passed(
+                                raw_probe_score,
+                                search_probe_score,
+                                minimum_search_score=mcts_probe_score,
+                                minimum_improvement=(
+                                    mcts_probe_minimum_improvement
+                                ),
+                                valid=probe_valid,
+                            )
+                            parent_streak = (
+                                int(parent_capability["mcts_probe_streak"])
+                                if parent_capability is not None
+                                else 0
+                            )
+                            probe_streak = (
+                                parent_streak + 1 if probe_passed else 0
+                            )
+                            mcts_ready = (
+                                probe_streak >= mcts_probe_patience
+                            )
+                            probe_summary = {
+                                "enabled": 1.0,
+                                "performed": 1.0,
+                                "games": float(mcts_probe_games),
+                                "simulations": float(
+                                    mcts_probe_simulations
+                                ),
+                                "raw_score": raw_probe_score,
+                                "search_score": search_probe_score,
+                                "minimum_search_score": float(
+                                    mcts_probe_score
+                                ),
+                                "minimum_improvement": float(
+                                    mcts_probe_minimum_improvement
+                                ),
+                                "valid": float(probe_valid),
+                                "passed": float(probe_passed),
+                                "streak": float(probe_streak),
+                                "patience": float(mcts_probe_patience),
+                                "ready": float(mcts_ready),
+                                "promotion_gate_active": float(
+                                    mcts_gate_active
+                                ),
+                                "evaluation_active": float(
+                                    mcts_gate_active or mcts_ready
+                                ),
+                                "raw": raw_probe,
+                                "search": search_probe,
+                            }
+                            database.record_mcts_capability(
+                                candidate_id,
+                                games=mcts_probe_games,
+                                simulations=mcts_probe_simulations,
+                                raw_score=raw_probe_score,
+                                search_score=search_probe_score,
+                                streak=probe_streak,
+                                ready=mcts_ready,
+                                evaluation_active=(
+                                    mcts_gate_active or mcts_ready
+                                ),
+                                summary=probe_summary,
+                            )
+                            print(
+                                "league MCTS readiness probe | "
+                                f"raw={raw_probe_score:.4f} | "
+                                f"search={search_probe_score:.4f} | "
+                                f"passed={int(probe_passed)} | "
+                                f"ready={int(mcts_ready)} "
+                                f"({probe_streak}/{mcts_probe_patience})",
+                                flush=True,
+                            )
+
+                        if mcts_gate_active and flat_promoted:
+                            if probe_passed and pending_flat_path is not None:
+                                database.finalise_candidate(
+                                    candidate_id,
+                                    promoted_path=pending_flat_path,
+                                )
+                                promotions += 1
+                                champion_path = pending_flat_path
+                                champion_id = candidate_id
+                                challenger_path = None
+                                challenger_id = None
+                                retain_challenger = False
+                                promoted = True
+                                print(
+                                    "league MCTS-aware promotion "
+                                    f"{promotions}: saved {champion_path}",
+                                    flush=True,
+                                )
+                            else:
+                                promoted = False
+                                retain_challenger = True
+                                print(
+                                    "league MCTS-aware promotion deferred | "
+                                    "flat checkpoint retained as challenger",
+                                    flush=True,
+                                )
+
+                        round_training_summary["pool"] = {}
+                        round_training_summary["population"] = {
+                            "mcts_training_skipped_flat_champion": 1.0,
+                            "mcts_probe": probe_summary,
+                        }
+                        last_training = dict(round_training_summary)
+                        gate_summary = {
+                            "mode": "flat",
+                            "flat_promoted": float(flat_promoted),
+                            "promoted": float(promoted),
+                            "valid": float(not flat_invalid),
+                            "candidate_score": last_candidate_score,
+                            "champion_lower_95": champion_lower_95,
+                            "population_score": last_population_score,
+                            "minimum_historical_score": (
+                                minimum_historical_score
+                            ),
+                            "retained_challenger": float(
+                                retain_challenger and not promoted
+                            ),
+                            "evaluations": flat_evaluations,
+                            "mcts_probe": probe_summary,
+                            "mcts_ready": float(
+                                probe_summary.get("ready", 0.0)
+                            ),
+                            "mcts_promotion_gate_active": float(
+                                mcts_gate_active
+                            ),
+                        }
+                        database.finish_round(
+                            round_id,
+                            champion_id,
+                            promoted,
+                            round_training_summary,
+                            gate_summary,
+                        )
+                        run.log(
+                            round=round_index,
+                            champion_mode_flat=1.0,
+                            candidate_score=last_candidate_score,
+                            population_score=last_population_score,
+                            promoted=float(promoted),
+                            mcts_probe_passed=float(
+                                probe_summary.get("passed", 0.0)
+                            ),
+                            mcts_ready=float(
+                                probe_summary.get("ready", 0.0)
+                            ),
+                            mcts_evaluation_active=float(
+                                probe_summary.get(
+                                    "evaluation_active", 0.0
+                                )
+                            ),
+                            mcts_promotion_gate_active=float(
+                                mcts_gate_active
+                            ),
+                            promotions=promotions,
+                        )
+                        database.flush()
+                        print(
+                            f"league flat decision {round_index}/{rounds} | "
+                            f"champion={last_candidate_score:.4f} | "
+                            f"population={last_population_score:.4f} | "
+                            f"worst={minimum_historical_score:.4f} | "
+                            f"promoted={int(promoted)}",
                             flush=True,
                         )
                         del candidate, champion, frozen_models
@@ -1672,6 +2286,11 @@ def train_promotion_league(
                 ),
                 "league_database_path": str(database_path.resolve()),
                 "league_population_size": float(population_size),
+                "league_champion_mode": champion_mode,
+                "league_mcts_probe_games": float(mcts_probe_games),
+                "league_mcts_probe_simulations": float(
+                    mcts_probe_simulations
+                ),
                 "league_champion_anchor_weight": float(champion_anchor_weight),
                 "league_champion_value_anchor_weight": float(
                     champion_value_anchor_weight
@@ -1732,6 +2351,21 @@ def train_promotion_league(
                 )
                 summary["league_last_mcts_started"] = float(
                     bool(population_rung_rows)
+                )
+                probe = last_training.get("population", {}).get(
+                    "mcts_probe", {}
+                )
+                summary["league_last_mcts_probe_performed"] = float(
+                    probe.get("performed", 0.0)
+                )
+                summary["league_last_mcts_probe_passed"] = float(
+                    probe.get("passed", 0.0)
+                )
+                summary["league_last_mcts_ready"] = float(
+                    probe.get("ready", 0.0)
+                )
+                summary["league_last_mcts_evaluation_active"] = float(
+                    probe.get("evaluation_active", 0.0)
                 )
                 summary["league_last_pool_anchor_mean_l1"] = float(
                     last_training.get("pool", {}).get(

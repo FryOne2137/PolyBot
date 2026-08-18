@@ -111,12 +111,17 @@ python scripts/evaluate.py `
 
 # 5. Liga z curriculum: najpierw szybka nauka przejmowania wiosek i innych
 # widocznych celów bez MCTS, potem actor-critic bez MCTS i szybkie mecze
-# surowej sieci przeciw całej populacji. MCTS uruchamia się jednocześnie we
-# wszystkich etapach dopiero, gdy surowa sieć przejmuje miasta/wioski, kończy
-# gry i nie cofa się przeciw żadnemu historycznemu modelowi. Szybkie etapy
+# surowej sieci przeciw całej populacji. Początkowo o awansie championa decyduje
+# wyłącznie płaska polityka. Po bramce wykonywane jest 10 sparowanych gier przy
+# 32 symulacjach i search@32 musi ściśle pobić raw policy na tych samych mapach.
+# Dwa kolejne udane probe'y zapisują status MCTS-ready. Od następnej rundy MCTS
+# staje się dodatkową bramką awansu; nieudany probe zachowuje starego championa
+# i zapisuje płaskiego kandydata jako challengera. Dlatego komenda ma co najmniej
+# 3 rundy: dwie mogą potwierdzić gotowość, a trzecia już użyć nowej bramki.
+# Szybkie etapy
 # mogą wykorzystać do 5000 + 10000 kroków na rundę, ale dwie kolejne regresje
-# kończą etap wcześniej na najlepszym bezpiecznym checkpointcie. Potem model
-# przechodzi adaptacyjne szczeble 4,8,16,32,64; każdy ma bramkę i rollback.
+# kończą etap wcześniej na najlepszym bezpiecznym checkpointcie. Ciężka drabina
+# MCTS jest wyłączona przez --population-games 0.
 # Checkpointy
 # po promocji trafią
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
@@ -132,8 +137,8 @@ python scripts/train_league.py `
   --checkpoint-prefix champion `
   --league-db models\league\league.sqlite3 `
   --population-size 6 `
-  --population-games 128 `
-  --population-updates-per-game 1 `
+  --population-games 0 `
+  --population-updates-per-game 0 `
   --population-workers 16 `
   --pfsp-alpha 2.0 `
   --champion-probability 0.40 `
@@ -170,10 +175,13 @@ python scripts/train_league.py `
   --direct-population-opponent-policy-weight 0.50 `
   --direct-population-teacher-weight 0.25 `
   --direct-population-shaping-weight 0.20 `
-  --mcts-simulation-ladder 16,32,64 `
-  --mcts-gate-games 20 `
-  --mcts-gate-score 0.50 `
-  --rounds 2 `
+  --champion-mode flat `
+  --mcts-probe-games 10 `
+  --mcts-probe-simulations 32 `
+  --mcts-probe-score 0.55 `
+  --mcts-probe-min-improvement 0.00 `
+  --mcts-probe-patience 2 `
+  --rounds 3 `
   --promotion-games 100 `
   --promotion-score 0.55 `
   --promotion-lower-bound 0.50 `
@@ -191,7 +199,7 @@ python scripts/train_league.py `
   --max-pending-leaves 8 `
   --visible-action-history 0 `
   --belief-retries 4 `
-  --simulations 64 `
+  --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
   --mcts-top-actions 0 `

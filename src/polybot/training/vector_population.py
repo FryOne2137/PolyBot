@@ -692,15 +692,22 @@ def train_direct_population_curriculum(
             best_completion_rate = completion_rate
             if not baseline:
                 accepted_blocks += 1
-            meets = (
-                weighted_score >= gate_score
-                and worst_score >= historical_score_floor
-                and capture_rate >= readiness_city_captures_per_game
-                and completion_rate >= readiness_completion_rate
-            )
-            best_meets_readiness = meets
-            readiness_streak = readiness_streak + 1 if meets else 0
-            ready = readiness_streak >= readiness_patience
+            if baseline:
+                # Baseline protects the input checkpoint but does not count as
+                # a successful population-training block.
+                best_meets_readiness = False
+                readiness_streak = 0
+                ready = False
+            else:
+                meets = (
+                    weighted_score >= gate_score
+                    and worst_score >= historical_score_floor
+                    and capture_rate >= readiness_city_captures_per_game
+                    and completion_rate >= readiness_completion_rate
+                )
+                best_meets_readiness = meets
+                readiness_streak = readiness_streak + 1 if meets else 0
+                ready = readiness_streak >= readiness_patience
             consecutive_regressions = 0
         else:
             restore_model_state(candidate, best_state)
@@ -788,10 +795,8 @@ def train_direct_population_curriculum(
         accepted = gate("population", block)
         if (
             not accepted
-            and best_meets_readiness
             and consecutive_regressions >= regression_patience
         ):
-            ready = True
             early_stopped = True
             early_stop_reason = "persistent_population_regression"
             break

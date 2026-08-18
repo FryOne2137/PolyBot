@@ -205,8 +205,32 @@ class LeagueDatabase:
             );
             CREATE INDEX IF NOT EXISTS training_metrics_lookup
                 ON training_metrics(run_id, round_id, stage, metric, iteration);
+
+            CREATE TABLE IF NOT EXISTS model_capabilities (
+                model_id INTEGER PRIMARY KEY REFERENCES models(id),
+                mcts_probe_games INTEGER NOT NULL DEFAULT 0,
+                mcts_probe_simulations INTEGER NOT NULL DEFAULT 0,
+                mcts_raw_score REAL,
+                mcts_search_score REAL,
+                mcts_probe_streak INTEGER NOT NULL DEFAULT 0,
+                mcts_ready INTEGER NOT NULL DEFAULT 0,
+                mcts_evaluation_active INTEGER NOT NULL DEFAULT 0,
+                summary_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
+        capability_columns = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA table_info(model_capabilities)"
+            ).fetchall()
+        }
+        if "mcts_evaluation_active" not in capability_columns:
+            self.connection.execute(
+                "ALTER TABLE model_capabilities ADD COLUMN "
+                "mcts_evaluation_active INTEGER NOT NULL DEFAULT 0"
+            )
         current = self.connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
@@ -341,6 +365,51 @@ class LeagueDatabase:
         )
         self.connection.commit()
 
+    def model_capability(self, model_id: int) -> Mapping[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM model_capabilities WHERE model_id = ?", (model_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def record_mcts_capability(
+        self,
+        model_id: int,
+        *,
+        games: int,
+        simulations: int,
+        raw_score: float,
+        search_score: float,
+        streak: int,
+        ready: bool,
+        evaluation_active: bool | None = None,
+        summary: Mapping[str, Any],
+    ) -> None:
+        """Persist a diagnostic probe without changing Elo or model status."""
+        self.connection.execute(
+            """INSERT INTO model_capabilities(
+                   model_id, mcts_probe_games, mcts_probe_simulations,
+                   mcts_raw_score, mcts_search_score, mcts_probe_streak,
+                   mcts_ready, mcts_evaluation_active, summary_json, updated_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(model_id) DO UPDATE SET
+                   mcts_probe_games = excluded.mcts_probe_games,
+                   mcts_probe_simulations = excluded.mcts_probe_simulations,
+                   mcts_raw_score = excluded.mcts_raw_score,
+                   mcts_search_score = excluded.mcts_search_score,
+                   mcts_probe_streak = excluded.mcts_probe_streak,
+                   mcts_ready = excluded.mcts_ready,
+                   mcts_evaluation_active = excluded.mcts_evaluation_active,
+                   summary_json = excluded.summary_json,
+                   updated_at = excluded.updated_at""",
+            (
+                model_id, games, simulations, raw_score, search_score, streak,
+                int(ready),
+                int(ready if evaluation_active is None else evaluation_active),
+                _json(summary), _utc_now(),
+            ),
+        )
+        self.connection.commit()
+
     def start_round(
         self,
         run_id: int,
@@ -464,6 +533,8 @@ class LeagueDatabase:
         direct = self.connection.execute(
             """SELECT score_a FROM evaluations
                WHERE model_a_id = ? AND model_b_id = ? AND score_a IS NOT NULL
+                 AND purpose IN ('champion_gate', 'historical_gate',
+                                 'flat_champion_gate', 'flat_historical_gate')
                ORDER BY id DESC LIMIT 1""",
             (model_a_id, model_b_id),
         ).fetchone()
@@ -472,6 +543,8 @@ class LeagueDatabase:
         reverse = self.connection.execute(
             """SELECT score_a FROM evaluations
                WHERE model_a_id = ? AND model_b_id = ? AND score_a IS NOT NULL
+                 AND purpose IN ('champion_gate', 'historical_gate',
+                                 'flat_champion_gate', 'flat_historical_gate')
                ORDER BY id DESC LIMIT 1""",
             (model_b_id, model_a_id),
         ).fetchone()
@@ -635,6 +708,30 @@ class LeagueDatabase:
                 (evaluation_id, int(model_a["id"]), old_a, new_a, expected_a, score, _utc_now()),
                 (evaluation_id, int(model_b["id"]), old_b, new_b, 1.0 - expected_a, 1.0 - score, _utc_now()),
             ],
+        )
+        self.connection.commit()
+
+    def finish_evaluation_unrated(
+        self,
+        evaluation_id: int,
+        summary: Mapping[str, Any],
+    ) -> None:
+        """Store a diagnostic evaluation without updating Elo or counters."""
+        exists = self.connection.execute(
+            "SELECT 1 FROM evaluations WHERE id = ?", (evaluation_id,)
+        ).fetchone()
+        if exists is None:
+            raise KeyError(f"unknown evaluation {evaluation_id}")
+        self.connection.execute(
+            """UPDATE evaluations SET score_a = ?, lower_95 = ?, summary_json = ?,
+               finished_at = ? WHERE id = ?""",
+            (
+                float(summary["model_a_score"]),
+                float(summary["score_lower_95"]),
+                _json(summary),
+                _utc_now(),
+                evaluation_id,
+            ),
         )
         self.connection.commit()
 

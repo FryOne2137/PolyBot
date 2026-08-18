@@ -64,8 +64,8 @@ def main() -> None:
     )
     parser.add_argument("--population-size", type=int, default=6)
     parser.add_argument(
-        "--population-games", type=int, default=64,
-        help="Candidate-vs-population training games per round",
+        "--population-games", type=int, default=0,
+        help="MCTS training games; keep 0 while --champion-mode flat",
     )
     parser.add_argument("--population-updates-per-game", type=int, default=2)
     parser.add_argument(
@@ -98,7 +98,7 @@ def main() -> None:
         "--direct-actor-max-steps", type=int, default=5_000,
         help="Maximum direct-play steps before a round defers MCTS",
     )
-    parser.add_argument("--direct-gate-games", type=int, default=10)
+    parser.add_argument("--direct-gate-games", type=int, default=30)
     parser.add_argument(
         "--direct-gate-max-moves", type=int, default=700,
         help="Longer raw-policy games used by direct and population gates",
@@ -154,14 +154,31 @@ def main() -> None:
         "--direct-population-shaping-weight", type=float, default=0.20,
     )
     parser.add_argument(
+        "--champion-mode",
+        choices=("flat", "mcts"),
+        default="flat",
+        help="Flat promotes by raw policy; mcts enables the legacy search ladder",
+    )
+    parser.add_argument(
+        "--mcts-probe-games", type=int, default=10,
+        help="Fast paired diagnostic games; 0 disables the MCTS readiness probe",
+    )
+    parser.add_argument("--mcts-probe-simulations", type=int, default=32)
+    parser.add_argument("--mcts-probe-score", type=float, default=0.55)
+    parser.add_argument(
+        "--mcts-probe-min-improvement", type=float, default=0.0,
+        help="Strict score margin by which search@32 must beat raw policy on the same maps",
+    )
+    parser.add_argument("--mcts-probe-patience", type=int, default=2)
+    parser.add_argument(
         "--mcts-simulation-ladder", type=_simulation_ladder,
-        default=(4, 8, 16, 32),
+        default=(16, 32, 64),
         help="Comma-separated search curriculum; every failed rung is rolled back",
     )
     parser.add_argument("--mcts-gate-games", type=int, default=20)
     parser.add_argument("--mcts-gate-score", type=float, default=0.50)
     parser.add_argument("--rounds", type=int, default=10, help="Candidate train-and-gate cycles")
-    parser.add_argument("--promotion-games", type=int, default=100, help="Fixed-seed MCTS games per gate")
+    parser.add_argument("--promotion-games", type=int, default=100, help="Fixed-seed paired games per promotion gate")
     parser.add_argument("--promotion-score", type=float, default=0.55, help="Win=1 / draw=0.5 score required")
     parser.add_argument("--promotion-lower-bound", type=float, default=0.50)
     parser.add_argument(
@@ -287,6 +304,14 @@ def main() -> None:
         direct_population_shaping_weight=(
             args.direct_population_shaping_weight
         ),
+        champion_mode=args.champion_mode,
+        mcts_probe_games=args.mcts_probe_games,
+        mcts_probe_simulations=args.mcts_probe_simulations,
+        mcts_probe_score=args.mcts_probe_score,
+        mcts_probe_minimum_improvement=(
+            args.mcts_probe_min_improvement
+        ),
+        mcts_probe_patience=args.mcts_probe_patience,
         mcts_simulation_ladder=args.mcts_simulation_ladder,
         mcts_gate_games=args.mcts_gate_games,
         mcts_gate_score=args.mcts_gate_score,

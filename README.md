@@ -117,13 +117,12 @@ widocznych celów, ekonomię i walkę, a następnie actor-critic uczy się z wł
 akcji. Krótkie, sparowane bramki cofają każdy blok, który pogorszył grę względem
 zamrożonego championa. Direct-play trwa co najmniej
 `--direct-actor-steps`, a w razie potrzeby rośnie do
-`--direct-actor-max-steps`. MCTS pozostaje wyłączone, dopóki surowa polityka
-nie osiągnie progów wyniku, przejęć miast/wiosek i completion rate przez
-`--direct-readiness-patience` kolejnych bramek. Niegotowy model jest zachowany
-jako challenger i kontynuuje direct curriculum w następnej rundzie.
-Gotowość należy do najlepszego zapisanego stanu, więc rollback złej próby jej
-nie kasuje. Po `--direct-regression-patience` kolejnych odrzuconych blokach
-faza kończy się wcześniej i przekazuje najlepszy gotowy checkpoint dalej.
+`--direct-actor-max-steps`. Baseline chroni wejściowy checkpoint, ale nie jest
+liczony jako wytrenowany sukces. Gotowość wymaga
+`--direct-readiness-patience` zaakceptowanych bramek po aktualizacji. Rollback
+złej próby nie kasuje najlepszego stanu, a po
+`--direct-regression-patience` kolejnych odrzuconych blokach etap kończy się
+wcześniej zamiast marnować resztę budżetu.
 
 Następnie działa drugi szybki etap bez MCTS: kandydat gra surową polityką
 przeciw championowi i historycznym checkpointom dobranym przez PFSP. Tury
@@ -134,17 +133,31 @@ osobną bramkę przeciw całej populacji i rollback. Gry treningowe w natywnym
 `VectorGameEnv` nie mają sztucznego limitu ruchów, a bramki direct używają
 `--direct-gate-max-moves`. Analogicznie,
 `--direct-population-regression-patience` zatrzymuje trwałe pogarszanie i
-przechodzi do MCTS na najlepszym checkpointcie, o ile przeszedł on progi
-gotowości całej populacji.
+przekazuje najlepszy checkpoint do końcowej płaskiej bramki.
 
-Dopiero kandydat gotowy w obu etapach bez MCTS przechodzi szczeble MCTS, np.
-`4,8,16,32,64`.
-Po każdym szczeblu sprawdzany jest zarówno wynik z wyszukiwaniem, jak i surowa
-sieć bez MCTS. Wyższy szczebel jest dostępny tylko wtedy, gdy sieć przyswoiła
-targety search bez utraty wcześniejszego wyniku, przejęć i completion rate;
-nieudany szczebel jest atomowo cofany.
+Domyślny `--champion-mode flat` zaczyna od promocji całkowicie niezależnej od
+MCTS. Końcowa bramka używa surowej polityki przeciw championowi i całej
+historycznej populacji. Dopiero po bezpiecznym wyniku uruchamiany jest krótki,
+beztreningowy probe: `--mcts-probe-games 10` przy
+`--mcts-probe-simulations 32`. Raw policy i search@32 grają na tych samych
+sparowanych mapach. Probe przechodzi tylko wtedy, gdy search@32 osiąga co
+najmniej `--mcts-probe-score` i jest ściśle lepszy od raw policy o więcej niż
+`--mcts-probe-min-improvement`. Nie wykonuje aktualizacji ani nie zmienia Elo.
 
-Gry MCTS przeciw populacji i końcowe sparowane bramki korzystają z natywnego
+Po `--mcts-probe-patience` kolejnych sukcesach SQLite oznacza lineage jako
+`mcts_ready`. Od następnej rundy MCTS@32 staje się dodatkową bramką awansu:
+kandydat musi najpierw wygrać płasko, a następnie ponownie wykazać poprawę z
+search@32. Jeżeli search nie pomaga, dotychczasowy champion pozostaje bez zmian,
+a poprawny płaski checkpoint kandydata zostaje zachowany jako challenger.
+Status bramki jest dziedziczony przez kolejne modele, więc pojedyncza porażka
+probe nie wyłącza automatycznie sprawdzania MCTS.
+
+Ciężka historyczna drabina pozostaje dostępna przez `--champion-mode mcts`, ale
+zalecana komenda początkowa ustawia `--population-games 0`. Dzięki temu jedynym
+kosztem MCTS w rundzie jest krótki probe, a wszystkie właściwe aktualizacje
+odbywają się w szybkim `VectorGameEnv`.
+
+Probe i opcjonalne gry MCTS przeciw populacji korzystają z natywnego
 `SelfPlayPool`. `agent_id` wybiera właściwy checkpoint osobno dla każdego
 gracza, a batche belief i liści są grupowane według modelu i składane z powrotem
 w kolejności oczekiwanej przez silnik. Nie ma tu krótkotrwałych `MctsPool`.
@@ -174,6 +187,8 @@ nie jest nadpisywany. Przerwany run można kontynuować przez
 `--league-db models/league/league.sqlite3` zapisuje konfiguracje runów, rundy,
 lineage i sumy SHA-256 checkpointów, dobór przeciwników, wszystkie gry etapu
 populacyjnego i bramek, wyniki, metryki treningowe oraz pomocniczy ranking Elo.
+Tabela `model_capabilities` przechowuje również wynik raw/search, serię probe'ów
+i trwały status `mcts_ready`.
 Ciężkie tensory modeli pozostają w atomowo zapisywanych plikach `.pt`; baza
 przechowuje ich ścieżki i sumy kontrolne, dzięki czemu nie rośnie o setki MB na
 każdy checkpoint. Ranking Elo służy do diagnostyki, nie decyduje o promocji.

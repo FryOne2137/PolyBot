@@ -11,6 +11,11 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
 from .league_db import LeagueDatabase
 from .belief_recovery import BeliefQualityError, BeliefRecoveryRequired
+from .direct_curriculum import (
+    model_state_on_cpu,
+    restore_model_state,
+    train_direct_policy_curriculum,
+)
 from .routed_self_play_pool import (
     evaluate_matches_pool,
     require_routed_self_play_pool,
@@ -95,6 +100,7 @@ def train_promotion_league(
     training: TrainingConfig,
     *,
     champion_in: Path,
+    challenger_in: Path | None = None,
     checkpoint_dir: Path,
     rounds: int,
     promotion_games: int,
@@ -126,6 +132,21 @@ def train_promotion_league(
     historical_score_floor: float = 0.45,
     elo_k: float = 32.0,
     champion_anchor_weight: float = 0.30,
+    champion_value_anchor_weight: float = 0.25,
+    direct_teacher_envs: int = 128,
+    direct_teacher_steps: int = 0,
+    direct_actor_envs: int = 128,
+    direct_actor_steps: int = 0,
+    direct_actor_block_steps: int = 250,
+    direct_gate_games: int = 20,
+    direct_gate_score: float = 0.50,
+    direct_policy_anchor_weight: float = 0.75,
+    direct_value_anchor_weight: float = 0.50,
+    direct_teacher_weight: float = 0.50,
+    direct_shaping_weight: float = 0.20,
+    mcts_simulation_ladder: Sequence[int] = (),
+    mcts_gate_games: int = 20,
+    mcts_gate_score: float = 0.50,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train candidates against a PFSP population and promote robust winners.
@@ -160,11 +181,43 @@ def train_promotion_league(
         raise ValueError("checkpoint_prefix must not be empty")
     if num_envs < 2:
         raise ValueError("num_envs must be at least two for paired SelfPlayPool gates")
+    if steps < 0 or updates < 0:
+        raise ValueError("same-network MCTS steps and updates must not be negative")
+    if steps == 0 and updates:
+        raise ValueError("updates require a positive same-network MCTS step count")
+    if direct_gate_games < 2 or direct_gate_games % 2:
+        raise ValueError("direct_gate_games must be positive and even")
+    if mcts_gate_games < 2 or mcts_gate_games % 2:
+        raise ValueError("mcts_gate_games must be positive and even")
+    for name, value in {
+        "direct_gate_score": direct_gate_score,
+        "direct_policy_anchor_weight": direct_policy_anchor_weight,
+        "direct_value_anchor_weight": direct_value_anchor_weight,
+        "direct_teacher_weight": direct_teacher_weight,
+        "direct_shaping_weight": direct_shaping_weight,
+        "mcts_gate_score": mcts_gate_score,
+        "champion_value_anchor_weight": champion_value_anchor_weight,
+    }.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between zero and one")
+    ladder = tuple(int(value) for value in mcts_simulation_ladder)
+    if any(value < 1 for value in ladder) or tuple(sorted(set(ladder))) != ladder:
+        raise ValueError("mcts_simulation_ladder must be strictly increasing")
+    population_rungs = ladder or ((int(mcts.simulations),) if population_games else ())
+    population_game_allocations = tuple(
+        population_games // max(1, len(population_rungs))
+        + int(index < population_games % max(1, len(population_rungs)))
+        for index in range(len(population_rungs))
+    )
     # Check the multi-agent binding before spending hours on the first
     # same-network rollout phase.
     require_routed_self_play_pool()
     if not champion_in.is_file():
         raise FileNotFoundError(f"champion checkpoint does not exist: {champion_in}")
+    if challenger_in is not None and not challenger_in.is_file():
+        raise FileNotFoundError(
+            f"challenger checkpoint does not exist: {challenger_in}"
+        )
     for path in population_model_paths:
         if not path.is_file():
             raise FileNotFoundError(f"population checkpoint does not exist: {path}")
@@ -184,6 +237,7 @@ def train_promotion_league(
         "training": training,
         "mcts": mcts,
         "champion_in": champion_in,
+        "challenger_in": challenger_in,
         "checkpoint_dir": checkpoint_dir,
         "database_path": database_path,
         "population_model_paths": list(population_model_paths),
@@ -205,6 +259,7 @@ def train_promotion_league(
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
         "champion_anchor_weight": champion_anchor_weight,
+        "champion_value_anchor_weight": champion_value_anchor_weight,
         "elo_k": elo_k,
         "checkpoint_prefix": checkpoint_prefix,
         "num_envs": num_envs,
@@ -214,10 +269,27 @@ def train_promotion_league(
         "max_pending_leaves": max_pending_leaves,
         "visible_action_history": visible_action_history,
         "belief_retries": belief_retries,
+        "direct_teacher_envs": direct_teacher_envs,
+        "direct_teacher_steps": direct_teacher_steps,
+        "direct_actor_envs": direct_actor_envs,
+        "direct_actor_steps": direct_actor_steps,
+        "direct_actor_block_steps": direct_actor_block_steps,
+        "direct_gate_games": direct_gate_games,
+        "direct_gate_score": direct_gate_score,
+        "direct_policy_anchor_weight": direct_policy_anchor_weight,
+        "direct_value_anchor_weight": direct_value_anchor_weight,
+        "direct_teacher_weight": direct_teacher_weight,
+        "direct_shaping_weight": direct_shaping_weight,
+        "mcts_simulation_ladder": list(ladder),
+        "population_game_allocations": list(population_game_allocations),
+        "mcts_gate_games": mcts_gate_games,
+        "mcts_gate_score": mcts_gate_score,
     }
     run.write_config(**league_config)
 
     champion_path = champion_in
+    challenger_path = challenger_in
+    challenger_id: int | None = None
     promotions = 0
     last_candidate_score = 0.0
     last_population_score = 0.0
@@ -246,6 +318,27 @@ def train_promotion_league(
                 protected=True,
             )
             del initial_model
+            if challenger_path is not None:
+                challenger_model, challenger_config = load_model(
+                    challenger_path, device
+                )
+                if challenger_config != initial_config:
+                    raise RuntimeError(
+                        "challenger checkpoint has a different ModelConfig"
+                    )
+                challenger_id = database.register_checkpoint(
+                    challenger_path,
+                    challenger_config,
+                    run_id=database_run_id,
+                    parent_model_id=champion_id,
+                    status="challenger",
+                    protected=False,
+                    in_population=False,
+                )
+                if challenger_id == champion_id:
+                    challenger_path = None
+                    challenger_id = None
+                del challenger_model
             for population_path in population_model_paths:
                 population_model, population_config = load_model(population_path, device)
                 if population_config != initial_config:
@@ -295,13 +388,14 @@ def train_promotion_league(
                         f"collection seed: {round_training.seed}",
                         flush=True,
                     )
-                    candidate, model_config = load_model(champion_path, device)
+                    candidate_source = challenger_path or champion_path
+                    candidate, model_config = load_model(candidate_source, device)
                     champion, champion_config = load_model(champion_path, device)
                     if champion_config != model_config:
                         raise RuntimeError("candidate and champion ModelConfig differ")
                     candidate_id = database.create_candidate(
                         database_run_id,
-                        champion_id,
+                        challenger_id or champion_id,
                         f"candidate-round-{round_index:03d}",
                         model_config,
                     )
@@ -338,10 +432,36 @@ def train_promotion_league(
                         if evaluation_map_seeds & opponent_map_seeds:
                             raise ValueError("held-out evaluation schedules overlap")
                         evaluation_map_seeds.update(opponent_map_seeds)
-                    known_training_map_seeds = {
-                        population_training_seed + game_index
-                        for game_index in range(population_games)
-                    }
+                    direct_gate_seed = _offset_seed(
+                        round_evaluation_seed, 300_000_007
+                    )
+                    evaluation_map_seeds.update(
+                        direct_gate_seed + game_index // 2
+                        for game_index in range(direct_gate_games)
+                    )
+                    # Reuse one development arena across search depths so a
+                    # later rung cannot silently erase a score earned by an
+                    # earlier rung. The final promotion arena remains separate.
+                    mcts_gate_seeds = [
+                        _offset_seed(round_evaluation_seed, 400_000_007)
+                    ] * len(population_rungs)
+                    for seed in mcts_gate_seeds:
+                        evaluation_map_seeds.update(
+                            seed + game_index // 2
+                            for game_index in range(mcts_gate_games)
+                        )
+                    known_training_map_seeds: set[int] = set()
+                    for rung_index, rung_games in enumerate(
+                        population_game_allocations
+                    ):
+                        rung_seed = _offset_seed(
+                            population_training_seed,
+                            rung_index * 2_000_003,
+                        )
+                        known_training_map_seeds.update(
+                            rung_seed + game_index
+                            for game_index in range(rung_games)
+                        )
                     if evaluation_map_seeds & known_training_map_seeds:
                         raise ValueError(
                             "population training maps overlap held-out evaluation maps"
@@ -359,27 +479,85 @@ def train_promotion_league(
                         flush=True,
                     )
 
-                    pool_summary = train_self_play_pool(
-                        round_training,
-                        model_config,
-                        mcts,
-                        num_envs=num_envs,
-                        steps=steps,
-                        updates=updates,
-                        num_threads=num_threads,
-                        max_pending_leaves=max_pending_leaves,
-                        visible_action_history=visible_action_history,
-                        belief_retries=belief_retries,
-                        model_out=None,
-                        model=candidate,
-                        # Shallow MCTS can be much noisier than the teacher on
-                        # wide roots. Keep a frozen champion contribution in
-                        # every policy target to prevent catastrophic drift.
-                        anchor_model=champion,
-                        anchor_policy_weight=champion_anchor_weight,
-                        reserved_seeds=evaluation_map_seeds,
-                        run=run.child(f"round_{round_index:03d}/pool_self_play"),
-                    )
+                    direct_summary: Dict[str, Any] = {}
+                    if direct_teacher_steps or direct_actor_steps:
+                        def record_direct_gate_game(
+                            stage: str,
+                            block: int,
+                            game: Mapping[str, Any],
+                        ) -> None:
+                            row = dict(game)
+                            row["curriculum_stage"] = stage
+                            row["curriculum_block"] = int(block)
+                            database.record_match(
+                                run_id=database_run_id,
+                                round_id=round_id,
+                                phase=f"direct_curriculum_gate_{stage}_{block}",
+                                model_a_id=candidate_id,
+                                model_b_id=champion_id,
+                                game=row,
+                            )
+
+                        direct_summary = train_direct_policy_curriculum(
+                            round_training,
+                            model_config,
+                            candidate,
+                            champion,
+                            teacher_envs=direct_teacher_envs,
+                            teacher_steps=direct_teacher_steps,
+                            actor_envs=direct_actor_envs,
+                            actor_steps=direct_actor_steps,
+                            actor_block_steps=direct_actor_block_steps,
+                            num_threads=num_threads,
+                            max_actions=mcts.native_max_actions,
+                            gate_games=direct_gate_games,
+                            gate_seed=direct_gate_seed,
+                            gate_score=direct_gate_score,
+                            policy_anchor_weight=direct_policy_anchor_weight,
+                            value_anchor_weight=direct_value_anchor_weight,
+                            teacher_weight=direct_teacher_weight,
+                            shaping_weight=direct_shaping_weight,
+                            gate_game_callback=record_direct_gate_game,
+                            run=run.child(
+                                f"round_{round_index:03d}/direct_curriculum"
+                            ),
+                        )
+                    round_training_summary["direct"] = direct_summary
+
+                    pool_summary: Dict[str, Any] = {}
+                    if steps:
+                        # This legacy same-network phase is now optional. It is
+                        # disabled in the recommended curriculum because weak
+                        # candidate-vs-candidate MCTS was the main regression
+                        # source observed in long league runs.
+                        pool_state = model_state_on_cpu(candidate)
+                        pool_summary = train_self_play_pool(
+                            round_training,
+                            model_config,
+                            mcts,
+                            num_envs=num_envs,
+                            steps=steps,
+                            updates=updates,
+                            num_threads=num_threads,
+                            max_pending_leaves=max_pending_leaves,
+                            visible_action_history=visible_action_history,
+                            belief_retries=belief_retries,
+                            model_out=None,
+                            model=candidate,
+                            anchor_model=champion,
+                            anchor_policy_weight=champion_anchor_weight,
+                            anchor_value_weight=champion_value_anchor_weight,
+                            reserved_seeds=evaluation_map_seeds,
+                            run=run.child(
+                                f"round_{round_index:03d}/pool_self_play"
+                            ),
+                        )
+                        # The final held-out gate still decides promotion. This
+                        # snapshot permits later ladder recovery if its first
+                        # rung detects an immediate regression.
+                        pool_summary["rollback_state_available"] = 1.0
+                    else:
+                        pool_state = model_state_on_cpu(candidate)
                     round_training_summary["pool"] = pool_summary
 
                     frozen_models = []
@@ -394,48 +572,169 @@ def train_promotion_league(
                             )
                         frozen_models.append(frozen_model.eval())
 
-                    population_summary: Dict[str, Any] = {}
+                    population_summary: Dict[str, Any] = {
+                        "mcts_ladder": [],
+                        "mcts_ladder_accepted": 0.0,
+                        "mcts_ladder_rollbacks": 0.0,
+                    }
+                    best_mcts_state = pool_state
+                    best_mcts_score = 0.50
                     if population_games:
-                        population_training = replace(
-                            round_training,
-                            seed=population_training_seed,
-                        )
-
-                        def record_training_game(game: Mapping[str, Any]) -> None:
-                            opponent_index = game.get("opponent_model_index")
-                            opponent_id = (
-                                population_ids[int(opponent_index)]
-                                if opponent_index is not None else None
+                        for rung_index, (simulations, rung_games) in enumerate(
+                            zip(population_rungs, population_game_allocations)
+                        ):
+                            if rung_games <= 0:
+                                continue
+                            rung_training = replace(
+                                round_training,
+                                seed=_offset_seed(
+                                    population_training_seed,
+                                    rung_index * 2_000_003,
+                                ),
                             )
-                            database.record_match(
-                                run_id=database_run_id,
-                                round_id=round_id,
-                                phase="population_training",
-                                model_a_id=candidate_id,
-                                model_b_id=opponent_id,
-                                game=game,
+                            rung_mcts = replace(
+                                mcts,
+                                simulations=int(simulations),
+                                # The direct curriculum must first prove that
+                                # the neural policy/value help search. Manual
+                                # priors are therefore reduced rung by rung.
+                                strategic_prior_weight=min(
+                                    mcts.strategic_prior_weight,
+                                    0.50 if rung_index == 0 else 0.20,
+                                ),
+                                teacher_prior_weight=min(
+                                    mcts.teacher_prior_weight,
+                                    0.10,
+                                ),
                             )
 
-                        population_summary = train_population_pool(
-                            population_training,
-                            model_config,
-                            mcts,
-                            games=population_games,
-                            updates_per_game=population_updates_per_game,
-                            candidate=candidate,
-                            opponent_models=frozen_models,
-                            opponent_weights=probabilities,
-                            anchor_model=champion,
-                            anchor_policy_weight=champion_anchor_weight,
-                            num_threads=population_workers,
-                            max_pending_leaves=max_pending_leaves,
-                            visible_action_history=visible_action_history,
-                            belief_retries=belief_retries,
-                            max_envs=num_envs,
-                            game_callback=record_training_game,
-                            reserved_seeds=evaluation_map_seeds,
-                            run=run.child(f"round_{round_index:03d}/population_training"),
-                        )
+                            def record_training_game(
+                                game: Mapping[str, Any],
+                                *,
+                                selected_rung: int = rung_index,
+                                selected_simulations: int = int(simulations),
+                            ) -> None:
+                                opponent_index = game.get("opponent_model_index")
+                                opponent_id = (
+                                    population_ids[int(opponent_index)]
+                                    if opponent_index is not None else None
+                                )
+                                row = dict(game)
+                                row["mcts_rung"] = selected_rung
+                                row["mcts_simulations"] = selected_simulations
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    phase=f"population_training_rung_{selected_rung + 1}",
+                                    model_a_id=candidate_id,
+                                    model_b_id=opponent_id,
+                                    game=row,
+                                )
+
+                            rung_summary = train_population_pool(
+                                rung_training,
+                                model_config,
+                                rung_mcts,
+                                games=rung_games,
+                                updates_per_game=population_updates_per_game,
+                                candidate=candidate,
+                                opponent_models=frozen_models,
+                                opponent_weights=probabilities,
+                                anchor_model=champion,
+                                anchor_policy_weight=champion_anchor_weight,
+                                anchor_value_weight=champion_value_anchor_weight,
+                                num_threads=population_workers,
+                                max_pending_leaves=max_pending_leaves,
+                                visible_action_history=visible_action_history,
+                                belief_retries=belief_retries,
+                                max_envs=num_envs,
+                                game_callback=record_training_game,
+                                reserved_seeds=evaluation_map_seeds,
+                                run=run.child(
+                                    f"round_{round_index:03d}/mcts_rung_{rung_index + 1:02d}"
+                                ),
+                            )
+                            gate_mcts = replace(
+                                evaluation_mcts,
+                                simulations=int(simulations),
+                            )
+
+                            def record_rung_gate_game(
+                                game: Mapping[str, Any],
+                                *,
+                                selected_rung: int = rung_index,
+                                selected_simulations: int = int(simulations),
+                            ) -> None:
+                                row = dict(game)
+                                row["mcts_rung"] = selected_rung
+                                row["mcts_simulations"] = selected_simulations
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    phase=(
+                                        f"mcts_curriculum_gate_rung_"
+                                        f"{selected_rung + 1}"
+                                    ),
+                                    model_a_id=candidate_id,
+                                    model_b_id=champion_id,
+                                    game=row,
+                                )
+
+                            rung_gate = evaluate_matches_pool(
+                                candidate,
+                                champion,
+                                replace(
+                                    training,
+                                    seed=mcts_gate_seeds[rung_index],
+                                ),
+                                gate_mcts,
+                                mcts_gate_games,
+                                num_threads=num_threads,
+                                max_pending_leaves=max_pending_leaves,
+                                visible_action_history=visible_action_history,
+                                belief_retries=belief_retries,
+                                max_envs=num_envs,
+                                game_callback=record_rung_gate_game,
+                            )
+                            rung_score = float(rung_gate.get("model_a_score", 0.0))
+                            accepted = bool(rung_gate.get("valid", 1.0)) and (
+                                rung_score
+                                >= max(float(mcts_gate_score), best_mcts_score)
+                            )
+                            if accepted:
+                                best_mcts_state = model_state_on_cpu(candidate)
+                                best_mcts_score = rung_score
+                                population_summary["mcts_ladder_accepted"] += 1.0
+                            else:
+                                restore_model_state(candidate, best_mcts_state)
+                                population_summary["mcts_ladder_rollbacks"] += 1.0
+                            rung_record = {
+                                "simulations": float(simulations),
+                                "games": float(rung_games),
+                                "accepted": float(accepted),
+                                "gate_score": rung_score,
+                                "best_gate_score": best_mcts_score,
+                                "gate_lower_95": float(
+                                    rung_gate.get("score_lower_95", 0.0)
+                                ),
+                                "training": rung_summary,
+                                "gate": rung_gate,
+                            }
+                            population_summary["mcts_ladder"].append(rung_record)
+                            run.log(
+                                round=round_index,
+                                mcts_rung=rung_index + 1,
+                                mcts_simulations=simulations,
+                                mcts_rung_score=rung_score,
+                                mcts_rung_accepted=float(accepted),
+                            )
+                            print(
+                                f"league MCTS rung {simulations} | "
+                                f"score={rung_score:.4f} | accepted={int(accepted)}",
+                                flush=True,
+                            )
+                            if not accepted:
+                                break
                     round_training_summary["population"] = population_summary
                     database.flush()
                     last_training = dict(round_training_summary)
@@ -577,14 +876,52 @@ def train_promotion_league(
                         database.finalise_candidate(candidate_id, promoted_path=promoted_path)
                         champion_path = promoted_path
                         champion_id = candidate_id
+                        challenger_path = None
+                        challenger_id = None
                         print(
                             f"league promotion {promotions}: saved {champion_path}",
                             flush=True,
                         )
                     else:
-                        database.finalise_candidate(candidate_id, promoted_path=None)
+                        # A statistically inconclusive 0.50-0.55 challenger is
+                        # useful learning progress, not a reason to restart
+                        # from the teacher. Keep it only when every completed
+                        # held-out gate is non-regressing; the protected
+                        # champion and league population remain unchanged.
+                        retain_challenger = (
+                            not invalid_evaluation
+                            and last_candidate_score >= 0.50
+                            and last_population_score >= 0.50
+                            and minimum_historical_score
+                            >= historical_score_floor
+                        )
+                        if retain_challenger:
+                            retained_path = checkpoint_dir / (
+                                f"{checkpoint_prefix}-challenger-"
+                                f"{round_index:03d}.pt"
+                            )
+                            save_model(retained_path, candidate, model_config)
+                            database.retain_candidate(candidate_id, retained_path)
+                            challenger_path = retained_path
+                            challenger_id = candidate_id
+                            print(
+                                "league challenger retained for the next "
+                                f"round: {challenger_path}",
+                                flush=True,
+                            )
+                        else:
+                            database.finalise_candidate(
+                                candidate_id, promoted_path=None
+                            )
+                        gate_summary["retained_challenger"] = float(
+                            retain_challenger
+                        )
 
-                    round_summary = {"pool": pool_summary, "population": population_summary}
+                    round_summary = {
+                        "direct": direct_summary,
+                        "pool": pool_summary,
+                        "population": population_summary,
+                    }
                     database.finish_round(
                         round_id,
                         champion_id,
@@ -656,9 +993,15 @@ def train_promotion_league(
                 "league_population_threshold": population_score,
                 "league_historical_score_floor": historical_score_floor,
                 "league_champion_path": str(champion_path),
+                "league_challenger_path": (
+                    str(challenger_path) if challenger_path is not None else ""
+                ),
                 "league_database_path": str(database_path.resolve()),
                 "league_population_size": float(population_size),
                 "league_champion_anchor_weight": float(champion_anchor_weight),
+                "league_champion_value_anchor_weight": float(
+                    champion_value_anchor_weight
+                ),
                 "league_evaluation_seed": float(resolved_evaluation_seed),
                 "league_evaluation_seed_stride": float(evaluation_seed_stride),
             }
@@ -668,8 +1011,27 @@ def train_promotion_league(
                         "self_play_pool_optimisation_updates", 0.0
                     )
                 )
+                population_rung_rows = last_training.get("population", {}).get(
+                    "mcts_ladder", []
+                )
                 summary["league_last_population_games"] = float(
-                    last_training.get("population", {}).get("population_pool_games", 0.0)
+                    sum(
+                        float(row.get("training", {}).get("population_pool_games", 0.0))
+                        for row in population_rung_rows
+                    )
+                )
+                summary["league_last_mcts_rungs_accepted"] = float(
+                    last_training.get("population", {}).get(
+                        "mcts_ladder_accepted", 0.0
+                    )
+                )
+                summary["league_last_mcts_rung_rollbacks"] = float(
+                    last_training.get("population", {}).get(
+                        "mcts_ladder_rollbacks", 0.0
+                    )
+                )
+                summary["league_last_direct_best_score"] = float(
+                    last_training.get("direct", {}).get("direct_best_score", 0.0)
                 )
                 summary["league_last_pool_anchor_mean_l1"] = float(
                     last_training.get("pool", {}).get(
@@ -677,9 +1039,11 @@ def train_promotion_league(
                     )
                 )
                 summary["league_last_population_anchor_mean_l1"] = float(
-                    last_training.get("population", {}).get(
-                        "population_pool_anchor_mean_l1", 0.0
-                    )
+                    population_rung_rows[-1]
+                    .get("training", {})
+                    .get("population_pool_anchor_mean_l1", 0.0)
+                    if population_rung_rows
+                    else 0.0
                 )
             run_directory = run.finish(summary)
             summary["run_dir"] = str(run_directory)

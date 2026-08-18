@@ -37,6 +37,11 @@ class TrainingExample:
     # bridge/terrain relation can be learned.  This is metadata only and is
     # never exposed as a model input.
     bridge_priority: bool = False
+    # Frozen-champion value distillation is kept separate from the game/MCTS
+    # target.  This lets the optimiser improve value estimates while limiting
+    # catastrophic drift of the shared representation during a league rung.
+    anchor_value_target: float = 0.0
+    anchor_value_loss_weight: float = 0.0
 
 
 class ReplayBuffer:

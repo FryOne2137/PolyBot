@@ -380,6 +380,14 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
     hidden = np.stack([row.hidden_mask for row in rows]).astype(bool)
     values = np.asarray([row.value_target for row in rows], dtype=np.float32)
     value_weights = np.asarray([row.value_loss_weight for row in rows], dtype=np.float32)
+    anchor_values = np.asarray(
+        [getattr(row, "anchor_value_target", 0.0) for row in rows],
+        dtype=np.float32,
+    )
+    anchor_value_weights = np.asarray(
+        [getattr(row, "anchor_value_loss_weight", 0.0) for row in rows],
+        dtype=np.float32,
+    )
     cats = np.full((batch_size, max_actions, cat_dim), -1, dtype=np.int64)
     conts = np.zeros((batch_size, max_actions, cont_dim), dtype=np.float32)
     masks = np.zeros((batch_size, max_actions), dtype=bool)
@@ -413,6 +421,12 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
         "policy_target": torch.as_tensor(policies, dtype=torch.float32, device=device),
         "value_target": torch.as_tensor(values, dtype=torch.float32, device=device),
         "value_loss_weight": torch.as_tensor(value_weights, dtype=torch.float32, device=device),
+        "anchor_value_target": torch.as_tensor(
+            anchor_values, dtype=torch.float32, device=device
+        ),
+        "anchor_value_loss_weight": torch.as_tensor(
+            anchor_value_weights, dtype=torch.float32, device=device
+        ),
         "full_map_target": torch.as_tensor(full_maps, dtype=torch.long, device=device),
         "hidden_mask": torch.as_tensor(hidden, dtype=torch.bool, device=device),
     }

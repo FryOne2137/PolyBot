@@ -109,15 +109,18 @@ python scripts/evaluate.py `
   --seed 1500000007 `
   --device cuda
 
-# 5. Liga populacyjna: wszystkie trzy fazy (self-play kandydata, gry PFSP
-# przeciw populacji i sparowane bramki) działają w szybkim SelfPlayPool.
-# Modele są routowane przez agent_id bez wolnego GameEnv/MctsPool. Checkpointy
+# 5. Liga z curriculum: najpierw szybka nauka przejmowania wiosek i innych
+# widocznych celów bez MCTS, potem actor-critic bez MCTS, a na końcu stopniowe
+# szczeble 4,8,16,32,64 symulacji przeciw populacji. Każdy etap ma bramkę i
+# automatyczny rollback, więc słabszy etap nie przechodzi dalej. Checkpointy
 # po promocji trafią
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
 # do runs\league\train\round_001, round_002 itd.
 # Stały --seed jest bazą wielu map, nie jednej mapy. Każda runda ma odległy
 # seed self-play, a bramka osobny, nieużywany w treningu zestaw map. Wznów
-# następny run od ostatniego champion-XXX.pt.
+# następny run od ostatniego champion-XXX.pt. Jeżeli nie było promocji, ale
+# log podał "challenger retained", zachowaj tego samego --champion-in i dopisz
+# --challenger-in models\league\champion-challenger-XXX.pt.
 python scripts/train_league.py `
   --champion-in models\teacher-structured-v1.pt `
   --checkpoint-dir models\league `
@@ -130,8 +133,23 @@ python scripts/train_league.py `
   --pfsp-alpha 2.0 `
   --champion-probability 0.40 `
   --minimum-sampling-probability 0.05 `
-  --champion-anchor-weight 0.50 `
-  --rounds 1 `
+  --champion-anchor-weight 0.80 `
+  --champion-value-anchor-weight 0.50 `
+  --direct-teacher-envs 128 `
+  --direct-teacher-steps 500 `
+  --direct-actor-envs 128 `
+  --direct-actor-steps 1000 `
+  --direct-actor-block-steps 250 `
+  --direct-gate-games 20 `
+  --direct-gate-score 0.50 `
+  --direct-policy-anchor-weight 0.75 `
+  --direct-value-anchor-weight 0.50 `
+  --direct-teacher-weight 0.50 `
+  --direct-shaping-weight 0.20 `
+  --mcts-simulation-ladder 4,8,16,32,64 `
+  --mcts-gate-games 20 `
+  --mcts-gate-score 0.50 `
+  --rounds 2 `
   --promotion-games 100 `
   --promotion-score 0.55 `
   --promotion-lower-bound 0.50 `
@@ -143,8 +161,8 @@ python scripts/train_league.py `
   --evaluation-seed-stride 20000033 `
   --round-seed-stride 10000019 `
   --num-envs 128 `
-  --steps 1000 `
-  --updates 500 `
+  --steps 0 `
+  --updates 0 `
   --num-threads 16 `
   --max-pending-leaves 8 `
   --visible-action-history 0 `
@@ -152,8 +170,10 @@ python scripts/train_league.py `
   --simulations 64 `
   --particles 2 `
   --mcts-max-actions 1024 `
-  --mcts-top-actions 48 `
-  --mcts-random-actions 8 `
+  --mcts-top-actions 0 `
+  --mcts-random-actions 0 `
+  --strategic-prior-weight 0.50 `
+  --teacher-prior-weight 0.10 `
   --batch-size 64 `
   --replay-capacity 50000 `
   --max-replay-epochs 6 `

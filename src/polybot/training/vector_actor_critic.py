@@ -18,7 +18,11 @@ from ..infrastructure.model_io import save_model
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .run_artifacts import TrainingRun
-from .vector_teacher import _teacher_targets, _vector_tensors
+from .vector_teacher import (
+    _teacher_targets,
+    _vector_tensors,
+    _visible_goal_progress,
+)
 
 
 def _normalise_advantage(advantage: torch.Tensor) -> torch.Tensor:
@@ -30,7 +34,13 @@ def _normalise_advantage(advantage: torch.Tensor) -> torch.Tensor:
     ).clamp_min(1e-4)
 
 
-def _visible_action_reward(features: np.ndarray, rows: np.ndarray) -> np.ndarray:
+def _visible_action_reward(
+    features: np.ndarray,
+    rows: np.ndarray,
+    map_tokens: np.ndarray | None = None,
+    state: np.ndarray | None = None,
+    map_size: int | None = None,
+) -> np.ndarray:
     """Dense, visible-only curriculum reward for early flat self-play.
 
     This is not an engine reward and never reads the full map. It merely makes
@@ -49,6 +59,13 @@ def _visible_action_reward(features: np.ndarray, rows: np.ndarray) -> np.ndarray
     reward += np.where(np.isin(action_type, (4, 7)), 0.01, 0.0)
     reward -= np.where(action_type == 3, 0.025, 0.0)  # premature end-turn
     reward -= np.where(affordable == 0, 0.03, 0.0)
+    if map_tokens is not None and state is not None and map_size is not None:
+        goal_score, enters_village = _visible_goal_progress(
+            features, map_tokens, state, int(map_size)
+        )
+        selected_goal_score = goal_score[np.arange(features.shape[0]), rows]
+        reward += np.clip(selected_goal_score, -1.0, 4.5) * 0.035
+        reward += enters_village[np.arange(features.shape[0]), rows] * 0.12
     return reward
 
 
@@ -66,12 +83,23 @@ def train_vector_actor_critic(
     model_out: Optional[Path] = None,
     model: Optional[PolicyValueBeliefNet] = None,
     run: TrainingRun | None = None,
+    anchor_model: Optional[PolicyValueBeliefNet] = None,
+    policy_anchor_weight: float = 0.75,
+    value_anchor_weight: float = 0.50,
+    shaping_weight: float = 0.20,
 ) -> Dict[str, float | str]:
     """Train policy/value directly from native vector rollouts in RAM only."""
     if num_envs < 1 or steps < 1 or max_actions < 1:
         raise ValueError("num_envs, steps and max_actions must be positive")
     if training.map_type != "lakes":
         raise ValueError("the documented VectorGameEnv constructor currently exposes the default lakes ruleset only")
+    for name, value in {
+        "policy_anchor_weight": policy_anchor_weight,
+        "value_anchor_weight": value_anchor_weight,
+        "shaping_weight": shaping_weight,
+    }.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between zero and one")
     try:
         from PolyEnv import Bardur, Imperius, VectorGameEnv
     except ImportError as error:
@@ -93,9 +121,18 @@ def train_vector_actor_critic(
             "teacher_weight": teacher_weight,
             "gamma": gamma,
             "model_out": model_out,
+            "policy_anchor_weight": policy_anchor_weight,
+            "value_anchor_weight": value_anchor_weight,
+            "shaping_weight": shaping_weight,
         },
     )
     model = model.to(device) if model is not None else PolicyValueBeliefNet(model_config).to(device)
+    if anchor_model is model:
+        raise ValueError("anchor_model must be a frozen copy")
+    if anchor_model is not None:
+        anchor_model = anchor_model.to(device).eval()
+        for parameter in anchor_model.parameters():
+            parameter.requires_grad_(False)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     cuda_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
@@ -105,7 +142,16 @@ def train_vector_actor_critic(
         auto_reset=True, visible_event_history=0,
     )
     batch = env.reset(seed=training.seed)
-    totals = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "teacher_loss": 0.0, "entropy": 0.0, "reward": 0.0}
+    totals = {
+        "loss": 0.0,
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "teacher_loss": 0.0,
+        "policy_anchor_loss": 0.0,
+        "value_anchor_loss": 0.0,
+        "entropy": 0.0,
+        "reward": 0.0,
+    }
     terminals = 0
 
     with tqdm(total=steps, desc=f"flat actor-critic ({device})", unit="step", dynamic_ncols=True) as progress:
@@ -113,7 +159,13 @@ def train_vector_actor_critic(
             tensors = _vector_tensors(batch, device, training)
             action_features = np.asarray(batch["action_features"], dtype=np.int64)
             teacher_target = torch.as_tensor(
-                _teacher_targets(action_features, np.asarray(batch["action_mask"], dtype=bool)),
+                _teacher_targets(
+                    action_features,
+                    np.asarray(batch["action_mask"], dtype=bool),
+                    np.asarray(batch["map_tokens"], dtype=np.int64),
+                    np.asarray(batch["state"], dtype=np.int64),
+                    training.map_size,
+                ),
                 dtype=torch.float32, device=device,
             )
             player_before = np.asarray(batch["state"], dtype=np.int32)[:, 1]
@@ -130,7 +182,13 @@ def train_vector_actor_critic(
                 log_probability = distribution.log_prob(actions)
                 entropy = distribution.entropy().mean()
             action_rows = actions.detach().cpu().numpy().astype(np.int64)
-            shaped = _visible_action_reward(action_features, action_rows)
+            shaped = _visible_action_reward(
+                action_features,
+                action_rows,
+                np.asarray(batch["map_tokens"], dtype=np.int64),
+                np.asarray(batch["state"], dtype=np.int64),
+                training.map_size,
+            )
             action_ids = np.asarray(batch["action_id"], dtype=np.int32)[np.arange(num_envs), action_rows]
             try:
                 next_batch = env.step(action_ids)
@@ -143,11 +201,12 @@ def train_vector_actor_critic(
                 raise
             terminal = np.asarray(next_batch["terminated"], dtype=bool)
             terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
-            reward = shaped + terminal_reward
+            reward = shaping_weight * shaped + terminal_reward
             terminals += int(terminal.sum())
 
             # Bootstrap from the next player-visible state. A turn switch
             # negates the zero-sum value; auto-reset terminal rows never boot.
+            model.eval()
             with torch.no_grad():
                 next_tensors = _vector_tensors(next_batch, device, training)
                 next_output = model(
@@ -160,6 +219,7 @@ def train_vector_actor_critic(
                 done = torch.as_tensor(terminal, dtype=torch.float32, device=device)
                 reward_tensor = torch.as_tensor(reward, dtype=torch.float32, device=device)
                 td_target = reward_tensor + gamma * (1.0 - done) * sign * next_output.value
+            model.train()
 
             advantage = td_target - output.value
             normalised_advantage = _normalise_advantage(advantage)
@@ -167,10 +227,37 @@ def train_vector_actor_critic(
             critic_loss = F.smooth_l1_loss(output.value, td_target)
             log_probabilities = F.log_softmax(output.policy_logits, dim=-1)
             teacher_loss = -(teacher_target * torch.where(tensors["action_mask"], log_probabilities, 0.0)).sum(dim=1).mean()
+            anchor_policy_loss = policy_loss.new_zeros(())
+            anchor_value_loss = policy_loss.new_zeros(())
+            if anchor_model is not None:
+                with torch.no_grad():
+                    anchor_output = anchor_model(
+                        tensors["map_tokens"], tensors["global_features"],
+                        tensors["action_categorical"], tensors["action_continuous"],
+                        tensors["action_mask"], tensors["event_features"],
+                        include_belief=False,
+                    )
+                    anchor_policy = torch.softmax(
+                        anchor_output.policy_logits, dim=-1
+                    )
+                anchor_policy_loss = -(
+                    anchor_policy
+                    * torch.where(tensors["action_mask"], log_probabilities, 0.0)
+                ).sum(dim=1).mean()
+                anchor_value_loss = F.smooth_l1_loss(
+                    output.value, anchor_output.value
+                )
             # The supervised anchor is deliberately small: it keeps early
             # exploration from destroying a useful teacher policy, while TD
             # gradients are still free to improve it.
-            loss = policy_loss + value_weight * critic_loss + teacher_weight * teacher_loss - entropy_weight * entropy
+            loss = (
+                policy_loss
+                + value_weight * critic_loss
+                + teacher_weight * teacher_loss
+                + policy_anchor_weight * anchor_policy_loss
+                + value_anchor_weight * anchor_value_loss
+                - entropy_weight * entropy
+            )
             optimiser.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimiser)
@@ -183,6 +270,8 @@ def train_vector_actor_critic(
             totals["policy_loss"] += float(policy_loss.detach().cpu())
             totals["value_loss"] += float(critic_loss.detach().cpu())
             totals["teacher_loss"] += float(teacher_loss.detach().cpu())
+            totals["policy_anchor_loss"] += float(anchor_policy_loss.detach().cpu())
+            totals["value_anchor_loss"] += float(anchor_value_loss.detach().cpu())
             totals["entropy"] += float(entropy.detach().cpu())
             totals["reward"] += float(reward.mean())
             run.log(
@@ -192,6 +281,8 @@ def train_vector_actor_critic(
                 policy_loss=float(policy_loss.detach().cpu()),
                 value_loss=float(critic_loss.detach().cpu()),
                 teacher_loss=float(teacher_loss.detach().cpu()),
+                policy_anchor_loss=float(anchor_policy_loss.detach().cpu()),
+                value_anchor_loss=float(anchor_value_loss.detach().cpu()),
                 entropy=float(entropy.detach().cpu()),
                 reward=float(reward.mean()),
                 terminal_episodes=terminals,
@@ -209,6 +300,13 @@ def train_vector_actor_critic(
         "flat_envs": float(num_envs), "flat_steps": float(steps),
         "environment_steps": float(num_envs * steps), "terminal_episodes": float(terminals),
         **{"flat_" + key: value / steps for key, value in totals.items()},
+        "policy_anchor_weight": float(
+            policy_anchor_weight if anchor_model is not None else 0.0
+        ),
+        "value_anchor_weight": float(
+            value_anchor_weight if anchor_model is not None else 0.0
+        ),
+        "shaping_weight": float(shaping_weight),
     }
     summary["run_dir"] = str(run.finish(summary))
     return summary

@@ -247,6 +247,7 @@ class LeagueDatabase:
         status: str = "initial",
         protected: bool = False,
         protect_existing: bool = False,
+        in_population: bool = True,
     ) -> int:
         resolved = path.resolve()
         digest, size = checkpoint_digest(resolved)
@@ -258,10 +259,14 @@ class LeagueDatabase:
             self.connection.execute(
                 """UPDATE models SET checkpoint_path = ?,
                    protected = CASE WHEN ? THEN MAX(protected, ?) ELSE protected END,
-                   in_population = 1, updated_at = ? WHERE id = ?""",
+                   in_population = CASE
+                       WHEN status IN ('initial', 'promoted') THEN in_population
+                       ELSE ?
+                   END,
+                   updated_at = ? WHERE id = ?""",
                 (
                     str(resolved), int(protect_existing), int(protected),
-                    _utc_now(), model_id,
+                    int(in_population), _utc_now(), model_id,
                 ),
             )
             self.connection.commit()
@@ -272,10 +277,11 @@ class LeagueDatabase:
                    run_id, parent_model_id, name, checkpoint_path, checkpoint_sha256,
                    checkpoint_bytes, model_config_json, status, protected,
                    in_population, created_at, updated_at
-               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id, parent_model_id, resolved.stem, str(resolved), digest, size,
-                _json(model_config), status, int(protected), now, now,
+                _json(model_config), status, int(protected), int(in_population),
+                now, now,
             ),
         )
         self.connection.commit()
@@ -321,6 +327,18 @@ class LeagueDatabase:
                    updated_at = ? WHERE id = ?""",
                 (str(resolved), digest, size, now, model_id),
             )
+        self.connection.commit()
+
+    def retain_candidate(self, model_id: int, checkpoint_path: Path) -> None:
+        """Keep a non-regressing learner outside the protected population."""
+        resolved = checkpoint_path.resolve()
+        digest, size = checkpoint_digest(resolved)
+        self.connection.execute(
+            """UPDATE models SET status = 'challenger', in_population = 0,
+               checkpoint_path = ?, checkpoint_sha256 = ?, checkpoint_bytes = ?,
+               updated_at = ? WHERE id = ? AND status = 'training'""",
+            (str(resolved), digest, size, _utc_now(), model_id),
+        )
         self.connection.commit()
 
     def start_round(

@@ -21,6 +21,22 @@ from polybot.training.cli import (
 from polybot.training.league import train_promotion_league
 
 
+def _simulation_ladder(value: str) -> tuple[int, ...]:
+    try:
+        result = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "simulation ladder must be comma-separated integers"
+        ) from error
+    if not result:
+        raise argparse.ArgumentTypeError("simulation ladder must not be empty")
+    if any(item < 1 for item in result) or tuple(sorted(set(result))) != result:
+        raise argparse.ArgumentTypeError(
+            "simulation ladder must be positive and strictly increasing"
+        )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train against a historical population and save only robust promotions"
@@ -32,6 +48,10 @@ def main() -> None:
     parser.set_defaults(bridge_constraint_weight=0.10)
     add_run_options(parser)
     parser.add_argument("--champion-in", type=Path, required=True, help="Initial frozen champion checkpoint")
+    parser.add_argument(
+        "--challenger-in", type=Path,
+        help="Optional retained challenger to continue training against the frozen champion",
+    )
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/league"))
     parser.add_argument("--checkpoint-prefix", default="champion")
     parser.add_argument(
@@ -59,6 +79,34 @@ def main() -> None:
         "--champion-anchor-weight", type=float, default=0.30,
         help="Frozen champion fraction blended into policy targets in both training phases",
     )
+    parser.add_argument(
+        "--champion-value-anchor-weight", type=float, default=0.25,
+        help="Frozen champion value loss used as a trust region during MCTS training",
+    )
+    parser.add_argument("--direct-teacher-envs", type=int, default=128)
+    parser.add_argument(
+        "--direct-teacher-steps", type=int, default=500,
+        help="Fast visible-objective imitation steps before MCTS",
+    )
+    parser.add_argument("--direct-actor-envs", type=int, default=128)
+    parser.add_argument(
+        "--direct-actor-steps", type=int, default=1_000,
+        help="On-policy direct-play steps before MCTS",
+    )
+    parser.add_argument("--direct-actor-block-steps", type=int, default=250)
+    parser.add_argument("--direct-gate-games", type=int, default=20)
+    parser.add_argument("--direct-gate-score", type=float, default=0.50)
+    parser.add_argument("--direct-policy-anchor-weight", type=float, default=0.75)
+    parser.add_argument("--direct-value-anchor-weight", type=float, default=0.50)
+    parser.add_argument("--direct-teacher-weight", type=float, default=0.50)
+    parser.add_argument("--direct-shaping-weight", type=float, default=0.20)
+    parser.add_argument(
+        "--mcts-simulation-ladder", type=_simulation_ladder,
+        default=(4, 8, 16, 32),
+        help="Comma-separated search curriculum; every failed rung is rolled back",
+    )
+    parser.add_argument("--mcts-gate-games", type=int, default=20)
+    parser.add_argument("--mcts-gate-score", type=float, default=0.50)
     parser.add_argument("--rounds", type=int, default=10, help="Candidate train-and-gate cycles")
     parser.add_argument("--promotion-games", type=int, default=100, help="Fixed-seed MCTS games per gate")
     parser.add_argument("--promotion-score", type=float, default=0.55, help="Win=1 / draw=0.5 score required")
@@ -74,8 +122,14 @@ def main() -> None:
     parser.add_argument("--evaluation-seed-stride", type=int, default=20_000_033)
     parser.add_argument("--round-seed-stride", type=int, default=10_000_019)
     parser.add_argument("--num-envs", type=int, default=128)
-    parser.add_argument("--steps", type=int, default=1_000, help="Vector decisions per candidate")
-    parser.add_argument("--updates", type=int, default=500, help="Online optimiser updates per candidate")
+    parser.add_argument(
+        "--steps", type=int, default=0,
+        help="Legacy same-network MCTS decisions; keep 0 for regression-safe curriculum",
+    )
+    parser.add_argument(
+        "--updates", type=int, default=0,
+        help="Legacy same-network optimiser updates; keep 0 with --steps 0",
+    )
     parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
     parser.add_argument("--visible-action-history", type=int, default=0, help="0 keeps train/evaluation inputs identical")
@@ -105,6 +159,7 @@ def main() -> None:
     print_summary(train_promotion_league(
         training,
         champion_in=args.champion_in,
+        challenger_in=args.challenger_in,
         checkpoint_dir=args.checkpoint_dir,
         rounds=args.rounds,
         promotion_games=args.promotion_games,
@@ -132,6 +187,21 @@ def main() -> None:
         champion_probability=args.champion_probability,
         minimum_sampling_probability=args.minimum_sampling_probability,
         champion_anchor_weight=args.champion_anchor_weight,
+        champion_value_anchor_weight=args.champion_value_anchor_weight,
+        direct_teacher_envs=args.direct_teacher_envs,
+        direct_teacher_steps=args.direct_teacher_steps,
+        direct_actor_envs=args.direct_actor_envs,
+        direct_actor_steps=args.direct_actor_steps,
+        direct_actor_block_steps=args.direct_actor_block_steps,
+        direct_gate_games=args.direct_gate_games,
+        direct_gate_score=args.direct_gate_score,
+        direct_policy_anchor_weight=args.direct_policy_anchor_weight,
+        direct_value_anchor_weight=args.direct_value_anchor_weight,
+        direct_teacher_weight=args.direct_teacher_weight,
+        direct_shaping_weight=args.direct_shaping_weight,
+        mcts_simulation_ladder=args.mcts_simulation_ladder,
+        mcts_gate_games=args.mcts_gate_games,
+        mcts_gate_score=args.mcts_gate_score,
         historical_games=args.historical_games,
         population_score=args.population_score,
         historical_score_floor=args.historical_score_floor,

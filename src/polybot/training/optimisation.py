@@ -189,6 +189,22 @@ def train_batch(
     else:
         value_weights = value_weights.to(per_example_value.dtype)
         value = (per_example_value * value_weights).sum() / value_weights.sum().clamp_min(1.0)
+    anchor_value = output.value.new_zeros(())
+    anchor_value_weights = batch.get("anchor_value_loss_weight")
+    anchor_value_targets = batch.get("anchor_value_target")
+    if anchor_value_weights is not None and anchor_value_targets is not None:
+        anchor_value_weights = anchor_value_weights.to(output.value.dtype)
+        # The coefficient is stored per example, so a weight of 0.5 really is
+        # half-strength. Dividing by the sum of weights would accidentally
+        # cancel that coefficient when every replay row uses the same value.
+        anchor_value = (
+            F.smooth_l1_loss(
+                output.value,
+                anchor_value_targets.to(output.value.dtype),
+                reduction="none",
+            )
+            * anchor_value_weights
+        ).mean()
     belief = belief_loss(output.belief_logits, batch["full_map_target"], batch["hidden_mask"])
     bridge = bridge_constraint_loss(
         output.belief_logits[19],
@@ -202,6 +218,7 @@ def train_batch(
     total = (
         config.policy_weight * policy
         + config.value_weight * value
+        + anchor_value
         + config.belief_weight * belief
         + config.bridge_constraint_weight * bridge
     )
@@ -215,6 +232,7 @@ def train_batch(
         "loss": float(total.detach().cpu()),
         "policy_loss": float(policy.detach().cpu()),
         "value_loss": float(value.detach().cpu()),
+        "value_anchor_loss": float(anchor_value.detach().cpu()),
         "belief_loss": float(belief.detach().cpu()),
         "bridge_constraint_loss": float(bridge.detach().cpu()),
     }

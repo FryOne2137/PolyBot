@@ -195,6 +195,35 @@ def _reference_policy(
     return policy
 
 
+def _reference_policy_value(
+    model: PolicyValueBeliefNet,
+    batch: Mapping[str, np.ndarray],
+    device: torch.device,
+    training: TrainingConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return frozen policy and value in one inference pass."""
+    tensors = native_batch_to_tensors(
+        dict(batch), device, training.map_size, training.map_type
+    )
+    with torch.inference_mode():
+        output = model(
+            tensors.map_tokens,
+            tensors.global_features,
+            tensors.action_categorical,
+            tensors.action_continuous,
+            tensors.action_mask,
+            tensors.event_features,
+            action_history=tensors.action_history,
+            action_history_mask=tensors.action_history_mask,
+            include_belief=False,
+        )
+        policy = torch.softmax(
+            output.policy_logits, dim=-1
+        ).float().cpu().numpy()
+        value = output.value.float().cpu().numpy()
+    return policy, value
+
+
 def _policy_distance(
     search_policy: np.ndarray,
     reference_policy: np.ndarray,
@@ -1353,6 +1382,7 @@ def train_population_pool(
     opponent_weights: Sequence[float],
     anchor_model: PolicyValueBeliefNet | None = None,
     anchor_policy_weight: float = 0.0,
+    anchor_value_weight: float = 0.25,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
@@ -1373,6 +1403,8 @@ def train_population_pool(
         raise ValueError("max_envs must be positive")
     if not 0.0 <= anchor_policy_weight <= 1.0:
         raise ValueError("anchor_policy_weight must be between zero and one")
+    if not 0.0 <= anchor_value_weight <= 1.0:
+        raise ValueError("anchor_value_weight must be between zero and one")
     if anchor_model is candidate:
         raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
     if training.max_replay_epochs <= 0.0:
@@ -1400,6 +1432,7 @@ def train_population_pool(
             "belief_retries": belief_retries,
             "opponent_weights": weights.tolist(),
             "anchor_policy_weight": anchor_policy_weight,
+            "anchor_value_weight": anchor_value_weight,
         },
     )
     candidate.to(device)
@@ -1630,8 +1663,11 @@ def train_population_pool(
                         search.pool.belief_targets_numpy(state_ids), dtype=np.int32
                     )
                     anchor_policy = None
-                    if anchor_model is not None and anchor_policy_weight > 0.0:
-                        anchor_policy = _reference_policy(
+                    anchor_value = None
+                    if anchor_model is not None and (
+                        anchor_policy_weight > 0.0 or anchor_value_weight > 0.0
+                    ):
+                        anchor_policy, anchor_value = _reference_policy_value(
                             anchor_model,
                             candidate_request,
                             device,
@@ -1652,6 +1688,8 @@ def train_population_pool(
                         belief_targets[candidate_rows],
                         anchor_policy=anchor_policy,
                         anchor_policy_weight=anchor_policy_weight,
+                        anchor_value=anchor_value,
+                        anchor_value_weight=anchor_value_weight,
                     )
                     root_values = np.asarray(root["root_value"], dtype=np.float32)
                     for env, example in zip(candidate_rows, candidate_examples):
@@ -1714,6 +1752,9 @@ def train_population_pool(
                 champion_anchor_weight=(
                     anchor_policy_weight if anchor_model is not None else 0.0
                 ),
+                champion_value_anchor_weight=(
+                    anchor_value_weight if anchor_model is not None else 0.0
+                ),
                 champion_anchor_agreement=(
                     anchor_agreements / max(1, anchor_decisions)
                 ),
@@ -1755,6 +1796,9 @@ def train_population_pool(
         "population_pool_candidate_decisions": float(decisions),
         "population_pool_anchor_policy_weight": float(
             anchor_policy_weight if anchor_model is not None else 0.0
+        ),
+        "population_pool_anchor_value_weight": float(
+            anchor_value_weight if anchor_model is not None else 0.0
         ),
         "population_pool_anchor_agreement": float(
             anchor_agreements / max(1, anchor_decisions)

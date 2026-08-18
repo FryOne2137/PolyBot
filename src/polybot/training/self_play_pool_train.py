@@ -94,6 +94,8 @@ def _root_examples(
     belief_targets: np.ndarray,
     anchor_policy: np.ndarray | None = None,
     anchor_policy_weight: float = 0.0,
+    anchor_value: np.ndarray | None = None,
+    anchor_value_weight: float = 0.0,
 ) -> List[TrainingExample]:
     """Create records from public MCTS roots plus training-only belief labels.
 
@@ -167,6 +169,12 @@ def _root_examples(
             action_history=histories[index].astype(np.float32, copy=True),
             action_history_mask=history_masks[index].copy(),
             bridge_priority=bridge_priority,
+            anchor_value_target=(
+                float(anchor_value[index]) if anchor_value is not None else 0.0
+            ),
+            anchor_value_loss_weight=(
+                float(anchor_value_weight) if anchor_value is not None else 0.0
+            ),
         ))
     return examples
 
@@ -456,6 +464,7 @@ def train_self_play_pool(
     model: Optional[PolicyValueBeliefNet] = None,
     anchor_model: Optional[PolicyValueBeliefNet] = None,
     anchor_policy_weight: float = 0.20,
+    anchor_value_weight: float = 0.25,
     reserved_seeds: Sequence[int] = (),
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
@@ -482,6 +491,8 @@ def train_self_play_pool(
         raise ValueError("visible_action_history must be between 0 and 1024")
     if not 0.0 <= anchor_policy_weight <= 1.0:
         raise ValueError("anchor_policy_weight must be between zero and one")
+    if not 0.0 <= anchor_value_weight <= 1.0:
+        raise ValueError("anchor_value_weight must be between zero and one")
     if training.max_replay_epochs <= 0.0:
         raise ValueError("max_replay_epochs must be positive")
     try:
@@ -518,6 +529,7 @@ def train_self_play_pool(
             "visible_action_history": visible_action_history,
             "belief_retries": belief_retries,
             "anchor_policy_weight": anchor_policy_weight,
+            "anchor_value_weight": anchor_value_weight,
             "model_out": model_out,
         },
     )
@@ -1097,7 +1109,10 @@ def train_self_play_pool(
             next_players = np.asarray(request["to_play"], dtype=np.int64)
             belief_targets = np.asarray(pool.belief_targets_numpy(state_ids), dtype=np.int32)
             anchor_policy = None
-            if anchor_model is not None and anchor_policy_weight > 0.0:
+            anchor_value = None
+            if anchor_model is not None and (
+                anchor_policy_weight > 0.0 or anchor_value_weight > 0.0
+            ):
                 with torch.inference_mode():
                     anchor_output = anchor_model(
                         root_tensors.map_tokens, root_tensors.global_features,
@@ -1108,6 +1123,7 @@ def train_self_play_pool(
                         include_belief=False,
                     )
                     anchor_policy = torch.softmax(anchor_output.policy_logits, dim=-1).float().cpu().numpy()
+                    anchor_value = anchor_output.value.float().cpu().numpy()
                 mcts_policy = np.asarray(root["policy"], dtype=np.float32)
                 root_mask = np.asarray(root["action_mask"], dtype=bool)
                 for index in range(num_envs):
@@ -1129,6 +1145,8 @@ def train_self_play_pool(
                 belief_targets,
                 anchor_policy=anchor_policy,
                 anchor_policy_weight=anchor_policy_weight,
+                anchor_value=anchor_value,
+                anchor_value_weight=anchor_value_weight,
             )
             for index, example in enumerate(examples):
                 example.bootstrap_value = float(root_values[index])
@@ -1241,6 +1259,9 @@ def train_self_play_pool(
         "completion_rate": completion_rate,
         "self_play_pool_truncated_roots": float(truncated_roots),
         "self_play_pool_anchor_policy_weight": float(anchor_policy_weight if anchor_model is not None else 0.0),
+        "self_play_pool_anchor_value_weight": float(
+            anchor_value_weight if anchor_model is not None else 0.0
+        ),
         "self_play_pool_anchor_agreement": float(anchor_agreements / max(1, anchor_decisions)),
         "self_play_pool_anchor_mean_l1": float(anchor_l1_sum / max(1, anchor_decisions)),
         "replay_examples": float(len(replay)),

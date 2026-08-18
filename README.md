@@ -111,28 +111,39 @@ python scripts/train_self_play.py \
 
 ## Population league and SQLite history
 
-`scripts/train_league.py` prowadzi cały gorący przebieg w jednym typie natywnego
-`SelfPlayPool`: same-network self-play kandydata, gry przeciw populacji oraz
-sparowane bramki ewaluacyjne. `agent_id` wybiera właściwy checkpoint osobno dla
-każdego gracza, a batche belief i liści są grupowane według modelu i składane z
-powrotem w kolejności oczekiwanej przez silnik. Nie ma tu skalarnych pętli
-`GameEnv` ani krótkotrwałych `MctsPool`. Aktualny champion dostaje stałą część
-losowań, a
+`scripts/train_league.py` zaczyna od szybkiego curriculum bez MCTS w natywnym
+`VectorGameEnv`. Nauczyciel visible-only pokazuje przejmowanie wiosek, ruch do
+widocznych celów, ekonomię i walkę, a następnie actor-critic uczy się z własnych
+akcji. Krótkie, sparowane bramki cofają każdy blok, który pogorszył grę względem
+zamrożonego championa. Dopiero potem kandydat przechodzi szczeble MCTS, np.
+`4,8,16,32,64`; nieudany szczebel jest atomowo cofany.
+
+Gry MCTS przeciw populacji i końcowe sparowane bramki korzystają z natywnego
+`SelfPlayPool`. `agent_id` wybiera właściwy checkpoint osobno dla każdego
+gracza, a batche belief i liści są grupowane według modelu i składane z powrotem
+w kolejności oczekiwanej przez silnik. Nie ma tu krótkotrwałych `MctsPool`.
+Aktualny champion dostaje stałą część losowań, a
 pozostała część jest dzielona metodą PFSP: częściej wybierane są historyczne
 modele, z którymi champion miał słabszy wynik albo których jeszcze nie
 zmierzono. Teacher, bieżący champion i najlepsi wcześniejsi championi tworzą
 ograniczoną przez `--population-size` pulę.
 
-W obu fazach uczących zamrożony champion kotwiczy część targetu policy
-(`--champion-anchor-weight`, domyślnie `0.30`). MCTS nadal wnosi nowe ruchy,
-ale pojedyncza runda z płytkim lub zaszumionym wyszukiwaniem nie może już tak
-łatwo nadpisać dobrej polityki wejściowej. Kotwica jest używana wyłącznie do
-inferencji i nigdy nie trafia do optymalizatora kandydata.
+We wszystkich fazach uczących zamrożony champion kotwiczy politykę i ocenę
+pozycji (`--champion-anchor-weight` oraz
+`--champion-value-anchor-weight`). MCTS nadal wnosi nowe ruchy, ale pojedyncza
+runda z płytkim lub zaszumionym wyszukiwaniem nie może już tak łatwo nadpisać
+dobrej polityki wejściowej ani zniszczyć głowicy value. Kotwica jest używana
+wyłącznie jako target trust-region i nigdy nie trafia do optymalizatora.
 
 Kandydat jest promowany tylko wtedy, gdy jednocześnie pokona aktualnego
 championa, przejdzie dolną granicę ufności, osiągnie wymagany średni wynik
 przeciw populacji i nie spadnie poniżej progu regresji przeciw żadnemu
-zachowanemu stylowi. Odrzucony kandydat nie zastępuje checkpointu championa.
+zachowanemu stylowi. Kandydat z bezpiecznym wynikiem co najmniej `0.50`, który
+nie osiągnął jeszcze progu promocji, jest zachowywany jako `challenger` i dalej
+trenowany w następnej rundzie. Słaby kandydat jest odrzucany, a champion nigdy
+nie jest nadpisywany. Przerwany run można kontynuować przez
+`--challenger-in <checkpoint-challengera>` przy zachowaniu tego samego
+`--champion-in`.
 
 `--league-db models/league/league.sqlite3` zapisuje konfiguracje runów, rundy,
 lineage i sumy SHA-256 checkpointów, dobór przeciwników, wszystkie gry etapu

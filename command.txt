@@ -146,7 +146,7 @@ python scripts/train_league.py `
   --direct-actor-steps 1000 `
   --direct-actor-block-steps 500 `
   --direct-actor-max-steps 5000 `
-  --direct-gate-games 10 `
+  --direct-gate-games 30 `
   --direct-gate-max-moves 700 `
   --direct-gate-score 0.50 `
   --direct-policy-anchor-weight 0.75 `
@@ -170,7 +170,7 @@ python scripts/train_league.py `
   --direct-population-opponent-policy-weight 0.50 `
   --direct-population-teacher-weight 0.25 `
   --direct-population-shaping-weight 0.20 `
-  --mcts-simulation-ladder 4,8,16,32,64 `
+  --mcts-simulation-ladder 16,32,64 `
   --mcts-gate-games 20 `
   --mcts-gate-score 0.50 `
   --rounds 2 `

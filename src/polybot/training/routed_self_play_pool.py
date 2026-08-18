@@ -1325,7 +1325,9 @@ def evaluate_matches_pool(
                 progress_counted[:] = True
             routing.add(search.counters)
             progress.set_postfix(
-                wins=int(totals["model_a_wins"]), draws=int(totals["draws"])
+                wins=int(totals["model_a_wins"]),
+                draws=int(totals["draws"]),
+                losses=int(totals["model_a_losses"]),
             )
     _paired_uncertainty(totals, scores)
     totals["valid"] = 1.0

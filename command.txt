@@ -162,7 +162,7 @@ python scripts/train_league.py `
   --direct-population-steps 2000 `
   --direct-population-block-steps 1000 `
   --direct-population-max-steps 10000 `
-  --direct-population-gate-games 10 `
+  --direct-population-gate-games 30 `
   --direct-population-gate-score 0.50 `
   --direct-population-historical-floor 0.45 `
   --direct-population-readiness-patience 2 `

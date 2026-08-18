@@ -309,6 +309,7 @@ def evaluate_direct_matches(
             progress.set_postfix(
                 wins=int(totals["model_a_wins"]),
                 draws=int(totals["draws"]),
+                losses=int(totals["model_a_losses"]),
             )
     totals["model_a_win_rate"] = totals["model_a_wins"] / max(1.0, float(games))
     totals["model_a_score"] = float(np.mean(scores)) if scores else 0.0

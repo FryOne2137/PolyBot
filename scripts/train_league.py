@@ -132,7 +132,7 @@ def main() -> None:
     parser.add_argument(
         "--direct-population-block-steps", type=int, default=1_000,
     )
-    parser.add_argument("--direct-population-gate-games", type=int, default=10)
+    parser.add_argument("--direct-population-gate-games", type=int, default=30)
     parser.add_argument("--direct-population-gate-score", type=float, default=0.50)
     parser.add_argument(
         "--direct-population-historical-floor", type=float, default=0.45,

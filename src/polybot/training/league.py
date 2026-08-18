@@ -159,7 +159,7 @@ def train_promotion_league(
     direct_population_steps: int = 0,
     direct_population_max_steps: int = 10_000,
     direct_population_block_steps: int = 1_000,
-    direct_population_gate_games: int = 4,
+    direct_population_gate_games: int = 30,
     direct_population_gate_score: float = 0.50,
     direct_population_historical_floor: float = 0.45,
     direct_population_readiness_patience: int = 2,

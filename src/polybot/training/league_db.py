@@ -371,6 +371,17 @@ class LeagueDatabase:
         ).fetchone()
         return None if row is None else dict(row)
 
+    def model_record(self, model_id: int) -> Mapping[str, Any]:
+        """Return immutable lineage metadata needed to choose a curriculum."""
+        row = self.connection.execute(
+            """SELECT id, parent_model_id, status, protected, in_population
+               FROM models WHERE id = ?""",
+            (model_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown model id {model_id}")
+        return dict(row)
+
     def record_mcts_capability(
         self,
         model_id: int,

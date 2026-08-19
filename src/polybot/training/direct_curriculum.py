@@ -13,6 +13,7 @@ from ..evaluation.matches import evaluate_direct_matches
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .run_artifacts import TrainingRun
 from .vector_actor_critic import train_vector_actor_critic
+from .vector_objectives import train_vector_objective_curriculum
 from .vector_teacher import train_vector_teacher
 
 
@@ -99,6 +100,12 @@ def train_direct_policy_curriculum(
     regression_patience: int = 2,
     gate_game_callback: Callable[[str, int, Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
+    objective_envs: int | None = None,
+    objective_steps: int = 0,
+    objective_block_steps: int = 500,
+    objective_rollout_horizon: int = 8,
+    objective_updates_per_rollout: int = 2,
+    objective_teacher_probability: float = 0.35,
 ) -> Dict[str, Any]:
     """Learn visible objectives directly and roll back every regression.
 
@@ -106,7 +113,7 @@ def train_direct_policy_curriculum(
     round. The league's later held-out MCTS gate remains the sole promotion
     authority, so no mini-gate result can replace the champion.
     """
-    if teacher_steps < 0 or actor_steps < 0:
+    if teacher_steps < 0 or objective_steps < 0 or actor_steps < 0:
         raise ValueError("direct curriculum step counts must not be negative")
     if (
         actor_max_steps is not None
@@ -119,8 +126,17 @@ def train_direct_policy_curriculum(
         if actor_max_steps is None or actor_steps == 0
         else int(actor_max_steps)
     )
+    resolved_objective_envs = actor_envs if objective_envs is None else int(objective_envs)
     if teacher_steps and teacher_envs < 1:
         raise ValueError("teacher_envs must be positive when teacher is enabled")
+    if objective_steps and resolved_objective_envs < 1:
+        raise ValueError("objective_envs must be positive when objective training is enabled")
+    if objective_steps and objective_block_steps < 1:
+        raise ValueError("objective_block_steps must be positive when objective training is enabled")
+    if objective_steps and objective_rollout_horizon < 2:
+        raise ValueError("objective_rollout_horizon must be at least two")
+    if objective_steps and objective_updates_per_rollout < 1:
+        raise ValueError("objective_updates_per_rollout must be positive")
     if maximum_actor_steps and actor_envs < 1:
         raise ValueError("actor_envs must be positive when actor is enabled")
     if maximum_actor_steps and actor_block_steps < 1:
@@ -136,6 +152,7 @@ def train_direct_policy_curriculum(
         "gate_score": gate_score,
         "readiness_score": readiness_score,
         "readiness_completion_rate": readiness_completion_rate,
+        "objective_teacher_probability": objective_teacher_probability,
     }.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be between zero and one")
@@ -154,6 +171,12 @@ def train_direct_policy_curriculum(
         stage={
             "teacher_envs": teacher_envs,
             "teacher_steps": teacher_steps,
+            "objective_envs": resolved_objective_envs,
+            "objective_steps": objective_steps,
+            "objective_block_steps": objective_block_steps,
+            "objective_rollout_horizon": objective_rollout_horizon,
+            "objective_updates_per_rollout": objective_updates_per_rollout,
+            "objective_teacher_probability": objective_teacher_probability,
             "actor_envs": actor_envs,
             "actor_steps": actor_steps,
             "actor_max_steps": maximum_actor_steps,
@@ -317,6 +340,45 @@ def train_direct_policy_curriculum(
         )
         gate("teacher", 0)
 
+    # The objective stage uses real short rollouts, so its value update spans
+    # several decisions instead of rewarding only the immediately selected
+    # move. Each block passes through the same fixed gate as all other
+    # curriculum work; a bad block is restored before the next one starts.
+    objective_summaries: list[Dict[str, Any]] = []
+    objective_completed = 0
+    objective_block = 0
+    while objective_completed < objective_steps:
+        objective_block += 1
+        block_steps = min(
+            objective_block_steps, objective_steps - objective_completed
+        )
+        objective_training = replace(
+            training,
+            seed=(int(training.seed) - 1 + 4_000_037 * objective_block)
+            % (2**31 - 1) + 1,
+        )
+        objective_summary = train_vector_objective_curriculum(
+            objective_training,
+            model_config,
+            num_envs=resolved_objective_envs,
+            steps=block_steps,
+            num_threads=num_threads,
+            max_actions=max_actions,
+            rollout_horizon=objective_rollout_horizon,
+            updates_per_rollout=objective_updates_per_rollout,
+            objective_teacher_probability=objective_teacher_probability,
+            teacher_weight=teacher_weight,
+            shaping_weight=shaping_weight,
+            policy_anchor_weight=policy_anchor_weight,
+            value_anchor_weight=value_anchor_weight,
+            model=candidate,
+            anchor_model=champion,
+            run=run.child(f"objectives_{objective_block:03d}"),
+        )
+        objective_summaries.append(objective_summary)
+        objective_completed += block_steps
+        gate("objective", objective_block)
+
     actor_summaries: list[Dict[str, Any]] = []
     completed = 0
     block = 0
@@ -368,6 +430,8 @@ def train_direct_policy_curriculum(
     restore_model_state(candidate, best_state)
     summary: Dict[str, Any] = {
         "direct_teacher_steps": float(teacher_steps),
+        "direct_objective_steps": float(objective_completed),
+        "direct_objective_blocks": float(objective_block),
         "direct_actor_min_steps": float(actor_steps),
         "direct_actor_max_steps": float(maximum_actor_steps),
         "direct_actor_steps": float(completed),
@@ -392,6 +456,7 @@ def train_direct_policy_curriculum(
         "direct_policy_anchor_weight": float(policy_anchor_weight),
         "direct_value_anchor_weight": float(value_anchor_weight),
         "direct_teacher_summary": copy.deepcopy(teacher_summary),
+        "direct_objective_summaries": copy.deepcopy(objective_summaries),
         "direct_actor_summaries": copy.deepcopy(actor_summaries),
         "direct_gate_rows": copy.deepcopy(gate_rows),
     }

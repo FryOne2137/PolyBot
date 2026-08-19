@@ -70,6 +70,7 @@ def train_vector_population(
     opponent_policy_weight: float = 0.50,
     teacher_weight: float = 0.25,
     shaping_weight: float = 0.20,
+    greedy_advantage_weight: float = 0.25,
     entropy_weight: float = 0.004,
     gamma: float = 0.995,
     game_callback: Callable[[Mapping[str, Any]], None] | None = None,
@@ -111,6 +112,8 @@ def train_vector_population(
         "opponent_policy_weight": opponent_policy_weight,
         "teacher_weight": teacher_weight,
         "shaping_weight": shaping_weight,
+        "greedy_advantage_weight": greedy_advantage_weight,
+        "exploration_rate": training.exploration_rate,
     }.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be between zero and one")
@@ -136,6 +139,8 @@ def train_vector_population(
             "opponent_policy_weight": opponent_policy_weight,
             "teacher_weight": teacher_weight,
             "shaping_weight": shaping_weight,
+            "greedy_advantage_weight": greedy_advantage_weight,
+            "exploration_rate": training.exploration_rate,
         },
     )
     candidate.to(device)
@@ -177,9 +182,11 @@ def train_vector_population(
     episode_numbers = np.zeros(num_envs, dtype=np.int64)
     completed_games = wins = losses = draws = 0
     candidate_turns = opponent_turns = 0
+    candidate_exploration_turns = 0
     totals = {
         "loss": 0.0,
         "policy_loss": 0.0,
+        "greedy_advantage_loss": 0.0,
         "opponent_policy_loss": 0.0,
         "value_loss": 0.0,
         "teacher_loss": 0.0,
@@ -236,6 +243,32 @@ def train_vector_population(
                 distribution = Categorical(logits=output.policy_logits)
                 action_rows = distribution.sample()
                 entropy_rows = distribution.entropy()
+
+            # Evaluation is greedy.  Keeping most learner turns greedy makes
+            # the rollout/value targets describe the policy that promotion
+            # actually measures, while the small sampled subset still gives
+            # REINFORCE a genuine exploration signal.  Previously every
+            # candidate action was sampled even with --exploration-rate 0.10,
+            # making this otherwise supervised population phase needlessly
+            # noisy and unlike its own held-out gate.
+            exploratory_rows = np.zeros(num_envs, dtype=bool)
+            if candidate_rows.size:
+                exploratory_rows[candidate_rows] = (
+                    rng.random(candidate_rows.size)
+                    < float(training.exploration_rate)
+                )
+                exploit_rows = candidate_rows[~exploratory_rows[candidate_rows]]
+                if exploit_rows.size:
+                    exploit_index = torch.as_tensor(
+                        exploit_rows, dtype=torch.long, device=device
+                    )
+                    greedy_rows = output.policy_logits.argmax(dim=-1)
+                    action_rows.index_copy_(
+                        0,
+                        exploit_index,
+                        greedy_rows.index_select(0, exploit_index),
+                    )
+            candidate_exploration_turns += int(exploratory_rows.sum())
 
             # Keep distillation targets in fp32 even when the candidate
             # forward pass is autocast to fp16. Frozen opponents run outside
@@ -330,9 +363,10 @@ def train_vector_population(
                 log_probabilities,
                 torch.zeros_like(log_probabilities),
             )
-            if candidate_rows.size:
+            exploratory_candidate_rows = np.flatnonzero(exploratory_rows)
+            if exploratory_candidate_rows.size:
                 candidate_index = torch.as_tensor(
-                    candidate_rows, dtype=torch.long, device=device
+                    exploratory_candidate_rows, dtype=torch.long, device=device
                 )
                 candidate_advantage = _normalise_advantage(
                     advantage.index_select(0, candidate_index)
@@ -350,6 +384,28 @@ def train_vector_population(
             else:
                 policy_loss = output.value.sum() * 0.0
                 entropy = output.value.sum() * 0.0
+            greedy_candidate_rows = candidate_rows[
+                ~exploratory_rows[candidate_rows]
+            ]
+            if greedy_candidate_rows.size:
+                greedy_index = torch.as_tensor(
+                    greedy_candidate_rows, dtype=torch.long, device=device
+                )
+                greedy_actions = action_rows.index_select(0, greedy_index)
+                greedy_log_probability = valid_log_probabilities.index_select(
+                    0, greedy_index
+                ).gather(1, greedy_actions.unsqueeze(1)).squeeze(1)
+                # Greedy rows match evaluation. Reinforce only a positive TD
+                # advantage, so the stable rollout mode can improve rather
+                # than merely preserve frozen-policy targets.
+                positive_advantage = advantage.index_select(
+                    0, greedy_index
+                ).detach().clamp(min=0.0, max=1.0)
+                greedy_advantage_loss = -(
+                    greedy_log_probability * positive_advantage
+                ).mean()
+            else:
+                greedy_advantage_loss = output.value.sum() * 0.0
             if opponent_rows.size:
                 opponent_index_tensor = torch.as_tensor(
                     opponent_rows, dtype=torch.long, device=device
@@ -374,6 +430,7 @@ def train_vector_population(
             )
             loss = (
                 policy_loss
+                + greedy_advantage_weight * greedy_advantage_loss
                 + opponent_policy_weight * opponent_policy_loss
                 + 0.50 * value_loss
                 + teacher_weight * teacher_loss
@@ -430,6 +487,9 @@ def train_vector_population(
             metrics = {
                 "loss": float(loss.detach().cpu()),
                 "policy_loss": float(policy_loss.detach().cpu()),
+                "greedy_advantage_loss": float(
+                    greedy_advantage_loss.detach().cpu()
+                ),
                 "opponent_policy_loss": float(
                     opponent_policy_loss.detach().cpu()
                 ),
@@ -453,6 +513,7 @@ def train_vector_population(
                 candidate_losses=losses,
                 draws=draws,
                 candidate_turns=candidate_turns,
+                candidate_exploration_turns=candidate_exploration_turns,
                 opponent_turns=opponent_turns,
                 **metrics,
             )
@@ -476,6 +537,12 @@ def train_vector_population(
             (wins + 0.5 * draws) / max(1, completed_games)
         ),
         "direct_population_candidate_turns": float(candidate_turns),
+        "direct_population_candidate_exploration_turns": float(
+            candidate_exploration_turns
+        ),
+        "direct_population_effective_exploration_rate": float(
+            candidate_exploration_turns / max(1, candidate_turns)
+        ),
         "direct_population_opponent_turns": float(opponent_turns),
         **{
             "direct_population_" + key: value / max(1, steps)
@@ -555,6 +622,75 @@ def evaluate_direct_population_matches(
     }
 
 
+def _population_objective_progress(
+    city_captures_per_game: float,
+    completion_rate: float,
+) -> float:
+    """Combine auxiliary objectives without making either a hard gate."""
+    return float(city_captures_per_game) + float(completion_rate)
+
+
+def _population_block_acceptance(
+    *,
+    baseline: bool,
+    weighted_score: float,
+    worst_score: float,
+    objective_progress: float,
+    best_score: float,
+    best_objective_progress: float,
+    historical_score_floor: float,
+    score_tolerance: float,
+    objective_tolerance: float,
+) -> tuple[bool, str]:
+    """Select a population checkpoint using strength as the primary metric.
+
+    A Pareto rule over score, worst opponent, captures and completion made a
+    useful policy update almost impossible to accept: improving a win often
+    changes the route and therefore a secondary visible-objective metric.
+    The hard safety property is the historical floor.  Above it, score wins;
+    equally strong policies can use the visible objectives as a tie-breaker.
+    """
+    if baseline:
+        return True, "baseline"
+    if worst_score < historical_score_floor:
+        return False, "historical_floor"
+    if weighted_score > best_score + 1e-8:
+        return True, "score_improved"
+    if weighted_score < best_score - score_tolerance:
+        return False, "score_regression"
+    if objective_progress >= best_objective_progress - objective_tolerance:
+        return True, "score_tied_or_close"
+    return False, "objective_regression"
+
+
+def _population_block_selects_checkpoint(
+    *,
+    baseline: bool,
+    weighted_score: float,
+    objective_progress: float,
+    best_score: float,
+    best_objective_progress: float,
+) -> tuple[bool, str]:
+    """Return whether a safe block becomes the final selected checkpoint.
+
+    ``_population_block_acceptance`` intentionally has a small tolerance so
+    noisy, nearly-equal gate results do not terminate the curriculum early.
+    That tolerance must *not* let a slightly weaker checkpoint overwrite the
+    real high-water mark.  A checkpoint is therefore selected only for a
+    strict score improvement, or for a score tie with better visible progress.
+    """
+    if baseline:
+        return True, "baseline"
+    if weighted_score > best_score + 1e-8:
+        return True, "score_improved"
+    if (
+        abs(weighted_score - best_score) <= 1e-8
+        and objective_progress > best_objective_progress + 1e-8
+    ):
+        return True, "score_tie_objective_improved"
+    return False, "safe_but_not_best"
+
+
 def train_direct_population_curriculum(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -581,7 +717,10 @@ def train_direct_population_curriculum(
     opponent_policy_weight: float,
     teacher_weight: float,
     shaping_weight: float,
+    greedy_advantage_weight: float = 0.25,
     regression_patience: int = 2,
+    score_tolerance: float = 0.02,
+    objective_tolerance: float = 0.05,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -599,6 +738,12 @@ def train_direct_population_curriculum(
         raise ValueError("readiness_patience must be positive")
     if regression_patience < 1:
         raise ValueError("regression_patience must be positive")
+    if not 0.0 <= greedy_advantage_weight <= 1.0:
+        raise ValueError(
+            "greedy_advantage_weight must be between zero and one"
+        )
+    if score_tolerance < 0.0 or objective_tolerance < 0.0:
+        raise ValueError("population acceptance tolerances must not be negative")
     weights = np.asarray(opponent_weights, dtype=np.float64)
     if (
         weights.shape != (len(opponent_models),)
@@ -629,12 +774,15 @@ def train_direct_population_curriculum(
             "readiness_completion_rate": readiness_completion_rate,
             "readiness_patience": readiness_patience,
             "regression_patience": regression_patience,
+            "score_tolerance": score_tolerance,
+            "objective_tolerance": objective_tolerance,
             "opponent_weights": weights.tolist(),
             "policy_anchor_weight": policy_anchor_weight,
             "value_anchor_weight": value_anchor_weight,
             "opponent_policy_weight": opponent_policy_weight,
             "teacher_weight": teacher_weight,
             "shaping_weight": shaping_weight,
+            "greedy_advantage_weight": greedy_advantage_weight,
         },
     )
     best_state = model_state_on_cpu(candidate)
@@ -642,10 +790,11 @@ def train_direct_population_curriculum(
     best_worst_score = 0.0
     best_capture_rate = 0.0
     best_completion_rate = 0.0
+    best_objective_progress = 0.0
     readiness_streak = 0
     ready = False
     best_meets_readiness = False
-    accepted_blocks = rollback_blocks = 0
+    accepted_blocks = selected_blocks = rollback_blocks = 0
     consecutive_regressions = 0
     maximum_consecutive_regressions = 0
     gate_rows: list[Dict[str, Any]] = []
@@ -653,7 +802,9 @@ def train_direct_population_curriculum(
     def gate(label: str, block: int, baseline: bool = False) -> bool:
         nonlocal best_state, best_score, best_worst_score
         nonlocal best_capture_rate, best_completion_rate
-        nonlocal readiness_streak, ready, accepted_blocks, rollback_blocks
+        nonlocal best_objective_progress
+        nonlocal readiness_streak, ready, accepted_blocks, selected_blocks
+        nonlocal rollback_blocks
         nonlocal best_meets_readiness
         nonlocal consecutive_regressions, maximum_consecutive_regressions
         evaluation = evaluate_direct_population_matches(
@@ -678,27 +829,54 @@ def train_direct_population_curriculum(
             evaluation["model_a_city_captures_per_game"]
         )
         completion_rate = float(evaluation["completion_rate"])
-        accepted = baseline or (
-            weighted_score >= best_score
-            and worst_score >= best_worst_score
-            and capture_rate >= best_capture_rate
-            and completion_rate >= best_completion_rate
+        objective_progress = _population_objective_progress(
+            capture_rate, completion_rate
         )
+        accepted, acceptance_reason = _population_block_acceptance(
+            baseline=baseline,
+            weighted_score=weighted_score,
+            worst_score=worst_score,
+            objective_progress=objective_progress,
+            best_score=best_score,
+            best_objective_progress=best_objective_progress,
+            historical_score_floor=historical_score_floor,
+            score_tolerance=score_tolerance,
+            objective_tolerance=objective_tolerance,
+        )
+        selected, selection_reason = _population_block_selects_checkpoint(
+            baseline=baseline,
+            weighted_score=weighted_score,
+            objective_progress=objective_progress,
+            best_score=best_score,
+            best_objective_progress=best_objective_progress,
+        )
+        if not accepted:
+            selected = False
+            selection_reason = "not_accepted"
         if accepted:
-            best_state = model_state_on_cpu(candidate)
-            best_score = weighted_score
-            best_worst_score = worst_score
-            best_capture_rate = capture_rate
-            best_completion_rate = completion_rate
             if not baseline:
                 accepted_blocks += 1
+            if selected:
+                best_state = model_state_on_cpu(candidate)
+                best_score = weighted_score
+                best_worst_score = worst_score
+                best_capture_rate = capture_rate
+                best_completion_rate = completion_rate
+                best_objective_progress = objective_progress
+                if not baseline:
+                    selected_blocks += 1
+            elif not baseline:
+                # Safe near-ties keep the phase alive, but training resumes
+                # from the actual strongest model rather than accumulating
+                # several tolerated score drops.
+                restore_model_state(candidate, best_state)
             if baseline:
                 # Baseline protects the input checkpoint but does not count as
                 # a successful population-training block.
                 best_meets_readiness = False
                 readiness_streak = 0
                 ready = False
-            else:
+            elif selected:
                 meets = (
                     weighted_score >= gate_score
                     and worst_score >= historical_score_floor
@@ -724,7 +902,11 @@ def train_direct_population_curriculum(
             "worst_score": worst_score,
             "city_captures_per_game": capture_rate,
             "completion_rate": completion_rate,
+            "objective_progress": objective_progress,
             "accepted": float(accepted),
+            "acceptance_reason": acceptance_reason,
+            "selected": float(selected),
+            "selection_reason": selection_reason,
             "ready": float(ready),
             "best_meets_readiness": float(best_meets_readiness),
             "readiness_streak": float(readiness_streak),
@@ -737,7 +919,11 @@ def train_direct_population_curriculum(
             direct_population_gate_worst=worst_score,
             direct_population_gate_captures=capture_rate,
             direct_population_gate_completion=completion_rate,
+            direct_population_gate_objective_progress=objective_progress,
             direct_population_gate_accepted=float(accepted),
+            direct_population_gate_acceptance_reason=acceptance_reason,
+            direct_population_gate_selected=float(selected),
+            direct_population_gate_selection_reason=selection_reason,
             direct_population_ready=float(ready),
             direct_population_best_meets_readiness=float(
                 best_meets_readiness
@@ -781,6 +967,7 @@ def train_direct_population_curriculum(
             opponent_policy_weight=opponent_policy_weight,
             teacher_weight=teacher_weight,
             shaping_weight=shaping_weight,
+            greedy_advantage_weight=greedy_advantage_weight,
             game_callback=(
                 None
                 if training_game_callback is None
@@ -794,7 +981,8 @@ def train_direct_population_curriculum(
         completed += current_steps
         accepted = gate("population", block)
         if (
-            not accepted
+            completed >= minimum_steps
+            and not accepted
             and consecutive_regressions >= regression_patience
         ):
             early_stopped = True
@@ -815,7 +1003,16 @@ def train_direct_population_curriculum(
         "direct_population_best_worst_score": float(best_worst_score),
         "direct_population_best_city_captures_per_game": float(best_capture_rate),
         "direct_population_best_completion_rate": float(best_completion_rate),
+        "direct_population_best_objective_progress": float(
+            best_objective_progress
+        ),
+        "direct_population_score_tolerance": float(score_tolerance),
+        "direct_population_objective_tolerance": float(objective_tolerance),
+        "direct_population_greedy_advantage_weight": float(
+            greedy_advantage_weight
+        ),
         "direct_population_accepted_blocks": float(accepted_blocks),
+        "direct_population_selected_blocks": float(selected_blocks),
         "direct_population_rollback_blocks": float(rollback_blocks),
         "direct_population_regression_patience": float(
             regression_patience

@@ -88,6 +88,21 @@ def main() -> None:
         "--direct-teacher-steps", type=int, default=2_000,
         help="Fast visible-objective imitation steps before MCTS",
     )
+    parser.add_argument(
+        "--direct-objective-envs", type=int, default=128,
+        help="Parallel native environments for short multi-step objective rollouts",
+    )
+    parser.add_argument(
+        "--direct-objective-steps", type=int, default=1_000,
+        help="Short-horizon objective steps before unrestricted flat self-play",
+    )
+    parser.add_argument("--direct-objective-block-steps", type=int, default=500)
+    parser.add_argument("--direct-objective-rollout-horizon", type=int, default=8)
+    parser.add_argument("--direct-objective-updates-per-rollout", type=int, default=2)
+    parser.add_argument(
+        "--direct-objective-teacher-probability", type=float, default=0.35,
+        help="Legal objective-teacher fraction while collecting short rollouts",
+    )
     parser.add_argument("--direct-actor-envs", type=int, default=128)
     parser.add_argument(
         "--direct-actor-steps", type=int, default=1_000,
@@ -152,6 +167,31 @@ def main() -> None:
     )
     parser.add_argument(
         "--direct-population-shaping-weight", type=float, default=0.20,
+    )
+    parser.add_argument(
+        "--post-bootstrap-population-steps", type=int, default=6_000,
+        help="Minimum champion-population steps after the first promotion",
+    )
+    parser.add_argument(
+        "--post-bootstrap-population-max-steps", type=int, default=12_000,
+        help="Maximum champion-population steps after the first promotion",
+    )
+    parser.add_argument(
+        "--post-bootstrap-objective-steps", type=int, default=500,
+        help="Conservative multi-step objective refresh for an established champion",
+    )
+    parser.add_argument(
+        "--post-bootstrap-champion-probability", type=float, default=0.65,
+        help="Current-champion share in post-bootstrap population training",
+    )
+    parser.add_argument(
+        "--post-bootstrap-policy-anchor-weight", type=float, default=0.35,
+    )
+    parser.add_argument(
+        "--post-bootstrap-teacher-weight", type=float, default=0.02,
+    )
+    parser.add_argument(
+        "--post-bootstrap-opponent-policy-weight", type=float, default=0.65,
     )
     parser.add_argument(
         "--champion-mode",
@@ -260,6 +300,16 @@ def main() -> None:
         champion_value_anchor_weight=args.champion_value_anchor_weight,
         direct_teacher_envs=args.direct_teacher_envs,
         direct_teacher_steps=args.direct_teacher_steps,
+        direct_objective_envs=args.direct_objective_envs,
+        direct_objective_steps=args.direct_objective_steps,
+        direct_objective_block_steps=args.direct_objective_block_steps,
+        direct_objective_rollout_horizon=args.direct_objective_rollout_horizon,
+        direct_objective_updates_per_rollout=(
+            args.direct_objective_updates_per_rollout
+        ),
+        direct_objective_teacher_probability=(
+            args.direct_objective_teacher_probability
+        ),
         direct_actor_envs=args.direct_actor_envs,
         direct_actor_steps=args.direct_actor_steps,
         direct_actor_block_steps=args.direct_actor_block_steps,
@@ -303,6 +353,23 @@ def main() -> None:
         ),
         direct_population_shaping_weight=(
             args.direct_population_shaping_weight
+        ),
+        post_bootstrap_population_steps=(
+            args.post_bootstrap_population_steps
+        ),
+        post_bootstrap_population_max_steps=(
+            args.post_bootstrap_population_max_steps
+        ),
+        post_bootstrap_objective_steps=args.post_bootstrap_objective_steps,
+        post_bootstrap_champion_probability=(
+            args.post_bootstrap_champion_probability
+        ),
+        post_bootstrap_policy_anchor_weight=(
+            args.post_bootstrap_policy_anchor_weight
+        ),
+        post_bootstrap_teacher_weight=args.post_bootstrap_teacher_weight,
+        post_bootstrap_opponent_policy_weight=(
+            args.post_bootstrap_opponent_policy_weight
         ),
         champion_mode=args.champion_mode,
         mcts_probe_games=args.mcts_probe_games,

@@ -102,6 +102,113 @@ def _mcts_probe_passed(
     )
 
 
+def _champion_focused_probabilities(
+    population_ids: Sequence[int],
+    probabilities: Sequence[float],
+    champion_id: int,
+    *,
+    champion_probability: float,
+    probability_floor: float,
+) -> list[float]:
+    """Raise the current champion's training share without dropping a rival.
+
+    Once a model has earned a promotion, learning has to be driven mainly by
+    the policy it must now beat.  Historical models retain at least the PFSP
+    floor, so this is focused self-play rather than forgetting the population.
+    """
+    result = [float(value) for value in probabilities]
+    if len(population_ids) != len(result):
+        raise ValueError("population ids and probabilities must have equal length")
+    try:
+        champion_index = list(population_ids).index(champion_id)
+    except ValueError as error:
+        raise ValueError("current champion is missing from population") from error
+    other_indices = [
+        index for index in range(len(result)) if index != champion_index
+    ]
+    if not other_indices:
+        return [1.0]
+    if not 0.0 <= probability_floor <= 1.0:
+        raise ValueError("probability_floor must be between zero and one")
+    maximum_champion_probability = 1.0 - len(other_indices) * probability_floor
+    if champion_probability > maximum_champion_probability + 1e-8:
+        raise ValueError(
+            "post-bootstrap champion probability leaves no PFSP floor for rivals"
+        )
+    if result[champion_index] >= champion_probability:
+        return result
+    remaining = 1.0 - champion_probability
+    free_mass = remaining - len(other_indices) * probability_floor
+    old_other_mass = sum(result[index] for index in other_indices)
+    if old_other_mass <= 0.0:
+        shares = [1.0 / len(other_indices)] * len(other_indices)
+    else:
+        shares = [result[index] / old_other_mass for index in other_indices]
+    result[champion_index] = champion_probability
+    for index, share in zip(other_indices, shares):
+        result[index] = probability_floor + free_mass * share
+    return result
+
+
+def _curriculum_controls(
+    *,
+    champion_status: str,
+    direct_teacher_steps: int,
+    direct_actor_steps: int,
+    direct_actor_max_steps: int,
+    direct_population_steps: int,
+    direct_population_max_steps: int,
+    direct_policy_anchor_weight: float,
+    direct_population_teacher_weight: float,
+    direct_population_opponent_policy_weight: float,
+    post_bootstrap_population_steps: int,
+    post_bootstrap_population_max_steps: int,
+    post_bootstrap_policy_anchor_weight: float,
+    post_bootstrap_teacher_weight: float,
+    post_bootstrap_opponent_policy_weight: float,
+    direct_objective_steps: int = 0,
+    post_bootstrap_objective_steps: int = 0,
+) -> Dict[str, float | int | str | bool]:
+    """Select bootstrap or champion-focused raw-policy training.
+
+    The teacher is valuable only until a model has earned its first league
+    promotion.  Reapplying it to an established champion lineage repeatedly
+    trains the candidate to beat the teacher rather than its current parent.
+    """
+    post_bootstrap = champion_status == "promoted"
+    if post_bootstrap:
+        return {
+            "phase": "champion_population",
+            "post_bootstrap": True,
+            "teacher_steps": 0,
+            "objective_steps": post_bootstrap_objective_steps,
+            "actor_steps": 0,
+            "actor_max_steps": 0,
+            "population_steps": post_bootstrap_population_steps,
+            "population_max_steps": post_bootstrap_population_max_steps,
+            "policy_anchor_weight": post_bootstrap_policy_anchor_weight,
+            "population_teacher_weight": post_bootstrap_teacher_weight,
+            "population_opponent_policy_weight": (
+                post_bootstrap_opponent_policy_weight
+            ),
+        }
+    return {
+        "phase": "bootstrap",
+        "post_bootstrap": False,
+        "teacher_steps": direct_teacher_steps,
+        "objective_steps": direct_objective_steps,
+        "actor_steps": direct_actor_steps,
+        "actor_max_steps": direct_actor_max_steps,
+        "population_steps": direct_population_steps,
+        "population_max_steps": direct_population_max_steps,
+        "policy_anchor_weight": direct_policy_anchor_weight,
+        "population_teacher_weight": direct_population_teacher_weight,
+        "population_opponent_policy_weight": (
+            direct_population_opponent_policy_weight
+        ),
+    }
+
+
 def _validate_options(
     *,
     rounds: int,
@@ -195,6 +302,12 @@ def train_promotion_league(
     champion_value_anchor_weight: float = 0.25,
     direct_teacher_envs: int = 128,
     direct_teacher_steps: int = 0,
+    direct_objective_envs: int = 128,
+    direct_objective_steps: int = 0,
+    direct_objective_block_steps: int = 500,
+    direct_objective_rollout_horizon: int = 8,
+    direct_objective_updates_per_rollout: int = 2,
+    direct_objective_teacher_probability: float = 0.35,
     direct_actor_envs: int = 128,
     direct_actor_steps: int = 0,
     direct_actor_block_steps: int = 250,
@@ -223,6 +336,13 @@ def train_promotion_league(
     direct_population_opponent_policy_weight: float = 0.50,
     direct_population_teacher_weight: float = 0.25,
     direct_population_shaping_weight: float = 0.20,
+    post_bootstrap_population_steps: int = 6_000,
+    post_bootstrap_population_max_steps: int = 12_000,
+    post_bootstrap_objective_steps: int = 0,
+    post_bootstrap_champion_probability: float = 0.65,
+    post_bootstrap_policy_anchor_weight: float = 0.35,
+    post_bootstrap_teacher_weight: float = 0.02,
+    post_bootstrap_opponent_policy_weight: float = 0.65,
     champion_mode: str = "flat",
     mcts_probe_games: int = 10,
     mcts_probe_simulations: int = 32,
@@ -297,6 +417,9 @@ def train_promotion_league(
         "direct_value_anchor_weight": direct_value_anchor_weight,
         "direct_teacher_weight": direct_teacher_weight,
         "direct_shaping_weight": direct_shaping_weight,
+        "direct_objective_teacher_probability": (
+            direct_objective_teacher_probability
+        ),
         "direct_readiness_score": direct_readiness_score,
         "direct_readiness_completion_rate": direct_readiness_completion_rate,
         "direct_population_gate_score": direct_population_gate_score,
@@ -322,6 +445,17 @@ def train_promotion_league(
         raise ValueError(
             "direct_readiness_city_captures_per_game must not be negative"
         )
+    if direct_objective_steps < 0 or post_bootstrap_objective_steps < 0:
+        raise ValueError("objective curriculum steps must not be negative")
+    if (direct_objective_steps or post_bootstrap_objective_steps) and (
+        direct_objective_envs < 1
+        or direct_objective_block_steps < 1
+        or direct_objective_rollout_horizon < 2
+        or direct_objective_updates_per_rollout < 1
+    ):
+        raise ValueError(
+            "objective curriculum requires positive envs/blocks/updates and horizon >= 2"
+        )
     if direct_actor_max_steps < direct_actor_steps:
         raise ValueError(
             "direct_actor_max_steps must not be smaller than direct_actor_steps"
@@ -336,7 +470,27 @@ def train_promotion_league(
         raise ValueError(
             "direct_population_max_steps must not be smaller than its minimum"
         )
-    if direct_population_steps and (
+    if post_bootstrap_population_steps < 0:
+        raise ValueError("post_bootstrap_population_steps must not be negative")
+    if post_bootstrap_population_max_steps < post_bootstrap_population_steps:
+        raise ValueError(
+            "post_bootstrap_population_max_steps must not be smaller than its minimum"
+        )
+    for name, value in {
+        "post_bootstrap_champion_probability": (
+            post_bootstrap_champion_probability
+        ),
+        "post_bootstrap_policy_anchor_weight": (
+            post_bootstrap_policy_anchor_weight
+        ),
+        "post_bootstrap_teacher_weight": post_bootstrap_teacher_weight,
+        "post_bootstrap_opponent_policy_weight": (
+            post_bootstrap_opponent_policy_weight
+        ),
+    }.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between zero and one")
+    if (direct_population_steps or post_bootstrap_population_steps) and (
         direct_population_envs < 2 or direct_population_block_steps < 1
     ):
         raise ValueError(
@@ -422,6 +576,16 @@ def train_promotion_league(
         "belief_retries": belief_retries,
         "direct_teacher_envs": direct_teacher_envs,
         "direct_teacher_steps": direct_teacher_steps,
+        "direct_objective_envs": direct_objective_envs,
+        "direct_objective_steps": direct_objective_steps,
+        "direct_objective_block_steps": direct_objective_block_steps,
+        "direct_objective_rollout_horizon": direct_objective_rollout_horizon,
+        "direct_objective_updates_per_rollout": (
+            direct_objective_updates_per_rollout
+        ),
+        "direct_objective_teacher_probability": (
+            direct_objective_teacher_probability
+        ),
         "direct_actor_envs": direct_actor_envs,
         "direct_actor_steps": direct_actor_steps,
         "direct_actor_block_steps": direct_actor_block_steps,
@@ -460,6 +624,21 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "post_bootstrap_population_steps": post_bootstrap_population_steps,
+        "post_bootstrap_population_max_steps": (
+            post_bootstrap_population_max_steps
+        ),
+        "post_bootstrap_objective_steps": post_bootstrap_objective_steps,
+        "post_bootstrap_champion_probability": (
+            post_bootstrap_champion_probability
+        ),
+        "post_bootstrap_policy_anchor_weight": (
+            post_bootstrap_policy_anchor_weight
+        ),
+        "post_bootstrap_teacher_weight": post_bootstrap_teacher_weight,
+        "post_bootstrap_opponent_policy_weight": (
+            post_bootstrap_opponent_policy_weight
+        ),
         "champion_mode": champion_mode,
         "mcts_probe_games": mcts_probe_games,
         "mcts_probe_simulations": mcts_probe_simulations,
@@ -600,9 +779,98 @@ def train_promotion_league(
                         champion_probability=champion_probability,
                         probability_floor=minimum_sampling_probability,
                     )
+                    champion_record = database.model_record(champion_id)
+                    controls = _curriculum_controls(
+                        champion_status=str(champion_record["status"]),
+                        direct_teacher_steps=direct_teacher_steps,
+                        direct_actor_steps=direct_actor_steps,
+                        direct_actor_max_steps=direct_actor_max_steps,
+                        direct_population_steps=direct_population_steps,
+                        direct_population_max_steps=direct_population_max_steps,
+                        direct_policy_anchor_weight=direct_policy_anchor_weight,
+                        direct_population_teacher_weight=(
+                            direct_population_teacher_weight
+                        ),
+                        direct_population_opponent_policy_weight=(
+                            direct_population_opponent_policy_weight
+                        ),
+                        post_bootstrap_population_steps=(
+                            post_bootstrap_population_steps
+                        ),
+                        post_bootstrap_population_max_steps=(
+                            post_bootstrap_population_max_steps
+                        ),
+                        post_bootstrap_policy_anchor_weight=(
+                            post_bootstrap_policy_anchor_weight
+                        ),
+                        post_bootstrap_teacher_weight=(
+                            post_bootstrap_teacher_weight
+                        ),
+                        post_bootstrap_opponent_policy_weight=(
+                            post_bootstrap_opponent_policy_weight
+                        ),
+                        direct_objective_steps=direct_objective_steps,
+                        post_bootstrap_objective_steps=(
+                            post_bootstrap_objective_steps
+                        ),
+                    )
+                    post_bootstrap = bool(controls["post_bootstrap"])
+                    if post_bootstrap:
+                        probabilities = _champion_focused_probabilities(
+                            population_ids,
+                            probabilities,
+                            champion_id,
+                            champion_probability=(
+                                post_bootstrap_champion_probability
+                            ),
+                            probability_floor=minimum_sampling_probability,
+                        )
+                    effective_teacher_steps = int(controls["teacher_steps"])
+                    effective_objective_steps = int(controls["objective_steps"])
+                    effective_actor_steps = int(controls["actor_steps"])
+                    effective_actor_max_steps = int(
+                        controls["actor_max_steps"]
+                    )
+                    effective_population_steps = int(
+                        controls["population_steps"]
+                    )
+                    effective_population_max_steps = int(
+                        controls["population_max_steps"]
+                    )
+                    effective_policy_anchor_weight = float(
+                        controls["policy_anchor_weight"]
+                    )
+                    effective_population_teacher_weight = float(
+                        controls["population_teacher_weight"]
+                    )
+                    effective_population_opponent_policy_weight = float(
+                        controls["population_opponent_policy_weight"]
+                    )
                     database.record_opponent_selection(
                         round_id, population_ids, probabilities, reference_scores
                     )
+                    curriculum_phase = str(controls["phase"])
+                    round_training_summary["curriculum"] = {
+                        "phase": curriculum_phase,
+                        "teacher_steps": float(effective_teacher_steps),
+                        "objective_steps": float(effective_objective_steps),
+                        "actor_steps": float(effective_actor_steps),
+                        "population_min_steps": float(
+                            effective_population_steps
+                        ),
+                        "population_max_steps": float(
+                            effective_population_max_steps
+                        ),
+                        "policy_anchor_weight": float(
+                            effective_policy_anchor_weight
+                        ),
+                        "population_teacher_weight": float(
+                            effective_population_teacher_weight
+                        ),
+                        "population_opponent_policy_weight": float(
+                            effective_population_opponent_policy_weight
+                        ),
+                    }
                     population_training_seed = _offset_seed(
                         round_training.seed, 5_000_003
                     )
@@ -695,9 +963,22 @@ def train_promotion_league(
                         ),
                         flush=True,
                     )
+                    if post_bootstrap:
+                        print(
+                            "league curriculum | champion-population | "
+                            "teacher/actor skipped | "
+                            f"objectives={effective_objective_steps} | "
+                            f"population={effective_population_steps}-"
+                            f"{effective_population_max_steps} steps",
+                            flush=True,
+                        )
 
                     direct_summary: Dict[str, Any] = {}
-                    if direct_teacher_steps or direct_actor_steps:
+                    if (
+                        effective_teacher_steps
+                        or effective_objective_steps
+                        or effective_actor_steps
+                    ):
                         def record_direct_gate_game(
                             stage: str,
                             block: int,
@@ -721,20 +1002,41 @@ def train_promotion_league(
                             candidate,
                             champion,
                             teacher_envs=direct_teacher_envs,
-                            teacher_steps=direct_teacher_steps,
+                            teacher_steps=effective_teacher_steps,
+                            objective_envs=direct_objective_envs,
+                            objective_steps=effective_objective_steps,
+                            objective_block_steps=direct_objective_block_steps,
+                            objective_rollout_horizon=(
+                                direct_objective_rollout_horizon
+                            ),
+                            objective_updates_per_rollout=(
+                                direct_objective_updates_per_rollout
+                            ),
+                            objective_teacher_probability=(
+                                min(
+                                    direct_objective_teacher_probability,
+                                    0.15,
+                                )
+                                if post_bootstrap
+                                else direct_objective_teacher_probability
+                            ),
                             actor_envs=direct_actor_envs,
-                            actor_steps=direct_actor_steps,
+                            actor_steps=effective_actor_steps,
                             actor_block_steps=direct_actor_block_steps,
-                            actor_max_steps=direct_actor_max_steps,
+                            actor_max_steps=effective_actor_max_steps,
                             num_threads=num_threads,
                             max_actions=mcts.native_max_actions,
                             gate_games=direct_gate_games,
                             gate_seed=direct_gate_seed,
                             gate_max_moves=direct_gate_max_moves,
                             gate_score=direct_gate_score,
-                            policy_anchor_weight=direct_policy_anchor_weight,
+                            policy_anchor_weight=effective_policy_anchor_weight,
                             value_anchor_weight=direct_value_anchor_weight,
-                            teacher_weight=direct_teacher_weight,
+                            teacher_weight=(
+                                min(direct_teacher_weight, 0.10)
+                                if post_bootstrap
+                                else direct_teacher_weight
+                            ),
                             shaping_weight=direct_shaping_weight,
                             readiness_score=direct_readiness_score,
                             readiness_city_captures_per_game=(
@@ -753,7 +1055,9 @@ def train_promotion_league(
                     round_training_summary["direct"] = direct_summary
 
                     direct_enabled = bool(
-                        direct_teacher_steps or direct_actor_steps
+                        effective_teacher_steps
+                        or effective_objective_steps
+                        or effective_actor_steps
                     )
                     direct_ready = (
                         not direct_enabled
@@ -869,7 +1173,7 @@ def train_promotion_league(
                         frozen_models.append(frozen_model.eval())
 
                     direct_population_summary: Dict[str, Any] = {}
-                    if direct_population_steps:
+                    if effective_population_steps:
                         def record_direct_population_gate_game(
                             stage: str,
                             block: int,
@@ -922,8 +1226,8 @@ def train_promotion_league(
                                 frozen_models,
                                 probabilities,
                                 num_envs=direct_population_envs,
-                                minimum_steps=direct_population_steps,
-                                maximum_steps=direct_population_max_steps,
+                                minimum_steps=effective_population_steps,
+                                maximum_steps=effective_population_max_steps,
                                 block_steps=direct_population_block_steps,
                                 num_threads=num_threads,
                                 max_actions=mcts.native_max_actions,
@@ -946,16 +1250,16 @@ def train_promotion_league(
                                     direct_population_regression_patience
                                 ),
                                 policy_anchor_weight=(
-                                    direct_policy_anchor_weight
+                                    effective_policy_anchor_weight
                                 ),
                                 value_anchor_weight=(
                                     direct_value_anchor_weight
                                 ),
                                 opponent_policy_weight=(
-                                    direct_population_opponent_policy_weight
+                                    effective_population_opponent_policy_weight
                                 ),
                                 teacher_weight=(
-                                    direct_population_teacher_weight
+                                    effective_population_teacher_weight
                                 ),
                                 shaping_weight=(
                                     direct_population_shaping_weight
@@ -1298,9 +1602,12 @@ def train_promotion_league(
                             "evaluation_active": float(mcts_gate_active),
                         }
                         probe_passed = False
-                        if mcts_probe_games and (
-                            flat_promoted or retain_challenger
-                        ):
+                        # Search quality is a property of a model that has
+                        # already earned a flat promotion.  Probing merely
+                        # retained challengers consumed expensive belief-MCTS
+                        # games without changing the champion or producing a
+                        # useful readiness signal for its lineage.
+                        if mcts_probe_games and flat_promoted:
                             raw_probe_id = database.start_evaluation(
                                 round_id,
                                 candidate_id,

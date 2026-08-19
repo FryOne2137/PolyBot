@@ -113,9 +113,12 @@ python scripts/train_self_play.py \
 
 `scripts/train_league.py` zaczyna od szybkiego curriculum bez MCTS w natywnym
 `VectorGameEnv`. Nauczyciel visible-only pokazuje przejmowanie wiosek, ruch do
-widocznych celów, ekonomię i walkę, a następnie actor-critic uczy się z własnych
-akcji. Krótkie, sparowane bramki cofają każdy blok, który pogorszył grę względem
-zamrożonego championa. Direct-play trwa co najmniej
+widocznych celów, ekonomię i walkę. Po nim działa etap `objectives`: zbiera on
+krótkie, rzeczywiste rollouty z kilku kolejnych decyzji i liczy GAE, dzięki
+czemu sygnał z wioski/miasta dociera także do ruchu, który do niego prowadzi.
+Nie tworzy sztucznych map ani nie czyta ukrytych pól. Dopiero potem actor-critic
+uczy się z własnych akcji. Krótkie, sparowane bramki cofają każdy blok, który
+pogorszył grę względem zamrożonego championa. Direct-play trwa co najmniej
 `--direct-actor-steps`, a w razie potrzeby rośnie do
 `--direct-actor-max-steps`. Baseline chroni wejściowy checkpoint, ale nie jest
 liczony jako wytrenowany sukces. Gotowość wymaga
@@ -127,17 +130,28 @@ wcześniej zamiast marnować resztę budżetu.
 Następnie działa drugi szybki etap bez MCTS: kandydat gra surową polityką
 przeciw championowi i historycznym checkpointom dobranym przez PFSP. Tury
 przeciwników wykonują zamrożone modele, a kandydat uczy się własnych akcji,
-wartości pozycji i destyluje zachowanie populacji. Etap może rosnąć od
-`--direct-population-steps` do `--direct-population-max-steps`; każdy blok ma
-osobną bramkę przeciw całej populacji i rollback. Gry treningowe w natywnym
-`VectorGameEnv` nie mają sztucznego limitu ruchów, a bramki direct używają
-`--direct-gate-max-moves`. Analogicznie,
-`--direct-population-regression-patience` zatrzymuje trwałe pogarszanie i
-przekazuje najlepszy checkpoint do końcowej płaskiej bramki.
+wartości pozycji i destyluje zachowanie populacji. Pierwszy model może jeszcze
+korzystać z warm-upu teachera i actor-critic, lecz po pierwszej promocji liga
+automatycznie przechodzi do `champion_population`: teacher i actor-critic są
+pomijane, ale poprzedza ją mały, silnie zakotwiczony refresh `objectives`
+(`--post-bootstrap-objective-steps`). Bieżący champion otrzymuje 65% losowań,
+a populacja używa budżetu
+`--post-bootstrap-population-steps` do
+`--post-bootstrap-population-max-steps`.
+
+Brama populacji traktuje wygrany wynik przeciw populacji jako kryterium główne.
+Najgorszy wynik historyczny pozostaje twardym floor, a przejęcia miast i
+completion są tie-breakerami zamiast czterech niezależnych warunków blokujących
+każdą zmianę polityki. Gry treningowe w natywnym `VectorGameEnv` nie mają
+sztucznego limitu ruchów, a bramki direct używają `--direct-gate-max-moves`.
+W population play tylko `--exploration-rate` tur kandydata jest próbkowana;
+pozostałe wykonują ruch greedy, tak jak w końcowej bramce. Dodatni TD advantage
+z tych tur nadal wzmacnia wybraną akcję, więc stabilność nie oznacza zatrzymania
+uczenia.
 
 Domyślny `--champion-mode flat` zaczyna od promocji całkowicie niezależnej od
 MCTS. Końcowa bramka używa surowej polityki przeciw championowi i całej
-historycznej populacji. Dopiero po bezpiecznym wyniku uruchamiany jest krótki,
+historycznej populacji. Tylko po bezpiecznym, realnym awansie uruchamiany jest krótki,
 beztreningowy probe: `--mcts-probe-games 10` przy
 `--mcts-probe-simulations 32`. Raw policy i search@32 grają na tych samych
 sparowanych mapach. Probe przechodzi tylko wtedy, gdy search@32 osiąga co
@@ -344,6 +358,7 @@ src/polybot/
 │   ├── league.py                 PFSP population training and promotion gates
 │   ├── league_db.py              SQLite games, metrics, lineage and ratings
 │   ├── vector_population.py      raw-policy population play without MCTS
+│   ├── vector_objectives.py       multi-step visible-objective rollouts (GAE)
 │   ├── routed_self_play_pool.py  multi-model native training and paired gates
 │   ├── replay_buffer.py           stored self-play examples
 │   ├── optimisation.py            policy/value/belief loss functions

@@ -46,7 +46,15 @@ def _visible_goal_progress(
     state: np.ndarray,
     map_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Score legal moves that approach visible villages and enemy objectives."""
+    """Score legal moves toward the next visible strategic objective.
+
+    In the opening, an available village has priority over an enemy unit. Once
+    the player owns more than one city, visible enemy cities take priority.
+    Enemy units remain a fallback only when there is no expansion or conquest
+    objective.  The former union of all three made a nearby enemy unit pull
+    early policies away from villages, which is exactly the local optimum the
+    short-horizon curriculum must avoid.
+    """
     features = np.asarray(features, dtype=np.int64)
     tokens = np.asarray(map_tokens, dtype=np.int64)
     state = np.asarray(state, dtype=np.int64)
@@ -71,7 +79,18 @@ def _visible_goal_progress(
         & (tokens[..., 3] >= 0)
         & (tokens[..., 3] != players[:, None])
     )
-    goals = village | enemy_city | enemy_unit
+    own_cities = np.maximum(state[:, 6], 0)
+    has_village = village.any(axis=1)
+    has_enemy_city = enemy_city.any(axis=1)
+    has_enemy_unit = enemy_unit.any(axis=1)
+    prefer_village = has_village & ((own_cities <= 1) | ~has_enemy_city)
+    prefer_enemy_city = ~prefer_village & has_enemy_city
+    prefer_enemy_unit = ~(prefer_village | prefer_enemy_city) & has_enemy_unit
+    goals = (
+        (prefer_village[:, None] & village)
+        | (prefer_enemy_city[:, None] & enemy_city)
+        | (prefer_enemy_unit[:, None] & enemy_unit)
+    )
     distances = _manhattan_distances(int(map_size))
     large = float(tiles * 2)
     distance_to_goal = np.where(
@@ -87,7 +106,7 @@ def _visible_goal_progress(
     progress = distance_to_goal[rows, sources] - distance_to_goal[rows, targets]
     enters_village = is_move & village[rows, targets]
     enters_enemy_city = is_move & enemy_city[rows, targets]
-    explores_hidden = is_move & ~visible[rows, targets]
+    explores_hidden = is_move & ~visible[rows, targets] & no_goal[:, None]
     score = np.zeros((batch, actions), dtype=np.float32)
     score += np.where(is_move, np.clip(progress, -2.0, 3.0) * 0.65, 0.0)
     score += np.where(enters_village, 4.0, 0.0)

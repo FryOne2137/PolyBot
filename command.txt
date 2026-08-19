@@ -109,30 +109,34 @@ python scripts/evaluate.py `
   --seed 1500000007 `
   --device cuda
 
-# 5. Liga z curriculum: najpierw szybka nauka przejmowania wiosek i innych
-# widocznych celów bez MCTS, potem actor-critic bez MCTS i szybkie mecze
-# surowej sieci przeciw całej populacji. Początkowo o awansie championa decyduje
-# wyłącznie płaska polityka. Po bramce wykonywane jest 10 sparowanych gier przy
-# 32 symulacjach i search@32 musi ściśle pobić raw policy na tych samych mapach.
+# 5. Liga z curriculum. Pierwszy model może korzystać z teachera oraz objectives:
+# krótkich, wielokrokowych rolloutów, które przekazują sygnał wioski/miasta do
+# ruchów prowadzących do celu. Po pierwszym awansie teacher i actor-critic są
+# pomijane, ale działa mały refresh objectives; champion dostaje 65% gier, a
+# populacja trenuje 6000-12000 kroków przeciw championowi i historii.
+# Początkowo o awansie decyduje wyłącznie płaska polityka. Dopiero po realnym
+# płaskim awansie wykonywane jest 10 sparowanych gier przy 32 symulacjach;
+# search@32 musi ściśle pobić raw policy na tych samych mapach.
 # Dwa kolejne udane probe'y zapisują status MCTS-ready. Od następnej rundy MCTS
 # staje się dodatkową bramką awansu; nieudany probe zachowuje starego championa
 # i zapisuje płaskiego kandydata jako challengera. Dlatego komenda ma co najmniej
 # 3 rundy: dwie mogą potwierdzić gotowość, a trzecia już użyć nowej bramki.
-# Szybkie etapy
-# mogą wykorzystać do 5000 + 10000 kroków na rundę, ale dwie kolejne regresje
-# kończą etap wcześniej na najlepszym bezpiecznym checkpointcie. Ciężka drabina
-# MCTS jest wyłączona przez --population-games 0.
+# Bramka populacji priorytetowo traktuje wynik gry; przejęcia i completion są
+# tie-breakerami, a historyczny floor pozostaje twardym zabezpieczeniem. Ciężka
+# drabina MCTS jest wyłączona przez --population-games 0.
 # Checkpointy
 # po promocji trafią
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
 # do runs\league\train\round_001, round_002 itd.
 # Stały --seed jest bazą wielu map, nie jednej mapy. Każda runda ma odległy
-# seed self-play, a bramka osobny, nieużywany w treningu zestaw map. Wznów
-# następny run od ostatniego champion-XXX.pt. Jeżeli nie było promocji, ale
+# seed self-play, a bramka osobny, nieużywany w treningu zestaw map. Aktualny
+# run wznawia champion-002 i tę samą SQLite, aby kod rozpoznał etap
+# champion-population. Po kolejnym awansie podmień tylko --champion-in na
+# najnowszy champion-XXX.pt. Jeżeli nie było promocji, ale
 # log podał "challenger retained", zachowaj tego samego --champion-in i dopisz
 # --challenger-in models\league\champion-challenger-XXX.pt.
 python scripts/train_league.py `
-  --champion-in models\teacher-structured-v1.pt `
+  --champion-in models\league\champion-002.pt `
   --checkpoint-dir models\league `
   --checkpoint-prefix champion `
   --league-db models\league\league.sqlite3 `
@@ -147,6 +151,12 @@ python scripts/train_league.py `
   --champion-value-anchor-weight 0.50 `
   --direct-teacher-envs 128 `
   --direct-teacher-steps 2000 `
+  --direct-objective-envs 128 `
+  --direct-objective-steps 1000 `
+  --direct-objective-block-steps 500 `
+  --direct-objective-rollout-horizon 8 `
+  --direct-objective-updates-per-rollout 2 `
+  --direct-objective-teacher-probability 0.35 `
   --direct-actor-envs 128 `
   --direct-actor-steps 1000 `
   --direct-actor-block-steps 500 `
@@ -165,23 +175,30 @@ python scripts/train_league.py `
   --direct-regression-patience 2 `
   --direct-population-envs 128 `
   --direct-population-steps 2000 `
-  --direct-population-block-steps 1000 `
+  --direct-population-block-steps 2000 `
   --direct-population-max-steps 10000 `
   --direct-population-gate-games 30 `
   --direct-population-gate-score 0.50 `
   --direct-population-historical-floor 0.45 `
   --direct-population-readiness-patience 2 `
-  --direct-population-regression-patience 2 `
+  --direct-population-regression-patience 3 `
   --direct-population-opponent-policy-weight 0.50 `
   --direct-population-teacher-weight 0.25 `
   --direct-population-shaping-weight 0.20 `
+  --post-bootstrap-population-steps 6000 `
+  --post-bootstrap-population-max-steps 12000 `
+  --post-bootstrap-objective-steps 500 `
+  --post-bootstrap-champion-probability 0.65 `
+  --post-bootstrap-policy-anchor-weight 0.35 `
+  --post-bootstrap-teacher-weight 0.02 `
+  --post-bootstrap-opponent-policy-weight 0.65 `
   --champion-mode flat `
   --mcts-probe-games 10 `
   --mcts-probe-simulations 32 `
   --mcts-probe-score 0.55 `
   --mcts-probe-min-improvement 0.00 `
   --mcts-probe-patience 2 `
-  --rounds 3 `
+  --rounds 8 `
   --promotion-games 100 `
   --promotion-score 0.55 `
   --promotion-lower-bound 0.50 `
@@ -212,7 +229,7 @@ python scripts/train_league.py `
   --belief-weight 0.25 `
   --bridge-constraint-weight 0.10 `
   --bridge-replay-fraction 0.25 `
-  --exploration-rate 0.10 `
+  --exploration-rate 0.08 `
   --td-lambda 1.0 `
   --learning-rate 1e-5 `
   --max-moves 700 `

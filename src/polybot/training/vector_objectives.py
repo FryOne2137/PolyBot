@@ -354,10 +354,17 @@ def train_vector_objective_curriculum(
                             step_advantage = normalised_policy_advantages[
                                 advantage_offset:advantage_offset + on_policy_count
                             ]
-                            actions = transition["actions"][on_policy]
+                            # ``Categorical`` has one distribution per
+                            # original environment row.  Score the complete
+                            # action batch first, then mask teacher-executed
+                            # rows; passing a shortened action vector would
+                            # violate its [B] batch shape.
+                            action_log_probability = distribution.log_prob(
+                                transition["actions"]
+                            )
                             policy_losses.append(
                                 -(
-                                    distribution.log_prob(actions)[on_policy]
+                                    action_log_probability[on_policy]
                                     * step_advantage.detach()
                                 ).mean()
                             )

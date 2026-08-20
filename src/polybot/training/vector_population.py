@@ -1238,7 +1238,11 @@ def train_vector_population(
                     entropy = Categorical(
                         logits=output.policy_logits / ppo_rollout_temperature
                     ).entropy().mean()
-                with torch.inference_mode():
+                # The champion is frozen, but its logits are part of the KL
+                # and value-anchor losses.  ``no_grad`` avoids building its
+                # backward graph while keeping ordinary tensors that PyTorch
+                # can safely retain for the candidate's backward pass.
+                with torch.no_grad():
                     anchor_output = anchor_model(
                         tensors["map_tokens"],
                         tensors["global_features"],

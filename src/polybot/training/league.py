@@ -334,6 +334,7 @@ def train_promotion_league(
     direct_population_max_steps: int = 10_000,
     direct_population_block_steps: int = 1_000,
     direct_population_gate_games: int = 100,
+    direct_population_diagnostic_gate_games: int = 20,
     direct_population_gate_score: float = 0.50,
     direct_population_historical_floor: float = 0.45,
     direct_population_readiness_patience: int = 2,
@@ -341,6 +342,17 @@ def train_promotion_league(
     direct_population_opponent_policy_weight: float = 0.50,
     direct_population_teacher_weight: float = 0.25,
     direct_population_shaping_weight: float = 0.20,
+    direct_population_ppo_rollout_steps: int = 32,
+    direct_population_ppo_epochs: int = 2,
+    direct_population_ppo_minibatch_size: int = 256,
+    direct_population_ppo_clip_range: float = 0.15,
+    direct_population_ppo_gae_lambda: float = 0.95,
+    direct_population_ppo_target_kl: float = 0.015,
+    direct_population_ppo_hard_kl: float = 0.030,
+    direct_population_ppo_rollout_temperature: float = 0.85,
+    direct_population_ppo_max_pending_examples: int = 32_768,
+    direct_population_ppo_min_learning_rate: float = 1.0e-5,
+    direct_population_ppo_lr_backoff: float = 0.5,
     direct_population_objective_replay_horizon: int = 16,
     direct_population_objective_replay_capacity: int = 512,
     direct_population_objective_replay_batch_size: int = 32,
@@ -368,10 +380,10 @@ def train_promotion_league(
 ) -> Dict[str, float | str]:
     """Train candidates against a PFSP population and promote robust winners.
 
-    Flat mode first learns and evaluates the raw policy against a weighted
-    mixture of the champion and historical checkpoints. Search@32 becomes an
-    additional promotion gate only after paired probes prove that it improves
-    the raw result. Legacy MCTS mode keeps the full search ladder. SQLite
+    Flat mode learns and evaluates only the raw policy against a weighted
+    mixture of the champion and historical checkpoints. Search@32 is probed
+    independently and can only permit a later teacher experiment; it never
+    vetoes a raw-policy promotion. Legacy MCTS mode keeps the full search ladder. SQLite
     stores game/metric lineage; tensors remain in ``.pt`` files referenced by
     path and SHA-256 rather than database BLOBs.
     """
@@ -411,6 +423,15 @@ def train_promotion_league(
         raise ValueError(
             "direct_population_gate_games must be positive and even"
         )
+    if (
+        direct_population_diagnostic_gate_games < 2
+        or direct_population_diagnostic_gate_games % 2
+        or direct_population_diagnostic_gate_games
+        > direct_population_gate_games
+    ):
+        raise ValueError(
+            "direct_population_diagnostic_gate_games must be even, positive and no larger than the full gate"
+        )
     if direct_gate_max_moves < 1:
         raise ValueError("direct_gate_max_moves must be positive")
     if mcts_gate_games < 2 or mcts_gate_games % 2:
@@ -443,6 +464,12 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "direct_population_ppo_clip_range": (
+            direct_population_ppo_clip_range
+        ),
+        "direct_population_ppo_gae_lambda": (
+            direct_population_ppo_gae_lambda
+        ),
         "direct_population_objective_replay_weight": (
             direct_population_objective_replay_weight
         ),
@@ -463,6 +490,24 @@ def train_promotion_league(
         raise ValueError(
             "direct_readiness_city_captures_per_game must not be negative"
         )
+    if (
+        direct_population_ppo_rollout_steps < 1
+        or direct_population_ppo_epochs < 1
+        or direct_population_ppo_minibatch_size < 1
+        or direct_population_ppo_max_pending_examples
+        < direct_population_ppo_minibatch_size
+    ):
+        raise ValueError("direct population PPO sizes must be positive")
+    if not 0.0 < direct_population_ppo_target_kl <= (
+        direct_population_ppo_hard_kl
+    ):
+        raise ValueError("direct population PPO requires 0 < target KL <= hard KL")
+    if not 0.1 <= direct_population_ppo_rollout_temperature <= 2.0:
+        raise ValueError("direct population PPO rollout temperature is invalid")
+    if direct_population_ppo_min_learning_rate <= 0.0:
+        raise ValueError("direct population PPO minimum learning rate must be positive")
+    if not 0.0 < direct_population_ppo_lr_backoff < 1.0:
+        raise ValueError("direct population PPO learning-rate backoff is invalid")
     for name, value in {
         "direct_population_objective_replay_horizon": (
             direct_population_objective_replay_horizon
@@ -646,6 +691,9 @@ def train_promotion_league(
         "direct_population_max_steps": direct_population_max_steps,
         "direct_population_block_steps": direct_population_block_steps,
         "direct_population_gate_games": direct_population_gate_games,
+        "direct_population_diagnostic_gate_games": (
+            direct_population_diagnostic_gate_games
+        ),
         "direct_population_gate_score": direct_population_gate_score,
         "direct_population_historical_floor": (
             direct_population_historical_floor
@@ -661,6 +709,37 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "direct_population_ppo_rollout_steps": (
+            direct_population_ppo_rollout_steps
+        ),
+        "direct_population_ppo_epochs": direct_population_ppo_epochs,
+        "direct_population_ppo_minibatch_size": (
+            direct_population_ppo_minibatch_size
+        ),
+        "direct_population_ppo_clip_range": (
+            direct_population_ppo_clip_range
+        ),
+        "direct_population_ppo_gae_lambda": (
+            direct_population_ppo_gae_lambda
+        ),
+        "direct_population_ppo_target_kl": (
+            direct_population_ppo_target_kl
+        ),
+        "direct_population_ppo_hard_kl": (
+            direct_population_ppo_hard_kl
+        ),
+        "direct_population_ppo_rollout_temperature": (
+            direct_population_ppo_rollout_temperature
+        ),
+        "direct_population_ppo_max_pending_examples": (
+            direct_population_ppo_max_pending_examples
+        ),
+        "direct_population_ppo_min_learning_rate": (
+            direct_population_ppo_min_learning_rate
+        ),
+        "direct_population_ppo_lr_backoff": (
+            direct_population_ppo_lr_backoff
+        ),
         "direct_population_objective_replay_horizon": (
             direct_population_objective_replay_horizon
         ),
@@ -1290,6 +1369,9 @@ def train_promotion_league(
                                 num_threads=num_threads,
                                 max_actions=mcts.native_max_actions,
                                 gate_games=direct_population_gate_games,
+                                diagnostic_gate_games=(
+                                    direct_population_diagnostic_gate_games
+                                ),
                                 gate_seed=direct_population_gate_seed,
                                 gate_score=direct_population_gate_score,
                                 historical_score_floor=(
@@ -1321,6 +1403,37 @@ def train_promotion_league(
                                 ),
                                 shaping_weight=(
                                     direct_population_shaping_weight
+                                ),
+                                ppo_rollout_steps=(
+                                    direct_population_ppo_rollout_steps
+                                ),
+                                ppo_epochs=direct_population_ppo_epochs,
+                                ppo_minibatch_size=(
+                                    direct_population_ppo_minibatch_size
+                                ),
+                                ppo_clip_range=(
+                                    direct_population_ppo_clip_range
+                                ),
+                                ppo_gae_lambda=(
+                                    direct_population_ppo_gae_lambda
+                                ),
+                                ppo_target_kl=(
+                                    direct_population_ppo_target_kl
+                                ),
+                                ppo_hard_kl=(
+                                    direct_population_ppo_hard_kl
+                                ),
+                                ppo_rollout_temperature=(
+                                    direct_population_ppo_rollout_temperature
+                                ),
+                                ppo_max_pending_examples=(
+                                    direct_population_ppo_max_pending_examples
+                                ),
+                                ppo_min_learning_rate=(
+                                    direct_population_ppo_min_learning_rate
+                                ),
+                                ppo_lr_backoff=(
+                                    direct_population_ppo_lr_backoff
                                 ),
                                 objective_replay_horizon=(
                                     direct_population_objective_replay_horizon
@@ -1595,17 +1708,11 @@ def train_promotion_league(
                         parent_capability = database.model_capability(
                             candidate_parent_id
                         )
-                        mcts_gate_active = bool(
-                            parent_capability is not None
-                            and (
-                                int(parent_capability["mcts_ready"])
-                                or int(
-                                    parent_capability.get(
-                                        "mcts_evaluation_active", 0
-                                    )
-                                )
-                            )
-                        )
+                        # Raw policy is the sole champion representation.
+                        # A successful MCTS@32 probe is only evidence that a
+                        # later search-teacher experiment is allowed; it must
+                        # never defer or veto a flat-policy promotion.
+                        mcts_gate_active = False
                         pending_flat_path: Path | None = None
 
                         # Persist the raw-policy outcome before touching MCTS.

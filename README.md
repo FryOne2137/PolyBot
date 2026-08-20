@@ -130,17 +130,20 @@ wcześniej zamiast marnować resztę budżetu.
 Następnie działa drugi szybki etap bez MCTS: kandydat gra surową polityką
 przeciw championowi i historycznym checkpointom dobranym przez PFSP. Tury
 przeciwników wykonują zamrożone modele, a kandydat uczy się własnych akcji,
-wartości pozycji i destyluje zachowanie populacji. Pierwszy model może jeszcze
+wieloetapowej wartości pozycji. Pierwszy model może jeszcze
 korzystać z warm-upu teachera i actor-critic, lecz po pierwszej promocji liga
 automatycznie przechodzi do `champion_population`: teacher i actor-critic są
-pomijane. Nie uruchamia już kosztownych, arbitralnych krótkich rolloutów
-`objectives`: wewnątrz population play zachowywany jest ograniczony replay
-wyłącznie poprzednich **widocznych decyzji kandydata**, które faktycznie
-doprowadziły do wejścia do wioski, założenia/przejęcia miasta albo wygranej.
-Replay aktualizuje tylko policy loss — nie fałszuje value targetu jako wygranej.
-Budżet kredytów ogranicza średnie użycie jednej pozycji do
-`--direct-population-objective-replay-max-epochs` (domyślnie 4), więc mały
-bufor sukcesów nie może być optymalizowany w nieskończoność.
+pomijane. Population play używa teraz signed PPO/GAE: dla każdego slotu zbiera
+pełny ciąg własnych **i przeciwnika** ruchów, po czym propaguje return do
+decyzji kandydata aż do terminala. Przy zmianie aktywnego gracza znak bootstrapu
+i advantage jest odwracany, więc przegrana po turze przeciwnika nie staje się
+fałszywym dodatnim celem. Standardowe ograniczenie PPO chroni przed zbyt dużą
+zmianą polityki, a KL względem zamrożonego championa ma target i twardy limit.
+Przekroczenie limitu cofa blok i automatycznie obniża learning rate.
+Niedokończona trajektoria jest bootstrapowana wyłącznie na końcu bloku albo po
+przekroczeniu bezpiecznego limitu RAM
+`--direct-population-ppo-max-pending-examples`; nigdy nie jest oznaczana jako
+remis.
 Bieżący champion otrzymuje 65% losowań, a populacja używa budżetu
 `--post-bootstrap-population-steps` do
 `--post-bootstrap-population-max-steps`.
@@ -148,15 +151,15 @@ Bieżący champion otrzymuje 65% losowań, a populacja używa budżetu
 Brama populacji traktuje wygrany wynik przeciw populacji jako kryterium główne.
 Najgorszy wynik historyczny pozostaje twardym floor, a przejęcia miast i
 completion są tie-breakerami zamiast czterech niezależnych warunków blokujących
-każdą zmianę polityki. Checkpoint populacji jest wybierany dopiero przez większą,
-sparowaną bramkę `--direct-population-gate-games` (domyślnie 100 gier na
-przeciwnika), aby nie zastąpić najlepszego stanu szumem z 30 gier. Gry
+każdą zmianę polityki. Po każdym bloku PPO działa szybka, sparowana diagnostyka
+`--direct-population-diagnostic-gate-games` (domyślnie 20 gier). Dopiero jeden
+najlepszy checkpoint otrzymuje pełną bramkę
+`--direct-population-gate-games` (domyślnie 100 gier na przeciwnika), więc czas
+jest przeznaczany na dane treningowe, a nie powtarzane kosztowne ewaluacje. Gry
 treningowe w natywnym `VectorGameEnv` nie mają sztucznego limitu ruchów, a
-bramki direct używają `--direct-gate-max-moves`.
-W population play tylko `--exploration-rate` tur kandydata jest próbkowana;
-pozostałe wykonują ruch greedy, tak jak w końcowej bramce. Dodatni TD advantage
-z tych tur nadal wzmacnia wybraną akcję, więc stabilność nie oznacza zatrzymania
-uczenia.
+bramki direct używają `--direct-gate-max-moves`. PPO próbuje pełną politykę o
+temperaturze `--direct-population-ppo-rollout-temperature`; promocja nadal
+ocenia deterministyczną raw policy.
 
 Domyślny `--champion-mode flat` zaczyna od promocji całkowicie niezależnej od
 MCTS. Końcowa bramka używa surowej polityki przeciw championowi i całej
@@ -168,16 +171,13 @@ najmniej `--mcts-probe-score` i jest ściśle lepszy od raw policy o więcej ni�
 `--mcts-probe-min-improvement`. Nie wykonuje aktualizacji ani nie zmienia Elo.
 
 Po `--mcts-probe-patience` kolejnych sukcesach SQLite oznacza lineage jako
-`mcts_ready`. Od następnej rundy MCTS@32 staje się dodatkową bramką awansu:
-kandydat musi najpierw wygrać płasko, a następnie ponownie wykazać poprawę z
-search@32. Jeżeli search nie pomaga, dotychczasowy champion pozostaje bez zmian,
-a poprawny płaski checkpoint kandydata zostaje zachowany jako challenger.
-Status bramki jest dziedziczony przez kolejne modele, więc pojedyncza porażka
-probe nie wyłącza automatycznie sprawdzania MCTS.
+`mcts_ready`. Status jest wyłącznie zgodą na przyszły eksperyment, w którym
+MCTS może zostać użyty jako nauczyciel; nie jest bramką promocji i nie zmienia
+raw-policy championa. Jeżeli search nie pomaga, nie jest używany do treningu.
 
 Ciężka historyczna drabina pozostaje dostępna przez `--champion-mode mcts`, ale
-zalecana komenda początkowa ustawia `--population-games 0`. Dzięki temu jedynym
-kosztem MCTS w rundzie jest krótki probe, a wszystkie właściwe aktualizacje
+zalecana komenda PPO ustawia `--population-games 0`. Dzięki temu jedynym kosztem
+MCTS w rundzie jest krótki, niezależny probe, a wszystkie właściwe aktualizacje
 odbywają się w szybkim `VectorGameEnv`.
 
 Probe i opcjonalne gry MCTS przeciw populacji korzystają z natywnego

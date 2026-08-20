@@ -151,6 +151,10 @@ def main() -> None:
         "--direct-population-gate-games", type=int, default=100,
         help="Paired games per population checkpoint selection gate",
     )
+    parser.add_argument(
+        "--direct-population-diagnostic-gate-games", type=int, default=20,
+        help="Cheap paired games after a PPO block; full gate runs once for its best checkpoint",
+    )
     parser.add_argument("--direct-population-gate-score", type=float, default=0.50)
     parser.add_argument(
         "--direct-population-historical-floor", type=float, default=0.45,
@@ -163,37 +167,47 @@ def main() -> None:
         help="Advance with the best ready checkpoint after persistent population regression",
     )
     parser.add_argument(
-        "--direct-population-opponent-policy-weight", type=float, default=0.50,
+        "--direct-population-opponent-policy-weight", type=float, default=0.0,
+        help="Deprecated: PPO learns only candidate actions",
     )
     parser.add_argument(
-        "--direct-population-teacher-weight", type=float, default=0.25,
+        "--direct-population-teacher-weight", type=float, default=0.0,
+        help="Deprecated: PPO uses on-policy GAE rather than a heuristic target",
     )
     parser.add_argument(
         "--direct-population-shaping-weight", type=float, default=0.20,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-horizon", type=int, default=16,
-        help="Visible candidate decisions credited by one real success",
+        "--direct-population-ppo-rollout-steps", type=int, default=32,
+    )
+    parser.add_argument("--direct-population-ppo-epochs", type=int, default=2)
+    parser.add_argument(
+        "--direct-population-ppo-minibatch-size", type=int, default=256,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-capacity", type=int, default=512,
+        "--direct-population-ppo-clip-range", type=float, default=0.15,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-batch-size", type=int, default=32,
+        "--direct-population-ppo-gae-lambda", type=float, default=0.95,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-interval", type=int, default=16,
+        "--direct-population-ppo-target-kl", type=float, default=0.015,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-weight", type=float, default=0.35,
-        help="Extra policy-only loss for prefixes ending in visible success",
+        "--direct-population-ppo-hard-kl", type=float, default=0.030,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-recency", type=float, default=0.92,
+        "--direct-population-ppo-rollout-temperature", type=float, default=0.85,
     )
     parser.add_argument(
-        "--direct-population-objective-replay-max-epochs", type=int, default=4,
-        help="Maximum average reuses of each successful visible decision",
+        "--direct-population-ppo-max-pending-examples", type=int, default=32_768,
+        help="RAM safety cap; unfinished trajectories bootstrap only if this is exceeded",
+    )
+    parser.add_argument(
+        "--direct-population-ppo-min-learning-rate", type=float, default=1.0e-5,
+    )
+    parser.add_argument(
+        "--direct-population-ppo-lr-backoff", type=float, default=0.5,
     )
     parser.add_argument(
         "--post-bootstrap-population-steps", type=int, default=6_000,
@@ -205,7 +219,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--post-bootstrap-objective-steps", type=int, default=0,
-        help="Deprecated: established champions use event-triggered population replay instead",
+        help="Deprecated: established champions use PPO/GAE instead",
     )
     parser.add_argument(
         "--post-bootstrap-champion-probability", type=float, default=0.65,
@@ -215,10 +229,12 @@ def main() -> None:
         "--post-bootstrap-policy-anchor-weight", type=float, default=0.35,
     )
     parser.add_argument(
-        "--post-bootstrap-teacher-weight", type=float, default=0.02,
+        "--post-bootstrap-teacher-weight", type=float, default=0.0,
+        help="Deprecated: PPO uses on-policy GAE",
     )
     parser.add_argument(
-        "--post-bootstrap-opponent-policy-weight", type=float, default=0.65,
+        "--post-bootstrap-opponent-policy-weight", type=float, default=0.0,
+        help="Deprecated: PPO learns only candidate actions",
     )
     parser.add_argument(
         "--champion-mode",
@@ -365,6 +381,9 @@ def main() -> None:
         direct_population_max_steps=args.direct_population_max_steps,
         direct_population_block_steps=args.direct_population_block_steps,
         direct_population_gate_games=args.direct_population_gate_games,
+        direct_population_diagnostic_gate_games=(
+            args.direct_population_diagnostic_gate_games
+        ),
         direct_population_gate_score=args.direct_population_gate_score,
         direct_population_historical_floor=(
             args.direct_population_historical_floor
@@ -384,26 +403,36 @@ def main() -> None:
         direct_population_shaping_weight=(
             args.direct_population_shaping_weight
         ),
-        direct_population_objective_replay_horizon=(
-            args.direct_population_objective_replay_horizon
+        direct_population_ppo_rollout_steps=(
+            args.direct_population_ppo_rollout_steps
         ),
-        direct_population_objective_replay_capacity=(
-            args.direct_population_objective_replay_capacity
+        direct_population_ppo_epochs=args.direct_population_ppo_epochs,
+        direct_population_ppo_minibatch_size=(
+            args.direct_population_ppo_minibatch_size
         ),
-        direct_population_objective_replay_batch_size=(
-            args.direct_population_objective_replay_batch_size
+        direct_population_ppo_clip_range=(
+            args.direct_population_ppo_clip_range
         ),
-        direct_population_objective_replay_interval=(
-            args.direct_population_objective_replay_interval
+        direct_population_ppo_gae_lambda=(
+            args.direct_population_ppo_gae_lambda
         ),
-        direct_population_objective_replay_weight=(
-            args.direct_population_objective_replay_weight
+        direct_population_ppo_target_kl=(
+            args.direct_population_ppo_target_kl
         ),
-        direct_population_objective_replay_recency=(
-            args.direct_population_objective_replay_recency
+        direct_population_ppo_hard_kl=(
+            args.direct_population_ppo_hard_kl
         ),
-        direct_population_objective_replay_max_epochs=(
-            args.direct_population_objective_replay_max_epochs
+        direct_population_ppo_rollout_temperature=(
+            args.direct_population_ppo_rollout_temperature
+        ),
+        direct_population_ppo_max_pending_examples=(
+            args.direct_population_ppo_max_pending_examples
+        ),
+        direct_population_ppo_min_learning_rate=(
+            args.direct_population_ppo_min_learning_rate
+        ),
+        direct_population_ppo_lr_backoff=(
+            args.direct_population_ppo_lr_backoff
         ),
         post_bootstrap_population_steps=(
             args.post_bootstrap_population_steps

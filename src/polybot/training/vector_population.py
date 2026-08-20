@@ -53,6 +53,136 @@ class _ObjectiveReplayExample:
     weight: float
 
 
+@dataclass
+class _PPOExample:
+    """One on-policy candidate decision with immutable public inputs."""
+
+    observation: Mapping[str, np.ndarray]
+    action_row: int
+    old_log_probability: float
+    old_value: float
+    advantage: float = 0.0
+    return_target: float = 0.0
+
+
+@dataclass
+class _PPOTransition:
+    """One native action in a slot, including opponent actions for GAE."""
+
+    value: float
+    reward: float
+    next_value: float
+    sign: float
+    terminal: bool
+    candidate_example: _PPOExample | None
+
+
+def _ppo_snapshot(
+    batch: Mapping[str, np.ndarray], row: int, action_row: int
+) -> tuple[Dict[str, np.ndarray], int]:
+    """Copy and compact only public observations needed for PPO replay."""
+    result: Dict[str, np.ndarray] = {}
+    for field in _OBJECTIVE_REPLAY_FIELDS:
+        if field in {"action_features", "action_mask"}:
+            continue
+        value = np.asarray(batch[field])[row]
+        # PolyEnv's public token and action fields are documented int32 but
+        # their categorical/runtime ranges fit in int16. Keeping a rollout in
+        # RAM at this width avoids buffering multi-gigabyte full trajectories.
+        if np.issubdtype(value.dtype, np.integer) and value.dtype != np.bool_:
+            value = value.astype(np.int16, copy=False)
+        result[field] = value.copy()
+    legal_rows = np.flatnonzero(np.asarray(batch["action_mask"])[row])
+    compact_action_row = int(np.searchsorted(legal_rows, action_row))
+    if (
+        compact_action_row >= legal_rows.size
+        or int(legal_rows[compact_action_row]) != int(action_row)
+    ):
+        raise RuntimeError("PPO attempted to snapshot an illegal action")
+    result["action_features"] = np.asarray(
+        batch["action_features"]
+    )[row, legal_rows].astype(np.int16, copy=True)
+    result["action_mask"] = np.ones(legal_rows.size, dtype=bool)
+    return result, compact_action_row
+
+
+def _finish_ppo_trace(
+    transitions: Sequence[_PPOTransition],
+    *,
+    gamma: float,
+    gae_lambda: float,
+) -> list[_PPOExample]:
+    """Compute sign-correct GAE through candidate and opponent actions.
+
+    The value head is always from the active player's viewpoint.  Therefore a
+    turn switch changes the sign both in the bootstrap and in the recursive
+    advantage.  This is the multi-step counterpart of the old one-step TD
+    target and correctly propagates a terminal loss through the opponent turn.
+    """
+    advantage = 0.0
+    result: list[_PPOExample] = []
+    for transition in reversed(transitions):
+        continuation = 0.0 if transition.terminal else transition.sign
+        delta = (
+            transition.reward
+            + gamma * continuation * transition.next_value
+            - transition.value
+        )
+        advantage = delta + gamma * gae_lambda * continuation * advantage
+        if transition.candidate_example is not None:
+            example = transition.candidate_example
+            example.advantage = float(advantage)
+            example.return_target = float(transition.value + advantage)
+            result.append(example)
+    result.reverse()
+    return result
+
+
+def _ppo_batch(
+    examples: Sequence[_PPOExample],
+) -> tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Collate a public on-policy PPO minibatch."""
+    if not examples:
+        raise ValueError("PPO batch must not be empty")
+    batch_size = len(examples)
+    maximum_actions = max(
+        example.observation["action_features"].shape[0]
+        for example in examples
+    )
+    action_features = np.zeros(
+        (
+            batch_size,
+            maximum_actions,
+            examples[0].observation["action_features"].shape[1],
+        ),
+        dtype=np.int16,
+    )
+    action_mask = np.zeros((batch_size, maximum_actions), dtype=bool)
+    for row, example in enumerate(examples):
+        actions = example.observation["action_features"]
+        action_features[row, : actions.shape[0]] = actions
+        action_mask[row, : actions.shape[0]] = True
+    observation = {
+        field: np.stack(
+            [example.observation[field] for example in examples], axis=0
+        )
+        for field in _OBJECTIVE_REPLAY_FIELDS
+        if field not in {"action_features", "action_mask"}
+    }
+    observation["action_features"] = action_features
+    observation["action_mask"] = action_mask
+    return (
+        observation,
+        np.asarray([example.action_row for example in examples], dtype=np.int64),
+        np.asarray(
+            [example.old_log_probability for example in examples],
+            dtype=np.float32,
+        ),
+        np.asarray([example.advantage for example in examples], dtype=np.float32),
+        np.asarray([example.return_target for example in examples], dtype=np.float32),
+    )
+
+
 def _objective_replay_success_weights(
     features: np.ndarray,
     selected_rows: np.ndarray,
@@ -156,7 +286,7 @@ def _index_copy_policy_rows_(
     )
 
 
-def train_vector_population(
+def _train_vector_population_legacy(
     training: TrainingConfig,
     model_config: ModelConfig,
     candidate: PolicyValueBeliefNet,
@@ -834,6 +964,630 @@ def train_vector_population(
     return summary
 
 
+def train_vector_population(
+    training: TrainingConfig,
+    model_config: ModelConfig,
+    candidate: PolicyValueBeliefNet,
+    opponent_models: Sequence[PolicyValueBeliefNet],
+    opponent_weights: Sequence[float],
+    *,
+    num_envs: int,
+    steps: int,
+    num_threads: int | None,
+    max_actions: int,
+    anchor_model: PolicyValueBeliefNet,
+    policy_anchor_weight: float = 0.10,
+    value_anchor_weight: float = 0.10,
+    opponent_policy_weight: float = 0.0,
+    teacher_weight: float = 0.0,
+    shaping_weight: float = 0.20,
+    greedy_advantage_weight: float = 0.0,
+    entropy_weight: float = 0.002,
+    gamma: float = 0.995,
+    ppo_rollout_steps: int = 32,
+    ppo_epochs: int = 2,
+    ppo_minibatch_size: int = 256,
+    ppo_clip_range: float = 0.15,
+    ppo_gae_lambda: float = 0.95,
+    ppo_target_kl: float = 0.015,
+    ppo_hard_kl: float = 0.030,
+    ppo_rollout_temperature: float = 0.85,
+    ppo_max_pending_examples: int = 32_768,
+    game_callback: Callable[[Mapping[str, Any]], None] | None = None,
+    run: TrainingRun | None = None,
+) -> Dict[str, float | str]:
+    """Train the raw policy with signed, multi-step PPO/GAE trajectories.
+
+    Only candidate actions receive an actor loss.  The per-slot trace still
+    contains every intervening opponent action, so a terminal result and all
+    intermediate rewards are propagated back with the correct player sign.
+    A trace normally remains in RAM until its native game terminates. A bounded
+    safety cap or the end of a training block may bootstrap an unfinished
+    trace from its observed next value; neither case is ever labelled as a
+    draw.
+    """
+    if num_envs < 2 or steps < 1 or max_actions < 1:
+        raise ValueError("num_envs >= 2, steps and max_actions are required")
+    if training.map_type != "lakes":
+        raise ValueError(
+            "VectorGameEnv population play currently supports lakes only"
+        )
+    if not opponent_models:
+        raise ValueError("direct population play requires an opponent")
+    if anchor_model is candidate or any(
+        opponent is candidate for opponent in opponent_models
+    ):
+        raise ValueError(
+            "candidate, anchor and frozen opponents must be separate models"
+        )
+    weights = np.asarray(opponent_weights, dtype=np.float64)
+    if (
+        weights.shape != (len(opponent_models),)
+        or np.any(weights < 0.0)
+        or not np.isfinite(weights).all()
+        or float(weights.sum()) <= 0.0
+    ):
+        raise ValueError("opponent_weights must be finite and positive")
+    weights /= weights.sum()
+    for name, value in {
+        "policy_anchor_weight": policy_anchor_weight,
+        "value_anchor_weight": value_anchor_weight,
+        "opponent_policy_weight": opponent_policy_weight,
+        "teacher_weight": teacher_weight,
+        "greedy_advantage_weight": greedy_advantage_weight,
+        "shaping_weight": shaping_weight,
+        "entropy_weight": entropy_weight,
+        "ppo_clip_range": ppo_clip_range,
+        "ppo_gae_lambda": ppo_gae_lambda,
+        "ppo_target_kl": ppo_target_kl,
+        "ppo_hard_kl": ppo_hard_kl,
+    }.items():
+        if value < 0.0 or (name != "ppo_hard_kl" and value > 1.0):
+            raise ValueError(f"{name} must be between zero and one")
+    if ppo_hard_kl < ppo_target_kl:
+        raise ValueError("ppo_hard_kl must be at least ppo_target_kl")
+    if (
+        ppo_rollout_steps < 1
+        or ppo_epochs < 1
+        or ppo_minibatch_size < 1
+        or ppo_max_pending_examples < ppo_minibatch_size
+    ):
+        raise ValueError("PPO rollout, epoch and minibatch sizes must be positive")
+    if not 0.1 <= ppo_rollout_temperature <= 2.0:
+        raise ValueError("ppo_rollout_temperature must be between 0.1 and 2.0")
+    try:
+        from PolyEnv import Bardur, Imperius, VectorGameEnv
+    except ImportError as error:
+        raise RuntimeError("PolyEnv VectorGameEnv is required") from error
+
+    seed_everything(training.seed)
+    device = select_device(training.device)
+    run = run or TrainingRun.create("runs", "direct_population_ppo")
+    run.write_config(
+        training=training,
+        model=model_config,
+        stage={
+            "algorithm": "signed_ppo_gae",
+            "num_envs": num_envs,
+            "steps": steps,
+            "num_threads": num_threads,
+            "max_actions": max_actions,
+            "opponent_weights": weights.tolist(),
+            "shaping_weight": shaping_weight,
+            "policy_anchor_weight": policy_anchor_weight,
+            "value_anchor_weight": value_anchor_weight,
+            "ppo_rollout_steps": ppo_rollout_steps,
+            "ppo_epochs": ppo_epochs,
+            "ppo_minibatch_size": ppo_minibatch_size,
+            "ppo_clip_range": ppo_clip_range,
+            "ppo_gamma": gamma,
+            "ppo_gae_lambda": ppo_gae_lambda,
+            "ppo_target_kl": ppo_target_kl,
+            "ppo_hard_kl": ppo_hard_kl,
+            "ppo_rollout_temperature": ppo_rollout_temperature,
+            "ppo_max_pending_examples": ppo_max_pending_examples,
+            # Kept in the artifacts so obsolete command-line flags remain
+            # auditable rather than silently affecting the PPO objective.
+            "legacy_opponent_policy_weight": opponent_policy_weight,
+            "legacy_teacher_weight": teacher_weight,
+            "legacy_greedy_advantage_weight": greedy_advantage_weight,
+        },
+    )
+    candidate.to(device).eval()
+    anchor_model.to(device).eval()
+    for parameter in anchor_model.parameters():
+        parameter.requires_grad_(False)
+    frozen: list[PolicyValueBeliefNet] = []
+    for model in opponent_models:
+        model.to(device).eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        frozen.append(model)
+    optimiser = torch.optim.AdamW(
+        candidate.parameters(),
+        lr=training.learning_rate,
+        weight_decay=training.weight_decay,
+    )
+    cuda_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+    env = VectorGameEnv(
+        num_envs=num_envs,
+        seed=training.seed,
+        map_size=training.map_size,
+        players=(Bardur, Imperius),
+        num_threads=num_threads,
+        max_actions=max_actions,
+        auto_reset=True,
+        visible_event_history=0,
+    )
+    batch = env.reset(seed=training.seed)
+    rng = np.random.default_rng(training.seed ^ 0x50504F)
+    opponent_indices = rng.choice(
+        len(frozen), size=num_envs, p=weights
+    ).astype(np.int32)
+    candidate_players = (np.arange(num_envs, dtype=np.int32) & 1).copy()
+    traces: list[list[_PPOTransition]] = [[] for _ in range(num_envs)]
+    episode_moves = np.zeros(num_envs, dtype=np.int32)
+    episode_numbers = np.zeros(num_envs, dtype=np.int64)
+    completed_games = wins = losses = draws = 0
+    candidate_turns = opponent_turns = 0
+    ppo_samples = ppo_updates = ppo_rollouts = 0
+    ppo_kl_exceeded = False
+    completed_examples: list[_PPOExample] = []
+    pending_candidate_examples = 0
+    ppo_forced_truncations = 0
+    ppo_update_target = max(
+        ppo_minibatch_size, num_envs * ppo_rollout_steps // 2
+    )
+    totals = {
+        "loss": 0.0,
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "champion_kl": 0.0,
+        "behaviour_kl": 0.0,
+        "clip_fraction": 0.0,
+        "entropy": 0.0,
+    }
+    reward_total = 0.0
+
+    def optimise_rollout(examples: Sequence[_PPOExample]) -> Dict[str, float]:
+        """Run PPO epochs and stop before an unsafe champion-policy drift."""
+        nonlocal ppo_updates, ppo_kl_exceeded
+        if not examples:
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "champion_kl": 0.0,
+                "behaviour_kl": 0.0,
+                "clip_fraction": 0.0,
+                "entropy": 0.0,
+            }
+        advantages = np.asarray(
+            [example.advantage for example in examples], dtype=np.float32
+        )
+        advantages = (advantages - advantages.mean()) / max(
+            float(advantages.std()), 1e-4
+        )
+        for example, advantage in zip(examples, advantages):
+            example.advantage = float(advantage)
+        totals_local = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "champion_kl": 0.0,
+            "behaviour_kl": 0.0,
+            "clip_fraction": 0.0,
+            "entropy": 0.0,
+        }
+        local_updates = 0
+        for _ in range(ppo_epochs):
+            order = rng.permutation(len(examples))
+            for start in range(0, len(order), ppo_minibatch_size):
+                subset = [examples[int(index)] for index in order[start:start + ppo_minibatch_size]]
+                replay_batch, actions, old_log_probabilities, advantages_batch, returns = _ppo_batch(
+                    subset
+                )
+                tensors = _vector_tensors(replay_batch, device, training)
+                action_tensor = torch.as_tensor(
+                    actions, dtype=torch.long, device=device
+                )
+                old_log_tensor = torch.as_tensor(
+                    old_log_probabilities, dtype=torch.float32, device=device
+                )
+                advantage_tensor = torch.as_tensor(
+                    advantages_batch, dtype=torch.float32, device=device
+                )
+                return_tensor = torch.as_tensor(
+                    returns, dtype=torch.float32, device=device
+                )
+                # PPO compares against the rollout policy. Keeping dropout
+                # disabled makes that ratio deterministic while preserving
+                # gradients through the model parameters.
+                candidate.eval()
+                autocast = (
+                    torch.autocast(device_type="cuda", dtype=torch.float16)
+                    if cuda_amp
+                    else nullcontext()
+                )
+                with autocast:
+                    output = candidate(
+                        tensors["map_tokens"],
+                        tensors["global_features"],
+                        tensors["action_categorical"],
+                        tensors["action_continuous"],
+                        tensors["action_mask"],
+                        tensors["event_features"],
+                        include_belief=False,
+                    )
+                    policy_log_probabilities = F.log_softmax(
+                        output.policy_logits / ppo_rollout_temperature, dim=-1
+                    )
+                    new_log_probability = policy_log_probabilities.gather(
+                        1, action_tensor.unsqueeze(1)
+                    ).squeeze(1).float()
+                    ratio = torch.exp(new_log_probability - old_log_tensor)
+                    unclipped = ratio * advantage_tensor
+                    clipped = torch.clamp(
+                        ratio, 1.0 - ppo_clip_range, 1.0 + ppo_clip_range
+                    ) * advantage_tensor
+                    policy_loss = -torch.minimum(unclipped, clipped).mean()
+                    value_loss = F.smooth_l1_loss(
+                        output.value.float(), return_tensor
+                    )
+                    entropy = Categorical(
+                        logits=output.policy_logits / ppo_rollout_temperature
+                    ).entropy().mean()
+                with torch.inference_mode():
+                    anchor_output = anchor_model(
+                        tensors["map_tokens"],
+                        tensors["global_features"],
+                        tensors["action_categorical"],
+                        tensors["action_continuous"],
+                        tensors["action_mask"],
+                        tensors["event_features"],
+                        include_belief=False,
+                    )
+                    anchor_log_probabilities = F.log_softmax(
+                        anchor_output.policy_logits / ppo_rollout_temperature,
+                        dim=-1,
+                    )
+                    anchor_policy = anchor_log_probabilities.exp()
+                legal_actions = tensors["action_mask"]
+                kl_difference = torch.where(
+                    legal_actions,
+                    anchor_log_probabilities
+                    - policy_log_probabilities.float(),
+                    torch.zeros_like(policy_log_probabilities.float()),
+                )
+                champion_kl = (anchor_policy * kl_difference).sum(dim=1).mean()
+                behaviour_kl = 0.5 * (
+                    new_log_probability - old_log_tensor
+                ).square().mean()
+                if float(champion_kl.detach().cpu()) > ppo_hard_kl:
+                    ppo_kl_exceeded = True
+                    candidate.eval()
+                    return {
+                        **{
+                            name: total / max(1, local_updates)
+                            for name, total in totals_local.items()
+                        },
+                        "champion_kl": float(champion_kl.detach().cpu()),
+                        "behaviour_kl": float(behaviour_kl.detach().cpu()),
+                        "clip_fraction": float(
+                            ((ratio - 1.0).abs() > ppo_clip_range)
+                            .float().mean().detach().cpu()
+                        ),
+                    }
+                kl_multiplier = policy_anchor_weight * max(
+                    1.0,
+                    float(champion_kl.detach().cpu())
+                    / max(ppo_target_kl, 1e-6),
+                )
+                value_anchor_loss = F.smooth_l1_loss(
+                    output.value.float(), anchor_output.value.float()
+                )
+                loss = (
+                    policy_loss
+                    + 0.50 * value_loss
+                    + kl_multiplier * champion_kl
+                    + 0.25 * value_anchor_weight * value_anchor_loss
+                    - entropy_weight * entropy
+                )
+                optimiser.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimiser)
+                torch.nn.utils.clip_grad_norm_(candidate.parameters(), 1.0)
+                scaler.step(optimiser)
+                scaler.update()
+                candidate.eval()
+                values = {
+                    "loss": float(loss.detach().cpu()),
+                    "policy_loss": float(policy_loss.detach().cpu()),
+                    "value_loss": float(value_loss.detach().cpu()),
+                    "champion_kl": float(champion_kl.detach().cpu()),
+                    "behaviour_kl": float(behaviour_kl.detach().cpu()),
+                    "clip_fraction": float(
+                        ((ratio - 1.0).abs() > ppo_clip_range)
+                        .float().mean().detach().cpu()
+                    ),
+                    "entropy": float(entropy.detach().cpu()),
+                }
+                for name, value in values.items():
+                    totals_local[name] += value
+                local_updates += 1
+                ppo_updates += 1
+        return {
+            name: total / max(1, local_updates)
+            for name, total in totals_local.items()
+        }
+
+    with tqdm(
+        total=steps,
+        desc=f"direct population PPO ({device}, no MCTS)",
+        unit="step",
+        dynamic_ncols=True,
+    ) as progress:
+        for step in range(steps):
+            candidate.eval()
+            tensors = _vector_tensors(batch, device, training)
+            features = np.asarray(batch["action_features"], dtype=np.int64)
+            legal = np.asarray(batch["action_mask"], dtype=bool)
+            state = np.asarray(batch["state"], dtype=np.int32)
+            players_before = state[:, 1]
+            candidate_rows = np.flatnonzero(players_before == candidate_players)
+            opponent_rows = np.flatnonzero(players_before != candidate_players)
+            candidate_turns += int(candidate_rows.size)
+            opponent_turns += int(opponent_rows.size)
+            with torch.inference_mode():
+                output = candidate(
+                    tensors["map_tokens"],
+                    tensors["global_features"],
+                    tensors["action_categorical"],
+                    tensors["action_continuous"],
+                    tensors["action_mask"],
+                    tensors["event_features"],
+                    include_belief=False,
+                )
+                rollout_distribution = Categorical(
+                    logits=output.policy_logits / ppo_rollout_temperature
+                )
+                action_rows = rollout_distribution.sample()
+                old_log_probabilities = rollout_distribution.log_prob(action_rows)
+                values_before = output.value.float()
+            for opponent_index, opponent in enumerate(frozen):
+                rows = opponent_rows[
+                    opponent_indices[opponent_rows] == opponent_index
+                ]
+                if not rows.size:
+                    continue
+                with torch.inference_mode():
+                    opponent_output = _model_rows(opponent, tensors, rows)
+                    selected = opponent_output.policy_logits.argmax(dim=-1)
+                row_tensor = torch.as_tensor(
+                    rows, dtype=torch.long, device=device
+                )
+                action_rows.index_copy_(0, row_tensor, selected)
+            selected_rows = action_rows.detach().cpu().numpy().astype(np.int64)
+            if not legal[np.arange(num_envs), selected_rows].all():
+                raise RuntimeError("raw PPO selected an illegal VectorGameEnv action")
+            shaped = _visible_action_reward(
+                features,
+                selected_rows,
+                np.asarray(batch["map_tokens"], dtype=np.int64),
+                state,
+                training.map_size,
+            )
+            action_ids = np.asarray(batch["action_id"], dtype=np.int32)[
+                np.arange(num_envs), selected_rows
+            ]
+            next_batch = env.step(action_ids)
+            terminal = np.asarray(next_batch["terminated"], dtype=bool)
+            terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
+            reward = shaping_weight * shaped + terminal_reward
+            reward_total += float(reward.mean())
+            with torch.inference_mode():
+                next_tensors = _vector_tensors(next_batch, device, training)
+                next_output = candidate(
+                    next_tensors["map_tokens"],
+                    next_tensors["global_features"],
+                    next_tensors["action_categorical"],
+                    next_tensors["action_continuous"],
+                    next_tensors["action_mask"],
+                    next_tensors["event_features"],
+                    include_belief=False,
+                )
+                next_values = next_output.value.float().cpu().numpy()
+            players_after = np.asarray(next_batch["state"], dtype=np.int32)[:, 1]
+            signs = np.where(players_after == players_before, 1.0, -1.0)
+            candidate_mask = np.zeros(num_envs, dtype=bool)
+            candidate_mask[candidate_rows] = True
+            old_logs = old_log_probabilities.float().cpu().numpy()
+            old_values = values_before.cpu().numpy()
+            for env_id in range(num_envs):
+                example = None
+                if candidate_mask[env_id]:
+                    observation, compact_action_row = _ppo_snapshot(
+                        batch, env_id, int(selected_rows[env_id])
+                    )
+                    example = _PPOExample(
+                        observation=observation,
+                        action_row=compact_action_row,
+                        old_log_probability=float(old_logs[env_id]),
+                        old_value=float(old_values[env_id]),
+                    )
+                    pending_candidate_examples += 1
+                traces[env_id].append(
+                    _PPOTransition(
+                        value=float(old_values[env_id]),
+                        reward=float(reward[env_id]),
+                        next_value=float(next_values[env_id]),
+                        sign=float(signs[env_id]),
+                        terminal=bool(terminal[env_id]),
+                        candidate_example=example,
+                    )
+                )
+
+            episode_moves += 1
+            for env_id in np.flatnonzero(terminal):
+                # Finish only a real game here.  The return crosses every
+                # opponent action stored in this slot before reaching its own
+                # candidate decisions.
+                finished_examples = _finish_ppo_trace(
+                    traces[int(env_id)], gamma=gamma, gae_lambda=ppo_gae_lambda
+                )
+                completed_examples.extend(finished_examples)
+                pending_candidate_examples -= len(finished_examples)
+                traces[int(env_id)].clear()
+                completed_games += 1
+                selected_opponent = int(opponent_indices[env_id])
+                if terminal_reward[env_id] != 0.0:
+                    winner_player = int(players_before[env_id])
+                    if terminal_reward[env_id] < 0.0:
+                        winner_player = 1 - winner_player
+                    candidate_won = winner_player == candidate_players[env_id]
+                    wins += int(candidate_won)
+                    losses += int(not candidate_won)
+                    score = float(candidate_won)
+                else:
+                    draws += 1
+                    winner_player = -1
+                    score = 0.5
+                if game_callback is not None:
+                    game_callback({
+                        "game_index": completed_games - 1,
+                        "map_seed": int(training.seed),
+                        "map_seed_is_collection_seed": 1,
+                        "vector_env_id": int(env_id),
+                        "vector_episode": int(episode_numbers[env_id]),
+                        "model_a_player": int(candidate_players[env_id]),
+                        "winner_player": winner_player,
+                        "score_a": score,
+                        "moves": int(episode_moves[env_id]),
+                        "opponent_model_index": selected_opponent,
+                    })
+                candidate_players[env_id] = 1 - candidate_players[env_id]
+                opponent_indices[env_id] = int(
+                    rng.choice(len(frozen), p=weights)
+                )
+                episode_moves[env_id] = 0
+                episode_numbers[env_id] += 1
+
+            rollout_metrics: Dict[str, float] = {}
+            if pending_candidate_examples > ppo_max_pending_examples:
+                for trace in traces:
+                    if not trace:
+                        continue
+                    truncated_examples = _finish_ppo_trace(
+                        trace, gamma=gamma, gae_lambda=ppo_gae_lambda
+                    )
+                    completed_examples.extend(truncated_examples)
+                    pending_candidate_examples -= len(truncated_examples)
+                    trace.clear()
+                    ppo_forced_truncations += 1
+            if step + 1 == steps:
+                # The final block boundary is a bootstrap, never a fake draw.
+                for trace in traces:
+                    if not trace:
+                        continue
+                    truncated_examples = _finish_ppo_trace(
+                        trace, gamma=gamma, gae_lambda=ppo_gae_lambda
+                    )
+                    completed_examples.extend(truncated_examples)
+                    pending_candidate_examples -= len(truncated_examples)
+                    trace.clear()
+                    ppo_forced_truncations += 1
+            if completed_examples and (
+                len(completed_examples) >= ppo_update_target
+                or step + 1 == steps
+            ):
+                examples = completed_examples
+                completed_examples = []
+                ppo_samples += len(examples)
+                ppo_rollouts += 1
+                rollout_metrics = optimise_rollout(examples)
+                for name, value in rollout_metrics.items():
+                    totals[name] += value
+
+            batch = next_batch
+            run.log(
+                step=step + 1,
+                environment_step=(step + 1) * num_envs,
+                completed_games=completed_games,
+                candidate_wins=wins,
+                candidate_losses=losses,
+                draws=draws,
+                candidate_turns=candidate_turns,
+                opponent_turns=opponent_turns,
+                ppo_samples=ppo_samples,
+                ppo_updates=ppo_updates,
+                ppo_rollouts=ppo_rollouts,
+                ppo_pending_examples=pending_candidate_examples,
+                ppo_forced_truncations=ppo_forced_truncations,
+                ppo_kl_exceeded=float(ppo_kl_exceeded),
+                ppo_learning_rate=float(optimiser.param_groups[0]["lr"]),
+                reward=float(reward.mean()),
+                **{
+                    "ppo_" + name: value
+                    for name, value in rollout_metrics.items()
+                },
+            )
+            progress.update(1)
+            if (step + 1) % 20 == 0 or step == 0:
+                progress.set_postfix(
+                    env_steps=(step + 1) * num_envs,
+                    games=completed_games,
+                    score=f"{(wins + 0.5 * draws) / max(1, completed_games):.3f}",
+                    ppo_updates=ppo_updates,
+                    kl=f"{rollout_metrics.get('champion_kl', 0.0):.3f}",
+                )
+            if ppo_kl_exceeded:
+                break
+
+    divisor = max(1, ppo_rollouts)
+    summary: Dict[str, float | str] = {
+        "direct_population_algorithm": "signed_ppo_gae",
+        "direct_population_envs": float(num_envs),
+        "direct_population_steps": float(step + 1),
+        "direct_population_environment_steps": float((step + 1) * num_envs),
+        "direct_population_completed_games": float(completed_games),
+        "direct_population_wins": float(wins),
+        "direct_population_losses": float(losses),
+        "direct_population_draws": float(draws),
+        "direct_population_score": float(
+            (wins + 0.5 * draws) / max(1, completed_games)
+        ),
+        "direct_population_candidate_turns": float(candidate_turns),
+        "direct_population_opponent_turns": float(opponent_turns),
+        "direct_population_ppo_samples": float(ppo_samples),
+        "direct_population_ppo_updates": float(ppo_updates),
+        "direct_population_ppo_rollouts": float(ppo_rollouts),
+        "direct_population_ppo_pending_examples": float(
+            pending_candidate_examples
+        ),
+        "direct_population_ppo_forced_truncations": float(
+            ppo_forced_truncations
+        ),
+        "direct_population_ppo_update_target": float(ppo_update_target),
+        "direct_population_ppo_max_pending_examples": float(
+            ppo_max_pending_examples
+        ),
+        "direct_population_ppo_kl_exceeded": float(ppo_kl_exceeded),
+        "direct_population_ppo_target_kl": float(ppo_target_kl),
+        "direct_population_ppo_hard_kl": float(ppo_hard_kl),
+        "direct_population_ppo_rollout_temperature": float(
+            ppo_rollout_temperature
+        ),
+        "direct_population_ppo_reward": reward_total / max(1, step + 1),
+        **{
+            "direct_population_ppo_" + name: value / divisor
+            for name, value in totals.items()
+        },
+    }
+    summary["run_dir"] = str(run.finish(summary))
+    return summary
+
+
 def evaluate_direct_population_matches(
     training: TrainingConfig,
     candidate: PolicyValueBeliefNet,
@@ -1002,6 +1756,18 @@ def train_direct_population_curriculum(
     regression_patience: int = 2,
     score_tolerance: float = 0.02,
     objective_tolerance: float = 0.05,
+    diagnostic_gate_games: int | None = 20,
+    ppo_rollout_steps: int = 32,
+    ppo_epochs: int = 2,
+    ppo_minibatch_size: int = 256,
+    ppo_clip_range: float = 0.15,
+    ppo_gae_lambda: float = 0.95,
+    ppo_target_kl: float = 0.015,
+    ppo_hard_kl: float = 0.030,
+    ppo_rollout_temperature: float = 0.85,
+    ppo_max_pending_examples: int = 32_768,
+    ppo_min_learning_rate: float = 1.0e-5,
+    ppo_lr_backoff: float = 0.5,
     objective_replay_horizon: int = 16,
     objective_replay_capacity: int = 512,
     objective_replay_batch_size: int = 32,
@@ -1022,6 +1788,17 @@ def train_direct_population_curriculum(
         raise ValueError("block_steps must be positive")
     if gate_games < 2 or gate_games % 2:
         raise ValueError("direct population gate games must be positive and even")
+    resolved_diagnostic_gate_games = (
+        gate_games if diagnostic_gate_games is None else int(diagnostic_gate_games)
+    )
+    if (
+        resolved_diagnostic_gate_games < 2
+        or resolved_diagnostic_gate_games % 2
+        or resolved_diagnostic_gate_games > gate_games
+    ):
+        raise ValueError(
+            "diagnostic gate games must be positive, even and no larger than the full gate"
+        )
     if readiness_patience < 1:
         raise ValueError("readiness_patience must be positive")
     if regression_patience < 1:
@@ -1032,6 +1809,25 @@ def train_direct_population_curriculum(
         )
     if score_tolerance < 0.0 or objective_tolerance < 0.0:
         raise ValueError("population acceptance tolerances must not be negative")
+    if (
+        ppo_rollout_steps < 1
+        or ppo_epochs < 1
+        or ppo_minibatch_size < 1
+        or ppo_max_pending_examples < ppo_minibatch_size
+    ):
+        raise ValueError("PPO rollout, epoch and minibatch sizes must be positive")
+    if not 0.0 < ppo_clip_range <= 1.0:
+        raise ValueError("ppo_clip_range must be in (0, 1]")
+    if not 0.0 <= ppo_gae_lambda <= 1.0:
+        raise ValueError("ppo_gae_lambda must be between zero and one")
+    if not 0.0 < ppo_target_kl <= ppo_hard_kl:
+        raise ValueError("PPO KL thresholds must satisfy 0 < target <= hard")
+    if not 0.1 <= ppo_rollout_temperature <= 2.0:
+        raise ValueError("ppo_rollout_temperature must be between 0.1 and 2.0")
+    if ppo_min_learning_rate <= 0.0:
+        raise ValueError("ppo_min_learning_rate must be positive")
+    if not 0.0 < ppo_lr_backoff < 1.0:
+        raise ValueError("ppo_lr_backoff must be between zero and one")
     for name, value in {
         "objective_replay_weight": objective_replay_weight,
         "objective_replay_recency": objective_replay_recency,
@@ -1068,6 +1864,7 @@ def train_direct_population_curriculum(
             "num_threads": num_threads,
             "max_actions": max_actions,
             "gate_games": gate_games,
+            "diagnostic_gate_games": resolved_diagnostic_gate_games,
             "gate_seed": gate_seed,
             "gate_score": gate_score,
             "historical_score_floor": historical_score_floor,
@@ -1086,6 +1883,18 @@ def train_direct_population_curriculum(
             "teacher_weight": teacher_weight,
             "shaping_weight": shaping_weight,
             "greedy_advantage_weight": greedy_advantage_weight,
+            "algorithm": "signed_ppo_gae",
+            "ppo_rollout_steps": ppo_rollout_steps,
+            "ppo_epochs": ppo_epochs,
+            "ppo_minibatch_size": ppo_minibatch_size,
+            "ppo_clip_range": ppo_clip_range,
+            "ppo_gae_lambda": ppo_gae_lambda,
+            "ppo_target_kl": ppo_target_kl,
+            "ppo_hard_kl": ppo_hard_kl,
+            "ppo_rollout_temperature": ppo_rollout_temperature,
+            "ppo_max_pending_examples": ppo_max_pending_examples,
+            "ppo_min_learning_rate": ppo_min_learning_rate,
+            "ppo_lr_backoff": ppo_lr_backoff,
             "objective_replay_horizon": objective_replay_horizon,
             "objective_replay_capacity": objective_replay_capacity,
             "objective_replay_batch_size": objective_replay_batch_size,
@@ -1095,6 +1904,7 @@ def train_direct_population_curriculum(
             "objective_replay_max_epochs": objective_replay_max_epochs,
         },
     )
+    parent_state = model_state_on_cpu(candidate)
     best_state = model_state_on_cpu(candidate)
     best_score = 0.0
     best_worst_score = 0.0
@@ -1109,7 +1919,13 @@ def train_direct_population_curriculum(
     maximum_consecutive_regressions = 0
     gate_rows: list[Dict[str, Any]] = []
 
-    def gate(label: str, block: int, baseline: bool = False) -> bool:
+    def gate(
+        label: str,
+        block: int,
+        baseline: bool = False,
+        *,
+        games: int = resolved_diagnostic_gate_games,
+    ) -> bool:
         nonlocal best_state, best_score, best_worst_score
         nonlocal best_capture_rate, best_completion_rate
         nonlocal best_objective_progress
@@ -1122,7 +1938,7 @@ def train_direct_population_curriculum(
             candidate,
             opponent_models,
             weights,
-            games=gate_games,
+            games=games,
             gate_seed=gate_seed,
             game_callback=(
                 None
@@ -1221,6 +2037,7 @@ def train_direct_population_curriculum(
             "best_meets_readiness": float(best_meets_readiness),
             "readiness_streak": float(readiness_streak),
             "consecutive_regressions": float(consecutive_regressions),
+            "games": float(games),
             "opponents": results,
         }
         gate_rows.append(row)
@@ -1241,6 +2058,7 @@ def train_direct_population_curriculum(
             direct_population_consecutive_regressions=float(
                 consecutive_regressions
             ),
+            direct_population_gate_games=float(games),
         )
         return accepted
 
@@ -1250,6 +2068,7 @@ def train_direct_population_curriculum(
     early_stopped = False
     early_stop_reason = ""
     training_rows: list[Dict[str, Any]] = []
+    current_ppo_learning_rate = float(training.learning_rate)
     while completed < maximum_steps and (
         completed < minimum_steps
         or not ready
@@ -1260,6 +2079,7 @@ def train_direct_population_curriculum(
         block_training = replace(
             training,
             seed=(training.seed - 1 + block * 2_000_003) % (2**31 - 1) + 1,
+            learning_rate=current_ppo_learning_rate,
         )
         result = train_vector_population(
             block_training,
@@ -1278,13 +2098,15 @@ def train_direct_population_curriculum(
             teacher_weight=teacher_weight,
             shaping_weight=shaping_weight,
             greedy_advantage_weight=greedy_advantage_weight,
-            objective_replay_horizon=objective_replay_horizon,
-            objective_replay_capacity=objective_replay_capacity,
-            objective_replay_batch_size=objective_replay_batch_size,
-            objective_replay_interval=objective_replay_interval,
-            objective_replay_weight=objective_replay_weight,
-            objective_replay_recency=objective_replay_recency,
-            objective_replay_max_epochs=objective_replay_max_epochs,
+            ppo_rollout_steps=ppo_rollout_steps,
+            ppo_epochs=ppo_epochs,
+            ppo_minibatch_size=ppo_minibatch_size,
+            ppo_clip_range=ppo_clip_range,
+            ppo_gae_lambda=ppo_gae_lambda,
+            ppo_target_kl=ppo_target_kl,
+            ppo_hard_kl=ppo_hard_kl,
+            ppo_rollout_temperature=ppo_rollout_temperature,
+            ppo_max_pending_examples=ppo_max_pending_examples,
             game_callback=(
                 None
                 if training_game_callback is None
@@ -1296,6 +2118,27 @@ def train_direct_population_curriculum(
         )
         training_rows.append(result)
         completed += current_steps
+        if bool(result.get("direct_population_ppo_kl_exceeded", 0.0)):
+            restore_model_state(candidate, best_state)
+            rollback_blocks += 1
+            previous_learning_rate = current_ppo_learning_rate
+            current_ppo_learning_rate = max(
+                ppo_min_learning_rate,
+                current_ppo_learning_rate * ppo_lr_backoff,
+            )
+            run.log(
+                direct_population_ppo_rollback=1.0,
+                direct_population_ppo_kl_exceeded=1.0,
+                direct_population_ppo_previous_learning_rate=(
+                    previous_learning_rate
+                ),
+                direct_population_ppo_learning_rate=current_ppo_learning_rate,
+            )
+            if previous_learning_rate <= ppo_min_learning_rate + 1e-12:
+                early_stopped = True
+                early_stop_reason = "ppo_kl_limit_at_min_learning_rate"
+                break
+            continue
         accepted = gate("population", block)
         if (
             completed >= minimum_steps
@@ -1307,6 +2150,62 @@ def train_direct_population_curriculum(
             break
 
     restore_model_state(candidate, best_state)
+    full_evaluation = evaluate_direct_population_matches(
+        training,
+        candidate,
+        opponent_models,
+        weights,
+        games=gate_games,
+        gate_seed=gate_seed,
+        game_callback=(
+            None
+            if gate_game_callback is None
+            else lambda opponent_index, game: gate_game_callback(
+                "final", block, opponent_index, game
+            )
+        ),
+    )
+    full_score = float(full_evaluation["model_a_score"])
+    full_worst_score = float(full_evaluation["worst_score"])
+    full_safe = (
+        full_score >= gate_score
+        and full_worst_score >= historical_score_floor
+    )
+    full_row = {
+        "stage": "final",
+        "block": float(block),
+        "games": float(gate_games),
+        "weighted_score": full_score,
+        "worst_score": full_worst_score,
+        "city_captures_per_game": float(
+            full_evaluation["model_a_city_captures_per_game"]
+        ),
+        "completion_rate": float(full_evaluation["completion_rate"]),
+        "selected": float(full_safe),
+        "accepted": float(full_safe),
+        "selection_reason": "full_gate" if full_safe else "full_gate_rejected",
+        "opponents": full_evaluation["opponents"],
+    }
+    gate_rows.append(full_row)
+    run.log(
+        direct_population_full_gate_score=full_score,
+        direct_population_full_gate_worst=full_worst_score,
+        direct_population_full_gate_selected=float(full_safe),
+        direct_population_full_gate_games=float(gate_games),
+    )
+    if full_safe:
+        best_score = full_score
+        best_worst_score = full_worst_score
+        best_capture_rate = float(
+            full_evaluation["model_a_city_captures_per_game"]
+        )
+        best_completion_rate = float(full_evaluation["completion_rate"])
+    else:
+        # Diagnostics decide which experiment deserves the expensive full
+        # gate; only that full gate may retain a challenger.
+        restore_model_state(candidate, parent_state)
+        ready = False
+        best_meets_readiness = False
     summary: Dict[str, Any] = {
         "direct_population_minimum_steps": float(minimum_steps),
         "direct_population_maximum_steps": float(maximum_steps),
@@ -1328,6 +2227,15 @@ def train_direct_population_curriculum(
         "direct_population_greedy_advantage_weight": float(
             greedy_advantage_weight
         ),
+        "direct_population_algorithm": "signed_ppo_gae",
+        "direct_population_diagnostic_gate_games": float(
+            resolved_diagnostic_gate_games
+        ),
+        "direct_population_full_gate_games": float(gate_games),
+        "direct_population_full_gate_score": full_score,
+        "direct_population_full_gate_worst_score": full_worst_score,
+        "direct_population_full_gate_selected": float(full_safe),
+        "direct_population_ppo_learning_rate_final": current_ppo_learning_rate,
         "direct_population_objective_replay_weight": float(
             objective_replay_weight
         ),

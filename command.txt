@@ -174,31 +174,32 @@ python scripts/train_league.py `
   --direct-readiness-patience 2 `
   --direct-regression-patience 2 `
   --direct-population-envs 128 `
-  --direct-population-steps 2000 `
-  --direct-population-block-steps 2000 `
-  --direct-population-max-steps 10000 `
+  --direct-population-steps 6000 `
+  --direct-population-block-steps 6000 `
+  --direct-population-max-steps 12000 `
   --direct-population-gate-games 100 `
+  --direct-population-diagnostic-gate-games 20 `
   --direct-population-gate-score 0.50 `
   --direct-population-historical-floor 0.45 `
   --direct-population-readiness-patience 2 `
   --direct-population-regression-patience 3 `
-  --direct-population-opponent-policy-weight 0.50 `
-  --direct-population-teacher-weight 0.25 `
   --direct-population-shaping-weight 0.20 `
-  --direct-population-objective-replay-horizon 16 `
-  --direct-population-objective-replay-capacity 512 `
-  --direct-population-objective-replay-batch-size 32 `
-  --direct-population-objective-replay-interval 16 `
-  --direct-population-objective-replay-weight 0.35 `
-  --direct-population-objective-replay-recency 0.92 `
-  --direct-population-objective-replay-max-epochs 4 `
+  --direct-population-ppo-rollout-steps 32 `
+  --direct-population-ppo-epochs 2 `
+  --direct-population-ppo-minibatch-size 256 `
+  --direct-population-ppo-clip-range 0.15 `
+  --direct-population-ppo-gae-lambda 0.95 `
+  --direct-population-ppo-target-kl 0.015 `
+  --direct-population-ppo-hard-kl 0.030 `
+  --direct-population-ppo-rollout-temperature 0.85 `
+  --direct-population-ppo-max-pending-examples 32768 `
+  --direct-population-ppo-min-learning-rate 1e-5 `
+  --direct-population-ppo-lr-backoff 0.50 `
   --post-bootstrap-population-steps 6000 `
   --post-bootstrap-population-max-steps 12000 `
   --post-bootstrap-objective-steps 0 `
   --post-bootstrap-champion-probability 0.65 `
   --post-bootstrap-policy-anchor-weight 0.35 `
-  --post-bootstrap-teacher-weight 0.02 `
-  --post-bootstrap-opponent-policy-weight 0.65 `
   --champion-mode flat `
   --mcts-probe-games 10 `
   --mcts-probe-simulations 32 `
@@ -238,7 +239,7 @@ python scripts/train_league.py `
   --bridge-replay-fraction 0.25 `
   --exploration-rate 0.15 `
   --td-lambda 1.0 `
-  --learning-rate 1e-5 `
+  --learning-rate 5e-5 `
   --max-moves 700 `
   --map-size 11 `
   --map-type lakes `

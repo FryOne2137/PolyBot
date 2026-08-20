@@ -147,7 +147,10 @@ def main() -> None:
     parser.add_argument(
         "--direct-population-block-steps", type=int, default=1_000,
     )
-    parser.add_argument("--direct-population-gate-games", type=int, default=30)
+    parser.add_argument(
+        "--direct-population-gate-games", type=int, default=100,
+        help="Paired games per population checkpoint selection gate",
+    )
     parser.add_argument("--direct-population-gate-score", type=float, default=0.50)
     parser.add_argument(
         "--direct-population-historical-floor", type=float, default=0.45,
@@ -169,6 +172,30 @@ def main() -> None:
         "--direct-population-shaping-weight", type=float, default=0.20,
     )
     parser.add_argument(
+        "--direct-population-objective-replay-horizon", type=int, default=16,
+        help="Visible candidate decisions credited by one real success",
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-capacity", type=int, default=512,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-batch-size", type=int, default=32,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-interval", type=int, default=16,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-weight", type=float, default=0.35,
+        help="Extra policy-only loss for prefixes ending in visible success",
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-recency", type=float, default=0.92,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-max-epochs", type=int, default=4,
+        help="Maximum average reuses of each successful visible decision",
+    )
+    parser.add_argument(
         "--post-bootstrap-population-steps", type=int, default=6_000,
         help="Minimum champion-population steps after the first promotion",
     )
@@ -177,8 +204,8 @@ def main() -> None:
         help="Maximum champion-population steps after the first promotion",
     )
     parser.add_argument(
-        "--post-bootstrap-objective-steps", type=int, default=500,
-        help="Conservative multi-step objective refresh for an established champion",
+        "--post-bootstrap-objective-steps", type=int, default=0,
+        help="Deprecated: established champions use event-triggered population replay instead",
     )
     parser.add_argument(
         "--post-bootstrap-champion-probability", type=float, default=0.65,
@@ -245,7 +272,10 @@ def main() -> None:
     parser.add_argument("--visible-action-history", type=int, default=0, help="0 keeps train/evaluation inputs identical")
     parser.add_argument("--belief-retries", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--exploration-rate", type=float, default=0.10)
+    parser.add_argument(
+        "--exploration-rate", type=float, default=0.15,
+        help="Sampled candidate-turn fraction during direct population play",
+    )
     parser.add_argument("--teacher-policy-target-weight", type=float, default=0.10)
     parser.add_argument("--priority-replay-fraction", type=float, default=0.35)
     parser.add_argument("--td-lambda", type=float, default=0.95)
@@ -353,6 +383,27 @@ def main() -> None:
         ),
         direct_population_shaping_weight=(
             args.direct_population_shaping_weight
+        ),
+        direct_population_objective_replay_horizon=(
+            args.direct_population_objective_replay_horizon
+        ),
+        direct_population_objective_replay_capacity=(
+            args.direct_population_objective_replay_capacity
+        ),
+        direct_population_objective_replay_batch_size=(
+            args.direct_population_objective_replay_batch_size
+        ),
+        direct_population_objective_replay_interval=(
+            args.direct_population_objective_replay_interval
+        ),
+        direct_population_objective_replay_weight=(
+            args.direct_population_objective_replay_weight
+        ),
+        direct_population_objective_replay_recency=(
+            args.direct_population_objective_replay_recency
+        ),
+        direct_population_objective_replay_max_epochs=(
+            args.direct_population_objective_replay_max_epochs
         ),
         post_bootstrap_population_steps=(
             args.post_bootstrap_population_steps

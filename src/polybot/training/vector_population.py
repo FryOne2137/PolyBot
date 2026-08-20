@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import nullcontext
-from dataclasses import replace
-from typing import Any, Callable, Dict, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Deque, Dict, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -20,7 +21,109 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 from .direct_curriculum import model_state_on_cpu, restore_model_state
 from .run_artifacts import TrainingRun
 from .vector_actor_critic import _normalise_advantage, _visible_action_reward
-from .vector_teacher import _teacher_targets, _vector_tensors
+from .vector_teacher import (
+    _teacher_targets,
+    _vector_tensors,
+    _visible_goal_progress,
+)
+
+
+_OBJECTIVE_REPLAY_FIELDS = (
+    "map_tokens",
+    "state",
+    "action_features",
+    "action_mask",
+    "visible_event_features",
+    "visible_event_mask",
+)
+
+
+@dataclass(frozen=True)
+class _ObjectiveReplayExample:
+    """One public candidate decision preceding a real in-game success.
+
+    The examples intentionally contain only the same visible tensors consumed
+    by the raw policy.  They are behaviour-cloning targets, not fabricated
+    value targets: reaching a village or a city is useful, but not proof that
+    the whole game will be won.
+    """
+
+    observation: Mapping[str, np.ndarray]
+    action_row: int
+    weight: float
+
+
+def _objective_replay_success_weights(
+    features: np.ndarray,
+    selected_rows: np.ndarray,
+    map_tokens: np.ndarray,
+    state: np.ndarray,
+    candidate_rows: np.ndarray,
+    terminal: np.ndarray,
+    terminal_reward: np.ndarray,
+    map_size: int,
+) -> np.ndarray:
+    """Return public success weights for candidate decisions only.
+
+    A successful prefix is created only after an observable event: entering a
+    visible village, founding or capturing a city, or winning the game.  This
+    avoids the previous arbitrary fixed-horizon objective rollouts and never
+    reads PolyEnv's authoritative hidden map.
+    """
+    count = int(features.shape[0])
+    rows = np.arange(count, dtype=np.int64)
+    chosen = features[rows, selected_rows]
+    candidate_mask = np.zeros(count, dtype=bool)
+    candidate_mask[np.asarray(candidate_rows, dtype=np.int64)] = True
+    _, enters_village = _visible_goal_progress(
+        features, map_tokens, state, int(map_size)
+    )
+    village = enters_village[rows, selected_rows]
+    capture_city = (chosen[:, 0] == 8) & (chosen[:, 8] == 14)
+    found_city = (chosen[:, 0] == 8) & (chosen[:, 8] == 11)
+    win = np.asarray(terminal, dtype=bool) & (
+        np.asarray(terminal_reward, dtype=np.float32) > 0.0
+    )
+    weights = np.zeros(count, dtype=np.float32)
+    weights = np.maximum(weights, np.where(village, 0.25, 0.0))
+    weights = np.maximum(weights, np.where(found_city, 0.35, 0.0))
+    weights = np.maximum(weights, np.where(capture_city, 0.60, 0.0))
+    weights = np.maximum(weights, np.where(win, 1.00, 0.0))
+    return np.where(candidate_mask, weights, 0.0).astype(np.float32)
+
+
+def _objective_replay_snapshot(
+    batch: Mapping[str, np.ndarray], row: int, action_row: int
+) -> _ObjectiveReplayExample:
+    """Copy one visible decision before VectorGameEnv advances the slot."""
+    return _ObjectiveReplayExample(
+        observation={
+            field: np.asarray(batch[field])[row].copy()
+            for field in _OBJECTIVE_REPLAY_FIELDS
+        },
+        action_row=int(action_row),
+        weight=1.0,
+    )
+
+
+def _objective_replay_batch(
+    examples: Sequence[_ObjectiveReplayExample],
+) -> tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Collate public replay examples for one extra policy-only update."""
+    if not examples:
+        raise ValueError("objective replay batch must not be empty")
+    return (
+        {
+            field: np.stack(
+                [example.observation[field] for example in examples], axis=0
+            )
+            for field in _OBJECTIVE_REPLAY_FIELDS
+        },
+        np.asarray(
+            [example.action_row for example in examples], dtype=np.int64
+        ),
+        np.asarray([example.weight for example in examples], dtype=np.float32),
+    )
 
 
 def _model_rows(
@@ -73,6 +176,13 @@ def train_vector_population(
     greedy_advantage_weight: float = 0.25,
     entropy_weight: float = 0.004,
     gamma: float = 0.995,
+    objective_replay_horizon: int = 16,
+    objective_replay_capacity: int = 512,
+    objective_replay_batch_size: int = 32,
+    objective_replay_interval: int = 16,
+    objective_replay_weight: float = 0.35,
+    objective_replay_recency: float = 0.92,
+    objective_replay_max_epochs: int = 4,
     game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
@@ -114,9 +224,21 @@ def train_vector_population(
         "shaping_weight": shaping_weight,
         "greedy_advantage_weight": greedy_advantage_weight,
         "exploration_rate": training.exploration_rate,
+        "objective_replay_weight": objective_replay_weight,
+        "objective_replay_recency": objective_replay_recency,
     }.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be between zero and one")
+    if objective_replay_horizon < 1:
+        raise ValueError("objective_replay_horizon must be positive")
+    if objective_replay_capacity < 1:
+        raise ValueError("objective_replay_capacity must be positive")
+    if objective_replay_batch_size < 1:
+        raise ValueError("objective_replay_batch_size must be positive")
+    if objective_replay_interval < 1:
+        raise ValueError("objective_replay_interval must be positive")
+    if objective_replay_max_epochs < 1:
+        raise ValueError("objective_replay_max_epochs must be positive")
     try:
         from PolyEnv import Bardur, Imperius, VectorGameEnv
     except ImportError as error:
@@ -141,6 +263,13 @@ def train_vector_population(
             "shaping_weight": shaping_weight,
             "greedy_advantage_weight": greedy_advantage_weight,
             "exploration_rate": training.exploration_rate,
+            "objective_replay_horizon": objective_replay_horizon,
+            "objective_replay_capacity": objective_replay_capacity,
+            "objective_replay_batch_size": objective_replay_batch_size,
+            "objective_replay_interval": objective_replay_interval,
+            "objective_replay_weight": objective_replay_weight,
+            "objective_replay_recency": objective_replay_recency,
+            "objective_replay_max_epochs": objective_replay_max_epochs,
         },
     )
     candidate.to(device)
@@ -180,9 +309,19 @@ def train_vector_population(
     candidate_players = (np.arange(num_envs, dtype=np.int32) & 1).copy()
     episode_moves = np.zeros(num_envs, dtype=np.int32)
     episode_numbers = np.zeros(num_envs, dtype=np.int64)
+    objective_histories: list[Deque[_ObjectiveReplayExample]] = [
+        deque(maxlen=objective_replay_horizon) for _ in range(num_envs)
+    ]
+    objective_replay: Deque[_ObjectiveReplayExample] = deque(
+        maxlen=objective_replay_capacity
+    )
     completed_games = wins = losses = draws = 0
     candidate_turns = opponent_turns = 0
     candidate_exploration_turns = 0
+    objective_replay_events = 0
+    objective_replay_positions = 0
+    objective_replay_updates = 0
+    objective_replay_update_credits = 0
     totals = {
         "loss": 0.0,
         "policy_loss": 0.0,
@@ -194,6 +333,7 @@ def train_vector_population(
         "value_anchor_loss": 0.0,
         "entropy": 0.0,
         "reward": 0.0,
+        "objective_replay_loss": 0.0,
     }
 
     with tqdm(
@@ -312,6 +452,58 @@ def train_vector_population(
             terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
             reward = shaping_weight * shaped + terminal_reward
 
+            # A prefix is retained only when the candidate just achieved an
+            # observable objective.  `batch` contains the public observation
+            # from before the action; keeping it is therefore valid even
+            # though VectorGameEnv has already advanced to `next_batch`.
+            if objective_replay_weight > 0.0 and candidate_rows.size:
+                success_weights = _objective_replay_success_weights(
+                    features,
+                    selected_rows,
+                    np.asarray(batch["map_tokens"], dtype=np.int64),
+                    state,
+                    candidate_rows,
+                    terminal,
+                    terminal_reward,
+                    training.map_size,
+                )
+                for env_id in candidate_rows:
+                    history = objective_histories[int(env_id)]
+                    history.append(
+                        _objective_replay_snapshot(
+                            batch, int(env_id), int(selected_rows[env_id])
+                        )
+                    )
+                    success_weight = float(success_weights[env_id])
+                    if success_weight <= 0.0:
+                        continue
+                    objective_replay_events += 1
+                    # The action that created the event is weighted most, but
+                    # the preceding public decisions receive credit too. This
+                    # is a bounded return-to-go, not an arbitrary rollout.
+                    for age, example in enumerate(reversed(history)):
+                        objective_replay.append(
+                            replace(
+                                example,
+                                weight=(
+                                    success_weight
+                                    * objective_replay_recency**age
+                                ),
+                            )
+                        )
+                        objective_replay_positions += 1
+                        # One stored public decision may be drawn at most a
+                        # small configured number of times on average. Without
+                        # this credit budget, a quiet replay of 32 examples
+                        # could be optimised every 16 vector steps forever.
+                        objective_replay_update_credits += (
+                            objective_replay_max_epochs
+                        )
+            # Native auto-reset affects only finished slots. Their history
+            # must never leak into the following episode in that slot.
+            for env_id in np.flatnonzero(terminal):
+                objective_histories[int(env_id)].clear()
+
             candidate.eval()
             with torch.no_grad():
                 next_tensors = _vector_tensors(next_batch, device, training)
@@ -428,6 +620,60 @@ def train_vector_population(
             value_anchor_loss = F.smooth_l1_loss(
                 output.value, anchor_output.value
             )
+            objective_replay_loss = output.value.sum() * 0.0
+            if (
+                objective_replay_weight > 0.0
+                and len(objective_replay) >= objective_replay_batch_size
+                and objective_replay_update_credits
+                >= objective_replay_batch_size
+                and (step + 1) % objective_replay_interval == 0
+            ):
+                replay_indices = rng.choice(
+                    len(objective_replay),
+                    size=objective_replay_batch_size,
+                    replace=False,
+                )
+                replay_examples = [
+                    objective_replay[int(index)] for index in replay_indices
+                ]
+                replay_batch, replay_actions, replay_weights = (
+                    _objective_replay_batch(replay_examples)
+                )
+                replay_tensors = _vector_tensors(
+                    replay_batch, device, training
+                )
+                replay_action_tensor = torch.as_tensor(
+                    replay_actions, dtype=torch.long, device=device
+                )
+                replay_weight_tensor = torch.as_tensor(
+                    replay_weights, dtype=torch.float32, device=device
+                )
+                replay_autocast = (
+                    torch.autocast(device_type="cuda", dtype=torch.float16)
+                    if cuda_amp
+                    else nullcontext()
+                )
+                with replay_autocast:
+                    replay_output = candidate(
+                        replay_tensors["map_tokens"],
+                        replay_tensors["global_features"],
+                        replay_tensors["action_categorical"],
+                        replay_tensors["action_continuous"],
+                        replay_tensors["action_mask"],
+                        replay_tensors["event_features"],
+                        include_belief=False,
+                    )
+                    replay_log_probabilities = F.log_softmax(
+                        replay_output.policy_logits, dim=-1
+                    )
+                    replay_log_probability = replay_log_probabilities.gather(
+                        1, replay_action_tensor.unsqueeze(1)
+                    ).squeeze(1)
+                    objective_replay_loss = -(
+                        replay_weight_tensor * replay_log_probability
+                    ).sum() / replay_weight_tensor.sum().clamp_min(1e-6)
+                objective_replay_updates += 1
+                objective_replay_update_credits -= objective_replay_batch_size
             loss = (
                 policy_loss
                 + greedy_advantage_weight * greedy_advantage_loss
@@ -436,6 +682,7 @@ def train_vector_population(
                 + teacher_weight * teacher_loss
                 + policy_anchor_weight * policy_anchor_loss
                 + value_anchor_weight * value_anchor_loss
+                + objective_replay_weight * objective_replay_loss
                 - entropy_weight * entropy
             )
             optimiser.zero_grad(set_to_none=True)
@@ -501,6 +748,9 @@ def train_vector_population(
                 "value_anchor_loss": float(value_anchor_loss.detach().cpu()),
                 "entropy": float(entropy.detach().cpu()),
                 "reward": float(reward.mean()),
+                "objective_replay_loss": float(
+                    objective_replay_loss.detach().cpu()
+                ),
             }
             for key, value in metrics.items():
                 totals[key] += value
@@ -515,6 +765,14 @@ def train_vector_population(
                 candidate_turns=candidate_turns,
                 candidate_exploration_turns=candidate_exploration_turns,
                 opponent_turns=opponent_turns,
+                objective_replay_events=objective_replay_events,
+                objective_replay_positions=objective_replay_positions,
+                objective_replay_size=len(objective_replay),
+                objective_replay_updates=objective_replay_updates,
+                objective_replay_effective_epochs=(
+                    objective_replay_updates * objective_replay_batch_size
+                    / max(1, objective_replay_positions)
+                ),
                 **metrics,
             )
             progress.update(1)
@@ -544,6 +802,29 @@ def train_vector_population(
             candidate_exploration_turns / max(1, candidate_turns)
         ),
         "direct_population_opponent_turns": float(opponent_turns),
+        "direct_population_objective_replay_events": float(
+            objective_replay_events
+        ),
+        "direct_population_objective_replay_positions": float(
+            objective_replay_positions
+        ),
+        "direct_population_objective_replay_size": float(len(objective_replay)),
+        "direct_population_objective_replay_updates": float(
+            objective_replay_updates
+        ),
+        "direct_population_objective_replay_weight": float(
+            objective_replay_weight
+        ),
+        "direct_population_objective_replay_horizon": float(
+            objective_replay_horizon
+        ),
+        "direct_population_objective_replay_max_epochs": float(
+            objective_replay_max_epochs
+        ),
+        "direct_population_objective_replay_effective_epochs": float(
+            objective_replay_updates * objective_replay_batch_size
+            / max(1, objective_replay_positions)
+        ),
         **{
             "direct_population_" + key: value / max(1, steps)
             for key, value in totals.items()
@@ -721,6 +1002,13 @@ def train_direct_population_curriculum(
     regression_patience: int = 2,
     score_tolerance: float = 0.02,
     objective_tolerance: float = 0.05,
+    objective_replay_horizon: int = 16,
+    objective_replay_capacity: int = 512,
+    objective_replay_batch_size: int = 32,
+    objective_replay_interval: int = 16,
+    objective_replay_weight: float = 0.35,
+    objective_replay_recency: float = 0.92,
+    objective_replay_max_epochs: int = 4,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -744,6 +1032,21 @@ def train_direct_population_curriculum(
         )
     if score_tolerance < 0.0 or objective_tolerance < 0.0:
         raise ValueError("population acceptance tolerances must not be negative")
+    for name, value in {
+        "objective_replay_weight": objective_replay_weight,
+        "objective_replay_recency": objective_replay_recency,
+    }.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between zero and one")
+    for name, value in {
+        "objective_replay_horizon": objective_replay_horizon,
+        "objective_replay_capacity": objective_replay_capacity,
+        "objective_replay_batch_size": objective_replay_batch_size,
+        "objective_replay_interval": objective_replay_interval,
+        "objective_replay_max_epochs": objective_replay_max_epochs,
+    }.items():
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
     weights = np.asarray(opponent_weights, dtype=np.float64)
     if (
         weights.shape != (len(opponent_models),)
@@ -783,6 +1086,13 @@ def train_direct_population_curriculum(
             "teacher_weight": teacher_weight,
             "shaping_weight": shaping_weight,
             "greedy_advantage_weight": greedy_advantage_weight,
+            "objective_replay_horizon": objective_replay_horizon,
+            "objective_replay_capacity": objective_replay_capacity,
+            "objective_replay_batch_size": objective_replay_batch_size,
+            "objective_replay_interval": objective_replay_interval,
+            "objective_replay_weight": objective_replay_weight,
+            "objective_replay_recency": objective_replay_recency,
+            "objective_replay_max_epochs": objective_replay_max_epochs,
         },
     )
     best_state = model_state_on_cpu(candidate)
@@ -968,6 +1278,13 @@ def train_direct_population_curriculum(
             teacher_weight=teacher_weight,
             shaping_weight=shaping_weight,
             greedy_advantage_weight=greedy_advantage_weight,
+            objective_replay_horizon=objective_replay_horizon,
+            objective_replay_capacity=objective_replay_capacity,
+            objective_replay_batch_size=objective_replay_batch_size,
+            objective_replay_interval=objective_replay_interval,
+            objective_replay_weight=objective_replay_weight,
+            objective_replay_recency=objective_replay_recency,
+            objective_replay_max_epochs=objective_replay_max_epochs,
             game_callback=(
                 None
                 if training_game_callback is None
@@ -1010,6 +1327,18 @@ def train_direct_population_curriculum(
         "direct_population_objective_tolerance": float(objective_tolerance),
         "direct_population_greedy_advantage_weight": float(
             greedy_advantage_weight
+        ),
+        "direct_population_objective_replay_weight": float(
+            objective_replay_weight
+        ),
+        "direct_population_objective_replay_horizon": float(
+            objective_replay_horizon
+        ),
+        "direct_population_objective_replay_capacity": float(
+            objective_replay_capacity
+        ),
+        "direct_population_objective_replay_max_epochs": float(
+            objective_replay_max_epochs
         ),
         "direct_population_accepted_blocks": float(accepted_blocks),
         "direct_population_selected_blocks": float(selected_blocks),

@@ -133,17 +133,26 @@ przeciwników wykonują zamrożone modele, a kandydat uczy się własnych akcji,
 wartości pozycji i destyluje zachowanie populacji. Pierwszy model może jeszcze
 korzystać z warm-upu teachera i actor-critic, lecz po pierwszej promocji liga
 automatycznie przechodzi do `champion_population`: teacher i actor-critic są
-pomijane, ale poprzedza ją mały, silnie zakotwiczony refresh `objectives`
-(`--post-bootstrap-objective-steps`). Bieżący champion otrzymuje 65% losowań,
-a populacja używa budżetu
+pomijane. Nie uruchamia już kosztownych, arbitralnych krótkich rolloutów
+`objectives`: wewnątrz population play zachowywany jest ograniczony replay
+wyłącznie poprzednich **widocznych decyzji kandydata**, które faktycznie
+doprowadziły do wejścia do wioski, założenia/przejęcia miasta albo wygranej.
+Replay aktualizuje tylko policy loss — nie fałszuje value targetu jako wygranej.
+Budżet kredytów ogranicza średnie użycie jednej pozycji do
+`--direct-population-objective-replay-max-epochs` (domyślnie 4), więc mały
+bufor sukcesów nie może być optymalizowany w nieskończoność.
+Bieżący champion otrzymuje 65% losowań, a populacja używa budżetu
 `--post-bootstrap-population-steps` do
 `--post-bootstrap-population-max-steps`.
 
 Brama populacji traktuje wygrany wynik przeciw populacji jako kryterium główne.
 Najgorszy wynik historyczny pozostaje twardym floor, a przejęcia miast i
 completion są tie-breakerami zamiast czterech niezależnych warunków blokujących
-każdą zmianę polityki. Gry treningowe w natywnym `VectorGameEnv` nie mają
-sztucznego limitu ruchów, a bramki direct używają `--direct-gate-max-moves`.
+każdą zmianę polityki. Checkpoint populacji jest wybierany dopiero przez większą,
+sparowaną bramkę `--direct-population-gate-games` (domyślnie 100 gier na
+przeciwnika), aby nie zastąpić najlepszego stanu szumem z 30 gier. Gry
+treningowe w natywnym `VectorGameEnv` nie mają sztucznego limitu ruchów, a
+bramki direct używają `--direct-gate-max-moves`.
 W population play tylko `--exploration-rate` tur kandydata jest próbkowana;
 pozostałe wykonują ruch greedy, tak jak w końcowej bramce. Dodatni TD advantage
 z tych tur nadal wzmacnia wybraną akcję, więc stabilność nie oznacza zatrzymania

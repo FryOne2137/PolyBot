@@ -181,7 +181,12 @@ def _curriculum_controls(
             "phase": "champion_population",
             "post_bootstrap": True,
             "teacher_steps": 0,
-            "objective_steps": post_bootstrap_objective_steps,
+            # The old short-horizon objective stage was not event-selected:
+            # it replayed arbitrary eight-decision windows and consumed about
+            # an hour per round without a reliable lift. Established lineages
+            # now use event-triggered prefix replay inside population play.
+            # Keep the legacy argument for old commands, but never run it.
+            "objective_steps": 0,
             "actor_steps": 0,
             "actor_max_steps": 0,
             "population_steps": post_bootstrap_population_steps,
@@ -328,7 +333,7 @@ def train_promotion_league(
     direct_population_steps: int = 0,
     direct_population_max_steps: int = 10_000,
     direct_population_block_steps: int = 1_000,
-    direct_population_gate_games: int = 30,
+    direct_population_gate_games: int = 100,
     direct_population_gate_score: float = 0.50,
     direct_population_historical_floor: float = 0.45,
     direct_population_readiness_patience: int = 2,
@@ -336,6 +341,13 @@ def train_promotion_league(
     direct_population_opponent_policy_weight: float = 0.50,
     direct_population_teacher_weight: float = 0.25,
     direct_population_shaping_weight: float = 0.20,
+    direct_population_objective_replay_horizon: int = 16,
+    direct_population_objective_replay_capacity: int = 512,
+    direct_population_objective_replay_batch_size: int = 32,
+    direct_population_objective_replay_interval: int = 16,
+    direct_population_objective_replay_weight: float = 0.35,
+    direct_population_objective_replay_recency: float = 0.92,
+    direct_population_objective_replay_max_epochs: int = 4,
     post_bootstrap_population_steps: int = 6_000,
     post_bootstrap_population_max_steps: int = 12_000,
     post_bootstrap_objective_steps: int = 0,
@@ -431,6 +443,12 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "direct_population_objective_replay_weight": (
+            direct_population_objective_replay_weight
+        ),
+        "direct_population_objective_replay_recency": (
+            direct_population_objective_replay_recency
+        ),
         "mcts_gate_score": mcts_gate_score,
         "mcts_probe_score": mcts_probe_score,
         "champion_value_anchor_weight": champion_value_anchor_weight,
@@ -445,6 +463,25 @@ def train_promotion_league(
         raise ValueError(
             "direct_readiness_city_captures_per_game must not be negative"
         )
+    for name, value in {
+        "direct_population_objective_replay_horizon": (
+            direct_population_objective_replay_horizon
+        ),
+        "direct_population_objective_replay_capacity": (
+            direct_population_objective_replay_capacity
+        ),
+        "direct_population_objective_replay_batch_size": (
+            direct_population_objective_replay_batch_size
+        ),
+        "direct_population_objective_replay_interval": (
+            direct_population_objective_replay_interval
+        ),
+        "direct_population_objective_replay_max_epochs": (
+            direct_population_objective_replay_max_epochs
+        ),
+    }.items():
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
     if direct_objective_steps < 0 or post_bootstrap_objective_steps < 0:
         raise ValueError("objective curriculum steps must not be negative")
     if (direct_objective_steps or post_bootstrap_objective_steps) and (
@@ -624,6 +661,27 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "direct_population_objective_replay_horizon": (
+            direct_population_objective_replay_horizon
+        ),
+        "direct_population_objective_replay_capacity": (
+            direct_population_objective_replay_capacity
+        ),
+        "direct_population_objective_replay_batch_size": (
+            direct_population_objective_replay_batch_size
+        ),
+        "direct_population_objective_replay_interval": (
+            direct_population_objective_replay_interval
+        ),
+        "direct_population_objective_replay_weight": (
+            direct_population_objective_replay_weight
+        ),
+        "direct_population_objective_replay_recency": (
+            direct_population_objective_replay_recency
+        ),
+        "direct_population_objective_replay_max_epochs": (
+            direct_population_objective_replay_max_epochs
+        ),
         "post_bootstrap_population_steps": post_bootstrap_population_steps,
         "post_bootstrap_population_max_steps": (
             post_bootstrap_population_max_steps
@@ -1263,6 +1321,27 @@ def train_promotion_league(
                                 ),
                                 shaping_weight=(
                                     direct_population_shaping_weight
+                                ),
+                                objective_replay_horizon=(
+                                    direct_population_objective_replay_horizon
+                                ),
+                                objective_replay_capacity=(
+                                    direct_population_objective_replay_capacity
+                                ),
+                                objective_replay_batch_size=(
+                                    direct_population_objective_replay_batch_size
+                                ),
+                                objective_replay_interval=(
+                                    direct_population_objective_replay_interval
+                                ),
+                                objective_replay_weight=(
+                                    direct_population_objective_replay_weight
+                                ),
+                                objective_replay_recency=(
+                                    direct_population_objective_replay_recency
+                                ),
+                                objective_replay_max_epochs=(
+                                    direct_population_objective_replay_max_epochs
                                 ),
                                 gate_game_callback=(
                                     record_direct_population_gate_game

@@ -1355,6 +1355,12 @@ def train_vector_population(
                 action_rows = rollout_distribution.sample()
                 old_log_probabilities = rollout_distribution.log_prob(action_rows)
                 values_before = output.value.float()
+            # ``sample`` is intentionally run under ``inference_mode`` because it
+            # is behaviour-policy data, not part of the PPO gradient.  Opponent
+            # turns replace a subset of these rows below, however, and PyTorch
+            # forbids an in-place write to an inference tensor outside that
+            # context.  Make an ordinary tensor at the boundary.
+            action_rows = action_rows.clone()
             for opponent_index, opponent in enumerate(frozen):
                 rows = opponent_rows[
                     opponent_indices[opponent_rows] == opponent_index

@@ -1148,6 +1148,11 @@ def train_vector_population(
         "clip_fraction": 0.0,
         "entropy": 0.0,
     }
+    # A PPO update happens only after enough completed trajectories have been
+    # collected.  Keep its most recent value separately from the metrics for
+    # *this environment step*, otherwise tqdm misleadingly displays 0.000 on
+    # every collection-only step.
+    last_champion_kl = 0.0
     reward_total = 0.0
 
     def optimise_rollout(examples: Sequence[_PPOExample]) -> Dict[str, float]:
@@ -1516,6 +1521,9 @@ def train_vector_population(
                 ppo_samples += len(examples)
                 ppo_rollouts += 1
                 rollout_metrics = optimise_rollout(examples)
+                last_champion_kl = float(
+                    rollout_metrics.get("champion_kl", last_champion_kl)
+                )
                 for name, value in rollout_metrics.items():
                     totals[name] += value
 
@@ -1536,6 +1544,8 @@ def train_vector_population(
                 ppo_forced_truncations=ppo_forced_truncations,
                 ppo_kl_exceeded=float(ppo_kl_exceeded),
                 ppo_learning_rate=float(optimiser.param_groups[0]["lr"]),
+                ppo_update_this_step=float(bool(rollout_metrics)),
+                ppo_last_champion_kl=last_champion_kl,
                 reward=float(reward.mean()),
                 **{
                     "ppo_" + name: value
@@ -1549,7 +1559,7 @@ def train_vector_population(
                     games=completed_games,
                     score=f"{(wins + 0.5 * draws) / max(1, completed_games):.3f}",
                     ppo_updates=ppo_updates,
-                    kl=f"{rollout_metrics.get('champion_kl', 0.0):.3f}",
+                    kl=f"{last_champion_kl:.5f}",
                 )
             if ppo_kl_exceeded:
                 break
@@ -1607,6 +1617,8 @@ def evaluate_direct_population_matches(
     games: int,
     gate_seed: int,
     game_callback: Callable[[int, Mapping[str, Any]], None] | None = None,
+    candidate_label: str = "pretendent",
+    opponent_labels: Sequence[str] | None = None,
 ) -> Dict[str, Any]:
     """Evaluate one raw network on the same paired arena for a population."""
     if not opponent_models:
@@ -1622,6 +1634,13 @@ def evaluate_direct_population_matches(
     ):
         raise ValueError("opponent_weights must be finite and positive")
     weights /= weights.sum()
+    resolved_opponent_labels = (
+        [f"model B {index + 1}" for index in range(len(opponent_models))]
+        if opponent_labels is None
+        else [str(label) for label in opponent_labels]
+    )
+    if len(resolved_opponent_labels) != len(opponent_models):
+        raise ValueError("opponent_labels must match opponent_models")
     results: list[Dict[str, Any]] = []
     device = next(candidate.parameters()).device
     for opponent_index, opponent in enumerate(opponent_models):
@@ -1645,6 +1664,8 @@ def evaluate_direct_population_matches(
                     selected, game
                 )
             ),
+            model_a_label=candidate_label,
+            model_b_label=resolved_opponent_labels[opponent_index],
         )
         results.append(match)
     return {
@@ -1789,6 +1810,8 @@ def train_direct_population_curriculum(
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
     | None = None,
+    candidate_label: str = "pretendent",
+    opponent_labels: Sequence[str] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, Any]:
     """Advance raw population play only while held-out population skill grows."""
@@ -1957,6 +1980,8 @@ def train_direct_population_curriculum(
                     label, block, opponent_index, game
                 )
             ),
+            candidate_label=candidate_label,
+            opponent_labels=opponent_labels,
         )
         results = evaluation["opponents"]
         weighted_score = float(evaluation["model_a_score"])
@@ -2174,6 +2199,8 @@ def train_direct_population_curriculum(
                 "final", block, opponent_index, game
             )
         ),
+        candidate_label=candidate_label,
+        opponent_labels=opponent_labels,
     )
     full_score = float(full_evaluation["model_a_score"])
     full_worst_score = float(full_evaluation["worst_score"])

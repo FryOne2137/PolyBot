@@ -91,6 +91,8 @@ def main() -> None:
             max_envs=args.num_envs,
             model_b_search_top_actions=args.model_b_mcts_top_actions,
             model_b_search_random_actions=args.model_b_mcts_random_actions,
+            model_a_label=args.model_a.stem,
+            model_b_label=args.model_b.stem,
         )
     print_summary(summary)
 

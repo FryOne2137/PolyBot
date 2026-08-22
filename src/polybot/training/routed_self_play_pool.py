@@ -1062,6 +1062,8 @@ def evaluate_matches_pool(
     game_callback: GameCallback | None = None,
     model_b_search_top_actions: int | None = None,
     model_b_search_random_actions: int | None = None,
+    model_a_label: str = "model A",
+    model_b_label: str = "model B",
 ) -> Dict[str, Any]:
     """Run deterministic, paired candidate evaluation entirely in native pools."""
     if games < 2 or games % 2:
@@ -1118,7 +1120,12 @@ def evaluate_matches_pool(
         int(training.seed) + game_index // 2 for game_index in range(games)
     }
     chunk_limit = max(2, int(max_envs) - int(max_envs) % 2)
-    with tqdm(total=games, desc="evaluate A vs model_b (SelfPlayPool)", unit="game", dynamic_ncols=True) as progress:
+    with tqdm(
+        total=games,
+        desc=f"evaluate MCTS {model_a_label} vs {model_b_label}",
+        unit="game",
+        dynamic_ncols=True,
+    ) as progress:
         for start in range(0, games, chunk_limit):
             count = min(chunk_limit, games - start)
             if count % 2:

@@ -207,6 +207,9 @@ def evaluate_direct_matches(
     training: TrainingConfig,
     games: int,
     game_callback: Optional[Callable[[Dict[str, float | int]], None]] = None,
+    *,
+    model_a_label: str = "policy A",
+    model_b_label: str = "model B",
 ) -> Dict[str, float]:
     """Paired greedy-policy arena used before MCTS is allowed to train."""
     if games < 2 or games % 2:
@@ -232,7 +235,7 @@ def evaluate_direct_matches(
     scores: list[float] = []
     with tqdm(
         total=games,
-        desc="evaluate direct policy A vs model_b",
+        desc=f"evaluate direct {model_a_label} vs {model_b_label}",
         unit="game",
         dynamic_ncols=True,
     ) as progress:

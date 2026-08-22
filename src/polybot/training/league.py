@@ -88,6 +88,37 @@ def _promotion_gate_decision(
     }
 
 
+def _challenger_continuation_action(
+    *,
+    valid: bool,
+    candidate_score: float,
+    population_score: float,
+    minimum_historical_score: float,
+    historical_score_floor: float,
+    has_previous_challenger: bool,
+) -> str:
+    """Choose the checkpoint from which the next league round should learn.
+
+    Promotion remains deliberately strict, but a noisy score just below 0.50
+    must not erase a useful multi-round challenger lineage.  A valid candidate
+    may therefore continue while it stays above the league's existing safety
+    floor and remains competitive with the population.  If it violates that
+    continuation gate, fall back to the previous challenger instead of
+    restarting from the champion.
+    """
+    candidate_is_safe = (
+        valid
+        and candidate_score >= historical_score_floor
+        and population_score >= 0.50
+        and minimum_historical_score >= historical_score_floor
+    )
+    if candidate_is_safe:
+        return "candidate"
+    if has_previous_challenger:
+        return "previous"
+    return "none"
+
+
 def _mcts_probe_passed(
     raw_score: float,
     search_score: float,
@@ -892,8 +923,23 @@ def train_promotion_league(
                         f"collection seed: {round_training.seed}",
                         flush=True,
                     )
-                    candidate_source = challenger_path or champion_path
-                    candidate_parent_id = challenger_id or champion_id
+                    previous_challenger_path = challenger_path
+                    previous_challenger_id = challenger_id
+                    candidate_source = previous_challenger_path or champion_path
+                    candidate_parent_id = previous_challenger_id or champion_id
+                    candidate_source_kind = (
+                        "challenger"
+                        if previous_challenger_path is not None
+                        else "champion"
+                    )
+                    candidate_evaluation_label = (
+                        f"pretendent {candidate_source.stem}"
+                    )
+                    print(
+                        "league candidate source | "
+                        f"{candidate_source_kind}: {candidate_source}",
+                        flush=True,
+                    )
                     candidate, model_config = load_model(candidate_source, device)
                     champion, champion_config = load_model(champion_path, device)
                     if champion_config != model_config:
@@ -909,6 +955,9 @@ def train_promotion_league(
                     population_rows = database.select_population(champion_id, population_size)
                     population_ids = [int(row["id"]) for row in population_rows]
                     population_paths = [Path(str(row["checkpoint_path"])) for row in population_rows]
+                    population_evaluation_labels = [
+                        path.stem for path in population_paths
+                    ]
                     probabilities, reference_scores = database.opponent_probabilities(
                         champion_id,
                         population_ids,
@@ -1185,6 +1234,8 @@ def train_promotion_league(
                             readiness_patience=direct_readiness_patience,
                             regression_patience=direct_regression_patience,
                             gate_game_callback=record_direct_gate_game,
+                            candidate_label=candidate_evaluation_label,
+                            champion_label=champion_path.stem,
                             run=run.child(
                                 f"round_{round_index:03d}/direct_curriculum"
                             ),
@@ -1462,6 +1513,10 @@ def train_promotion_league(
                                 training_game_callback=(
                                     record_direct_population_training_game
                                 ),
+                                candidate_label=candidate_evaluation_label,
+                                opponent_labels=(
+                                    population_evaluation_labels
+                                ),
                                 run=run.child(
                                     f"round_{round_index:03d}/"
                                     "direct_population"
@@ -1642,6 +1697,8 @@ def train_promotion_league(
                                 ),
                                 games,
                                 game_callback=record_flat_gate_game,
+                                model_a_label=candidate_evaluation_label,
+                                model_b_label=opponent_path.stem,
                             )
                             result = {
                                 "opponent_id": opponent_id,
@@ -1698,12 +1755,22 @@ def train_promotion_league(
                         )
                         flat_promoted = bool(decision["promoted"])
                         promoted = flat_promoted
-                        retain_challenger = (
-                            not flat_invalid
-                            and last_candidate_score >= 0.50
-                            and last_population_score >= 0.50
-                            and minimum_historical_score
-                            >= historical_score_floor
+                        continuation_action = _challenger_continuation_action(
+                            valid=not flat_invalid,
+                            candidate_score=last_candidate_score,
+                            population_score=last_population_score,
+                            minimum_historical_score=(
+                                minimum_historical_score
+                            ),
+                            historical_score_floor=historical_score_floor,
+                            has_previous_challenger=(
+                                previous_challenger_path is not None
+                                and previous_challenger_id is not None
+                            ),
+                        )
+                        retain_challenger = continuation_action == "candidate"
+                        continue_previous_challenger = (
+                            continuation_action == "previous"
                         )
                         parent_capability = database.model_capability(
                             candidate_parent_id
@@ -1769,12 +1836,33 @@ def train_promotion_league(
                             )
                             challenger_path = retained_path
                             challenger_id = candidate_id
+                            print(
+                                "league challenger advanced | saved "
+                                f"{challenger_path} | continuation floor="
+                                f"{historical_score_floor:.4f}",
+                                flush=True,
+                            )
                         else:
                             database.finalise_candidate(
                                 candidate_id, promoted_path=None
                             )
-                            challenger_path = None
-                            challenger_id = None
+                            if continue_previous_challenger:
+                                challenger_path = previous_challenger_path
+                                challenger_id = previous_challenger_id
+                                print(
+                                    "league challenger update rejected | "
+                                    "continuing next round from previous "
+                                    f"challenger: {challenger_path}",
+                                    flush=True,
+                                )
+                            else:
+                                challenger_path = None
+                                challenger_id = None
+                                print(
+                                    "league candidate rejected | next round "
+                                    "starts from the champion",
+                                    flush=True,
+                                )
 
                         probe_summary: Dict[str, Any] = {
                             "enabled": float(bool(mcts_probe_games)),
@@ -1827,6 +1915,8 @@ def train_promotion_league(
                                 ),
                                 mcts_probe_games,
                                 game_callback=record_raw_probe_game,
+                                model_a_label=candidate_evaluation_label,
+                                model_b_label=champion_path.stem,
                             )
                             database.finish_evaluation_unrated(
                                 raw_probe_id, raw_probe
@@ -1874,6 +1964,8 @@ def train_promotion_league(
                                         num_envs, mcts_probe_games
                                     ),
                                     game_callback=record_search_probe_game,
+                                    model_a_label=candidate_evaluation_label,
+                                    model_b_label=champion_path.stem,
                                 )
                             except (
                                 BeliefQualityError,
@@ -2024,6 +2116,9 @@ def train_promotion_league(
                             "retained_challenger": float(
                                 retain_challenger and not promoted
                             ),
+                            "continued_previous_challenger": float(
+                                continue_previous_challenger and not promoted
+                            ),
                             "evaluations": flat_evaluations,
                             "mcts_probe": probe_summary,
                             "mcts_ready": float(
@@ -2046,6 +2141,12 @@ def train_promotion_league(
                             candidate_score=last_candidate_score,
                             population_score=last_population_score,
                             promoted=float(promoted),
+                            retained_challenger=float(
+                                retain_challenger and not promoted
+                            ),
+                            continued_previous_challenger=float(
+                                continue_previous_challenger and not promoted
+                            ),
                             mcts_probe_passed=float(
                                 probe_summary.get("passed", 0.0)
                             ),
@@ -2063,12 +2164,18 @@ def train_promotion_league(
                             promotions=promotions,
                         )
                         database.flush()
+                        next_candidate_source = (
+                            "champion"
+                            if challenger_path is None
+                            else challenger_path.stem
+                        )
                         print(
                             f"league flat decision {round_index}/{rounds} | "
                             f"champion={last_candidate_score:.4f} | "
                             f"population={last_population_score:.4f} | "
                             f"worst={minimum_historical_score:.4f} | "
-                            f"promoted={int(promoted)}",
+                            f"promoted={int(promoted)} | "
+                            f"next={next_candidate_source}",
                             flush=True,
                         )
                         del candidate, champion, frozen_models
@@ -2169,6 +2276,8 @@ def train_promotion_league(
                                 game_callback=(
                                     record_raw_population_baseline_game
                                 ),
+                                candidate_label=candidate_evaluation_label,
+                                opponent_labels=population_evaluation_labels,
                             )
                         )
                     population_summary["raw_population_baseline"] = (
@@ -2304,6 +2413,8 @@ def train_promotion_league(
                                 belief_retries=belief_retries,
                                 max_envs=num_envs,
                                 game_callback=record_rung_gate_game,
+                                model_a_label=candidate_evaluation_label,
+                                model_b_label=champion_path.stem,
                             )
                             rung_score = float(rung_gate.get("model_a_score", 0.0))
 
@@ -2340,6 +2451,8 @@ def train_promotion_league(
                                 games=direct_population_gate_games,
                                 gate_seed=direct_population_gate_seed,
                                 game_callback=record_absorption_gate_game,
+                                candidate_label=candidate_evaluation_label,
+                                opponent_labels=population_evaluation_labels,
                             )
                             raw_policy_score = float(
                                 absorption_gate.get("model_a_score", 0.0)
@@ -2573,6 +2686,8 @@ def train_promotion_league(
                             belief_retries=belief_retries,
                             max_envs=num_envs,
                             game_callback=record_evaluation_game,
+                            model_a_label=candidate_evaluation_label,
+                            model_b_label=opponent_path.stem,
                         )
                         result = {
                             "opponent_id": opponent_id,

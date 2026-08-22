@@ -333,6 +333,42 @@ python scripts/evaluate.py \
   --games 10 --simulations 32 --particles 2 --max-moves 300 --device mps
 ```
 
+## Saved self-play games
+
+`scripts/play_self.py` uruchamia jeden checkpoint przeciw niemu samemu na
+mapach treningowych (domyślnie `lakes` 11x11, Bardur kontra Imperius). Tryb
+`flat` gra bezpośrednio policy modelu, a `mcts` używa belief-MCTS. Każda partia
+jest od razu zapisywana przez `GameEnv.save()` do natywnego pliku
+`game_XXX.polygame`. Następnie skrypt wczytuje go przez `GameEnv.load()` i
+weryfikuje liczbę ruchów, wynik oraz stan terminalny. `manifest.json` pozostaje
+lekkim indeksem zawierającym konfigurację, sumę SHA-256 modelu i zbiorcze
+wyniki.
+
+```bash
+python scripts/play_self.py \
+  --model models/champion.pt \
+  --mode flat --games 10 --map-size 11 --moves 300 \
+  --tribes Bardur Imperius
+
+python scripts/play_self.py \
+  --model models/champion.pt \
+  --mode mcts --games 10 --map-size 14 \
+  --simulations 32 --particles 2
+```
+
+Wyniki trafiają domyślnie do `runs/self_play_games/NAZWA_MODE`; istniejący
+katalog nie jest nadpisywany, tylko dostaje kolejny numer. Własne miejsce
+można wskazać przez `--save-path KATALOG` (starsza nazwa `--output-dir` również
+działa). `--moves N` ogranicza każdą grę do N ruchów; domyślna wartość to 300.
+Starsza nazwa `--max-moves N` działa tak samo.
+Plemiona obu graczy wybiera się przez `--tribes TRIBE_1 TRIBE_2`; domyślnie
+są to `Bardur Imperius`.
+
+Podczas gry `tqdm` pokazuje postęp całej serii i ruchy bieżącej partii, gracza,
+ostatnią akcję, a w trybie MCTS również postęp symulacji i liczbę particles.
+Wybrane urządzenie jest wypisywane przed startem. Domyślne `--device auto`
+wybiera kolejno CUDA, MPS, a jeśli żadne nie jest dostępne — CPU.
+
 To compare a newer checkpoint with an older one, pass `--model-b`.
 
 Postęp nadal jest widoczny w terminalu, a skalarne metryki i wykresy trafiają

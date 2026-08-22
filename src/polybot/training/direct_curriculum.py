@@ -106,6 +106,8 @@ def train_direct_policy_curriculum(
     objective_rollout_horizon: int = 8,
     objective_updates_per_rollout: int = 2,
     objective_teacher_probability: float = 0.35,
+    candidate_label: str = "pretendent",
+    champion_label: str = "champion",
 ) -> Dict[str, Any]:
     """Learn visible objectives directly and roll back every regression.
 
@@ -236,6 +238,8 @@ def train_direct_policy_curriculum(
                 if gate_game_callback is None
                 else lambda game: gate_game_callback(label, block, game)
             ),
+            model_a_label=candidate_label,
+            model_b_label=champion_label,
         )
         score = float(result["model_a_score"])
         progress = _objective_progress(

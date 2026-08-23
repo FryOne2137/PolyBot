@@ -9,7 +9,11 @@ import torch
 from tqdm.auto import tqdm
 
 from ..config import MCTSConfig, TrainingConfig
-from ..data.polyenv_features import capture_flags, packet_to_tensors
+from ..data.polyenv_features import (
+    capture_flags,
+    packet_to_tensors,
+    visible_events_or_empty,
+)
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.belief_mcts import BeliefMCTS
@@ -183,9 +187,16 @@ def _direct_policy_action(
     model: PolicyValueBeliefNet,
     packet: Dict[str, object],
     device: torch.device,
+    events: Dict[str, object] | None = None,
+    visible_action_history: int = 0,
 ) -> int:
     """Choose a greedy legal action without belief completion or MCTS."""
-    tensors = packet_to_tensors(packet, device)
+    tensors = packet_to_tensors(
+        packet,
+        device,
+        events,
+        visible_action_history=visible_action_history,
+    )
     output = model(
         tensors.map_tokens,
         tensors.global_features,
@@ -210,10 +221,13 @@ def evaluate_direct_matches(
     *,
     model_a_label: str = "policy A",
     model_b_label: str = "model B",
+    visible_action_history: int = 0,
 ) -> Dict[str, float]:
     """Paired greedy-policy arena used before MCTS is allowed to train."""
     if games < 2 or games % 2:
         raise ValueError("direct evaluation games must be positive and even")
+    if not 0 <= visible_action_history <= 1024:
+        raise ValueError("visible_action_history must be between 0 and 1024")
     seed_everything(training.seed)
     model_a.eval()
     model_b.eval()
@@ -254,7 +268,14 @@ def evaluate_direct_matches(
                 )
                 is_a_turn = player == model_a_player
                 action_row = _direct_policy_action(
-                    model_a if is_a_turn else model_b, packet, device
+                    model_a if is_a_turn else model_b,
+                    packet,
+                    device,
+                    (
+                        visible_events_or_empty(env)
+                        if visible_action_history else None
+                    ),
+                    visible_action_history,
                 )
                 action_ids = np.asarray(
                     packet["actions"]["action_id"], dtype=np.int64
@@ -337,4 +358,5 @@ def evaluate_direct_matches(
     totals["model_a_city_captures_per_game"] = totals[
         "model_a_city_captures"
     ] / max(1.0, float(games))
+    totals["visible_action_history"] = float(visible_action_history)
     return totals

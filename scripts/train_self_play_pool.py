@@ -41,8 +41,8 @@ def main() -> None:
     parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
     parser.add_argument(
-        "--visible-action-history", type=int, default=0,
-        help="Keep at 0 until direct GameEnv evaluation exposes the same history tensor.",
+        "--visible-action-history", type=int, default=32,
+        help="Fog-safe compact action history (0 disables, default: 32).",
     )
     parser.add_argument("--belief-retries", type=int, default=4, help="Fresh belief samples for each rejected environment")
     parser.add_argument("--batch-size", type=int, default=64)

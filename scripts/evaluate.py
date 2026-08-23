@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--model-b-mcts-random-actions", type=int)
     parser.add_argument("--num-envs", type=int, default=128, help="Maximum parallel model-vs-model games")
     parser.add_argument("--max-pending-leaves", type=int, default=4)
-    parser.add_argument("--visible-action-history", type=int, default=0)
+    parser.add_argument("--visible-action-history", type=int, default=32)
     parser.add_argument("--belief-retries", type=int, default=4)
     parser.add_argument(
         "--strategic-prior-weight", type=float, default=0.0,

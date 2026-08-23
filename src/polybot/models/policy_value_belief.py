@@ -164,6 +164,7 @@ class ModelOutput:
     policy_logits: torch.Tensor
     value: torch.Tensor
     belief_logits: List[torch.Tensor]
+    state: torch.Tensor
     tile_states: torch.Tensor
 
 
@@ -323,7 +324,36 @@ class PolicyValueBeliefNet(nn.Module):
             raise ValueError("visible_action_history_mask must have shape [batch, length]")
         length = history.shape[1]
         positions = torch.arange(length, device=device)
-        encoded = self.history_encoder(history.float()) + self.history_position(positions)[None]
+        # PolyEnv history fields are categorical ids, bit flags, tile indexes
+        # and observer-local unit ids. Feeding those raw integers into one
+        # linear layer makes a tile index numerically dominate event kind and
+        # actor identity. Map every valid value to a comparable [0, 1] range;
+        # -1 (unknown under fog) becomes zero. The mask still distinguishes
+        # real all-zero tokens from left padding.
+        scales = torch.tensor(
+            (
+                16.0,  # event type
+                16.0,  # player
+                16.0,  # tribe
+                16.0,  # visibility bit mask
+                float(self.config.max_board_side**2),
+                float(self.config.max_board_side**2),
+                32.0,  # source unit type
+                32.0,  # target unit type
+                1024.0,  # observer-local source unit id
+                1024.0,  # observer-local target unit id
+                4.0,  # detail kind
+                128.0,  # tile/build/spawn/upgrade detail
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        normalised_history = torch.where(
+            history >= 0,
+            (history.float() + 1.0) / scales,
+            torch.zeros_like(history, dtype=torch.float32),
+        ).clamp_(0.0, 1.0)
+        encoded = self.history_encoder(normalised_history) + self.history_position(positions)[None]
         valid_mask = history_mask.bool()
         no_history = ~valid_mask.any(dim=1)
         safe_mask = valid_mask.clone()
@@ -368,6 +398,7 @@ class PolicyValueBeliefNet(nn.Module):
             policy_logits=logits,
             value=self.value_head(state).squeeze(-1),
             belief_logits=belief_logits,
+            state=state,
             tile_states=tile_states,
         )
 

@@ -155,6 +155,8 @@ class BeliefMCTS:
             tensors.action_continuous,
             tensors.action_mask,
             tensors.event_features,
+            action_history=tensors.action_history,
+            action_history_mask=tensors.action_history_mask,
             include_belief=False,
         )
         return self._decode_evaluations(packets, output.policy_logits, output.value)
@@ -332,6 +334,8 @@ class BeliefMCTS:
             tensors.map_tokens, tensors.global_features,
             tensors.action_categorical, tensors.action_continuous,
             tensors.action_mask, tensors.event_features,
+            action_history=tensors.action_history,
+            action_history_mask=tensors.action_history_mask,
             include_belief=False,
         )
         logits = output.policy_logits + self._native_prior_bias(

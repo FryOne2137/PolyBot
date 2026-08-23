@@ -1,6 +1,12 @@
 import numpy as np
 
-from polybot.data.polyenv_features import action_features, event_summary, global_features_from_obs
+from polybot.data.polyenv_features import (
+    action_features,
+    event_action_history,
+    event_summary,
+    global_features_from_obs,
+    vector_event_action_history,
+)
 
 
 def test_action_features_preserve_legal_action_row_count():
@@ -27,3 +33,42 @@ def test_event_summary_contains_no_runtime_ids():
     summary = event_summary({"type_id": np.asarray([0, 1, 1]), "damage": np.asarray([0, 4, 2])})
     assert summary.shape == (12,)
     assert summary[2] > 0
+
+
+def test_vector_events_match_compact_self_play_history_layout():
+    events = np.full((1, 3, 26), -1, dtype=np.int32)
+    mask = np.asarray([[0, 1, 1]], dtype=np.uint8)
+    events[0, 1, [2, 9, 10, 3, 4, 5, 14, 15, 16, 17]] = (
+        7, 0, 3, 3, 10, 11, 2, -1, 41, -1,
+    )
+    events[0, 2, [2, 9, 10, 3, 4, 5, 14, 15, 16, 17]] = (
+        13, 1, 2, 2, 11, 12, -1, -1, -1, -1,
+    )
+    events[0, 2, 12] = 5  # building detail
+    history, history_mask = vector_event_action_history({
+        "visible_event_features": events,
+        "visible_event_mask": mask,
+    })
+    assert history.shape == (1, 3, 12)
+    assert history_mask.tolist() == [[False, True, True]]
+    assert history[0, 1, :10].tolist() == [
+        7, 0, 3, 3, 10, 11, 2, -1, 41, -1,
+    ]
+    assert history[0, 2, 10:].tolist() == [2, 5]
+    assert not history[0, 0].any()
+
+
+def test_scalar_event_history_is_bounded_and_right_aligned():
+    events = {
+        "type_id": np.asarray([7, 9, 13]),
+        "actor_player": np.asarray([0, 1, 0]),
+        "actor_tribe": np.asarray([3, 2, 3]),
+        "flags": np.asarray([3, 2, 1]),
+        "source_index": np.asarray([10, 11, -1]),
+        "target_index": np.asarray([11, 12, 13]),
+        "building_type": np.asarray([-1, -1, 5]),
+    }
+    history, mask = event_action_history(events, 2)
+    assert mask.tolist() == [True, True]
+    assert history[:, 0].tolist() == [9, 13]
+    assert history[-1, 10:].tolist() == [2, 5]

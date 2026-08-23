@@ -28,6 +28,15 @@ NATIVE_ACTION_CATEGORICAL_COLUMNS = np.asarray(
 )
 NATIVE_ACTION_CONTINUOUS_COLUMNS = np.asarray((12, 13, 15, 16), dtype=np.int64)
 
+# ``VectorGameEnv`` exposes the fog-safe journal as 26 event columns, while
+# ``SelfPlayPool`` uses a compact 12-column action-history token.  These first
+# ten compact fields are direct, visibility-filtered projections of the native
+# event packet.  Keeping the mapping here gives flat PPO and MCTS one shared
+# history representation.
+_VECTOR_EVENT_TO_ACTION_HISTORY_COLUMNS = np.asarray(
+    (2, 9, 10, 3, 4, 5, 14, 15, 16, 17), dtype=np.int64
+)
+
 
 @dataclass
 class PacketTensors:
@@ -39,6 +48,107 @@ class PacketTensors:
     action_categorical: torch.Tensor
     action_continuous: torch.Tensor
     action_mask: torch.Tensor
+
+
+def vector_event_action_history(
+    batch: Dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a native vector event window to compact fog-safe action tokens.
+
+    PolyEnv already removed events and fields which the current observer could
+    not see.  This function only changes the representation; it never consults
+    the authoritative map or reconstructs hidden source/target information.
+    Both input and output remain chronological and right-aligned.
+    """
+    events = np.asarray(batch["visible_event_features"], dtype=np.int32)
+    mask = np.asarray(batch["visible_event_mask"], dtype=bool)
+    if events.ndim != 3 or events.shape[2] != 26:
+        raise ValueError(
+            "visible_event_features must have shape [batch, history, 26]"
+        )
+    if mask.shape != events.shape[:2]:
+        raise ValueError(
+            "visible_event_mask must match visible_event_features[:2]"
+        )
+    history = np.zeros(
+        (*events.shape[:2], VISIBLE_ACTION_HISTORY_FEATURES), dtype=np.int32
+    )
+    if events.shape[1] == 0:
+        return history, mask
+    history[..., :10] = events[..., _VECTOR_EVENT_TO_ACTION_HISTORY_COLUMNS]
+
+    # Match PolyEnv SelfPlayPool's detail_kind/detail_value precedence:
+    # tile action, building, spawned unit, then upgrade kind.
+    detail_kind = np.zeros(events.shape[:2], dtype=np.int32)
+    detail_value = np.full(events.shape[:2], -1, dtype=np.int32)
+    for kind, column in reversed(((1, 11), (2, 12), (3, 13), (4, 22))):
+        present = events[..., column] >= 0
+        detail_kind = np.where(present, kind, detail_kind)
+        detail_value = np.where(present, events[..., column], detail_value)
+    history[..., 10] = detail_kind
+    history[..., 11] = detail_value
+    history[~mask] = 0
+    return history, mask
+
+
+def event_action_history(
+    events: Dict[str, Any] | None,
+    max_history: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pack one scalar GameEnv journal into a fixed compact history window."""
+    if not 0 <= max_history <= 1024:
+        raise ValueError("max_history must be between 0 and 1024")
+    history = np.zeros(
+        (max_history, VISIBLE_ACTION_HISTORY_FEATURES), dtype=np.int32
+    )
+    mask = np.zeros(max_history, dtype=bool)
+    if max_history == 0 or not events or "type_id" not in events:
+        return history, mask
+    count = int(np.asarray(events["type_id"]).reshape(-1).size)
+    if count == 0:
+        return history, mask
+
+    def column(name: str, default: int = -1) -> np.ndarray:
+        value = events.get(name)
+        if value is None:
+            return np.full(count, default, dtype=np.int32)
+        result = np.asarray(value, dtype=np.int32).reshape(-1)
+        if result.size != count:
+            raise ValueError(
+                f"visible event field {name!r} has {result.size} rows, "
+                f"expected {count}"
+            )
+        return result
+
+    compact = np.stack(
+        [
+            column("type_id", 0),
+            column("actor_player"),
+            column("actor_tribe"),
+            column("flags", 0),
+            column("source_index"),
+            column("target_index"),
+            column("source_unit_type"),
+            column("target_unit_type"),
+            column("source_observed_unit_id"),
+            column("target_observed_unit_id"),
+            np.zeros(count, dtype=np.int32),
+            np.full(count, -1, dtype=np.int32),
+        ],
+        axis=-1,
+    )
+    for kind, name in reversed(
+        ((1, "tile_action_kind"), (2, "building_type"),
+         (3, "spawn_type"), (4, "unit_upgrade_kind"))
+    ):
+        values = column(name)
+        present = values >= 0
+        compact[present, 10] = kind
+        compact[present, 11] = values[present]
+    kept = min(max_history, count)
+    history[-kept:] = compact[-kept:]
+    mask[-kept:] = True
+    return history, mask
 
 
 def native_batch_to_tensors(
@@ -132,7 +242,10 @@ def global_features_from_obs(obs: Dict[str, Any]) -> np.ndarray:
     return np.asarray(values, dtype=np.float32)
 
 
-def event_summary(events: Dict[str, Any] | None) -> np.ndarray:
+def event_summary(
+    events: Dict[str, Any] | None,
+    max_events: int | None = None,
+) -> np.ndarray:
     """Compress the *visible* journal into fixed-size belief-model context.
 
     The summary intentionally has no engine unit IDs.  Passing a raw history to
@@ -143,15 +256,31 @@ def event_summary(events: Dict[str, Any] | None) -> np.ndarray:
     if not events or "type_id" not in events:
         return result
     types = np.asarray(events["type_id"], dtype=np.int64).reshape(-1)
+    if max_events is not None:
+        if max_events < 0:
+            raise ValueError("max_events must not be negative")
+        types = types[-max_events:] if max_events else types[:0]
     result[0] = min(types.size, 128) / 128.0
     for event_type in range(8):
         result[1 + event_type] = float(np.count_nonzero(types == event_type)) / 32.0
     if "damage" in events:
-        result[9] = float(np.clip(np.asarray(events["damage"]).clip(min=0).sum(), 0, 200)) / 200.0
+        damage = np.asarray(events["damage"]).reshape(-1)
+        if max_events is not None:
+            damage = damage[-max_events:] if max_events else damage[:0]
+        result[9] = float(np.clip(damage.clip(min=0).sum(), 0, 200)) / 200.0
     if "unit_destroyed" in events:
-        result[10] = float(np.count_nonzero(np.asarray(events["unit_destroyed"]) > 0)) / 16.0
+        destroyed = np.asarray(events["unit_destroyed"]).reshape(-1)
+        if max_events is not None:
+            destroyed = destroyed[-max_events:] if max_events else destroyed[:0]
+        result[10] = float(np.count_nonzero(destroyed > 0)) / 16.0
     if "source_unit_destroyed" in events:
-        result[11] = float(np.count_nonzero(np.asarray(events["source_unit_destroyed"]) > 0)) / 16.0
+        source_destroyed = np.asarray(events["source_unit_destroyed"]).reshape(-1)
+        if max_events is not None:
+            source_destroyed = (
+                source_destroyed[-max_events:]
+                if max_events else source_destroyed[:0]
+            )
+        result[11] = float(np.count_nonzero(source_destroyed > 0)) / 16.0
     return result
 
 
@@ -285,18 +414,37 @@ def packet_to_tensors(
     packet: Dict[str, Any],
     device: torch.device,
     events: Dict[str, Any] | None = None,
+    *,
+    visible_action_history: int = 0,
 ) -> PacketTensors:
     """Make a batch of one, retaining the current legal-action order."""
     map_tokens = np.asarray(packet["map_tokens"], dtype=np.int64)
     if map_tokens.ndim != 2 or map_tokens.shape[1] != len(MAP_FEATURE_MAX):
         raise ValueError("expected map_tokens with shape [tiles, 23]")
     categorical, continuous = action_features(packet["actions"])
+    history, history_mask = event_action_history(
+        events, visible_action_history
+    )
     return PacketTensors(
         map_tokens=torch.as_tensor(map_tokens[None], dtype=torch.long, device=device),
         global_features=torch.as_tensor(global_features_from_obs(packet["obs"])[None], device=device),
-        event_features=torch.as_tensor(event_summary(events)[None], dtype=torch.float32, device=device),
-        action_history=torch.empty((1, 0, VISIBLE_ACTION_HISTORY_FEATURES), dtype=torch.float32, device=device),
-        action_history_mask=torch.empty((1, 0), dtype=torch.bool, device=device),
+        event_features=torch.as_tensor(
+            event_summary(
+                events,
+                max_events=(
+                    visible_action_history
+                    if visible_action_history > 0 else None
+                ),
+            )[None],
+            dtype=torch.float32,
+            device=device,
+        ),
+        action_history=torch.as_tensor(
+            history[None], dtype=torch.float32, device=device
+        ),
+        action_history_mask=torch.as_tensor(
+            history_mask[None], dtype=torch.bool, device=device
+        ),
         action_categorical=torch.as_tensor(categorical[None], dtype=torch.long, device=device),
         action_continuous=torch.as_tensor(continuous[None], dtype=torch.float32, device=device),
         action_mask=torch.ones((1, categorical.shape[0]), dtype=torch.bool, device=device),

@@ -140,10 +140,29 @@ i advantage jest odwracany, więc przegrana po turze przeciwnika nie staje się
 fałszywym dodatnim celem. Standardowe ograniczenie PPO chroni przed zbyt dużą
 zmianą polityki, a KL względem zamrożonego championa ma target i twardy limit.
 Przekroczenie limitu cofa blok i automatycznie obniża learning rate.
+PPO jest history-aware: `--visible-action-history H` włącza ostatnie `H`
+zdarzeń bezpiecznych względem mgły wojny (domyślnie 32). `VectorGameEnv`
+zwraca pełniejszy format 26 pól, który PolyBot zamienia na ten sam zwarty token
+12 pól używany przez `SelfPlayPool`. Kandydat, zamrożeni przeciwnicy, champion
+anchor, objective replay i wszystkie płaskie bramki dostają identyczne okno.
+Domyślnie aktywny jest też single-network PPG
+(`--direct-population-ppg`). Faza policy zachowuje PPO/GAE, ale value loss
+aktualizuje wtedy tylko głowicę krytyka i nie nadpisuje wspólnego encodera.
+Co `--direct-population-ppg-interval` rolloutów faza auxiliary losuje
+zróżnicowane pozycje z ograniczonego bufora, zamraża na nich bieżący pełny
+rozkład policy, a następnie uczy wspólny encoder z value targetów. KL względem
+zamrożonego rozkładu chroni jakość ruchów podczas tej dodatkowej nauki.
+Domyślny budżet to 512 pozycji z rolloutu, maksymalnie 4096 pozycji na fazę,
+2 epoki co 8 rolloutów; `--no-direct-population-ppg` wykonuje test kontrolny
+czystego PPO.
 Niedokończona trajektoria jest bootstrapowana wyłącznie na końcu bloku albo po
 przekroczeniu bezpiecznego limitu RAM
 `--direct-population-ppo-max-pending-examples`; nigdy nie jest oznaczana jako
-remis.
+remis. PPO ma również bounded objective replay: po widocznym sukcesie
+(wejście do wioski, założenie lub przejęcie miasta albo wygrana) zapisuje
+publiczne decyzje prowadzące do zdarzenia i okresowo dodaje ważoną stratę
+self-imitation. `--direct-population-objective-replay-max-epochs` ogranicza
+średnią liczbę ponownych użyć, więc rzadki sukces nie może zdominować PPO.
 Bieżący champion otrzymuje 65% losowań, a populacja używa budżetu
 `--post-bootstrap-population-steps` do
 `--post-bootstrap-population-max-steps`.
@@ -161,9 +180,14 @@ bramki direct używają `--direct-gate-max-moves`. PPO próbuje pełną polityk�
 temperaturze `--direct-population-ppo-rollout-temperature`; promocja nadal
 ocenia deterministyczną raw policy.
 
-Domyślny `--champion-mode flat` zaczyna od promocji całkowicie niezależnej od
-MCTS. Końcowa bramka używa surowej polityki przeciw championowi i całej
-historycznej populacji. Tylko po bezpiecznym, realnym awansie uruchamiany jest krótki,
+Domyślny `--champion-mode flat` pozostawia promocję całkowicie zależną od
+surowej polityki. Opcjonalne `--flat-mcts-distill-games N` uruchamia przed nią
+Expert Iteration: belief-MCTS tworzy mocniejsze targety, a sieć uczy się je
+wykonywać bez search. Przed i po destylacji działa ta sama sparowana bramka
+`--flat-mcts-distill-gate-games`; jeśli raw policy nie poprawi wyniku przeciw
+championowi, wszystkie aktualizacje MCTS są cofane. Końcowa bramka nadal używa
+wyłącznie surowej polityki przeciw championowi i całej historycznej populacji.
+Tylko po bezpiecznym, realnym awansie uruchamiany jest krótki,
 beztreningowy probe: `--mcts-probe-games 10` przy
 `--mcts-probe-simulations 32`. Raw policy i search@32 grają na tych samych
 sparowanych mapach. Probe przechodzi tylko wtedy, gdy search@32 osiąga co
@@ -273,9 +297,11 @@ policy/value. Przed pierwszym SelfPlayPool trzeba wykonać bootstrap
 `train_teacher.py`; self-play zaczyna wtedy od zachowania „idź do celu”, po
 czym wygaszanie curriculum pozwala zastąpić je strategią wynikającą z wygranych.
 
-Domyślne `--visible-action-history 0` utrzymuje identyczne wejścia policy/value
-w szybkim treningu i w ewaluacji `GameEnv`. Historię należy włączyć dopiero,
-gdy używany evaluator przekazuje ten sam tensor historii co `SelfPlayPool`.
+Domyślne `--visible-action-history 32` jest używane spójnie przez szybkie PPO,
+objective replay, płaską ewaluację `GameEnv` i `SelfPlayPool`. Wartość `0`
+wyłącza pamięć na potrzeby testu porównawczego; wartości większe niż 32
+zwiększają koszt jednowarstwowego attention mniej więcej kwadratowo względem
+długości okna.
 
 ### Eksperymentalne top-K tylko w PolyBot
 

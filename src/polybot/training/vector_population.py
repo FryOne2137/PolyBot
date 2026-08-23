@@ -77,6 +77,23 @@ class _PPOTransition:
     candidate_example: _PPOExample | None
 
 
+@dataclass(frozen=True)
+class _PPGExample:
+    """One diverse public position retained for the auxiliary value phase."""
+
+    observation: Mapping[str, np.ndarray]
+    return_target: float
+
+
+@dataclass(frozen=True)
+class _PPGTargetExample:
+    """A PPG position with the policy frozen at auxiliary-phase start."""
+
+    observation: Mapping[str, np.ndarray]
+    policy_log_probabilities: np.ndarray
+    return_target: float
+
+
 def _ppo_snapshot(
     batch: Mapping[str, np.ndarray], row: int, action_row: int
 ) -> tuple[Dict[str, np.ndarray], int]:
@@ -104,6 +121,42 @@ def _ppo_snapshot(
     )[row, legal_rows].astype(np.int16, copy=True)
     result["action_mask"] = np.ones(legal_rows.size, dtype=bool)
     return result, compact_action_row
+
+
+def _collate_public_observations(
+    examples: Sequence[_PPOExample | _PPGExample | _PPGTargetExample],
+) -> Dict[str, np.ndarray]:
+    """Pad variable legal-action sets shared by PPO and PPG minibatches."""
+    if not examples:
+        raise ValueError("public observation batch must not be empty")
+    batch_size = len(examples)
+    maximum_actions = max(
+        example.observation["action_features"].shape[0]
+        for example in examples
+    )
+    action_features = np.zeros(
+        (
+            batch_size,
+            maximum_actions,
+            examples[0].observation["action_features"].shape[1],
+        ),
+        dtype=np.int16,
+    )
+    action_mask = np.zeros((batch_size, maximum_actions), dtype=bool)
+    for row, example in enumerate(examples):
+        actions = example.observation["action_features"]
+        action_features[row, : actions.shape[0]] = actions
+        action_mask[row, : actions.shape[0]] = True
+    observation = {
+        field: np.stack(
+            [example.observation[field] for example in examples], axis=0
+        )
+        for field in _OBJECTIVE_REPLAY_FIELDS
+        if field not in {"action_features", "action_mask"}
+    }
+    observation["action_features"] = action_features
+    observation["action_mask"] = action_mask
+    return observation
 
 
 def _finish_ppo_trace(
@@ -144,35 +197,8 @@ def _ppo_batch(
     """Collate a public on-policy PPO minibatch."""
     if not examples:
         raise ValueError("PPO batch must not be empty")
-    batch_size = len(examples)
-    maximum_actions = max(
-        example.observation["action_features"].shape[0]
-        for example in examples
-    )
-    action_features = np.zeros(
-        (
-            batch_size,
-            maximum_actions,
-            examples[0].observation["action_features"].shape[1],
-        ),
-        dtype=np.int16,
-    )
-    action_mask = np.zeros((batch_size, maximum_actions), dtype=bool)
-    for row, example in enumerate(examples):
-        actions = example.observation["action_features"]
-        action_features[row, : actions.shape[0]] = actions
-        action_mask[row, : actions.shape[0]] = True
-    observation = {
-        field: np.stack(
-            [example.observation[field] for example in examples], axis=0
-        )
-        for field in _OBJECTIVE_REPLAY_FIELDS
-        if field not in {"action_features", "action_mask"}
-    }
-    observation["action_features"] = action_features
-    observation["action_mask"] = action_mask
     return (
-        observation,
+        _collate_public_observations(examples),
         np.asarray([example.action_row for example in examples], dtype=np.int64),
         np.asarray(
             [example.old_log_probability for example in examples],
@@ -181,6 +207,60 @@ def _ppo_batch(
         np.asarray([example.advantage for example in examples], dtype=np.float32),
         np.asarray([example.return_target for example in examples], dtype=np.float32),
     )
+
+
+def _ppg_batch(
+    examples: Sequence[_PPGTargetExample],
+) -> tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Collate one auxiliary PPG minibatch with a padded frozen policy."""
+    if not examples:
+        raise ValueError("PPG batch must not be empty")
+    maximum_actions = max(
+        example.policy_log_probabilities.size for example in examples
+    )
+    reference_log_probabilities = np.zeros(
+        (len(examples), maximum_actions), dtype=np.float32
+    )
+    for row, example in enumerate(examples):
+        count = int(example.policy_log_probabilities.size)
+        if count != int(example.observation["action_features"].shape[0]):
+            raise ValueError("PPG policy target must match its legal actions")
+        reference_log_probabilities[row, :count] = (
+            example.policy_log_probabilities
+        )
+    return (
+        _collate_public_observations(examples),
+        reference_log_probabilities,
+        np.asarray(
+            [example.return_target for example in examples],
+            dtype=np.float32,
+        ),
+    )
+
+
+def _masked_policy_kl(
+    reference_log_probabilities: torch.Tensor,
+    current_logits: torch.Tensor,
+    action_mask: torch.Tensor,
+) -> torch.Tensor:
+    """KL(reference || current), excluding padded legal-action columns."""
+    if (
+        reference_log_probabilities.shape != current_logits.shape
+        or action_mask.shape != current_logits.shape
+    ):
+        raise ValueError("PPG policy tensors must have matching shapes")
+    current_log_probabilities = F.log_softmax(current_logits.float(), dim=-1)
+    reference_policy = torch.where(
+        action_mask,
+        reference_log_probabilities.float().exp(),
+        torch.zeros_like(reference_log_probabilities, dtype=torch.float32),
+    )
+    difference = torch.where(
+        action_mask,
+        reference_log_probabilities.float() - current_log_probabilities,
+        torch.zeros_like(current_log_probabilities),
+    )
+    return (reference_policy * difference).sum(dim=1).mean()
 
 
 def _objective_replay_success_weights(
@@ -269,6 +349,10 @@ def _model_rows(
         tensors["action_continuous"].index_select(0, index),
         tensors["action_mask"].index_select(0, index),
         tensors["event_features"].index_select(0, index),
+        action_history=tensors["action_history"].index_select(0, index),
+        action_history_mask=tensors["action_history_mask"].index_select(
+            0, index
+        ),
         include_belief=False,
     )
 
@@ -626,8 +710,11 @@ def _train_vector_population_legacy(
                         # small configured number of times on average. Without
                         # this credit budget, a quiet replay of 32 examples
                         # could be optimised every 16 vector steps forever.
-                        objective_replay_update_credits += (
-                            objective_replay_max_epochs
+                        objective_replay_update_credits = min(
+                            objective_replay_update_credits
+                            + objective_replay_max_epochs,
+                            len(objective_replay)
+                            * objective_replay_max_epochs,
                         )
             # Native auto-reset affects only finished slots. Their history
             # must never leak into the following episode in that slot.
@@ -976,6 +1063,7 @@ def train_vector_population(
     num_threads: int | None,
     max_actions: int,
     anchor_model: PolicyValueBeliefNet,
+    visible_action_history: int = 32,
     policy_anchor_weight: float = 0.10,
     value_anchor_weight: float = 0.10,
     opponent_policy_weight: float = 0.0,
@@ -993,6 +1081,22 @@ def train_vector_population(
     ppo_hard_kl: float = 0.030,
     ppo_rollout_temperature: float = 0.85,
     ppo_max_pending_examples: int = 32_768,
+    objective_replay_horizon: int = 16,
+    objective_replay_capacity: int = 512,
+    objective_replay_batch_size: int = 32,
+    objective_replay_interval: int = 16,
+    objective_replay_weight: float = 0.35,
+    objective_replay_recency: float = 0.92,
+    objective_replay_max_epochs: int = 4,
+    ppg_enabled: bool = True,
+    ppg_interval: int = 8,
+    ppg_buffer_capacity: int = 8_192,
+    ppg_samples_per_rollout: int = 512,
+    ppg_phase_samples: int = 4_096,
+    ppg_epochs: int = 2,
+    ppg_minibatch_size: int = 256,
+    ppg_policy_kl_weight: float = 1.0,
+    ppg_value_weight: float = 1.0,
     game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
@@ -1008,6 +1112,8 @@ def train_vector_population(
     """
     if num_envs < 2 or steps < 1 or max_actions < 1:
         raise ValueError("num_envs >= 2, steps and max_actions are required")
+    if not 0 <= visible_action_history <= 1024:
+        raise ValueError("visible_action_history must be between 0 and 1024")
     if training.map_type != "lakes":
         raise ValueError(
             "VectorGameEnv population play currently supports lakes only"
@@ -1041,9 +1147,20 @@ def train_vector_population(
         "ppo_gae_lambda": ppo_gae_lambda,
         "ppo_target_kl": ppo_target_kl,
         "ppo_hard_kl": ppo_hard_kl,
+        "objective_replay_weight": objective_replay_weight,
+        "objective_replay_recency": objective_replay_recency,
+        "ppg_policy_kl_weight": ppg_policy_kl_weight,
+        "ppg_value_weight": ppg_value_weight,
     }.items():
-        if value < 0.0 or (name != "ppo_hard_kl" and value > 1.0):
-            raise ValueError(f"{name} must be between zero and one")
+        if value < 0.0 or (
+            name not in {
+                "ppo_hard_kl",
+                "ppg_policy_kl_weight",
+                "ppg_value_weight",
+            }
+            and value > 1.0
+        ):
+            raise ValueError(f"{name} has an invalid value")
     if ppo_hard_kl < ppo_target_kl:
         raise ValueError("ppo_hard_kl must be at least ppo_target_kl")
     if (
@@ -1055,6 +1172,38 @@ def train_vector_population(
         raise ValueError("PPO rollout, epoch and minibatch sizes must be positive")
     if not 0.1 <= ppo_rollout_temperature <= 2.0:
         raise ValueError("ppo_rollout_temperature must be between 0.1 and 2.0")
+    for name, value in {
+        "objective_replay_horizon": objective_replay_horizon,
+        "objective_replay_capacity": objective_replay_capacity,
+        "objective_replay_batch_size": objective_replay_batch_size,
+        "objective_replay_interval": objective_replay_interval,
+        "objective_replay_max_epochs": objective_replay_max_epochs,
+    }.items():
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
+    if objective_replay_capacity < objective_replay_batch_size:
+        raise ValueError(
+            "objective_replay_capacity must be at least its batch size"
+        )
+    for name, value in {
+        "ppg_interval": ppg_interval,
+        "ppg_buffer_capacity": ppg_buffer_capacity,
+        "ppg_samples_per_rollout": ppg_samples_per_rollout,
+        "ppg_phase_samples": ppg_phase_samples,
+        "ppg_epochs": ppg_epochs,
+        "ppg_minibatch_size": ppg_minibatch_size,
+    }.items():
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
+    if ppg_enabled and (
+        ppg_buffer_capacity < ppg_phase_samples
+        or ppg_phase_samples < ppg_minibatch_size
+        or ppg_buffer_capacity < ppg_samples_per_rollout
+    ):
+        raise ValueError(
+            "PPG requires buffer >= phase samples >= minibatch and buffer "
+            ">= samples per rollout"
+        )
     try:
         from PolyEnv import Bardur, Imperius, VectorGameEnv
     except ImportError as error:
@@ -1067,11 +1216,14 @@ def train_vector_population(
         training=training,
         model=model_config,
         stage={
-            "algorithm": "signed_ppo_gae",
+            "algorithm": (
+                "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
+            ),
             "num_envs": num_envs,
             "steps": steps,
             "num_threads": num_threads,
             "max_actions": max_actions,
+            "visible_action_history": visible_action_history,
             "opponent_weights": weights.tolist(),
             "shaping_weight": shaping_weight,
             "policy_anchor_weight": policy_anchor_weight,
@@ -1086,6 +1238,22 @@ def train_vector_population(
             "ppo_hard_kl": ppo_hard_kl,
             "ppo_rollout_temperature": ppo_rollout_temperature,
             "ppo_max_pending_examples": ppo_max_pending_examples,
+            "objective_replay_horizon": objective_replay_horizon,
+            "objective_replay_capacity": objective_replay_capacity,
+            "objective_replay_batch_size": objective_replay_batch_size,
+            "objective_replay_interval": objective_replay_interval,
+            "objective_replay_weight": objective_replay_weight,
+            "objective_replay_recency": objective_replay_recency,
+            "objective_replay_max_epochs": objective_replay_max_epochs,
+            "ppg_enabled": ppg_enabled,
+            "ppg_interval": ppg_interval,
+            "ppg_buffer_capacity": ppg_buffer_capacity,
+            "ppg_samples_per_rollout": ppg_samples_per_rollout,
+            "ppg_phase_samples": ppg_phase_samples,
+            "ppg_epochs": ppg_epochs,
+            "ppg_minibatch_size": ppg_minibatch_size,
+            "ppg_policy_kl_weight": ppg_policy_kl_weight,
+            "ppg_value_weight": ppg_value_weight,
             # Kept in the artifacts so obsolete command-line flags remain
             # auditable rather than silently affecting the PPO objective.
             "legacy_opponent_policy_weight": opponent_policy_weight,
@@ -1118,7 +1286,7 @@ def train_vector_population(
         num_threads=num_threads,
         max_actions=max_actions,
         auto_reset=True,
-        visible_event_history=0,
+        visible_event_history=visible_action_history,
     )
     batch = env.reset(seed=training.seed)
     rng = np.random.default_rng(training.seed ^ 0x50504F)
@@ -1127,6 +1295,13 @@ def train_vector_population(
     ).astype(np.int32)
     candidate_players = (np.arange(num_envs, dtype=np.int32) & 1).copy()
     traces: list[list[_PPOTransition]] = [[] for _ in range(num_envs)]
+    objective_histories: list[Deque[_ObjectiveReplayExample]] = [
+        deque(maxlen=objective_replay_horizon) for _ in range(num_envs)
+    ]
+    objective_replay: Deque[_ObjectiveReplayExample] = deque(
+        maxlen=objective_replay_capacity
+    )
+    ppg_replay: Deque[_PPGExample] = deque(maxlen=ppg_buffer_capacity)
     episode_moves = np.zeros(num_envs, dtype=np.int32)
     episode_numbers = np.zeros(num_envs, dtype=np.int64)
     completed_games = wins = losses = draws = 0
@@ -1136,6 +1311,13 @@ def train_vector_population(
     completed_examples: list[_PPOExample] = []
     pending_candidate_examples = 0
     ppo_forced_truncations = 0
+    objective_replay_events = 0
+    objective_replay_positions = 0
+    objective_replay_updates = 0
+    objective_replay_update_credits = 0
+    ppg_samples_added = 0
+    ppg_phases = 0
+    ppg_updates = 0
     ppo_update_target = max(
         ppo_minibatch_size, num_envs * ppo_rollout_steps // 2
     )
@@ -1147,6 +1329,7 @@ def train_vector_population(
         "behaviour_kl": 0.0,
         "clip_fraction": 0.0,
         "entropy": 0.0,
+        "objective_replay_loss": 0.0,
     }
     # A PPO update happens only after enough completed trajectories have been
     # collected.  Keep its most recent value separately from the metrics for
@@ -1154,10 +1337,18 @@ def train_vector_population(
     # every collection-only step.
     last_champion_kl = 0.0
     reward_total = 0.0
+    history_tokens_seen = 0
+    history_rows_seen = 0
+    ppg_totals = {
+        "loss": 0.0,
+        "value_loss": 0.0,
+        "policy_kl": 0.0,
+    }
 
     def optimise_rollout(examples: Sequence[_PPOExample]) -> Dict[str, float]:
         """Run PPO epochs and stop before an unsafe champion-policy drift."""
         nonlocal ppo_updates, ppo_kl_exceeded
+        nonlocal objective_replay_updates, objective_replay_update_credits
         if not examples:
             return {
                 "loss": 0.0,
@@ -1167,6 +1358,7 @@ def train_vector_population(
                 "behaviour_kl": 0.0,
                 "clip_fraction": 0.0,
                 "entropy": 0.0,
+                "objective_replay_loss": 0.0,
             }
         advantages = np.asarray(
             [example.advantage for example in examples], dtype=np.float32
@@ -1184,6 +1376,7 @@ def train_vector_population(
             "behaviour_kl": 0.0,
             "clip_fraction": 0.0,
             "entropy": 0.0,
+            "objective_replay_loss": 0.0,
         }
         local_updates = 0
         for _ in range(ppo_epochs):
@@ -1223,6 +1416,8 @@ def train_vector_population(
                         tensors["action_continuous"],
                         tensors["action_mask"],
                         tensors["event_features"],
+                        action_history=tensors["action_history"],
+                        action_history_mask=tensors["action_history_mask"],
                         include_belief=False,
                     )
                     policy_log_probabilities = F.log_softmax(
@@ -1237,8 +1432,18 @@ def train_vector_population(
                         ratio, 1.0 - ppo_clip_range, 1.0 + ppo_clip_range
                     ) * advantage_tensor
                     policy_loss = -torch.minimum(unclipped, clipped).mean()
+                    # In PPG's policy phase the critic head may keep tracking
+                    # fresh returns, but its gradient must not rewrite the
+                    # shared map/history representation. The later auxiliary
+                    # phase is the only place where value learning updates the
+                    # shared encoder.
+                    policy_phase_value = (
+                        candidate.value_head(output.state.detach()).squeeze(-1)
+                        if ppg_enabled
+                        else output.value
+                    )
                     value_loss = F.smooth_l1_loss(
-                        output.value.float(), return_tensor
+                        policy_phase_value.float(), return_tensor
                     )
                     entropy = Categorical(
                         logits=output.policy_logits / ppo_rollout_temperature
@@ -1255,6 +1460,8 @@ def train_vector_population(
                         tensors["action_continuous"],
                         tensors["action_mask"],
                         tensors["event_features"],
+                        action_history=tensors["action_history"],
+                        action_history_mask=tensors["action_history_mask"],
                         include_belief=False,
                     )
                     anchor_log_probabilities = F.log_softmax(
@@ -1294,13 +1501,68 @@ def train_vector_population(
                     / max(ppo_target_kl, 1e-6),
                 )
                 value_anchor_loss = F.smooth_l1_loss(
-                    output.value.float(), anchor_output.value.float()
+                    policy_phase_value.float(), anchor_output.value.float()
                 )
+                objective_replay_loss = output.value.sum() * 0.0
+                if (
+                    objective_replay_weight > 0.0
+                    and len(objective_replay) >= objective_replay_batch_size
+                    and objective_replay_update_credits
+                    >= objective_replay_batch_size
+                    and (ppo_updates + 1) % objective_replay_interval == 0
+                ):
+                    replay_indices = rng.choice(
+                        len(objective_replay),
+                        size=objective_replay_batch_size,
+                        replace=False,
+                    )
+                    replay_examples = [
+                        objective_replay[int(index)] for index in replay_indices
+                    ]
+                    replay_batch, replay_actions, replay_weights = (
+                        _objective_replay_batch(replay_examples)
+                    )
+                    replay_tensors = _vector_tensors(
+                        replay_batch, device, training
+                    )
+                    replay_action_tensor = torch.as_tensor(
+                        replay_actions, dtype=torch.long, device=device
+                    )
+                    replay_weight_tensor = torch.as_tensor(
+                        replay_weights, dtype=torch.float32, device=device
+                    )
+                    replay_output = candidate(
+                        replay_tensors["map_tokens"],
+                        replay_tensors["global_features"],
+                        replay_tensors["action_categorical"],
+                        replay_tensors["action_continuous"],
+                        replay_tensors["action_mask"],
+                        replay_tensors["event_features"],
+                        action_history=replay_tensors["action_history"],
+                        action_history_mask=replay_tensors[
+                            "action_history_mask"
+                        ],
+                        include_belief=False,
+                    )
+                    replay_log_probabilities = F.log_softmax(
+                        replay_output.policy_logits, dim=-1
+                    )
+                    replay_log_probability = replay_log_probabilities.gather(
+                        1, replay_action_tensor.unsqueeze(1)
+                    ).squeeze(1)
+                    objective_replay_loss = -(
+                        replay_weight_tensor * replay_log_probability.float()
+                    ).sum() / replay_weight_tensor.sum().clamp_min(1e-6)
+                    objective_replay_updates += 1
+                    objective_replay_update_credits -= (
+                        objective_replay_batch_size
+                    )
                 loss = (
                     policy_loss
                     + 0.50 * value_loss
                     + kl_multiplier * champion_kl
                     + 0.25 * value_anchor_weight * value_anchor_loss
+                    + objective_replay_weight * objective_replay_loss
                     - entropy_weight * entropy
                 )
                 optimiser.zero_grad(set_to_none=True)
@@ -1321,6 +1583,9 @@ def train_vector_population(
                         .float().mean().detach().cpu()
                     ),
                     "entropy": float(entropy.detach().cpu()),
+                    "objective_replay_loss": float(
+                        objective_replay_loss.detach().cpu()
+                    ),
                 }
                 for name, value in values.items():
                     totals_local[name] += value
@@ -1331,15 +1596,185 @@ def train_vector_population(
             for name, total in totals_local.items()
         }
 
+    def retain_ppg_examples(examples: Sequence[_PPOExample]) -> None:
+        """Keep a bounded, rollout-balanced sample for later auxiliary work."""
+        nonlocal ppg_samples_added
+        if not ppg_enabled or not examples:
+            return
+        kept = min(len(examples), ppg_samples_per_rollout)
+        indices = (
+            np.arange(len(examples), dtype=np.int64)
+            if kept == len(examples)
+            else rng.choice(len(examples), size=kept, replace=False)
+        )
+        for index in indices:
+            example = examples[int(index)]
+            ppg_replay.append(
+                _PPGExample(
+                    observation=example.observation,
+                    return_target=float(example.return_target),
+                )
+            )
+        ppg_samples_added += kept
+
+    def optimise_ppg_phase() -> Dict[str, float]:
+        """Distil the current policy while value trains the shared encoder."""
+        nonlocal ppg_phases, ppg_updates
+        if not ppg_enabled or len(ppg_replay) < ppg_minibatch_size:
+            return {}
+        phase_size = min(ppg_phase_samples, len(ppg_replay))
+        selected_indices = rng.choice(
+            len(ppg_replay), size=phase_size, replace=False
+        )
+        replay_rows = list(ppg_replay)
+        selected = [replay_rows[int(index)] for index in selected_indices]
+
+        # Freeze the *current* post-PPO policy over the diverse replay states.
+        # Targets from collection time would unnecessarily pull the candidate
+        # back through several older policies instead of protecting only the
+        # policy that enters this auxiliary phase.
+        targets: list[_PPGTargetExample] = []
+        candidate.eval()
+        for start in range(0, len(selected), ppg_minibatch_size):
+            subset = selected[start:start + ppg_minibatch_size]
+            frozen_batch = _collate_public_observations(subset)
+            frozen_tensors = _vector_tensors(
+                frozen_batch, device, training
+            )
+            with torch.inference_mode():
+                frozen_output = candidate(
+                    frozen_tensors["map_tokens"],
+                    frozen_tensors["global_features"],
+                    frozen_tensors["action_categorical"],
+                    frozen_tensors["action_continuous"],
+                    frozen_tensors["action_mask"],
+                    frozen_tensors["event_features"],
+                    action_history=frozen_tensors["action_history"],
+                    action_history_mask=frozen_tensors[
+                        "action_history_mask"
+                    ],
+                    include_belief=False,
+                )
+                frozen_logs = F.log_softmax(
+                    frozen_output.policy_logits.float(), dim=-1
+                ).cpu().numpy()
+            for row, example in enumerate(subset):
+                legal_count = int(
+                    example.observation["action_features"].shape[0]
+                )
+                targets.append(
+                    _PPGTargetExample(
+                        observation=example.observation,
+                        policy_log_probabilities=frozen_logs[
+                            row, :legal_count
+                        ].astype(np.float32, copy=True),
+                        return_target=example.return_target,
+                    )
+                )
+
+        local_totals = {"loss": 0.0, "value_loss": 0.0, "policy_kl": 0.0}
+        local_updates = 0
+        auxiliary_progress = tqdm(
+            total=ppg_epochs * (
+                (len(targets) + ppg_minibatch_size - 1)
+                // ppg_minibatch_size
+            ),
+            desc=f"PPG auxiliary phase {ppg_phases + 1}",
+            unit="update",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        for _ in range(ppg_epochs):
+            order = rng.permutation(len(targets))
+            for start in range(0, len(order), ppg_minibatch_size):
+                subset = [
+                    targets[int(index)]
+                    for index in order[start:start + ppg_minibatch_size]
+                ]
+                replay_batch, reference_logs, returns = _ppg_batch(subset)
+                tensors = _vector_tensors(replay_batch, device, training)
+                reference_tensor = torch.as_tensor(
+                    reference_logs, dtype=torch.float32, device=device
+                )
+                return_tensor = torch.as_tensor(
+                    returns, dtype=torch.float32, device=device
+                )
+                autocast = (
+                    torch.autocast(device_type="cuda", dtype=torch.float16)
+                    if cuda_amp
+                    else nullcontext()
+                )
+                with autocast:
+                    output = candidate(
+                        tensors["map_tokens"],
+                        tensors["global_features"],
+                        tensors["action_categorical"],
+                        tensors["action_continuous"],
+                        tensors["action_mask"],
+                        tensors["event_features"],
+                        action_history=tensors["action_history"],
+                        action_history_mask=tensors["action_history_mask"],
+                        include_belief=False,
+                    )
+                    value_loss = F.smooth_l1_loss(
+                        output.value.float(), return_tensor
+                    )
+                policy_kl = _masked_policy_kl(
+                    reference_tensor,
+                    output.policy_logits,
+                    tensors["action_mask"],
+                )
+                loss = (
+                    ppg_value_weight * value_loss
+                    + ppg_policy_kl_weight * policy_kl
+                )
+                optimiser.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimiser)
+                torch.nn.utils.clip_grad_norm_(candidate.parameters(), 1.0)
+                scaler.step(optimiser)
+                scaler.update()
+                values = {
+                    "loss": float(loss.detach().cpu()),
+                    "value_loss": float(value_loss.detach().cpu()),
+                    "policy_kl": float(policy_kl.detach().cpu()),
+                }
+                for name, value in values.items():
+                    local_totals[name] += value
+                    ppg_totals[name] += value
+                local_updates += 1
+                ppg_updates += 1
+                auxiliary_progress.update(1)
+                if local_updates == 1 or local_updates % 8 == 0:
+                    auxiliary_progress.set_postfix(
+                        value=f"{values['value_loss']:.4f}",
+                        policy_kl=f"{values['policy_kl']:.5f}",
+                    )
+        auxiliary_progress.close()
+        candidate.eval()
+        ppg_phases += 1
+        return {
+            name: total / max(1, local_updates)
+            for name, total in local_totals.items()
+        }
+
     with tqdm(
         total=steps,
-        desc=f"direct population PPO ({device}, no MCTS)",
+        desc=(
+            f"direct population PPG ({device}, no MCTS)"
+            if ppg_enabled
+            else f"direct population PPO ({device}, no MCTS)"
+        ),
         unit="step",
         dynamic_ncols=True,
     ) as progress:
         for step in range(steps):
             candidate.eval()
             tensors = _vector_tensors(batch, device, training)
+            history_tokens_seen += int(
+                np.asarray(batch["visible_event_mask"], dtype=bool).sum()
+            )
+            history_rows_seen += num_envs
             features = np.asarray(batch["action_features"], dtype=np.int64)
             legal = np.asarray(batch["action_mask"], dtype=bool)
             state = np.asarray(batch["state"], dtype=np.int32)
@@ -1356,6 +1791,8 @@ def train_vector_population(
                     tensors["action_continuous"],
                     tensors["action_mask"],
                     tensors["event_features"],
+                    action_history=tensors["action_history"],
+                    action_history_mask=tensors["action_history_mask"],
                     include_belief=False,
                 )
                 rollout_distribution = Categorical(
@@ -1401,6 +1838,47 @@ def train_vector_population(
             terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
             reward = shaping_weight * shaped + terminal_reward
             reward_total += float(reward.mean())
+            if objective_replay_weight > 0.0 and candidate_rows.size:
+                success_weights = _objective_replay_success_weights(
+                    features,
+                    selected_rows,
+                    np.asarray(batch["map_tokens"], dtype=np.int64),
+                    state,
+                    candidate_rows,
+                    terminal,
+                    terminal_reward,
+                    training.map_size,
+                )
+                for env_id in candidate_rows:
+                    history = objective_histories[int(env_id)]
+                    history.append(
+                        _objective_replay_snapshot(
+                            batch, int(env_id), int(selected_rows[env_id])
+                        )
+                    )
+                    success_weight = float(success_weights[env_id])
+                    if success_weight <= 0.0:
+                        continue
+                    objective_replay_events += 1
+                    for age, example in enumerate(reversed(history)):
+                        objective_replay.append(
+                            replace(
+                                example,
+                                weight=(
+                                    success_weight
+                                    * objective_replay_recency**age
+                                ),
+                            )
+                        )
+                        objective_replay_positions += 1
+                        objective_replay_update_credits = min(
+                            objective_replay_update_credits
+                            + objective_replay_max_epochs,
+                            len(objective_replay)
+                            * objective_replay_max_epochs,
+                        )
+            for env_id in np.flatnonzero(terminal):
+                objective_histories[int(env_id)].clear()
             with torch.inference_mode():
                 next_tensors = _vector_tensors(next_batch, device, training)
                 next_output = candidate(
@@ -1410,6 +1888,10 @@ def train_vector_population(
                     next_tensors["action_continuous"],
                     next_tensors["action_mask"],
                     next_tensors["event_features"],
+                    action_history=next_tensors["action_history"],
+                    action_history_mask=next_tensors[
+                        "action_history_mask"
+                    ],
                     include_belief=False,
                 )
                 next_values = next_output.value.float().cpu().numpy()
@@ -1489,6 +1971,7 @@ def train_vector_population(
                 episode_numbers[env_id] += 1
 
             rollout_metrics: Dict[str, float] = {}
+            ppg_metrics: Dict[str, float] = {}
             if pending_candidate_examples > ppo_max_pending_examples:
                 for trace in traces:
                     if not trace:
@@ -1521,6 +2004,10 @@ def train_vector_population(
                 ppo_samples += len(examples)
                 ppo_rollouts += 1
                 rollout_metrics = optimise_rollout(examples)
+                if not ppo_kl_exceeded:
+                    retain_ppg_examples(examples)
+                    if ppo_rollouts % ppg_interval == 0:
+                        ppg_metrics = optimise_ppg_phase()
                 last_champion_kl = float(
                     rollout_metrics.get("champion_kl", last_champion_kl)
                 )
@@ -1542,6 +2029,19 @@ def train_vector_population(
                 ppo_rollouts=ppo_rollouts,
                 ppo_pending_examples=pending_candidate_examples,
                 ppo_forced_truncations=ppo_forced_truncations,
+                ppg_enabled=float(ppg_enabled),
+                ppg_buffer_size=len(ppg_replay),
+                ppg_samples_added=ppg_samples_added,
+                ppg_phases=ppg_phases,
+                ppg_updates=ppg_updates,
+                ppg_update_this_step=float(bool(ppg_metrics)),
+                objective_replay_events=objective_replay_events,
+                objective_replay_positions=objective_replay_positions,
+                objective_replay_size=len(objective_replay),
+                objective_replay_updates=objective_replay_updates,
+                objective_replay_update_credits=(
+                    objective_replay_update_credits
+                ),
                 ppo_kl_exceeded=float(ppo_kl_exceeded),
                 ppo_learning_rate=float(optimiser.param_groups[0]["lr"]),
                 ppo_update_this_step=float(bool(rollout_metrics)),
@@ -1551,6 +2051,10 @@ def train_vector_population(
                     "ppo_" + name: value
                     for name, value in rollout_metrics.items()
                 },
+                **{
+                    "ppg_" + name: value
+                    for name, value in ppg_metrics.items()
+                },
             )
             progress.update(1)
             if (step + 1) % 20 == 0 or step == 0:
@@ -1559,6 +2063,8 @@ def train_vector_population(
                     games=completed_games,
                     score=f"{(wins + 0.5 * draws) / max(1, completed_games):.3f}",
                     ppo_updates=ppo_updates,
+                    ppg_phases=ppg_phases,
+                    replay_updates=objective_replay_updates,
                     kl=f"{last_champion_kl:.5f}",
                 )
             if ppo_kl_exceeded:
@@ -1566,8 +2072,19 @@ def train_vector_population(
 
     divisor = max(1, ppo_rollouts)
     summary: Dict[str, float | str] = {
-        "direct_population_algorithm": "signed_ppo_gae",
+        "direct_population_algorithm": (
+            "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
+        ),
         "direct_population_envs": float(num_envs),
+        "direct_population_visible_action_history": float(
+            visible_action_history
+        ),
+        "direct_population_mean_visible_history_tokens": float(
+            history_tokens_seen / max(1, history_rows_seen)
+        ),
+        "direct_population_history_gate_norm": float(
+            candidate.history_gate[-1].weight.detach().float().norm().cpu()
+        ),
         "direct_population_steps": float(step + 1),
         "direct_population_environment_steps": float((step + 1) * num_envs),
         "direct_population_completed_games": float(completed_games),
@@ -1587,6 +2104,51 @@ def train_vector_population(
         ),
         "direct_population_ppo_forced_truncations": float(
             ppo_forced_truncations
+        ),
+        "direct_population_ppg_enabled": float(ppg_enabled),
+        "direct_population_ppg_policy_phase_value_head_only": float(
+            ppg_enabled
+        ),
+        "direct_population_ppg_interval": float(ppg_interval),
+        "direct_population_ppg_buffer_capacity": float(
+            ppg_buffer_capacity
+        ),
+        "direct_population_ppg_buffer_size": float(len(ppg_replay)),
+        "direct_population_ppg_samples_added": float(ppg_samples_added),
+        "direct_population_ppg_phase_samples": float(ppg_phase_samples),
+        "direct_population_ppg_phases": float(ppg_phases),
+        "direct_population_ppg_updates": float(ppg_updates),
+        "direct_population_ppg_loss": float(
+            ppg_totals["loss"] / max(1, ppg_updates)
+        ),
+        "direct_population_ppg_value_loss": float(
+            ppg_totals["value_loss"] / max(1, ppg_updates)
+        ),
+        "direct_population_ppg_policy_kl": float(
+            ppg_totals["policy_kl"] / max(1, ppg_updates)
+        ),
+        "direct_population_ppg_policy_kl_weight": float(
+            ppg_policy_kl_weight
+        ),
+        "direct_population_ppg_value_weight": float(ppg_value_weight),
+        "direct_population_objective_replay_events": float(
+            objective_replay_events
+        ),
+        "direct_population_objective_replay_positions": float(
+            objective_replay_positions
+        ),
+        "direct_population_objective_replay_size": float(
+            len(objective_replay)
+        ),
+        "direct_population_objective_replay_updates": float(
+            objective_replay_updates
+        ),
+        "direct_population_objective_replay_effective_epochs": float(
+            objective_replay_updates * objective_replay_batch_size
+            / max(1, objective_replay_positions)
+        ),
+        "direct_population_objective_replay_weight": float(
+            objective_replay_weight
         ),
         "direct_population_ppo_update_target": float(ppo_update_target),
         "direct_population_ppo_max_pending_examples": float(
@@ -1616,6 +2178,7 @@ def evaluate_direct_population_matches(
     *,
     games: int,
     gate_seed: int,
+    visible_action_history: int = 32,
     game_callback: Callable[[int, Mapping[str, Any]], None] | None = None,
     candidate_label: str = "pretendent",
     opponent_labels: Sequence[str] | None = None,
@@ -1666,6 +2229,7 @@ def evaluate_direct_population_matches(
             ),
             model_a_label=candidate_label,
             model_b_label=resolved_opponent_labels[opponent_index],
+            visible_action_history=visible_action_history,
         )
         results.append(match)
     return {
@@ -1771,6 +2335,7 @@ def train_direct_population_curriculum(
     block_steps: int,
     num_threads: int | None,
     max_actions: int,
+    visible_action_history: int = 32,
     gate_games: int,
     gate_seed: int,
     gate_score: float,
@@ -1806,6 +2371,15 @@ def train_direct_population_curriculum(
     objective_replay_weight: float = 0.35,
     objective_replay_recency: float = 0.92,
     objective_replay_max_epochs: int = 4,
+    ppg_enabled: bool = True,
+    ppg_interval: int = 8,
+    ppg_buffer_capacity: int = 8_192,
+    ppg_samples_per_rollout: int = 512,
+    ppg_phase_samples: int = 4_096,
+    ppg_epochs: int = 2,
+    ppg_minibatch_size: int = 256,
+    ppg_policy_kl_weight: float = 1.0,
+    ppg_value_weight: float = 1.0,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -1817,6 +2391,8 @@ def train_direct_population_curriculum(
     """Advance raw population play only while held-out population skill grows."""
     if minimum_steps < 0 or maximum_steps < minimum_steps:
         raise ValueError("invalid direct population step range")
+    if not 0 <= visible_action_history <= 1024:
+        raise ValueError("visible_action_history must be between 0 and 1024")
     if minimum_steps and block_steps < 1:
         raise ValueError("block_steps must be positive")
     if gate_games < 2 or gate_games % 2:
@@ -1876,6 +2452,24 @@ def train_direct_population_curriculum(
     }.items():
         if value < 1:
             raise ValueError(f"{name} must be positive")
+    for name, value in {
+        "ppg_interval": ppg_interval,
+        "ppg_buffer_capacity": ppg_buffer_capacity,
+        "ppg_samples_per_rollout": ppg_samples_per_rollout,
+        "ppg_phase_samples": ppg_phase_samples,
+        "ppg_epochs": ppg_epochs,
+        "ppg_minibatch_size": ppg_minibatch_size,
+    }.items():
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
+    if ppg_enabled and (
+        ppg_buffer_capacity < ppg_phase_samples
+        or ppg_phase_samples < ppg_minibatch_size
+        or ppg_buffer_capacity < ppg_samples_per_rollout
+    ):
+        raise ValueError("invalid PPG buffer or minibatch sizes")
+    if ppg_policy_kl_weight < 0.0 or ppg_value_weight < 0.0:
+        raise ValueError("PPG loss weights must not be negative")
     weights = np.asarray(opponent_weights, dtype=np.float64)
     if (
         weights.shape != (len(opponent_models),)
@@ -1896,6 +2490,7 @@ def train_direct_population_curriculum(
             "block_steps": block_steps,
             "num_threads": num_threads,
             "max_actions": max_actions,
+            "visible_action_history": visible_action_history,
             "gate_games": gate_games,
             "diagnostic_gate_games": resolved_diagnostic_gate_games,
             "gate_seed": gate_seed,
@@ -1916,7 +2511,9 @@ def train_direct_population_curriculum(
             "teacher_weight": teacher_weight,
             "shaping_weight": shaping_weight,
             "greedy_advantage_weight": greedy_advantage_weight,
-            "algorithm": "signed_ppo_gae",
+            "algorithm": (
+                "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
+            ),
             "ppo_rollout_steps": ppo_rollout_steps,
             "ppo_epochs": ppo_epochs,
             "ppo_minibatch_size": ppo_minibatch_size,
@@ -1935,6 +2532,15 @@ def train_direct_population_curriculum(
             "objective_replay_weight": objective_replay_weight,
             "objective_replay_recency": objective_replay_recency,
             "objective_replay_max_epochs": objective_replay_max_epochs,
+            "ppg_enabled": ppg_enabled,
+            "ppg_interval": ppg_interval,
+            "ppg_buffer_capacity": ppg_buffer_capacity,
+            "ppg_samples_per_rollout": ppg_samples_per_rollout,
+            "ppg_phase_samples": ppg_phase_samples,
+            "ppg_epochs": ppg_epochs,
+            "ppg_minibatch_size": ppg_minibatch_size,
+            "ppg_policy_kl_weight": ppg_policy_kl_weight,
+            "ppg_value_weight": ppg_value_weight,
         },
     )
     parent_state = model_state_on_cpu(candidate)
@@ -1973,6 +2579,7 @@ def train_direct_population_curriculum(
             weights,
             games=games,
             gate_seed=gate_seed,
+            visible_action_history=visible_action_history,
             game_callback=(
                 None
                 if gate_game_callback is None
@@ -2127,6 +2734,7 @@ def train_direct_population_curriculum(
             num_threads=num_threads,
             max_actions=max_actions,
             anchor_model=champion,
+            visible_action_history=visible_action_history,
             policy_anchor_weight=policy_anchor_weight,
             value_anchor_weight=value_anchor_weight,
             opponent_policy_weight=opponent_policy_weight,
@@ -2142,6 +2750,22 @@ def train_direct_population_curriculum(
             ppo_hard_kl=ppo_hard_kl,
             ppo_rollout_temperature=ppo_rollout_temperature,
             ppo_max_pending_examples=ppo_max_pending_examples,
+            objective_replay_horizon=objective_replay_horizon,
+            objective_replay_capacity=objective_replay_capacity,
+            objective_replay_batch_size=objective_replay_batch_size,
+            objective_replay_interval=objective_replay_interval,
+            objective_replay_weight=objective_replay_weight,
+            objective_replay_recency=objective_replay_recency,
+            objective_replay_max_epochs=objective_replay_max_epochs,
+            ppg_enabled=ppg_enabled,
+            ppg_interval=ppg_interval,
+            ppg_buffer_capacity=ppg_buffer_capacity,
+            ppg_samples_per_rollout=ppg_samples_per_rollout,
+            ppg_phase_samples=ppg_phase_samples,
+            ppg_epochs=ppg_epochs,
+            ppg_minibatch_size=ppg_minibatch_size,
+            ppg_policy_kl_weight=ppg_policy_kl_weight,
+            ppg_value_weight=ppg_value_weight,
             game_callback=(
                 None
                 if training_game_callback is None
@@ -2192,6 +2816,7 @@ def train_direct_population_curriculum(
         weights,
         games=gate_games,
         gate_seed=gate_seed,
+        visible_action_history=visible_action_history,
         game_callback=(
             None
             if gate_game_callback is None
@@ -2264,7 +2889,9 @@ def train_direct_population_curriculum(
         "direct_population_greedy_advantage_weight": float(
             greedy_advantage_weight
         ),
-        "direct_population_algorithm": "signed_ppo_gae",
+        "direct_population_algorithm": (
+            "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
+        ),
         "direct_population_diagnostic_gate_games": float(
             resolved_diagnostic_gate_games
         ),
@@ -2285,6 +2912,23 @@ def train_direct_population_curriculum(
         "direct_population_objective_replay_max_epochs": float(
             objective_replay_max_epochs
         ),
+        "direct_population_ppg_enabled": float(ppg_enabled),
+        "direct_population_ppg_interval": float(ppg_interval),
+        "direct_population_ppg_buffer_capacity": float(
+            ppg_buffer_capacity
+        ),
+        "direct_population_ppg_samples_per_rollout": float(
+            ppg_samples_per_rollout
+        ),
+        "direct_population_ppg_phase_samples": float(ppg_phase_samples),
+        "direct_population_ppg_epochs": float(ppg_epochs),
+        "direct_population_ppg_minibatch_size": float(
+            ppg_minibatch_size
+        ),
+        "direct_population_ppg_policy_kl_weight": float(
+            ppg_policy_kl_weight
+        ),
+        "direct_population_ppg_value_weight": float(ppg_value_weight),
         "direct_population_accepted_blocks": float(accepted_blocks),
         "direct_population_selected_blocks": float(selected_blocks),
         "direct_population_rollback_blocks": float(rollback_blocks),

@@ -20,7 +20,7 @@ from _bootstrap import add_local_source_root
 add_local_source_root()
 
 from polybot.config import MCTSConfig
-from polybot.data.polyenv_features import packet_to_tensors
+from polybot.data.polyenv_features import packet_to_tensors, visible_events_or_empty
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.infrastructure.randomness import seed_everything
@@ -148,9 +148,16 @@ def _flat_choice(
     device: torch.device,
     temperature: float,
     rng: np.random.Generator,
+    events: Dict[str, object] | None = None,
+    visible_action_history: int = 0,
 ) -> Dict[str, Any]:
     """Sample the raw policy in the same style as a flat training rollout."""
-    tensors = packet_to_tensors(packet, device)
+    tensors = packet_to_tensors(
+        packet,
+        device,
+        events,
+        visible_action_history=visible_action_history,
+    )
     output = model(
         tensors.map_tokens,
         tensors.global_features,
@@ -314,6 +321,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mcts-threads", type=int, default=1, help="MCTS only")
     parser.add_argument("--mcts-max-actions", type=int, default=1024, help="MCTS only")
     parser.add_argument(
+        "--visible-action-history",
+        type=int,
+        default=32,
+        help="Fog-safe events remembered by flat policy (0-1024, default: 32)",
+    )
+    parser.add_argument(
         "--save-path",
         "--output-dir",
         dest="output_dir",
@@ -337,6 +350,8 @@ def _validate_args(args: argparse.Namespace, max_board_side: int) -> None:
         raise ValueError("--temperature cannot be negative")
     if args.simulations < 1 or args.particles < 1:
         raise ValueError("--simulations and --particles must be positive")
+    if not 0 <= args.visible_action_history <= 1024:
+        raise ValueError("--visible-action-history must be between 0 and 1024")
     if args.inference_batch_size < 1 or args.mcts_threads < 1:
         raise ValueError("--inference-batch-size and --mcts-threads must be positive")
 
@@ -401,6 +416,7 @@ def main() -> None:
         "max_moves": args.max_moves,
         "base_seed": seed,
         "temperature": args.temperature,
+        "visible_action_history": args.visible_action_history,
         "device": str(device),
         "device_request": args.device,
         "device_auto_priority": ["cuda", "mps", "cpu"],
@@ -490,6 +506,11 @@ def main() -> None:
                                 device,
                                 args.temperature,
                                 rng,
+                                (
+                                    visible_events_or_empty(env)
+                                    if args.visible_action_history else None
+                                ),
+                                args.visible_action_history,
                             )
                         )
                         action_row = int(choice.pop("action_row"))

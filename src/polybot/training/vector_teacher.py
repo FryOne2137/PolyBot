@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 from ..config import ModelConfig, TrainingConfig
+from ..data.polyenv_features import vector_event_action_history
 from ..data.token_schema import EVENT_SUMMARY_SIZE
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
@@ -192,10 +193,17 @@ def _vector_tensors(
 ) -> Dict[str, torch.Tensor]:
     features = np.asarray(batch["action_features"], dtype=np.int64)
     mask = np.asarray(batch["action_mask"], dtype=bool)
+    action_history, action_history_mask = vector_event_action_history(batch)
     return {
         "map_tokens": torch.as_tensor(batch["map_tokens"], dtype=torch.long, device=device),
         "global_features": torch.as_tensor(_global_features(batch["state"], training.map_size, training.map_type), device=device),
         "event_features": torch.as_tensor(_event_summary(batch), dtype=torch.float32, device=device),
+        "action_history": torch.as_tensor(
+            action_history, dtype=torch.float32, device=device
+        ),
+        "action_history_mask": torch.as_tensor(
+            action_history_mask, dtype=torch.bool, device=device
+        ),
         "action_categorical": torch.as_tensor(features[..., _CATEGORICAL_COLUMNS], dtype=torch.long, device=device),
         "action_continuous": torch.as_tensor(features[..., _CONTINUOUS_COLUMNS], dtype=torch.float32, device=device),
         "action_mask": torch.as_tensor(mask, dtype=torch.bool, device=device),
@@ -318,6 +326,8 @@ def train_vector_teacher(
                     output = model(
                         tensors["map_tokens"], tensors["global_features"], tensors["action_categorical"],
                         tensors["action_continuous"], tensors["action_mask"], tensors["event_features"],
+                        action_history=tensors["action_history"],
+                        action_history_mask=tensors["action_history_mask"],
                         include_belief=False,
                     )
                     log_probabilities = F.log_softmax(output.policy_logits, dim=-1)
@@ -332,6 +342,8 @@ def train_vector_teacher(
                                 tensors["map_tokens"], tensors["global_features"],
                                 tensors["action_categorical"], tensors["action_continuous"],
                                 tensors["action_mask"], tensors["event_features"],
+                                action_history=tensors["action_history"],
+                                action_history_mask=tensors["action_history_mask"],
                                 include_belief=False,
                             )
                             anchor_policy = torch.softmax(

@@ -210,6 +210,63 @@ def main() -> None:
         "--direct-population-ppo-lr-backoff", type=float, default=0.5,
     )
     parser.add_argument(
+        "--direct-population-objective-replay-horizon", type=int, default=16,
+        help="Recent candidate decisions credited when a visible objective succeeds",
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-capacity", type=int, default=512,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-batch-size", type=int, default=32,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-interval", type=int, default=16,
+        help="PPO optimiser updates between bounded self-imitation batches",
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-weight", type=float, default=0.35,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-recency", type=float, default=0.92,
+    )
+    parser.add_argument(
+        "--direct-population-objective-replay-max-epochs", type=int, default=4,
+        help="Maximum average reuses credited to one successful public decision",
+    )
+    parser.add_argument(
+        "--direct-population-ppg",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable single-network PPG auxiliary value/distillation phases",
+    )
+    parser.add_argument(
+        "--direct-population-ppg-interval", type=int, default=8,
+        help="PPO rollouts between PPG auxiliary phases",
+    )
+    parser.add_argument(
+        "--direct-population-ppg-buffer-capacity", type=int, default=8_192,
+    )
+    parser.add_argument(
+        "--direct-population-ppg-samples-per-rollout", type=int, default=512,
+        help="Bounded diverse positions retained from each PPO rollout",
+    )
+    parser.add_argument(
+        "--direct-population-ppg-phase-samples", type=int, default=4_096,
+    )
+    parser.add_argument(
+        "--direct-population-ppg-epochs", type=int, default=2,
+    )
+    parser.add_argument(
+        "--direct-population-ppg-minibatch-size", type=int, default=256,
+    )
+    parser.add_argument(
+        "--direct-population-ppg-policy-kl-weight", type=float, default=1.0,
+        help="Protect the post-PPO policy while auxiliary value trains the encoder",
+    )
+    parser.add_argument(
+        "--direct-population-ppg-value-weight", type=float, default=1.0,
+    )
+    parser.add_argument(
         "--post-bootstrap-population-steps", type=int, default=6_000,
         help="Minimum champion-population steps after the first promotion",
     )
@@ -241,6 +298,26 @@ def main() -> None:
         choices=("flat", "mcts"),
         default="flat",
         help="Flat promotes by raw policy; mcts enables the legacy search ladder",
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-games", type=int, default=0,
+        help="MCTS expert games distilled into the raw policy before its flat promotion gate",
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-simulations", type=int, default=32,
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-updates-per-game", type=int, default=2,
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-gate-games", type=int, default=20,
+        help="Paired raw-policy games used to keep or roll back MCTS distillation",
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-policy-anchor-weight", type=float, default=0.20,
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-value-anchor-weight", type=float, default=0.25,
     )
     parser.add_argument(
         "--mcts-probe-games", type=int, default=10,
@@ -285,7 +362,15 @@ def main() -> None:
     )
     parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
-    parser.add_argument("--visible-action-history", type=int, default=0, help="0 keeps train/evaluation inputs identical")
+    parser.add_argument(
+        "--visible-action-history",
+        type=int,
+        default=32,
+        help=(
+            "Fog-safe events remembered by PPO, replay, flat gates and MCTS "
+            "(0 disables, default: 32)"
+        ),
+    )
     parser.add_argument("--belief-retries", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
@@ -311,7 +396,13 @@ def main() -> None:
     args = parser.parse_args()
 
     training = training_config_from_args(args)
-    print(f"device: {select_device(training.device)} | league rounds: {args.rounds}", flush=True)
+    print(
+        f"device: {select_device(training.device)} | league rounds: "
+        f"{args.rounds} | visible action history: "
+        f"{args.visible_action_history} | PPG: "
+        f"{'on' if args.direct_population_ppg else 'off'}",
+        flush=True,
+    )
     print_summary(train_promotion_league(
         training,
         champion_in=args.champion_in,
@@ -434,6 +525,50 @@ def main() -> None:
         direct_population_ppo_lr_backoff=(
             args.direct_population_ppo_lr_backoff
         ),
+        direct_population_objective_replay_horizon=(
+            args.direct_population_objective_replay_horizon
+        ),
+        direct_population_objective_replay_capacity=(
+            args.direct_population_objective_replay_capacity
+        ),
+        direct_population_objective_replay_batch_size=(
+            args.direct_population_objective_replay_batch_size
+        ),
+        direct_population_objective_replay_interval=(
+            args.direct_population_objective_replay_interval
+        ),
+        direct_population_objective_replay_weight=(
+            args.direct_population_objective_replay_weight
+        ),
+        direct_population_objective_replay_recency=(
+            args.direct_population_objective_replay_recency
+        ),
+        direct_population_objective_replay_max_epochs=(
+            args.direct_population_objective_replay_max_epochs
+        ),
+        direct_population_ppg_enabled=args.direct_population_ppg,
+        direct_population_ppg_interval=(
+            args.direct_population_ppg_interval
+        ),
+        direct_population_ppg_buffer_capacity=(
+            args.direct_population_ppg_buffer_capacity
+        ),
+        direct_population_ppg_samples_per_rollout=(
+            args.direct_population_ppg_samples_per_rollout
+        ),
+        direct_population_ppg_phase_samples=(
+            args.direct_population_ppg_phase_samples
+        ),
+        direct_population_ppg_epochs=args.direct_population_ppg_epochs,
+        direct_population_ppg_minibatch_size=(
+            args.direct_population_ppg_minibatch_size
+        ),
+        direct_population_ppg_policy_kl_weight=(
+            args.direct_population_ppg_policy_kl_weight
+        ),
+        direct_population_ppg_value_weight=(
+            args.direct_population_ppg_value_weight
+        ),
         post_bootstrap_population_steps=(
             args.post_bootstrap_population_steps
         ),
@@ -452,6 +587,20 @@ def main() -> None:
             args.post_bootstrap_opponent_policy_weight
         ),
         champion_mode=args.champion_mode,
+        flat_mcts_distill_games=args.flat_mcts_distill_games,
+        flat_mcts_distill_simulations=(
+            args.flat_mcts_distill_simulations
+        ),
+        flat_mcts_distill_updates_per_game=(
+            args.flat_mcts_distill_updates_per_game
+        ),
+        flat_mcts_distill_gate_games=args.flat_mcts_distill_gate_games,
+        flat_mcts_distill_policy_anchor_weight=(
+            args.flat_mcts_distill_policy_anchor_weight
+        ),
+        flat_mcts_distill_value_anchor_weight=(
+            args.flat_mcts_distill_value_anchor_weight
+        ),
         mcts_probe_games=args.mcts_probe_games,
         mcts_probe_simulations=args.mcts_probe_simulations,
         mcts_probe_score=args.mcts_probe_score,

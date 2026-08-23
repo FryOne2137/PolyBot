@@ -10,6 +10,7 @@ from ..config import MCTSConfig, TrainingConfig
 from ..evaluation.matches import evaluate_direct_matches
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import load_model, save_model
+from ..models.policy_value_belief import PolicyValueBeliefNet
 from .league_db import LeagueDatabase
 from .belief_recovery import BeliefQualityError, BeliefRecoveryRequired
 from .direct_curriculum import (
@@ -117,6 +118,35 @@ def _challenger_continuation_action(
     if has_previous_challenger:
         return "previous"
     return "none"
+
+
+def _select_exploiter_checkpoint(
+    main_summary: Mapping[str, Any],
+    exploiter_summary: Mapping[str, Any],
+) -> bool:
+    """Use the free branch only when it cleared the same development floor.
+
+    The final promotion gate remains independent.  This is only a cheap,
+    population-held-out decision about which lineage deserves that expensive
+    gate, so a spectacular but brittle exploiter cannot replace the main line.
+    """
+    if not bool(exploiter_summary.get("direct_population_full_gate_selected", 0.0)):
+        return False
+    if not bool(main_summary.get("direct_population_full_gate_selected", 0.0)):
+        return True
+    exploiter_score = float(
+        exploiter_summary.get("direct_population_full_gate_score", 0.0)
+    )
+    main_score = float(main_summary.get("direct_population_full_gate_score", 0.0))
+    if exploiter_score > main_score + 1e-8:
+        return True
+    if abs(exploiter_score - main_score) > 1e-8:
+        return False
+    return float(
+        exploiter_summary.get("direct_population_full_gate_worst_score", 0.0)
+    ) > float(
+        main_summary.get("direct_population_full_gate_worst_score", 0.0)
+    ) + 1e-8
 
 
 def _mcts_probe_passed(
@@ -391,11 +421,14 @@ def train_promotion_league(
     direct_population_opponent_policy_weight: float = 0.50,
     direct_population_teacher_weight: float = 0.25,
     direct_population_shaping_weight: float = 0.20,
+    direct_population_shaping_final_weight: float = 0.0,
     direct_population_ppo_rollout_steps: int = 32,
     direct_population_ppo_epochs: int = 2,
     direct_population_ppo_minibatch_size: int = 256,
     direct_population_ppo_clip_range: float = 0.15,
+    direct_population_ppo_gamma: float = 1.0,
     direct_population_ppo_gae_lambda: float = 0.95,
+    direct_population_ppo_top_advantage_fraction: float = 0.50,
     direct_population_ppo_target_kl: float = 0.015,
     direct_population_ppo_hard_kl: float = 0.030,
     direct_population_ppo_rollout_temperature: float = 0.85,
@@ -418,6 +451,15 @@ def train_promotion_league(
     direct_population_ppg_minibatch_size: int = 256,
     direct_population_ppg_policy_kl_weight: float = 1.0,
     direct_population_ppg_value_weight: float = 1.0,
+    direct_population_ema_enabled: bool = True,
+    direct_population_ema_decay: float = 0.999,
+    breakthrough_exploiter: bool = False,
+    exploiter_champion_probability: float = 0.75,
+    exploiter_policy_anchor_weight: float = 0.0,
+    exploiter_value_anchor_weight: float = 0.0,
+    exploiter_ppo_target_kl: float = 0.20,
+    exploiter_ppo_hard_kl: float = 0.50,
+    exploiter_ppo_rollout_temperature: float = 1.0,
     post_bootstrap_population_steps: int = 6_000,
     post_bootstrap_population_max_steps: int = 12_000,
     post_bootstrap_objective_steps: int = 0,
@@ -543,11 +585,18 @@ def train_promotion_league(
         ),
         "direct_population_teacher_weight": direct_population_teacher_weight,
         "direct_population_shaping_weight": direct_population_shaping_weight,
+        "direct_population_shaping_final_weight": (
+            direct_population_shaping_final_weight
+        ),
         "direct_population_ppo_clip_range": (
             direct_population_ppo_clip_range
         ),
+        "direct_population_ppo_gamma": direct_population_ppo_gamma,
         "direct_population_ppo_gae_lambda": (
             direct_population_ppo_gae_lambda
+        ),
+        "direct_population_ppo_top_advantage_fraction": (
+            direct_population_ppo_top_advantage_fraction
         ),
         "direct_population_objective_replay_weight": (
             direct_population_objective_replay_weight
@@ -587,6 +636,16 @@ def train_promotion_league(
         direct_population_ppo_hard_kl
     ):
         raise ValueError("direct population PPO requires 0 < target KL <= hard KL")
+    if not 0.0 < direct_population_ppo_gamma <= 1.0:
+        raise ValueError("direct population PPO gamma must be in (0, 1]")
+    if not 0.0 < direct_population_ppo_top_advantage_fraction <= 1.0:
+        raise ValueError(
+            "direct population PPO top advantage fraction must be in (0, 1]"
+        )
+    if not 0.0 <= direct_population_shaping_final_weight <= 1.0:
+        raise ValueError(
+            "direct population final shaping weight must be between zero and one"
+        )
     if not 0.1 <= direct_population_ppo_rollout_temperature <= 2.0:
         raise ValueError("direct population PPO rollout temperature is invalid")
     if direct_population_ppo_min_learning_rate <= 0.0:
@@ -652,6 +711,21 @@ def train_promotion_league(
         or direct_population_ppg_value_weight < 0.0
     ):
         raise ValueError("direct population PPG weights must not be negative")
+    if direct_population_ema_enabled and not 0.0 <= (
+        direct_population_ema_decay
+    ) < 1.0:
+        raise ValueError("direct population EMA decay must be in [0, 1)")
+    for name, value in {
+        "exploiter_champion_probability": exploiter_champion_probability,
+        "exploiter_policy_anchor_weight": exploiter_policy_anchor_weight,
+        "exploiter_value_anchor_weight": exploiter_value_anchor_weight,
+    }.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between zero and one")
+    if not 0.0 < exploiter_ppo_target_kl <= exploiter_ppo_hard_kl:
+        raise ValueError("exploiter PPO requires 0 < target KL <= hard KL")
+    if not 0.1 <= exploiter_ppo_rollout_temperature <= 2.0:
+        raise ValueError("exploiter PPO rollout temperature is invalid")
     if direct_objective_steps < 0 or post_bootstrap_objective_steps < 0:
         raise ValueError("objective curriculum steps must not be negative")
     if (direct_objective_steps or post_bootstrap_objective_steps) and (
@@ -850,8 +924,12 @@ def train_promotion_league(
         "direct_population_ppo_clip_range": (
             direct_population_ppo_clip_range
         ),
+        "direct_population_ppo_gamma": direct_population_ppo_gamma,
         "direct_population_ppo_gae_lambda": (
             direct_population_ppo_gae_lambda
+        ),
+        "direct_population_ppo_top_advantage_fraction": (
+            direct_population_ppo_top_advantage_fraction
         ),
         "direct_population_ppo_target_kl": (
             direct_population_ppo_target_kl
@@ -912,6 +990,17 @@ def train_promotion_league(
         ),
         "direct_population_ppg_value_weight": (
             direct_population_ppg_value_weight
+        ),
+        "direct_population_ema_enabled": direct_population_ema_enabled,
+        "direct_population_ema_decay": direct_population_ema_decay,
+        "breakthrough_exploiter": breakthrough_exploiter,
+        "exploiter_champion_probability": exploiter_champion_probability,
+        "exploiter_policy_anchor_weight": exploiter_policy_anchor_weight,
+        "exploiter_value_anchor_weight": exploiter_value_anchor_weight,
+        "exploiter_ppo_target_kl": exploiter_ppo_target_kl,
+        "exploiter_ppo_hard_kl": exploiter_ppo_hard_kl,
+        "exploiter_ppo_rollout_temperature": (
+            exploiter_ppo_rollout_temperature
         ),
         "post_bootstrap_population_steps": post_bootstrap_population_steps,
         "post_bootstrap_population_max_steps": (
@@ -1507,7 +1596,19 @@ def train_promotion_league(
                             )
                         frozen_models.append(frozen_model.eval())
 
+                    # The free exploiter starts from exactly the same point as
+                    # the main line, before the latter's champion-anchored PPO
+                    # updates.  It is evaluated on the same development arena
+                    # and can only earn the later independent promotion gate.
+                    exploiter_source_state = (
+                        model_state_on_cpu(candidate)
+                        if breakthrough_exploiter and effective_population_steps
+                        else None
+                    )
                     direct_population_summary: Dict[str, Any] = {}
+                    direct_population_main_summary: Dict[str, Any] = {}
+                    direct_population_exploiter_summary: Dict[str, Any] = {}
+                    selected_population_branch = "main"
                     if effective_population_steps:
                         def record_direct_population_gate_game(
                             stage: str,
@@ -1605,6 +1706,9 @@ def train_promotion_league(
                                 shaping_weight=(
                                     direct_population_shaping_weight
                                 ),
+                                shaping_final_weight=(
+                                    direct_population_shaping_final_weight
+                                ),
                                 ppo_rollout_steps=(
                                     direct_population_ppo_rollout_steps
                                 ),
@@ -1615,8 +1719,12 @@ def train_promotion_league(
                                 ppo_clip_range=(
                                     direct_population_ppo_clip_range
                                 ),
+                                ppo_gamma=direct_population_ppo_gamma,
                                 ppo_gae_lambda=(
                                     direct_population_ppo_gae_lambda
+                                ),
+                                ppo_top_advantage_fraction=(
+                                    direct_population_ppo_top_advantage_fraction
                                 ),
                                 ppo_target_kl=(
                                     direct_population_ppo_target_kl
@@ -1678,6 +1786,8 @@ def train_promotion_league(
                                 ppg_value_weight=(
                                     direct_population_ppg_value_weight
                                 ),
+                                ema_enabled=direct_population_ema_enabled,
+                                ema_decay=direct_population_ema_decay,
                                 gate_game_callback=(
                                     record_direct_population_gate_game
                                 ),
@@ -1694,8 +1804,248 @@ def train_promotion_league(
                                 ),
                             )
                         )
+                        direct_population_main_summary = dict(
+                            direct_population_summary
+                        )
+                        if exploiter_source_state is not None:
+                            exploiter = PolicyValueBeliefNet(model_config)
+                            restore_model_state(exploiter, exploiter_source_state)
+                            exploiter_probabilities = (
+                                _champion_focused_probabilities(
+                                    population_ids,
+                                    probabilities,
+                                    champion_id,
+                                    champion_probability=(
+                                        min(
+                                            exploiter_champion_probability,
+                                            1.0
+                                            - (len(population_ids) - 1)
+                                            * minimum_sampling_probability,
+                                        )
+                                    ),
+                                    probability_floor=(
+                                        minimum_sampling_probability
+                                    ),
+                                )
+                            )
+
+                            def record_exploiter_gate_game(
+                                stage: str,
+                                block: int,
+                                opponent_index: int,
+                                game: Mapping[str, Any],
+                            ) -> None:
+                                record_direct_population_gate_game(
+                                    f"exploiter_{stage}",
+                                    block,
+                                    opponent_index,
+                                    game,
+                                )
+
+                            def record_exploiter_training_game(
+                                block: int,
+                                game: Mapping[str, Any],
+                            ) -> None:
+                                opponent_index = int(
+                                    game.get("opponent_model_index", 0)
+                                )
+                                row = dict(game)
+                                row["curriculum_block"] = int(block)
+                                row["training_branch"] = "exploiter"
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    phase=(
+                                        "direct_population_exploiter_training_"
+                                        f"{block}"
+                                    ),
+                                    model_a_id=candidate_id,
+                                    model_b_id=population_ids[opponent_index],
+                                    game=row,
+                                )
+
+                            direct_population_exploiter_summary = (
+                                train_direct_population_curriculum(
+                                    replace(
+                                        round_training,
+                                        seed=_offset_seed(
+                                            direct_population_training_seed,
+                                            1_250_003,
+                                        ),
+                                        max_moves=direct_gate_max_moves,
+                                    ),
+                                    model_config,
+                                    exploiter,
+                                    champion,
+                                    frozen_models,
+                                    exploiter_probabilities,
+                                    num_envs=direct_population_envs,
+                                    minimum_steps=effective_population_steps,
+                                    maximum_steps=effective_population_max_steps,
+                                    block_steps=direct_population_block_steps,
+                                    num_threads=num_threads,
+                                    max_actions=mcts.native_max_actions,
+                                    visible_action_history=(
+                                        visible_action_history
+                                    ),
+                                    gate_games=direct_population_gate_games,
+                                    diagnostic_gate_games=(
+                                        direct_population_diagnostic_gate_games
+                                    ),
+                                    gate_seed=direct_population_gate_seed,
+                                    gate_score=direct_population_gate_score,
+                                    historical_score_floor=(
+                                        direct_population_historical_floor
+                                    ),
+                                    readiness_city_captures_per_game=(
+                                        direct_readiness_city_captures_per_game
+                                    ),
+                                    readiness_completion_rate=(
+                                        direct_readiness_completion_rate
+                                    ),
+                                    readiness_patience=(
+                                        direct_population_readiness_patience
+                                    ),
+                                    regression_patience=(
+                                        direct_population_regression_patience
+                                    ),
+                                    policy_anchor_weight=(
+                                        exploiter_policy_anchor_weight
+                                    ),
+                                    value_anchor_weight=(
+                                        exploiter_value_anchor_weight
+                                    ),
+                                    opponent_policy_weight=0.0,
+                                    teacher_weight=0.0,
+                                    shaping_weight=(
+                                        direct_population_shaping_weight
+                                    ),
+                                    shaping_final_weight=(
+                                        direct_population_shaping_final_weight
+                                    ),
+                                    ppo_rollout_steps=(
+                                        direct_population_ppo_rollout_steps
+                                    ),
+                                    ppo_epochs=direct_population_ppo_epochs,
+                                    ppo_minibatch_size=(
+                                        direct_population_ppo_minibatch_size
+                                    ),
+                                    ppo_clip_range=(
+                                        direct_population_ppo_clip_range
+                                    ),
+                                    ppo_gamma=direct_population_ppo_gamma,
+                                    ppo_gae_lambda=(
+                                        direct_population_ppo_gae_lambda
+                                    ),
+                                    ppo_top_advantage_fraction=(
+                                        direct_population_ppo_top_advantage_fraction
+                                    ),
+                                    ppo_target_kl=exploiter_ppo_target_kl,
+                                    ppo_hard_kl=exploiter_ppo_hard_kl,
+                                    ppo_rollout_temperature=(
+                                        exploiter_ppo_rollout_temperature
+                                    ),
+                                    ppo_max_pending_examples=(
+                                        direct_population_ppo_max_pending_examples
+                                    ),
+                                    ppo_min_learning_rate=(
+                                        direct_population_ppo_min_learning_rate
+                                    ),
+                                    ppo_lr_backoff=(
+                                        direct_population_ppo_lr_backoff
+                                    ),
+                                    objective_replay_horizon=(
+                                        direct_population_objective_replay_horizon
+                                    ),
+                                    objective_replay_capacity=(
+                                        direct_population_objective_replay_capacity
+                                    ),
+                                    objective_replay_batch_size=(
+                                        direct_population_objective_replay_batch_size
+                                    ),
+                                    objective_replay_interval=(
+                                        direct_population_objective_replay_interval
+                                    ),
+                                    objective_replay_weight=(
+                                        direct_population_objective_replay_weight
+                                    ),
+                                    objective_replay_recency=(
+                                        direct_population_objective_replay_recency
+                                    ),
+                                    objective_replay_max_epochs=(
+                                        direct_population_objective_replay_max_epochs
+                                    ),
+                                    ppg_enabled=direct_population_ppg_enabled,
+                                    ppg_interval=direct_population_ppg_interval,
+                                    ppg_buffer_capacity=(
+                                        direct_population_ppg_buffer_capacity
+                                    ),
+                                    ppg_samples_per_rollout=(
+                                        direct_population_ppg_samples_per_rollout
+                                    ),
+                                    ppg_phase_samples=(
+                                        direct_population_ppg_phase_samples
+                                    ),
+                                    ppg_epochs=direct_population_ppg_epochs,
+                                    ppg_minibatch_size=(
+                                        direct_population_ppg_minibatch_size
+                                    ),
+                                    ppg_policy_kl_weight=(
+                                        direct_population_ppg_policy_kl_weight
+                                    ),
+                                    ppg_value_weight=(
+                                        direct_population_ppg_value_weight
+                                    ),
+                                    ema_enabled=direct_population_ema_enabled,
+                                    ema_decay=direct_population_ema_decay,
+                                    gate_game_callback=(
+                                        record_exploiter_gate_game
+                                    ),
+                                    training_game_callback=(
+                                        record_exploiter_training_game
+                                    ),
+                                    candidate_label=(
+                                        f"exploiter {candidate_source.stem}"
+                                    ),
+                                    opponent_labels=(
+                                        population_evaluation_labels
+                                    ),
+                                    run=run.child(
+                                        f"round_{round_index:03d}/"
+                                        "direct_population_exploiter"
+                                    ),
+                                )
+                            )
+                            if _select_exploiter_checkpoint(
+                                direct_population_main_summary,
+                                direct_population_exploiter_summary,
+                            ):
+                                candidate = exploiter
+                                candidate_evaluation_label = (
+                                    f"exploiter {candidate_source.stem}"
+                                )
+                                direct_population_summary = dict(
+                                    direct_population_exploiter_summary
+                                )
+                                selected_population_branch = "exploiter"
+                                print(
+                                    "league breakthrough exploiter selected | "
+                                    f"score={float(direct_population_summary.get('direct_population_full_gate_score', 0.0)):.4f}",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    "league breakthrough exploiter kept in diagnostics | "
+                                    f"score={float(direct_population_exploiter_summary.get('direct_population_full_gate_score', 0.0)):.4f}",
+                                    flush=True,
+                                )
                     round_training_summary["direct_population"] = (
-                        direct_population_summary
+                        {
+                            **direct_population_summary,
+                            "selected_branch": selected_population_branch,
+                            "main": direct_population_main_summary,
+                            "exploiter": direct_population_exploiter_summary,
+                        }
                     )
                     direct_population_ready = (
                         not bool(direct_population_steps)

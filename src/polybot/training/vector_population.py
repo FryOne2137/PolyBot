@@ -63,6 +63,15 @@ class _PPOExample:
     old_value: float
     advantage: float = 0.0
     return_target: float = 0.0
+    # For finished games this is the undiscounted game outcome from the
+    # candidate's perspective (+1 / 0 / -1).  It deliberately remains
+    # separate from the GAE return used to construct the policy advantage:
+    # a 700-move game must still teach its opening positions who eventually
+    # won.  A forced partial-trajectory flush falls back to ``return_target``.
+    value_target: float | None = None
+    # Policy updates can use only the upper advantage quantile while the value
+    # and PPG objectives continue to see every completed position.
+    policy_selected: bool = True
 
 
 @dataclass
@@ -164,6 +173,7 @@ def _finish_ppo_trace(
     *,
     gamma: float,
     gae_lambda: float,
+    terminal_outcome: float | None = None,
 ) -> list[_PPOExample]:
     """Compute sign-correct GAE through candidate and opponent actions.
 
@@ -186,6 +196,11 @@ def _finish_ppo_trace(
             example = transition.candidate_example
             example.advantage = float(advantage)
             example.return_target = float(transition.value + advantage)
+            example.value_target = (
+                float(terminal_outcome)
+                if terminal_outcome is not None
+                else example.return_target
+            )
             result.append(example)
     result.reverse()
     return result
@@ -207,6 +222,59 @@ def _ppo_batch(
         np.asarray([example.advantage for example in examples], dtype=np.float32),
         np.asarray([example.return_target for example in examples], dtype=np.float32),
     )
+
+
+def _mark_top_advantage_examples(
+    examples: Sequence[_PPOExample],
+    fraction: float,
+) -> int:
+    """Mark the upper advantage quantile for the PPO policy loss.
+
+    Keeping all examples for the critic avoids throwing away terminal labels.
+    The actor, however, benefits from ignoring low-value/noisy transitions in
+    long self-play games.  The deterministic stable ordering makes this easy
+    to regression-test when advantages tie.
+    """
+    if not examples:
+        return 0
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("top advantage fraction must be in (0, 1]")
+    selected_count = max(1, int(np.ceil(len(examples) * fraction)))
+    order = np.argsort(
+        np.asarray([example.advantage for example in examples], dtype=np.float32),
+        kind="stable",
+    )
+    for example in examples:
+        example.policy_selected = False
+    for index in order[-selected_count:]:
+        examples[int(index)].policy_selected = True
+    return selected_count
+
+
+@torch.no_grad()
+def _update_parameter_ema(
+    ema_model: PolicyValueBeliefNet,
+    model: PolicyValueBeliefNet,
+    decay: float,
+) -> None:
+    """Update a deployment-only EMA without adding training gradients."""
+    if not 0.0 <= decay < 1.0:
+        raise ValueError("EMA decay must be in [0, 1)")
+    ema_parameters = dict(ema_model.named_parameters())
+    model_parameters = dict(model.named_parameters())
+    if ema_parameters.keys() != model_parameters.keys():
+        raise ValueError("EMA model must have the same parameter structure")
+    for name, ema_parameter in ema_parameters.items():
+        ema_parameter.lerp_(model_parameters[name].detach(), 1.0 - decay)
+    # The current models do not have floating running-stat buffers, but copy
+    # every buffer defensively so an architecture extension cannot leave EMA
+    # with stale integer masks or counters.
+    ema_buffers = dict(ema_model.named_buffers())
+    model_buffers = dict(model.named_buffers())
+    if ema_buffers.keys() != model_buffers.keys():
+        raise ValueError("EMA model must have the same buffer structure")
+    for name, ema_buffer in ema_buffers.items():
+        ema_buffer.copy_(model_buffers[name].detach())
 
 
 def _ppg_batch(
@@ -1069,14 +1137,18 @@ def train_vector_population(
     opponent_policy_weight: float = 0.0,
     teacher_weight: float = 0.0,
     shaping_weight: float = 0.20,
+    shaping_final_weight: float | None = None,
+    shaping_progress_start: float = 0.0,
+    shaping_progress_end: float = 1.0,
     greedy_advantage_weight: float = 0.0,
     entropy_weight: float = 0.002,
-    gamma: float = 0.995,
+    gamma: float = 1.0,
     ppo_rollout_steps: int = 32,
     ppo_epochs: int = 2,
     ppo_minibatch_size: int = 256,
     ppo_clip_range: float = 0.15,
     ppo_gae_lambda: float = 0.95,
+    ppo_top_advantage_fraction: float = 0.50,
     ppo_target_kl: float = 0.015,
     ppo_hard_kl: float = 0.030,
     ppo_rollout_temperature: float = 0.85,
@@ -1097,6 +1169,8 @@ def train_vector_population(
     ppg_minibatch_size: int = 256,
     ppg_policy_kl_weight: float = 1.0,
     ppg_value_weight: float = 1.0,
+    ema_model: PolicyValueBeliefNet | None = None,
+    ema_decay: float = 0.999,
     game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
@@ -1163,6 +1237,22 @@ def train_vector_population(
             raise ValueError(f"{name} has an invalid value")
     if ppo_hard_kl < ppo_target_kl:
         raise ValueError("ppo_hard_kl must be at least ppo_target_kl")
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError("gamma must be in (0, 1]")
+    if not 0.0 < ppo_top_advantage_fraction <= 1.0:
+        raise ValueError("ppo_top_advantage_fraction must be in (0, 1]")
+    resolved_shaping_final_weight = (
+        shaping_weight if shaping_final_weight is None else shaping_final_weight
+    )
+    if (
+        resolved_shaping_final_weight < 0.0
+        or not 0.0 <= shaping_progress_start <= 1.0
+        or not 0.0 <= shaping_progress_end <= 1.0
+        or shaping_progress_end < shaping_progress_start
+    ):
+        raise ValueError("invalid shaping anneal configuration")
+    if ema_model is not None and not 0.0 <= ema_decay < 1.0:
+        raise ValueError("ema_decay must be in [0, 1)")
     if (
         ppo_rollout_steps < 1
         or ppo_epochs < 1
@@ -1226,6 +1316,9 @@ def train_vector_population(
             "visible_action_history": visible_action_history,
             "opponent_weights": weights.tolist(),
             "shaping_weight": shaping_weight,
+            "shaping_final_weight": resolved_shaping_final_weight,
+            "shaping_progress_start": shaping_progress_start,
+            "shaping_progress_end": shaping_progress_end,
             "policy_anchor_weight": policy_anchor_weight,
             "value_anchor_weight": value_anchor_weight,
             "ppo_rollout_steps": ppo_rollout_steps,
@@ -1234,6 +1327,7 @@ def train_vector_population(
             "ppo_clip_range": ppo_clip_range,
             "ppo_gamma": gamma,
             "ppo_gae_lambda": ppo_gae_lambda,
+            "ppo_top_advantage_fraction": ppo_top_advantage_fraction,
             "ppo_target_kl": ppo_target_kl,
             "ppo_hard_kl": ppo_hard_kl,
             "ppo_rollout_temperature": ppo_rollout_temperature,
@@ -1254,6 +1348,8 @@ def train_vector_population(
             "ppg_minibatch_size": ppg_minibatch_size,
             "ppg_policy_kl_weight": ppg_policy_kl_weight,
             "ppg_value_weight": ppg_value_weight,
+            "ema_enabled": ema_model is not None,
+            "ema_decay": ema_decay if ema_model is not None else None,
             # Kept in the artifacts so obsolete command-line flags remain
             # auditable rather than silently affecting the PPO objective.
             "legacy_opponent_policy_weight": opponent_policy_weight,
@@ -1262,6 +1358,12 @@ def train_vector_population(
         },
     )
     candidate.to(device).eval()
+    if ema_model is not None:
+        if ema_model is candidate:
+            raise ValueError("ema_model must be a separate frozen copy")
+        ema_model.to(device).eval()
+        for parameter in ema_model.parameters():
+            parameter.requires_grad_(False)
     anchor_model.to(device).eval()
     for parameter in anchor_model.parameters():
         parameter.requires_grad_(False)
@@ -1307,6 +1409,7 @@ def train_vector_population(
     completed_games = wins = losses = draws = 0
     candidate_turns = opponent_turns = 0
     ppo_samples = ppo_updates = ppo_rollouts = 0
+    ppo_policy_samples = 0
     ppo_kl_exceeded = False
     completed_examples: list[_PPOExample] = []
     pending_candidate_examples = 0
@@ -1318,6 +1421,7 @@ def train_vector_population(
     ppg_samples_added = 0
     ppg_phases = 0
     ppg_updates = 0
+    ema_updates = 0
     ppo_update_target = max(
         ppo_minibatch_size, num_envs * ppo_rollout_steps // 2
     )
@@ -1330,6 +1434,7 @@ def train_vector_population(
         "clip_fraction": 0.0,
         "entropy": 0.0,
         "objective_replay_loss": 0.0,
+        "policy_selected_fraction": 0.0,
     }
     # A PPO update happens only after enough completed trajectories have been
     # collected.  Keep its most recent value separately from the metrics for
@@ -1337,6 +1442,7 @@ def train_vector_population(
     # every collection-only step.
     last_champion_kl = 0.0
     reward_total = 0.0
+    shaping_weight_total = 0.0
     history_tokens_seen = 0
     history_rows_seen = 0
     ppg_totals = {
@@ -1347,7 +1453,7 @@ def train_vector_population(
 
     def optimise_rollout(examples: Sequence[_PPOExample]) -> Dict[str, float]:
         """Run PPO epochs and stop before an unsafe champion-policy drift."""
-        nonlocal ppo_updates, ppo_kl_exceeded
+        nonlocal ppo_updates, ppo_policy_samples, ppo_kl_exceeded, ema_updates
         nonlocal objective_replay_updates, objective_replay_update_credits
         if not examples:
             return {
@@ -1368,6 +1474,9 @@ def train_vector_population(
         )
         for example, advantage in zip(examples, advantages):
             example.advantage = float(advantage)
+        _mark_top_advantage_examples(
+            examples, ppo_top_advantage_fraction
+        )
         totals_local = {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -1377,6 +1486,7 @@ def train_vector_population(
             "clip_fraction": 0.0,
             "entropy": 0.0,
             "objective_replay_loss": 0.0,
+            "policy_selected_fraction": 0.0,
         }
         local_updates = 0
         for _ in range(ppo_epochs):
@@ -1397,7 +1507,19 @@ def train_vector_population(
                     advantages_batch, dtype=torch.float32, device=device
                 )
                 return_tensor = torch.as_tensor(
-                    returns, dtype=torch.float32, device=device
+                    [
+                        example.return_target
+                        if example.value_target is None
+                        else example.value_target
+                        for example in subset
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                policy_selected_tensor = torch.as_tensor(
+                    [example.policy_selected for example in subset],
+                    dtype=torch.bool,
+                    device=device,
                 )
                 # PPO compares against the rollout policy. Keeping dropout
                 # disabled makes that ratio deterministic while preserving
@@ -1431,7 +1553,13 @@ def train_vector_population(
                     clipped = torch.clamp(
                         ratio, 1.0 - ppo_clip_range, 1.0 + ppo_clip_range
                     ) * advantage_tensor
-                    policy_loss = -torch.minimum(unclipped, clipped).mean()
+                    policy_terms = -torch.minimum(unclipped, clipped)
+                    selected_policy_count = int(policy_selected_tensor.sum().item())
+                    policy_loss = (
+                        policy_terms[policy_selected_tensor].mean()
+                        if selected_policy_count
+                        else policy_terms.sum() * 0.0
+                    )
                     # In PPG's policy phase the critic head may keep tracking
                     # fresh returns, but its gradient must not rewrite the
                     # shared map/history representation. The later auxiliary
@@ -1445,9 +1573,14 @@ def train_vector_population(
                     value_loss = F.smooth_l1_loss(
                         policy_phase_value.float(), return_tensor
                     )
-                    entropy = Categorical(
+                    entropy_per_example = Categorical(
                         logits=output.policy_logits / ppo_rollout_temperature
-                    ).entropy().mean()
+                    ).entropy()
+                    entropy = (
+                        entropy_per_example[policy_selected_tensor].mean()
+                        if selected_policy_count
+                        else entropy_per_example.sum() * 0.0
+                    )
                 # The champion is frozen, but its logits are part of the KL
                 # and value-anchor losses.  ``no_grad`` avoids building its
                 # backward graph while keeping ordinary tensors that PyTorch
@@ -1572,6 +1705,9 @@ def train_vector_population(
                 scaler.step(optimiser)
                 scaler.update()
                 candidate.eval()
+                if ema_model is not None:
+                    _update_parameter_ema(ema_model, candidate, ema_decay)
+                    ema_updates += 1
                 values = {
                     "loss": float(loss.detach().cpu()),
                     "policy_loss": float(policy_loss.detach().cpu()),
@@ -1586,11 +1722,15 @@ def train_vector_population(
                     "objective_replay_loss": float(
                         objective_replay_loss.detach().cpu()
                     ),
+                    "policy_selected_fraction": float(
+                        policy_selected_tensor.float().mean().detach().cpu()
+                    ),
                 }
                 for name, value in values.items():
                     totals_local[name] += value
                 local_updates += 1
                 ppo_updates += 1
+                ppo_policy_samples += int(policy_selected_tensor.sum().item())
         return {
             name: total / max(1, local_updates)
             for name, total in totals_local.items()
@@ -1612,14 +1752,18 @@ def train_vector_population(
             ppg_replay.append(
                 _PPGExample(
                     observation=example.observation,
-                    return_target=float(example.return_target),
+                    return_target=float(
+                        example.return_target
+                        if example.value_target is None
+                        else example.value_target
+                    ),
                 )
             )
         ppg_samples_added += kept
 
     def optimise_ppg_phase() -> Dict[str, float]:
         """Distil the current policy while value trains the shared encoder."""
-        nonlocal ppg_phases, ppg_updates
+        nonlocal ppg_phases, ppg_updates, ema_updates
         if not ppg_enabled or len(ppg_replay) < ppg_minibatch_size:
             return {}
         phase_size = min(ppg_phase_samples, len(ppg_replay))
@@ -1734,6 +1878,10 @@ def train_vector_population(
                 torch.nn.utils.clip_grad_norm_(candidate.parameters(), 1.0)
                 scaler.step(optimiser)
                 scaler.update()
+                candidate.eval()
+                if ema_model is not None:
+                    _update_parameter_ema(ema_model, candidate, ema_decay)
+                    ema_updates += 1
                 values = {
                     "loss": float(loss.detach().cpu()),
                     "value_loss": float(value_loss.detach().cpu()),
@@ -1836,8 +1984,20 @@ def train_vector_population(
             next_batch = env.step(action_ids)
             terminal = np.asarray(next_batch["terminated"], dtype=bool)
             terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
-            reward = shaping_weight * shaped + terminal_reward
+            local_progress = (step + 1) / max(1, steps)
+            shaping_progress = (
+                shaping_progress_start
+                + (shaping_progress_end - shaping_progress_start)
+                * local_progress
+            )
+            current_shaping_weight = (
+                shaping_weight
+                + (resolved_shaping_final_weight - shaping_weight)
+                * shaping_progress
+            )
+            reward = current_shaping_weight * shaped + terminal_reward
             reward_total += float(reward.mean())
+            shaping_weight_total += current_shaping_weight
             if objective_replay_weight > 0.0 and candidate_rows.size:
                 success_weights = _objective_replay_success_weights(
                     features,
@@ -1927,11 +2087,26 @@ def train_vector_population(
 
             episode_moves += 1
             for env_id in np.flatnonzero(terminal):
+                if terminal_reward[env_id] != 0.0:
+                    winner_player = int(players_before[env_id])
+                    if terminal_reward[env_id] < 0.0:
+                        winner_player = 1 - winner_player
+                    candidate_outcome = float(
+                        1.0
+                        if winner_player == candidate_players[env_id]
+                        else -1.0
+                    )
+                else:
+                    winner_player = -1
+                    candidate_outcome = 0.0
                 # Finish only a real game here.  The return crosses every
                 # opponent action stored in this slot before reaching its own
                 # candidate decisions.
                 finished_examples = _finish_ppo_trace(
-                    traces[int(env_id)], gamma=gamma, gae_lambda=ppo_gae_lambda
+                    traces[int(env_id)],
+                    gamma=gamma,
+                    gae_lambda=ppo_gae_lambda,
+                    terminal_outcome=candidate_outcome,
                 )
                 completed_examples.extend(finished_examples)
                 pending_candidate_examples -= len(finished_examples)
@@ -1939,10 +2114,7 @@ def train_vector_population(
                 completed_games += 1
                 selected_opponent = int(opponent_indices[env_id])
                 if terminal_reward[env_id] != 0.0:
-                    winner_player = int(players_before[env_id])
-                    if terminal_reward[env_id] < 0.0:
-                        winner_player = 1 - winner_player
-                    candidate_won = winner_player == candidate_players[env_id]
+                    candidate_won = candidate_outcome > 0.0
                     wins += int(candidate_won)
                     losses += int(not candidate_won)
                     score = float(candidate_won)
@@ -2025,6 +2197,7 @@ def train_vector_population(
                 candidate_turns=candidate_turns,
                 opponent_turns=opponent_turns,
                 ppo_samples=ppo_samples,
+                ppo_policy_samples=ppo_policy_samples,
                 ppo_updates=ppo_updates,
                 ppo_rollouts=ppo_rollouts,
                 ppo_pending_examples=pending_candidate_examples,
@@ -2044,9 +2217,12 @@ def train_vector_population(
                 ),
                 ppo_kl_exceeded=float(ppo_kl_exceeded),
                 ppo_learning_rate=float(optimiser.param_groups[0]["lr"]),
+                ema_enabled=float(ema_model is not None),
+                ema_updates=ema_updates,
                 ppo_update_this_step=float(bool(rollout_metrics)),
                 ppo_last_champion_kl=last_champion_kl,
                 reward=float(reward.mean()),
+                shaping_weight=current_shaping_weight,
                 **{
                     "ppo_" + name: value
                     for name, value in rollout_metrics.items()
@@ -2097,6 +2273,7 @@ def train_vector_population(
         "direct_population_candidate_turns": float(candidate_turns),
         "direct_population_opponent_turns": float(opponent_turns),
         "direct_population_ppo_samples": float(ppo_samples),
+        "direct_population_ppo_policy_samples": float(ppo_policy_samples),
         "direct_population_ppo_updates": float(ppo_updates),
         "direct_population_ppo_rollouts": float(ppo_rollouts),
         "direct_population_ppo_pending_examples": float(
@@ -2157,10 +2334,26 @@ def train_vector_population(
         "direct_population_ppo_kl_exceeded": float(ppo_kl_exceeded),
         "direct_population_ppo_target_kl": float(ppo_target_kl),
         "direct_population_ppo_hard_kl": float(ppo_hard_kl),
+        "direct_population_ppo_gamma": float(gamma),
+        "direct_population_ppo_top_advantage_fraction": float(
+            ppo_top_advantage_fraction
+        ),
         "direct_population_ppo_rollout_temperature": float(
             ppo_rollout_temperature
         ),
         "direct_population_ppo_reward": reward_total / max(1, step + 1),
+        "direct_population_shaping_weight_start": float(shaping_weight),
+        "direct_population_shaping_weight_final": float(
+            resolved_shaping_final_weight
+        ),
+        "direct_population_shaping_weight_mean": float(
+            shaping_weight_total / max(1, step + 1)
+        ),
+        "direct_population_ema_enabled": float(ema_model is not None),
+        "direct_population_ema_decay": float(
+            ema_decay if ema_model is not None else 0.0
+        ),
+        "direct_population_ema_updates": float(ema_updates),
         **{
             "direct_population_ppo_" + name: value / divisor
             for name, value in totals.items()
@@ -2352,6 +2545,7 @@ def train_direct_population_curriculum(
     opponent_policy_weight: float,
     teacher_weight: float,
     shaping_weight: float,
+    shaping_final_weight: float = 0.0,
     greedy_advantage_weight: float = 0.25,
     regression_patience: int = 2,
     score_tolerance: float = 0.02,
@@ -2361,7 +2555,9 @@ def train_direct_population_curriculum(
     ppo_epochs: int = 2,
     ppo_minibatch_size: int = 256,
     ppo_clip_range: float = 0.15,
+    ppo_gamma: float = 1.0,
     ppo_gae_lambda: float = 0.95,
+    ppo_top_advantage_fraction: float = 0.50,
     ppo_target_kl: float = 0.015,
     ppo_hard_kl: float = 0.030,
     ppo_rollout_temperature: float = 0.85,
@@ -2384,6 +2580,8 @@ def train_direct_population_curriculum(
     ppg_minibatch_size: int = 256,
     ppg_policy_kl_weight: float = 1.0,
     ppg_value_weight: float = 1.0,
+    ema_enabled: bool = True,
+    ema_decay: float = 0.999,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -2431,8 +2629,12 @@ def train_direct_population_curriculum(
         raise ValueError("PPO rollout, epoch and minibatch sizes must be positive")
     if not 0.0 < ppo_clip_range <= 1.0:
         raise ValueError("ppo_clip_range must be in (0, 1]")
+    if not 0.0 < ppo_gamma <= 1.0:
+        raise ValueError("ppo_gamma must be in (0, 1]")
     if not 0.0 <= ppo_gae_lambda <= 1.0:
         raise ValueError("ppo_gae_lambda must be between zero and one")
+    if not 0.0 < ppo_top_advantage_fraction <= 1.0:
+        raise ValueError("ppo_top_advantage_fraction must be in (0, 1]")
     if not 0.0 < ppo_target_kl <= ppo_hard_kl:
         raise ValueError("PPO KL thresholds must satisfy 0 < target <= hard")
     if not 0.1 <= ppo_rollout_temperature <= 2.0:
@@ -2474,6 +2676,10 @@ def train_direct_population_curriculum(
         raise ValueError("invalid PPG buffer or minibatch sizes")
     if ppg_policy_kl_weight < 0.0 or ppg_value_weight < 0.0:
         raise ValueError("PPG loss weights must not be negative")
+    if not 0.0 <= shaping_final_weight <= 1.0:
+        raise ValueError("shaping_final_weight must be between zero and one")
+    if ema_enabled and not 0.0 <= ema_decay < 1.0:
+        raise ValueError("ema_decay must be in [0, 1)")
     weights = np.asarray(opponent_weights, dtype=np.float64)
     if (
         weights.shape != (len(opponent_models),)
@@ -2514,6 +2720,7 @@ def train_direct_population_curriculum(
             "opponent_policy_weight": opponent_policy_weight,
             "teacher_weight": teacher_weight,
             "shaping_weight": shaping_weight,
+            "shaping_final_weight": shaping_final_weight,
             "greedy_advantage_weight": greedy_advantage_weight,
             "algorithm": (
                 "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
@@ -2522,7 +2729,9 @@ def train_direct_population_curriculum(
             "ppo_epochs": ppo_epochs,
             "ppo_minibatch_size": ppo_minibatch_size,
             "ppo_clip_range": ppo_clip_range,
+            "ppo_gamma": ppo_gamma,
             "ppo_gae_lambda": ppo_gae_lambda,
+            "ppo_top_advantage_fraction": ppo_top_advantage_fraction,
             "ppo_target_kl": ppo_target_kl,
             "ppo_hard_kl": ppo_hard_kl,
             "ppo_rollout_temperature": ppo_rollout_temperature,
@@ -2545,10 +2754,18 @@ def train_direct_population_curriculum(
             "ppg_minibatch_size": ppg_minibatch_size,
             "ppg_policy_kl_weight": ppg_policy_kl_weight,
             "ppg_value_weight": ppg_value_weight,
+            "ema_enabled": ema_enabled,
+            "ema_decay": ema_decay if ema_enabled else None,
         },
     )
     parent_state = model_state_on_cpu(candidate)
     best_state = model_state_on_cpu(candidate)
+    ema_model: PolicyValueBeliefNet | None = None
+    best_ema_state: Dict[str, torch.Tensor] | None = None
+    if ema_enabled:
+        ema_model = PolicyValueBeliefNet(model_config)
+        restore_model_state(ema_model, parent_state)
+        best_ema_state = model_state_on_cpu(ema_model)
     best_score = 0.0
     best_worst_score = 0.0
     best_capture_rate = 0.0
@@ -2570,6 +2787,7 @@ def train_direct_population_curriculum(
         games: int = resolved_diagnostic_gate_games,
     ) -> bool:
         nonlocal best_state, best_score, best_worst_score
+        nonlocal best_ema_state
         nonlocal best_capture_rate, best_completion_rate
         nonlocal best_objective_progress
         nonlocal readiness_streak, ready, accepted_blocks, selected_blocks
@@ -2632,6 +2850,8 @@ def train_direct_population_curriculum(
                 accepted_blocks += 1
             if selected:
                 best_state = model_state_on_cpu(candidate)
+                if ema_model is not None:
+                    best_ema_state = model_state_on_cpu(ema_model)
                 best_score = weighted_score
                 best_worst_score = worst_score
                 best_capture_rate = capture_rate
@@ -2644,6 +2864,8 @@ def train_direct_population_curriculum(
                 # from the actual strongest model rather than accumulating
                 # several tolerated score drops.
                 restore_model_state(candidate, best_state)
+                if ema_model is not None and best_ema_state is not None:
+                    restore_model_state(ema_model, best_ema_state)
             if baseline:
                 # Baseline protects the input checkpoint but does not count as
                 # a successful population-training block.
@@ -2663,6 +2885,8 @@ def train_direct_population_curriculum(
             consecutive_regressions = 0
         else:
             restore_model_state(candidate, best_state)
+            if ema_model is not None and best_ema_state is not None:
+                restore_model_state(ema_model, best_ema_state)
             rollback_blocks += 1
             consecutive_regressions += 1
             maximum_consecutive_regressions = max(
@@ -2746,12 +2970,18 @@ def train_direct_population_curriculum(
             opponent_policy_weight=opponent_policy_weight,
             teacher_weight=teacher_weight,
             shaping_weight=shaping_weight,
+            shaping_final_weight=shaping_final_weight,
+            shaping_progress_start=completed / max(1, maximum_steps),
+            shaping_progress_end=(completed + current_steps)
+            / max(1, maximum_steps),
             greedy_advantage_weight=greedy_advantage_weight,
+            gamma=ppo_gamma,
             ppo_rollout_steps=ppo_rollout_steps,
             ppo_epochs=ppo_epochs,
             ppo_minibatch_size=ppo_minibatch_size,
             ppo_clip_range=ppo_clip_range,
             ppo_gae_lambda=ppo_gae_lambda,
+            ppo_top_advantage_fraction=ppo_top_advantage_fraction,
             ppo_target_kl=ppo_target_kl,
             ppo_hard_kl=ppo_hard_kl,
             ppo_rollout_temperature=ppo_rollout_temperature,
@@ -2772,6 +3002,8 @@ def train_direct_population_curriculum(
             ppg_minibatch_size=ppg_minibatch_size,
             ppg_policy_kl_weight=ppg_policy_kl_weight,
             ppg_value_weight=ppg_value_weight,
+            ema_model=ema_model,
+            ema_decay=ema_decay,
             game_callback=(
                 None
                 if training_game_callback is None
@@ -2785,6 +3017,8 @@ def train_direct_population_curriculum(
         completed += current_steps
         if bool(result.get("direct_population_ppo_kl_exceeded", 0.0)):
             restore_model_state(candidate, best_state)
+            if ema_model is not None and best_ema_state is not None:
+                restore_model_state(ema_model, best_ema_state)
             rollback_blocks += 1
             previous_learning_rate = current_ppo_learning_rate
             current_ppo_learning_rate = max(
@@ -2815,7 +3049,9 @@ def train_direct_population_curriculum(
             break
 
     restore_model_state(candidate, best_state)
-    full_evaluation = evaluate_direct_population_matches(
+    if ema_model is not None and best_ema_state is not None:
+        restore_model_state(ema_model, best_ema_state)
+    raw_full_evaluation = evaluate_direct_population_matches(
         training,
         candidate,
         opponent_models,
@@ -2835,12 +3071,65 @@ def train_direct_population_curriculum(
         num_threads=num_threads,
         max_actions=max_actions,
     )
-    full_score = float(full_evaluation["model_a_score"])
-    full_worst_score = float(full_evaluation["worst_score"])
-    full_safe = (
-        full_score >= gate_score
-        and full_worst_score >= historical_score_floor
+    raw_full_score = float(raw_full_evaluation["model_a_score"])
+    raw_full_worst_score = float(raw_full_evaluation["worst_score"])
+    raw_full_safe = (
+        raw_full_score >= gate_score
+        and raw_full_worst_score >= historical_score_floor
     )
+    ema_full_evaluation: Dict[str, Any] | None = None
+    ema_full_score = 0.0
+    ema_full_worst_score = 0.0
+    ema_full_safe = False
+    if ema_model is not None:
+        ema_full_evaluation = evaluate_direct_population_matches(
+            training,
+            ema_model,
+            opponent_models,
+            weights,
+            games=gate_games,
+            gate_seed=gate_seed,
+            visible_action_history=visible_action_history,
+            game_callback=(
+                None
+                if gate_game_callback is None
+                else lambda opponent_index, game: gate_game_callback(
+                    "final_ema", block, opponent_index, game
+                )
+            ),
+            candidate_label=f"{candidate_label} EMA",
+            opponent_labels=opponent_labels,
+            num_threads=num_threads,
+            max_actions=max_actions,
+        )
+        ema_full_score = float(ema_full_evaluation["model_a_score"])
+        ema_full_worst_score = float(ema_full_evaluation["worst_score"])
+        ema_full_safe = (
+            ema_full_score >= gate_score
+            and ema_full_worst_score >= historical_score_floor
+        )
+    select_ema = ema_full_safe and (
+        not raw_full_safe
+        or ema_full_score > raw_full_score + 1e-8
+        or (
+            abs(ema_full_score - raw_full_score) <= 1e-8
+            and ema_full_worst_score > raw_full_worst_score + 1e-8
+        )
+    )
+    if select_ema:
+        assert ema_model is not None and ema_full_evaluation is not None
+        restore_model_state(candidate, model_state_on_cpu(ema_model))
+        full_evaluation = ema_full_evaluation
+        full_score = ema_full_score
+        full_worst_score = ema_full_worst_score
+        full_safe = True
+        full_selection = "ema"
+    else:
+        full_evaluation = raw_full_evaluation
+        full_score = raw_full_score
+        full_worst_score = raw_full_worst_score
+        full_safe = raw_full_safe
+        full_selection = "raw" if raw_full_safe else "rejected"
     full_row = {
         "stage": "final",
         "block": float(block),
@@ -2853,7 +3142,17 @@ def train_direct_population_curriculum(
         "completion_rate": float(full_evaluation["completion_rate"]),
         "selected": float(full_safe),
         "accepted": float(full_safe),
-        "selection_reason": "full_gate" if full_safe else "full_gate_rejected",
+        "selection_reason": (
+            f"full_gate_{full_selection}"
+            if full_safe
+            else "full_gate_rejected"
+        ),
+        "raw_score": raw_full_score,
+        "raw_worst_score": raw_full_worst_score,
+        "ema_score": ema_full_score if ema_model is not None else None,
+        "ema_worst_score": (
+            ema_full_worst_score if ema_model is not None else None
+        ),
         "opponents": full_evaluation["opponents"],
     }
     gate_rows.append(full_row)
@@ -2861,6 +3160,11 @@ def train_direct_population_curriculum(
         direct_population_full_gate_score=full_score,
         direct_population_full_gate_worst=full_worst_score,
         direct_population_full_gate_selected=float(full_safe),
+        direct_population_full_gate_selected_ema=float(select_ema),
+        direct_population_full_gate_raw_score=raw_full_score,
+        direct_population_full_gate_ema_score=(
+            ema_full_score if ema_model is not None else None
+        ),
         direct_population_full_gate_games=float(gate_games),
     )
     if full_safe:
@@ -2907,7 +3211,27 @@ def train_direct_population_curriculum(
         "direct_population_full_gate_score": full_score,
         "direct_population_full_gate_worst_score": full_worst_score,
         "direct_population_full_gate_selected": float(full_safe),
+        "direct_population_full_gate_selection": full_selection,
+        "direct_population_full_gate_raw_score": raw_full_score,
+        "direct_population_full_gate_raw_worst_score": raw_full_worst_score,
+        "direct_population_ema_enabled": float(ema_model is not None),
+        "direct_population_ema_decay": float(
+            ema_decay if ema_model is not None else 0.0
+        ),
+        "direct_population_full_gate_ema_score": float(ema_full_score),
+        "direct_population_full_gate_ema_worst_score": float(
+            ema_full_worst_score
+        ),
+        "direct_population_full_gate_selected_ema": float(select_ema),
         "direct_population_ppo_learning_rate_final": current_ppo_learning_rate,
+        "direct_population_ppo_gamma": float(ppo_gamma),
+        "direct_population_ppo_top_advantage_fraction": float(
+            ppo_top_advantage_fraction
+        ),
+        "direct_population_shaping_weight_start": float(shaping_weight),
+        "direct_population_shaping_weight_final": float(
+            shaping_final_weight
+        ),
         "direct_population_objective_replay_weight": float(
             objective_replay_weight
         ),

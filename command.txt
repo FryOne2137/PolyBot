@@ -122,8 +122,11 @@ python scripts/evaluate.py `
 # i zapisuje płaskiego kandydata jako challengera. Dlatego komenda ma co najmniej
 # 3 rundy: dwie mogą potwierdzić gotowość, a trzecia już użyć nowej bramki.
 # Bramka populacji priorytetowo traktuje wynik gry; przejęcia i completion są
-# tie-breakerami, a historyczny floor pozostaje twardym zabezpieczeniem. Ciężka
-# drabina MCTS jest wyłączona przez --population-games 0.
+# tie-breakerami, a historyczny floor pozostaje twardym zabezpieczeniem. PPO
+# używa wyniku całej partii dla value/PPG, gamma=1, wygaszanego shaping i EMA.
+# Włączona druga, swobodna linia exploiter gra głównie z championem bez kotwic;
+# nadal musi przejść tę samą niezależną bramkę. Ciężka drabina MCTS jest
+# wyłączona przez --population-games 0.
 # Checkpointy
 # po promocji trafią
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
@@ -187,11 +190,14 @@ python scripts/train_league.py `
   --direct-population-readiness-patience 2 `
   --direct-population-regression-patience 3 `
   --direct-population-shaping-weight 0.20 `
+  --direct-population-shaping-final-weight 0.0 `
   --direct-population-ppo-rollout-steps 32 `
   --direct-population-ppo-epochs 2 `
   --direct-population-ppo-minibatch-size 256 `
   --direct-population-ppo-clip-range 0.15 `
+  --direct-population-ppo-gamma 1.0 `
   --direct-population-ppo-gae-lambda 0.95 `
+  --direct-population-ppo-top-advantage-fraction 0.50 `
   --direct-population-ppo-target-kl 0.015 `
   --direct-population-ppo-hard-kl 0.030 `
   --direct-population-ppo-rollout-temperature 0.85 `
@@ -214,6 +220,15 @@ python scripts/train_league.py `
   --direct-population-ppg-minibatch-size 256 `
   --direct-population-ppg-policy-kl-weight 1.0 `
   --direct-population-ppg-value-weight 1.0 `
+  --direct-population-ema `
+  --direct-population-ema-decay 0.999 `
+  --breakthrough-exploiter `
+  --exploiter-champion-probability 0.75 `
+  --exploiter-policy-anchor-weight 0.0 `
+  --exploiter-value-anchor-weight 0.0 `
+  --exploiter-ppo-target-kl 0.20 `
+  --exploiter-ppo-hard-kl 0.50 `
+  --exploiter-ppo-rollout-temperature 1.0 `
   --post-bootstrap-population-steps 6000 `
   --post-bootstrap-population-max-steps 12000 `
   --post-bootstrap-objective-steps 0 `

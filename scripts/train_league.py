@@ -176,6 +176,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--direct-population-shaping-weight", type=float, default=0.20,
+        help="Initial visible-action shaping weight; it linearly decays during PPO",
+    )
+    parser.add_argument(
+        "--direct-population-shaping-final-weight", type=float, default=0.0,
+        help="Final visible-action shaping weight after the population phase",
     )
     parser.add_argument(
         "--direct-population-ppo-rollout-steps", type=int, default=32,
@@ -188,7 +193,17 @@ def main() -> None:
         "--direct-population-ppo-clip-range", type=float, default=0.15,
     )
     parser.add_argument(
+        "--direct-population-ppo-gamma", type=float, default=1.0,
+        help="Undiscounted terminal outcome objective for long Polytopia games",
+    )
+    parser.add_argument(
         "--direct-population-ppo-gae-lambda", type=float, default=0.95,
+    )
+    parser.add_argument(
+        "--direct-population-ppo-top-advantage-fraction",
+        type=float,
+        default=0.50,
+        help="Upper advantage fraction used by the PPO policy loss; value/PPG keep all positions",
     )
     parser.add_argument(
         "--direct-population-ppo-target-kl", type=float, default=0.015,
@@ -265,6 +280,36 @@ def main() -> None:
     )
     parser.add_argument(
         "--direct-population-ppg-value-weight", type=float, default=1.0,
+    )
+    parser.add_argument(
+        "--direct-population-ema",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Track a parameter EMA and select it when it wins the development population gate",
+    )
+    parser.add_argument(
+        "--direct-population-ema-decay", type=float, default=0.999,
+    )
+    parser.add_argument(
+        "--breakthrough-exploiter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train a second, champion-focused PPO branch without policy/value anchoring",
+    )
+    parser.add_argument(
+        "--exploiter-champion-probability", type=float, default=0.75,
+        help="Champion share for the free exploiter's opponent mix",
+    )
+    parser.add_argument(
+        "--exploiter-policy-anchor-weight", type=float, default=0.0,
+    )
+    parser.add_argument(
+        "--exploiter-value-anchor-weight", type=float, default=0.0,
+    )
+    parser.add_argument("--exploiter-ppo-target-kl", type=float, default=0.20)
+    parser.add_argument("--exploiter-ppo-hard-kl", type=float, default=0.50)
+    parser.add_argument(
+        "--exploiter-ppo-rollout-temperature", type=float, default=1.0,
     )
     parser.add_argument(
         "--post-bootstrap-population-steps", type=int, default=6_000,
@@ -501,6 +546,9 @@ def main() -> None:
         direct_population_shaping_weight=(
             args.direct_population_shaping_weight
         ),
+        direct_population_shaping_final_weight=(
+            args.direct_population_shaping_final_weight
+        ),
         direct_population_ppo_rollout_steps=(
             args.direct_population_ppo_rollout_steps
         ),
@@ -511,8 +559,12 @@ def main() -> None:
         direct_population_ppo_clip_range=(
             args.direct_population_ppo_clip_range
         ),
+        direct_population_ppo_gamma=args.direct_population_ppo_gamma,
         direct_population_ppo_gae_lambda=(
             args.direct_population_ppo_gae_lambda
+        ),
+        direct_population_ppo_top_advantage_fraction=(
+            args.direct_population_ppo_top_advantage_fraction
         ),
         direct_population_ppo_target_kl=(
             args.direct_population_ppo_target_kl
@@ -575,6 +627,17 @@ def main() -> None:
         ),
         direct_population_ppg_value_weight=(
             args.direct_population_ppg_value_weight
+        ),
+        direct_population_ema_enabled=args.direct_population_ema,
+        direct_population_ema_decay=args.direct_population_ema_decay,
+        breakthrough_exploiter=args.breakthrough_exploiter,
+        exploiter_champion_probability=args.exploiter_champion_probability,
+        exploiter_policy_anchor_weight=args.exploiter_policy_anchor_weight,
+        exploiter_value_anchor_weight=args.exploiter_value_anchor_weight,
+        exploiter_ppo_target_kl=args.exploiter_ppo_target_kl,
+        exploiter_ppo_hard_kl=args.exploiter_ppo_hard_kl,
+        exploiter_ppo_rollout_temperature=(
+            args.exploiter_ppo_rollout_temperature
         ),
         post_bootstrap_population_steps=(
             args.post_bootstrap_population_steps

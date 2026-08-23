@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Deque, Dict, Mapping, Sequence
@@ -1169,6 +1170,8 @@ def train_vector_population(
     ppo_top_advantage_fraction: float = 0.50,
     ppo_target_kl: float = 0.015,
     ppo_hard_kl: float = 0.030,
+    ppo_min_learning_rate: float = 1.0e-5,
+    ppo_lr_backoff: float = 0.5,
     ppo_rollout_temperature: float = 0.85,
     ppo_max_pending_examples: int = 32_768,
     objective_replay_horizon: int = 16,
@@ -1255,6 +1258,10 @@ def train_vector_population(
             raise ValueError(f"{name} has an invalid value")
     if ppo_hard_kl < ppo_target_kl:
         raise ValueError("ppo_hard_kl must be at least ppo_target_kl")
+    if ppo_min_learning_rate <= 0.0:
+        raise ValueError("ppo_min_learning_rate must be positive")
+    if not 0.0 < ppo_lr_backoff < 1.0:
+        raise ValueError("ppo_lr_backoff must be in (0, 1)")
     if not 0.0 < gamma <= 1.0:
         raise ValueError("gamma must be in (0, 1]")
     if not 0.0 < ppo_top_advantage_fraction <= 1.0:
@@ -1353,6 +1360,8 @@ def train_vector_population(
             "ppo_top_advantage_fraction": ppo_top_advantage_fraction,
             "ppo_target_kl": ppo_target_kl,
             "ppo_hard_kl": ppo_hard_kl,
+            "ppo_min_learning_rate": ppo_min_learning_rate,
+            "ppo_lr_backoff": ppo_lr_backoff,
             "ppo_rollout_temperature": ppo_rollout_temperature,
             "ppo_max_pending_examples": ppo_max_pending_examples,
             "objective_replay_horizon": objective_replay_horizon,
@@ -1433,7 +1442,7 @@ def train_vector_population(
     candidate_turns = opponent_turns = 0
     ppo_samples = ppo_updates = ppo_rollouts = 0
     ppo_policy_samples = 0
-    ppo_kl_exceeded = False
+    ppo_behaviour_kl_limits = 0
     completed_examples: list[_PPOExample] = []
     pending_candidate_examples = 0
     ppo_forced_truncations = 0
@@ -1454,6 +1463,7 @@ def train_vector_population(
         "value_loss": 0.0,
         "champion_kl": 0.0,
         "behaviour_kl": 0.0,
+        "behaviour_kl_limited": 0.0,
         "clip_fraction": 0.0,
         "entropy": 0.0,
         "objective_replay_loss": 0.0,
@@ -1475,8 +1485,9 @@ def train_vector_population(
     }
 
     def optimise_rollout(examples: Sequence[_PPOExample]) -> Dict[str, float]:
-        """Run PPO epochs and stop before an unsafe champion-policy drift."""
-        nonlocal ppo_updates, ppo_policy_samples, ppo_kl_exceeded, ema_updates
+        """Run PPO with a local trust region around the rollout policy."""
+        nonlocal ppo_updates, ppo_policy_samples, ppo_behaviour_kl_limits
+        nonlocal ema_updates
         nonlocal objective_replay_updates, objective_replay_update_credits
         if not examples:
             return {
@@ -1485,6 +1496,7 @@ def train_vector_population(
                 "value_loss": 0.0,
                 "champion_kl": 0.0,
                 "behaviour_kl": 0.0,
+                "behaviour_kl_limited": 0.0,
                 "clip_fraction": 0.0,
                 "entropy": 0.0,
                 "objective_replay_loss": 0.0,
@@ -1506,6 +1518,7 @@ def train_vector_population(
             "value_loss": 0.0,
             "champion_kl": 0.0,
             "behaviour_kl": 0.0,
+            "behaviour_kl_limited": 0.0,
             "clip_fraction": 0.0,
             "entropy": 0.0,
             "objective_replay_loss": 0.0,
@@ -1513,6 +1526,25 @@ def train_vector_population(
         }
         local_updates = 0
         for _ in range(ppo_epochs):
+            # An epoch may reuse a rollout many times.  If its behaviour KL
+            # grows too large, restore only this epoch and lower the learning
+            # rate; never discard the whole 6k-step population block.
+            epoch_start_state = model_state_on_cpu(candidate)
+            epoch_start_ema_state = (
+                model_state_on_cpu(ema_model)
+                if ema_model is not None
+                else None
+            )
+            epoch_optimiser_state = deepcopy(optimiser.state_dict())
+            epoch_scaler_state = deepcopy(scaler.state_dict())
+            epoch_totals = dict(totals_local)
+            epoch_local_updates = local_updates
+            epoch_ppo_updates = ppo_updates
+            epoch_ppo_policy_samples = ppo_policy_samples
+            epoch_objective_replay_updates = objective_replay_updates
+            epoch_objective_replay_credits = objective_replay_update_credits
+            epoch_ema_updates = ema_updates
+            limited_epoch = False
             order = rng.permutation(len(examples))
             for start in range(0, len(order), ppo_minibatch_size):
                 subset = [examples[int(index)] for index in order[start:start + ppo_minibatch_size]]
@@ -1636,21 +1668,39 @@ def train_vector_population(
                 behaviour_kl = 0.5 * (
                     new_log_probability - old_log_tensor
                 ).square().mean()
-                if float(champion_kl.detach().cpu()) > ppo_hard_kl:
-                    ppo_kl_exceeded = True
-                    candidate.eval()
-                    return {
-                        **{
-                            name: total / max(1, local_updates)
-                            for name, total in totals_local.items()
-                        },
-                        "champion_kl": float(champion_kl.detach().cpu()),
-                        "behaviour_kl": float(behaviour_kl.detach().cpu()),
-                        "clip_fraction": float(
-                            ((ratio - 1.0).abs() > ppo_clip_range)
-                            .float().mean().detach().cpu()
-                        ),
-                    }
+                if float(behaviour_kl.detach().cpu()) > ppo_hard_kl:
+                    restore_model_state(candidate, epoch_start_state)
+                    if ema_model is not None and epoch_start_ema_state is not None:
+                        restore_model_state(ema_model, epoch_start_ema_state)
+                    optimiser.load_state_dict(epoch_optimiser_state)
+                    scaler.load_state_dict(epoch_scaler_state)
+                    totals_local = epoch_totals
+                    local_updates = epoch_local_updates
+                    ppo_updates = epoch_ppo_updates
+                    ppo_policy_samples = epoch_ppo_policy_samples
+                    objective_replay_updates = epoch_objective_replay_updates
+                    objective_replay_update_credits = (
+                        epoch_objective_replay_credits
+                    )
+                    ema_updates = epoch_ema_updates
+                    previous_learning_rate = float(optimiser.param_groups[0]["lr"])
+                    adapted_learning_rate = max(
+                        ppo_min_learning_rate,
+                        previous_learning_rate * ppo_lr_backoff,
+                    )
+                    for parameter_group in optimiser.param_groups:
+                        parameter_group["lr"] = adapted_learning_rate
+                    ppo_behaviour_kl_limits += 1
+                    totals_local["behaviour_kl_limited"] += 1.0
+                    print(
+                        "direct population PPO behaviour-KL limit | "
+                        f"kl={float(behaviour_kl.detach().cpu()):.5f} "
+                        f"hard={ppo_hard_kl:.5f} | restored current epoch | "
+                        f"lr={previous_learning_rate:.2e}->{adapted_learning_rate:.2e}",
+                        flush=True,
+                    )
+                    limited_epoch = True
+                    break
                 kl_multiplier = policy_anchor_weight * max(
                     1.0,
                     float(champion_kl.detach().cpu())
@@ -1754,6 +1804,8 @@ def train_vector_population(
                 local_updates += 1
                 ppo_updates += 1
                 ppo_policy_samples += int(policy_selected_tensor.sum().item())
+            if limited_epoch:
+                continue
         return {
             name: total / max(1, local_updates)
             for name, total in totals_local.items()
@@ -2202,10 +2254,9 @@ def train_vector_population(
                 ppo_samples += len(examples)
                 ppo_rollouts += 1
                 rollout_metrics = optimise_rollout(examples)
-                if not ppo_kl_exceeded:
-                    retain_ppg_examples(examples)
-                    if ppo_rollouts % ppg_interval == 0:
-                        ppg_metrics = optimise_ppg_phase()
+                retain_ppg_examples(examples)
+                if ppo_rollouts % ppg_interval == 0:
+                    ppg_metrics = optimise_ppg_phase()
                 last_champion_kl = float(
                     rollout_metrics.get("champion_kl", last_champion_kl)
                 )
@@ -2241,7 +2292,7 @@ def train_vector_population(
                 objective_replay_update_credits=(
                     objective_replay_update_credits
                 ),
-                ppo_kl_exceeded=float(ppo_kl_exceeded),
+                ppo_behaviour_kl_limits=float(ppo_behaviour_kl_limits),
                 ppo_learning_rate=float(optimiser.param_groups[0]["lr"]),
                 ema_enabled=float(ema_model is not None),
                 ema_updates=ema_updates,
@@ -2268,9 +2319,9 @@ def train_vector_population(
                     ppg_phases=ppg_phases,
                     replay_updates=objective_replay_updates,
                     kl=f"{last_champion_kl:.5f}",
+                    bkl=f"{float(rollout_metrics.get('behaviour_kl', 0.0)):.5f}",
+                    kl_limits=ppo_behaviour_kl_limits,
                 )
-            if ppo_kl_exceeded:
-                break
 
     divisor = max(1, ppo_rollouts)
     summary: Dict[str, float | str] = {
@@ -2357,7 +2408,12 @@ def train_vector_population(
         "direct_population_ppo_max_pending_examples": float(
             ppo_max_pending_examples
         ),
-        "direct_population_ppo_kl_exceeded": float(ppo_kl_exceeded),
+        "direct_population_ppo_behaviour_kl_limits": float(
+            ppo_behaviour_kl_limits
+        ),
+        "direct_population_ppo_learning_rate": float(
+            optimiser.param_groups[0]["lr"]
+        ),
         "direct_population_ppo_target_kl": float(ppo_target_kl),
         "direct_population_ppo_hard_kl": float(ppo_hard_kl),
         "direct_population_ppo_gamma": float(gamma),
@@ -3029,6 +3085,8 @@ def train_direct_population_curriculum(
             ppo_top_advantage_fraction=ppo_top_advantage_fraction,
             ppo_target_kl=ppo_target_kl,
             ppo_hard_kl=ppo_hard_kl,
+            ppo_min_learning_rate=ppo_min_learning_rate,
+            ppo_lr_backoff=ppo_lr_backoff,
             ppo_rollout_temperature=ppo_rollout_temperature,
             ppo_max_pending_examples=ppo_max_pending_examples,
             objective_replay_horizon=objective_replay_horizon,
@@ -3060,29 +3118,25 @@ def train_direct_population_curriculum(
         )
         training_rows.append(result)
         completed += current_steps
-        if bool(result.get("direct_population_ppo_kl_exceeded", 0.0)):
-            restore_model_state(candidate, best_state)
-            if ema_model is not None and best_ema_state is not None:
-                restore_model_state(ema_model, best_ema_state)
-            rollback_blocks += 1
-            previous_learning_rate = current_ppo_learning_rate
-            current_ppo_learning_rate = max(
-                ppo_min_learning_rate,
-                current_ppo_learning_rate * ppo_lr_backoff,
+        adapted_learning_rate = float(
+            result.get(
+                "direct_population_ppo_learning_rate",
+                current_ppo_learning_rate,
             )
+        )
+        if adapted_learning_rate < current_ppo_learning_rate - 1e-12:
+            previous_learning_rate = current_ppo_learning_rate
+            current_ppo_learning_rate = adapted_learning_rate
             run.log(
-                direct_population_ppo_rollback=1.0,
-                direct_population_ppo_kl_exceeded=1.0,
+                direct_population_ppo_adaptive_kl_backoff=1.0,
+                direct_population_ppo_behaviour_kl_limits=float(
+                    result.get("direct_population_ppo_behaviour_kl_limits", 0.0)
+                ),
                 direct_population_ppo_previous_learning_rate=(
                     previous_learning_rate
                 ),
                 direct_population_ppo_learning_rate=current_ppo_learning_rate,
             )
-            if previous_learning_rate <= ppo_min_learning_rate + 1e-12:
-                early_stopped = True
-                early_stop_reason = "ppo_kl_limit_at_min_learning_rate"
-                break
-            continue
         accepted = gate("population", block)
         if (
             completed >= minimum_steps

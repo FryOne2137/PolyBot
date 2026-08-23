@@ -212,10 +212,16 @@ def main() -> None:
         help="Upper advantage fraction used by the PPO policy loss; value/PPG keep all positions",
     )
     parser.add_argument(
-        "--direct-population-ppo-target-kl", type=float, default=0.015,
+        "--direct-population-ppo-target-kl",
+        type=float,
+        default=0.015,
+        help="Target behaviour KL per PPO rollout; also scales the soft champion anchor",
     )
     parser.add_argument(
-        "--direct-population-ppo-hard-kl", type=float, default=0.030,
+        "--direct-population-ppo-hard-kl",
+        type=float,
+        default=0.030,
+        help="Hard behaviour KL that reverts only the current PPO epoch",
     )
     parser.add_argument(
         "--direct-population-ppo-rollout-temperature", type=float, default=0.85,
@@ -312,8 +318,18 @@ def main() -> None:
     parser.add_argument(
         "--exploiter-value-anchor-weight", type=float, default=0.0,
     )
-    parser.add_argument("--exploiter-ppo-target-kl", type=float, default=0.20)
-    parser.add_argument("--exploiter-ppo-hard-kl", type=float, default=0.50)
+    parser.add_argument(
+        "--exploiter-ppo-target-kl",
+        type=float,
+        default=0.015,
+        help="Target behaviour KL per PPO rollout; this does not anchor the exploiter to the champion",
+    )
+    parser.add_argument(
+        "--exploiter-ppo-hard-kl",
+        type=float,
+        default=0.030,
+        help="Hard behaviour KL that reverts only the current PPO epoch",
+    )
     parser.add_argument(
         "--exploiter-ppo-rollout-temperature", type=float, default=1.0,
     )

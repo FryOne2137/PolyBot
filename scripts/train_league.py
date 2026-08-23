@@ -200,6 +200,12 @@ def main() -> None:
         "--direct-population-ppo-gae-lambda", type=float, default=0.95,
     )
     parser.add_argument(
+        "--direct-population-ppo-terminal-advantage-weight",
+        type=float,
+        default=0.75,
+        help="Fraction of PPO actor advantage taken from the final game outcome",
+    )
+    parser.add_argument(
         "--direct-population-ppo-top-advantage-fraction",
         type=float,
         default=0.50,
@@ -562,6 +568,9 @@ def main() -> None:
         direct_population_ppo_gamma=args.direct_population_ppo_gamma,
         direct_population_ppo_gae_lambda=(
             args.direct_population_ppo_gae_lambda
+        ),
+        direct_population_ppo_terminal_advantage_weight=(
+            args.direct_population_ppo_terminal_advantage_weight
         ),
         direct_population_ppo_top_advantage_fraction=(
             args.direct_population_ppo_top_advantage_fraction

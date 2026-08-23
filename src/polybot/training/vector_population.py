@@ -174,6 +174,7 @@ def _finish_ppo_trace(
     gamma: float,
     gae_lambda: float,
     terminal_outcome: float | None = None,
+    terminal_advantage_weight: float = 0.75,
 ) -> list[_PPOExample]:
     """Compute sign-correct GAE through candidate and opponent actions.
 
@@ -182,6 +183,8 @@ def _finish_ppo_trace(
     advantage.  This is the multi-step counterpart of the old one-step TD
     target and correctly propagates a terminal loss through the opponent turn.
     """
+    if not 0.0 <= terminal_advantage_weight <= 1.0:
+        raise ValueError("terminal_advantage_weight must be between zero and one")
     advantage = 0.0
     result: list[_PPOExample] = []
     for transition in reversed(transitions):
@@ -194,7 +197,21 @@ def _finish_ppo_trace(
         advantage = delta + gamma * gae_lambda * continuation * advantage
         if transition.candidate_example is not None:
             example = transition.candidate_example
-            example.advantage = float(advantage)
+            # GAE retains a small, early-learning signal for visible tactical
+            # events.  It cannot by itself credit an opening move in a
+            # 700-turn game: lambda < 1 exponentially erases the terminal
+            # result.  On genuine game completion, mix in Monte-Carlo outcome
+            # advantage from this acting player's perspective so PPO receives
+            # the same long-horizon objective as value and PPG.
+            outcome_advantage = (
+                float(terminal_outcome) - float(example.old_value)
+                if terminal_outcome is not None
+                else float(advantage)
+            )
+            example.advantage = float(
+                (1.0 - terminal_advantage_weight) * advantage
+                + terminal_advantage_weight * outcome_advantage
+            )
             example.return_target = float(transition.value + advantage)
             example.value_target = (
                 float(terminal_outcome)
@@ -1148,6 +1165,7 @@ def train_vector_population(
     ppo_minibatch_size: int = 256,
     ppo_clip_range: float = 0.15,
     ppo_gae_lambda: float = 0.95,
+    ppo_terminal_advantage_weight: float = 0.75,
     ppo_top_advantage_fraction: float = 0.50,
     ppo_target_kl: float = 0.015,
     ppo_hard_kl: float = 0.030,
@@ -1241,6 +1259,10 @@ def train_vector_population(
         raise ValueError("gamma must be in (0, 1]")
     if not 0.0 < ppo_top_advantage_fraction <= 1.0:
         raise ValueError("ppo_top_advantage_fraction must be in (0, 1]")
+    if not 0.0 <= ppo_terminal_advantage_weight <= 1.0:
+        raise ValueError(
+            "ppo_terminal_advantage_weight must be between zero and one"
+        )
     resolved_shaping_final_weight = (
         shaping_weight if shaping_final_weight is None else shaping_final_weight
     )
@@ -1327,6 +1349,7 @@ def train_vector_population(
             "ppo_clip_range": ppo_clip_range,
             "ppo_gamma": gamma,
             "ppo_gae_lambda": ppo_gae_lambda,
+            "ppo_terminal_advantage_weight": ppo_terminal_advantage_weight,
             "ppo_top_advantage_fraction": ppo_top_advantage_fraction,
             "ppo_target_kl": ppo_target_kl,
             "ppo_hard_kl": ppo_hard_kl,
@@ -2107,6 +2130,9 @@ def train_vector_population(
                     gamma=gamma,
                     gae_lambda=ppo_gae_lambda,
                     terminal_outcome=candidate_outcome,
+                    terminal_advantage_weight=(
+                        ppo_terminal_advantage_weight
+                    ),
                 )
                 completed_examples.extend(finished_examples)
                 pending_candidate_examples -= len(finished_examples)
@@ -2335,6 +2361,9 @@ def train_vector_population(
         "direct_population_ppo_target_kl": float(ppo_target_kl),
         "direct_population_ppo_hard_kl": float(ppo_hard_kl),
         "direct_population_ppo_gamma": float(gamma),
+        "direct_population_ppo_terminal_advantage_weight": float(
+            ppo_terminal_advantage_weight
+        ),
         "direct_population_ppo_top_advantage_fraction": float(
             ppo_top_advantage_fraction
         ),
@@ -2557,6 +2586,7 @@ def train_direct_population_curriculum(
     ppo_clip_range: float = 0.15,
     ppo_gamma: float = 1.0,
     ppo_gae_lambda: float = 0.95,
+    ppo_terminal_advantage_weight: float = 0.75,
     ppo_top_advantage_fraction: float = 0.50,
     ppo_target_kl: float = 0.015,
     ppo_hard_kl: float = 0.030,
@@ -2633,6 +2663,10 @@ def train_direct_population_curriculum(
         raise ValueError("ppo_gamma must be in (0, 1]")
     if not 0.0 <= ppo_gae_lambda <= 1.0:
         raise ValueError("ppo_gae_lambda must be between zero and one")
+    if not 0.0 <= ppo_terminal_advantage_weight <= 1.0:
+        raise ValueError(
+            "ppo_terminal_advantage_weight must be between zero and one"
+        )
     if not 0.0 < ppo_top_advantage_fraction <= 1.0:
         raise ValueError("ppo_top_advantage_fraction must be in (0, 1]")
     if not 0.0 < ppo_target_kl <= ppo_hard_kl:
@@ -2731,6 +2765,7 @@ def train_direct_population_curriculum(
             "ppo_clip_range": ppo_clip_range,
             "ppo_gamma": ppo_gamma,
             "ppo_gae_lambda": ppo_gae_lambda,
+            "ppo_terminal_advantage_weight": ppo_terminal_advantage_weight,
             "ppo_top_advantage_fraction": ppo_top_advantage_fraction,
             "ppo_target_kl": ppo_target_kl,
             "ppo_hard_kl": ppo_hard_kl,
@@ -2860,12 +2895,13 @@ def train_direct_population_curriculum(
                 if not baseline:
                     selected_blocks += 1
             elif not baseline:
-                # Safe near-ties keep the phase alive, but training resumes
-                # from the actual strongest model rather than accumulating
-                # several tolerated score drops.
-                restore_model_state(candidate, best_state)
-                if ema_model is not None and best_ema_state is not None:
-                    restore_model_state(ema_model, best_ema_state)
+                # A 20-game diagnostic only resolves score in coarse steps.
+                # Keep a safe near-tie as the *working* policy so several
+                # individually too-small improvements can accumulate.  The
+                # strict high-water snapshot remains available for the final
+                # held-out selection, and an actual regression still rolls
+                # back in the branch below.
+                selection_reason = "safe_continue_accumulating"
             if baseline:
                 # Baseline protects the input checkpoint but does not count as
                 # a successful population-training block.
@@ -2932,6 +2968,14 @@ def train_direct_population_curriculum(
             ),
             direct_population_gate_games=float(games),
         )
+        if not baseline:
+            print(
+                "direct population diagnostic | "
+                f"block={block} score={weighted_score:.4f} "
+                f"worst={worst_score:.4f} accepted={int(accepted)} "
+                f"selection={selection_reason}",
+                flush=True,
+            )
         return accepted
 
     gate("baseline", -1, baseline=True)
@@ -2981,6 +3025,7 @@ def train_direct_population_curriculum(
             ppo_minibatch_size=ppo_minibatch_size,
             ppo_clip_range=ppo_clip_range,
             ppo_gae_lambda=ppo_gae_lambda,
+            ppo_terminal_advantage_weight=ppo_terminal_advantage_weight,
             ppo_top_advantage_fraction=ppo_top_advantage_fraction,
             ppo_target_kl=ppo_target_kl,
             ppo_hard_kl=ppo_hard_kl,
@@ -3048,43 +3093,44 @@ def train_direct_population_curriculum(
             early_stop_reason = "persistent_population_regression"
             break
 
-    restore_model_state(candidate, best_state)
-    if ema_model is not None and best_ema_state is not None:
-        restore_model_state(ema_model, best_ema_state)
-    raw_full_evaluation = evaluate_direct_population_matches(
-        training,
-        candidate,
-        opponent_models,
-        weights,
-        games=gate_games,
-        gate_seed=gate_seed,
-        visible_action_history=visible_action_history,
-        game_callback=(
-            None
-            if gate_game_callback is None
-            else lambda opponent_index, game: gate_game_callback(
-                "final", block, opponent_index, game
-            )
-        ),
-        candidate_label=candidate_label,
-        opponent_labels=opponent_labels,
-        num_threads=num_threads,
-        max_actions=max_actions,
-    )
-    raw_full_score = float(raw_full_evaluation["model_a_score"])
-    raw_full_worst_score = float(raw_full_evaluation["worst_score"])
-    raw_full_safe = (
-        raw_full_score >= gate_score
-        and raw_full_worst_score >= historical_score_floor
-    )
-    ema_full_evaluation: Dict[str, Any] | None = None
-    ema_full_score = 0.0
-    ema_full_worst_score = 0.0
-    ema_full_safe = False
+    def states_match(
+        first: Mapping[str, torch.Tensor], second: Mapping[str, torch.Tensor]
+    ) -> bool:
+        return first.keys() == second.keys() and all(
+            torch.equal(first[name], second[name]) for name in first
+        )
+
+    # The working state may hold several small, safe gains that a 20-game
+    # diagnostic could not resolve.  The high-water state protects against
+    # drift.  Compare both (and their EMA counterparts) only on the final
+    # held-out arena, then keep the strongest safe policy.
+    working_state = model_state_on_cpu(candidate)
+    final_variants: list[tuple[str, Mapping[str, torch.Tensor], str]] = [
+        ("working_raw", working_state, candidate_label),
+    ]
+    if not states_match(best_state, working_state):
+        final_variants.append(
+            ("best_raw", best_state, f"{candidate_label} best")
+        )
     if ema_model is not None:
-        ema_full_evaluation = evaluate_direct_population_matches(
+        working_ema_state = model_state_on_cpu(ema_model)
+        final_variants.append(
+            ("working_ema", working_ema_state, f"{candidate_label} EMA")
+        )
+        if (
+            best_ema_state is not None
+            and not states_match(best_ema_state, working_ema_state)
+        ):
+            final_variants.append(
+                ("best_ema", best_ema_state, f"{candidate_label} best EMA")
+            )
+
+    final_candidates: list[Dict[str, Any]] = []
+    for label, state, label_for_log in final_variants:
+        restore_model_state(candidate, state)
+        evaluation = evaluate_direct_population_matches(
             training,
-            ema_model,
+            candidate,
             opponent_models,
             weights,
             games=gate_games,
@@ -3093,43 +3139,85 @@ def train_direct_population_curriculum(
             game_callback=(
                 None
                 if gate_game_callback is None
-                else lambda opponent_index, game: gate_game_callback(
-                    "final_ema", block, opponent_index, game
+                else lambda opponent_index, game, stage=label: gate_game_callback(
+                    f"final_{stage}", block, opponent_index, game
                 )
             ),
-            candidate_label=f"{candidate_label} EMA",
+            candidate_label=label_for_log,
             opponent_labels=opponent_labels,
             num_threads=num_threads,
             max_actions=max_actions,
         )
-        ema_full_score = float(ema_full_evaluation["model_a_score"])
-        ema_full_worst_score = float(ema_full_evaluation["worst_score"])
-        ema_full_safe = (
-            ema_full_score >= gate_score
-            and ema_full_worst_score >= historical_score_floor
+        score = float(evaluation["model_a_score"])
+        worst_score = float(evaluation["worst_score"])
+        final_candidates.append(
+            {
+                "label": label,
+                "state": state,
+                "evaluation": evaluation,
+                "score": score,
+                "worst_score": worst_score,
+                "safe": score >= gate_score
+                and worst_score >= historical_score_floor,
+            }
         )
-    select_ema = ema_full_safe and (
-        not raw_full_safe
-        or ema_full_score > raw_full_score + 1e-8
-        or (
-            abs(ema_full_score - raw_full_score) <= 1e-8
-            and ema_full_worst_score > raw_full_worst_score + 1e-8
-        )
+
+    raw_candidate = final_candidates[0]
+    raw_full_evaluation = raw_candidate["evaluation"]
+    raw_full_score = float(raw_candidate["score"])
+    raw_full_worst_score = float(raw_candidate["worst_score"])
+    ema_candidate = next(
+        (
+            item
+            for item in final_candidates
+            if item["label"] == "working_ema"
+        ),
+        None,
     )
-    if select_ema:
-        assert ema_model is not None and ema_full_evaluation is not None
-        restore_model_state(candidate, model_state_on_cpu(ema_model))
-        full_evaluation = ema_full_evaluation
-        full_score = ema_full_score
-        full_worst_score = ema_full_worst_score
+    ema_full_score = (
+        float(ema_candidate["score"]) if ema_candidate is not None else 0.0
+    )
+    ema_full_worst_score = (
+        float(ema_candidate["worst_score"])
+        if ema_candidate is not None
+        else 0.0
+    )
+    select_ema = False
+    safe_final_candidates = [
+        item for item in final_candidates if bool(item["safe"])
+    ]
+    if safe_final_candidates:
+        chosen_final = max(
+            safe_final_candidates,
+            key=lambda item: (
+                float(item["score"]),
+                float(item["worst_score"]),
+                item["label"],
+            ),
+        )
+        restore_model_state(candidate, chosen_final["state"])
+        full_evaluation = chosen_final["evaluation"]
+        full_score = float(chosen_final["score"])
+        full_worst_score = float(chosen_final["worst_score"])
         full_safe = True
-        full_selection = "ema"
+        full_selection = str(chosen_final["label"])
+        select_ema = "ema" in full_selection
     else:
         full_evaluation = raw_full_evaluation
         full_score = raw_full_score
         full_worst_score = raw_full_worst_score
-        full_safe = raw_full_safe
-        full_selection = "raw" if raw_full_safe else "rejected"
+        full_safe = False
+        full_selection = "rejected"
+    print(
+        "direct population final candidates | "
+        + ", ".join(
+            f"{item['label']}={float(item['score']):.4f}"
+            f"/worst={float(item['worst_score']):.4f}"
+            for item in final_candidates
+        )
+        + f" | selected={full_selection}",
+        flush=True,
+    )
     full_row = {
         "stage": "final",
         "block": float(block),
@@ -3153,6 +3241,15 @@ def train_direct_population_curriculum(
         "ema_worst_score": (
             ema_full_worst_score if ema_model is not None else None
         ),
+        "candidates": [
+            {
+                "label": str(item["label"]),
+                "score": float(item["score"]),
+                "worst_score": float(item["worst_score"]),
+                "safe": float(bool(item["safe"])),
+            }
+            for item in final_candidates
+        ],
         "opponents": full_evaluation["opponents"],
     }
     gate_rows.append(full_row)
@@ -3165,6 +3262,7 @@ def train_direct_population_curriculum(
         direct_population_full_gate_ema_score=(
             ema_full_score if ema_model is not None else None
         ),
+        direct_population_full_gate_candidates=float(len(final_candidates)),
         direct_population_full_gate_games=float(gate_games),
     )
     if full_safe:
@@ -3223,8 +3321,20 @@ def train_direct_population_curriculum(
             ema_full_worst_score
         ),
         "direct_population_full_gate_selected_ema": float(select_ema),
+        "direct_population_full_gate_candidates": [
+            {
+                "label": str(item["label"]),
+                "score": float(item["score"]),
+                "worst_score": float(item["worst_score"]),
+                "safe": float(bool(item["safe"])),
+            }
+            for item in final_candidates
+        ],
         "direct_population_ppo_learning_rate_final": current_ppo_learning_rate,
         "direct_population_ppo_gamma": float(ppo_gamma),
+        "direct_population_ppo_terminal_advantage_weight": float(
+            ppo_terminal_advantage_weight
+        ),
         "direct_population_ppo_top_advantage_fraction": float(
             ppo_top_advantage_fraction
         ),

@@ -197,6 +197,7 @@ python scripts/train_league.py `
   --direct-population-ppo-clip-range 0.15 `
   --direct-population-ppo-gamma 1.0 `
   --direct-population-ppo-gae-lambda 0.95 `
+  --direct-population-ppo-terminal-advantage-weight 0.75 `
   --direct-population-ppo-top-advantage-fraction 0.50 `
   --direct-population-ppo-target-kl 0.015 `
   --direct-population-ppo-hard-kl 0.030 `

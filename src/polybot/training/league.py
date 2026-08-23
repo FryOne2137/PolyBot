@@ -428,6 +428,7 @@ def train_promotion_league(
     direct_population_ppo_clip_range: float = 0.15,
     direct_population_ppo_gamma: float = 1.0,
     direct_population_ppo_gae_lambda: float = 0.95,
+    direct_population_ppo_terminal_advantage_weight: float = 0.75,
     direct_population_ppo_top_advantage_fraction: float = 0.50,
     direct_population_ppo_target_kl: float = 0.015,
     direct_population_ppo_hard_kl: float = 0.030,
@@ -595,6 +596,9 @@ def train_promotion_league(
         "direct_population_ppo_gae_lambda": (
             direct_population_ppo_gae_lambda
         ),
+        "direct_population_ppo_terminal_advantage_weight": (
+            direct_population_ppo_terminal_advantage_weight
+        ),
         "direct_population_ppo_top_advantage_fraction": (
             direct_population_ppo_top_advantage_fraction
         ),
@@ -638,6 +642,10 @@ def train_promotion_league(
         raise ValueError("direct population PPO requires 0 < target KL <= hard KL")
     if not 0.0 < direct_population_ppo_gamma <= 1.0:
         raise ValueError("direct population PPO gamma must be in (0, 1]")
+    if not 0.0 <= direct_population_ppo_terminal_advantage_weight <= 1.0:
+        raise ValueError(
+            "direct population PPO terminal advantage weight must be between zero and one"
+        )
     if not 0.0 < direct_population_ppo_top_advantage_fraction <= 1.0:
         raise ValueError(
             "direct population PPO top advantage fraction must be in (0, 1]"
@@ -927,6 +935,9 @@ def train_promotion_league(
         "direct_population_ppo_gamma": direct_population_ppo_gamma,
         "direct_population_ppo_gae_lambda": (
             direct_population_ppo_gae_lambda
+        ),
+        "direct_population_ppo_terminal_advantage_weight": (
+            direct_population_ppo_terminal_advantage_weight
         ),
         "direct_population_ppo_top_advantage_fraction": (
             direct_population_ppo_top_advantage_fraction
@@ -1723,6 +1734,9 @@ def train_promotion_league(
                                 ppo_gae_lambda=(
                                     direct_population_ppo_gae_lambda
                                 ),
+                                ppo_terminal_advantage_weight=(
+                                    direct_population_ppo_terminal_advantage_weight
+                                ),
                                 ppo_top_advantage_fraction=(
                                     direct_population_ppo_top_advantage_fraction
                                 ),
@@ -1936,6 +1950,9 @@ def train_promotion_league(
                                     ppo_gamma=direct_population_ppo_gamma,
                                     ppo_gae_lambda=(
                                         direct_population_ppo_gae_lambda
+                                    ),
+                                    ppo_terminal_advantage_weight=(
+                                        direct_population_ppo_terminal_advantage_weight
                                     ),
                                     ppo_top_advantage_fraction=(
                                         direct_population_ppo_top_advantage_fraction

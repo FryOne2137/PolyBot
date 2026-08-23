@@ -129,14 +129,17 @@ python scripts/evaluate.py `
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
 # do runs\league\train\round_001, round_002 itd.
 # Stały --seed jest bazą wielu map, nie jednej mapy. Każda runda ma odległy
-# seed self-play, a bramka osobny, nieużywany w treningu zestaw map. Aktualny
-# run wznawia champion-002 i tę samą SQLite, aby kod rozpoznał etap
+# seed self-play, a bramka osobny, nieużywany w treningu zestaw map.
+# Płaskie bramki tej komendy automatycznie używają dwóch natywnych batchy
+# VectorGameEnv, buforów reset_into/step_into i pamięci pinned na CUDA. Nie
+# potrzeba osobnej flagi; --num-threads ustawia również workery tych bramek.
+# Aktualny run wznawia champion-005 i tę samą SQLite, aby kod rozpoznał etap
 # champion-population. Po kolejnym awansie podmień tylko --champion-in na
 # najnowszy champion-XXX.pt. Jeżeli nie było promocji, ale
 # log podał "challenger retained", zachowaj tego samego --champion-in i dopisz
 # --challenger-in models\league\champion-challenger-XXX.pt.
 python scripts/train_league.py `
-  --champion-in models\league\champion-002.pt `
+  --champion-in models\league\champion-005.pt `
   --checkpoint-dir models\league `
   --checkpoint-prefix champion `
   --league-db models\league\league.sqlite3 `
@@ -195,6 +198,22 @@ python scripts/train_league.py `
   --direct-population-ppo-max-pending-examples 32768 `
   --direct-population-ppo-min-learning-rate 1e-5 `
   --direct-population-ppo-lr-backoff 0.50 `
+  --direct-population-objective-replay-horizon 16 `
+  --direct-population-objective-replay-capacity 512 `
+  --direct-population-objective-replay-batch-size 32 `
+  --direct-population-objective-replay-interval 16 `
+  --direct-population-objective-replay-weight 0.35 `
+  --direct-population-objective-replay-recency 0.92 `
+  --direct-population-objective-replay-max-epochs 4 `
+  --direct-population-ppg `
+  --direct-population-ppg-interval 8 `
+  --direct-population-ppg-buffer-capacity 8192 `
+  --direct-population-ppg-samples-per-rollout 512 `
+  --direct-population-ppg-phase-samples 4096 `
+  --direct-population-ppg-epochs 2 `
+  --direct-population-ppg-minibatch-size 256 `
+  --direct-population-ppg-policy-kl-weight 1.0 `
+  --direct-population-ppg-value-weight 1.0 `
   --post-bootstrap-population-steps 6000 `
   --post-bootstrap-population-max-steps 12000 `
   --post-bootstrap-objective-steps 0 `
@@ -222,7 +241,7 @@ python scripts/train_league.py `
   --updates 0 `
   --num-threads 16 `
   --max-pending-leaves 8 `
-  --visible-action-history 0 `
+  --visible-action-history 32 `
   --belief-retries 4 `
   --simulations 32 `
   --particles 2 `

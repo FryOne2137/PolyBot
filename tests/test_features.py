@@ -6,6 +6,7 @@ from polybot.data.polyenv_features import (
     event_summary,
     global_features_from_obs,
     vector_event_action_history,
+    vector_event_summary,
 )
 
 
@@ -56,6 +57,14 @@ def test_vector_events_match_compact_self_play_history_layout():
     ]
     assert history[0, 2, 10:].tolist() == [2, 5]
     assert not history[0, 0].any()
+
+    summary = vector_event_summary({
+        "visible_event_features": events,
+        "visible_event_mask": mask,
+    })
+    assert summary.shape == (1, 12)
+    assert np.isclose(summary[0, 0], 2 / 128.0)
+    assert summary[0, 8] > 0.0  # event type 7
 
 
 def test_scalar_event_history_is_bounded_and_right_aligned():

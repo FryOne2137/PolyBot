@@ -13,8 +13,10 @@ from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 from ..config import ModelConfig, TrainingConfig
-from ..data.polyenv_features import vector_event_action_history
-from ..data.token_schema import EVENT_SUMMARY_SIZE
+from ..data.polyenv_features import (
+    vector_event_action_history,
+    vector_event_summary,
+)
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..infrastructure.randomness import seed_everything
@@ -131,23 +133,6 @@ def _global_features(state: np.ndarray, map_size: int, map_type: str) -> np.ndar
     return result
 
 
-def _event_summary(batch: Dict[str, np.ndarray]) -> np.ndarray:
-    """Compress native visible-event windows to the current model's 12 fields."""
-    events = np.asarray(batch["visible_event_features"], dtype=np.int32)
-    mask = np.asarray(batch["visible_event_mask"], dtype=bool)
-    result = np.zeros((events.shape[0], EVENT_SUMMARY_SIZE), dtype=np.float32)
-    if events.shape[1] == 0:
-        return result
-    result[:, 0] = np.minimum(mask.sum(axis=1), 128) / 128.0
-    types = events[:, :, 2]
-    for event_type in range(8):
-        result[:, 1 + event_type] = ((types == event_type) & mask).sum(axis=1) / 32.0
-    result[:, 9] = np.clip(np.where(mask, np.maximum(events[:, :, 6], 0), 0).sum(axis=1), 0, 200) / 200.0
-    result[:, 10] = ((events[:, :, 24] > 0) & mask).sum(axis=1) / 16.0
-    result[:, 11] = ((events[:, :, 25] > 0) & mask).sum(axis=1) / 16.0
-    return result
-
-
 def _teacher_targets(
     features: np.ndarray,
     mask: np.ndarray,
@@ -197,7 +182,9 @@ def _vector_tensors(
     return {
         "map_tokens": torch.as_tensor(batch["map_tokens"], dtype=torch.long, device=device),
         "global_features": torch.as_tensor(_global_features(batch["state"], training.map_size, training.map_type), device=device),
-        "event_features": torch.as_tensor(_event_summary(batch), dtype=torch.float32, device=device),
+        "event_features": torch.as_tensor(
+            vector_event_summary(batch), dtype=torch.float32, device=device
+        ),
         "action_history": torch.as_tensor(
             action_history, dtype=torch.float32, device=device
         ),

@@ -2182,6 +2182,8 @@ def evaluate_direct_population_matches(
     game_callback: Callable[[int, Mapping[str, Any]], None] | None = None,
     candidate_label: str = "pretendent",
     opponent_labels: Sequence[str] | None = None,
+    num_threads: int | None = None,
+    max_actions: int = 1024,
 ) -> Dict[str, Any]:
     """Evaluate one raw network on the same paired arena for a population."""
     if not opponent_models:
@@ -2230,6 +2232,8 @@ def evaluate_direct_population_matches(
             model_a_label=candidate_label,
             model_b_label=resolved_opponent_labels[opponent_index],
             visible_action_history=visible_action_history,
+            num_threads=num_threads,
+            max_actions=max_actions,
         )
         results.append(match)
     return {
@@ -2589,6 +2593,8 @@ def train_direct_population_curriculum(
             ),
             candidate_label=candidate_label,
             opponent_labels=opponent_labels,
+            num_threads=num_threads,
+            max_actions=max_actions,
         )
         results = evaluation["opponents"]
         weighted_score = float(evaluation["model_a_score"])
@@ -2826,6 +2832,8 @@ def train_direct_population_curriculum(
         ),
         candidate_label=candidate_label,
         opponent_labels=opponent_labels,
+        num_threads=num_threads,
+        max_actions=max_actions,
     )
     full_score = float(full_evaluation["model_a_score"])
     full_worst_score = float(full_evaluation["worst_score"])

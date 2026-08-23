@@ -91,6 +91,44 @@ def vector_event_action_history(
     return history, mask
 
 
+def vector_event_summary(batch: Dict[str, np.ndarray]) -> np.ndarray:
+    """Compress a native visible-event window to the model's event features."""
+    events = np.asarray(batch["visible_event_features"], dtype=np.int32)
+    mask = np.asarray(batch["visible_event_mask"], dtype=bool)
+    if events.ndim != 3 or events.shape[2] != 26:
+        raise ValueError(
+            "visible_event_features must have shape [batch, history, 26]"
+        )
+    if mask.shape != events.shape[:2]:
+        raise ValueError(
+            "visible_event_mask must match visible_event_features[:2]"
+        )
+    result = np.zeros((events.shape[0], EVENT_SUMMARY_SIZE), dtype=np.float32)
+    if events.shape[1] == 0:
+        return result
+    result[:, 0] = np.minimum(mask.sum(axis=1), 128) / 128.0
+    types = events[:, :, 2]
+    for event_type in range(8):
+        result[:, 1 + event_type] = (
+            ((types == event_type) & mask).sum(axis=1) / 32.0
+        )
+    result[:, 9] = (
+        np.clip(
+            np.where(mask, np.maximum(events[:, :, 6], 0), 0).sum(axis=1),
+            0,
+            200,
+        )
+        / 200.0
+    )
+    result[:, 10] = (
+        ((events[:, :, 24] > 0) & mask).sum(axis=1) / 16.0
+    )
+    result[:, 11] = (
+        ((events[:, :, 25] > 0) & mask).sum(axis=1) / 16.0
+    )
+    return result
+
+
 def event_action_history(
     events: Dict[str, Any] | None,
     max_history: int,
@@ -190,16 +228,32 @@ def native_batch_to_tensors(
     raw_features = torch.as_tensor(features).to(device=device, non_blocking=non_blocking)
     categorical_columns = torch.as_tensor(NATIVE_ACTION_CATEGORICAL_COLUMNS, dtype=torch.long, device=device)
     continuous_columns = torch.as_tensor(NATIVE_ACTION_CONTINUOUS_COLUMNS, dtype=torch.long, device=device)
-    history = np.asarray(batch.get("visible_action_history", np.empty((count, 0, VISIBLE_ACTION_HISTORY_FEATURES), dtype=np.int32)))
-    history_mask = np.asarray(batch.get("visible_action_history_mask", np.empty((count, 0), dtype=np.uint8)), dtype=bool)
+    if "visible_event_features" in batch:
+        history, history_mask = vector_event_action_history(batch)
+        summary = vector_event_summary(batch)
+    else:
+        history = np.asarray(batch.get(
+            "visible_action_history",
+            np.empty(
+                (count, 0, VISIBLE_ACTION_HISTORY_FEATURES), dtype=np.int32
+            ),
+        ))
+        history_mask = np.asarray(batch.get(
+            "visible_action_history_mask",
+            np.empty((count, 0), dtype=np.uint8),
+        ), dtype=bool)
+        summary = np.zeros((count, EVENT_SUMMARY_SIZE), dtype=np.float32)
     return PacketTensors(
         map_tokens=map_tokens,
         global_features=torch.as_tensor(global_features, dtype=torch.float32).to(
             device=device, non_blocking=non_blocking
         ),
-        # MctsPool intentionally omits journals from its hot path. Zero is the
-        # neutral representation and never introduces hidden information.
-        event_features=torch.zeros((count, EVENT_SUMMARY_SIZE), dtype=torch.float32, device=device),
+        # MctsPool intentionally omits journals from its hot path, in which
+        # case ``summary`` is the neutral all-zero representation. VectorGameEnv
+        # supplies its bounded fog-safe event window here.
+        event_features=torch.as_tensor(summary).to(
+            device=device, non_blocking=non_blocking
+        ).float(),
         action_history=torch.as_tensor(history).to(device=device, non_blocking=non_blocking).float(),
         action_history_mask=torch.as_tensor(history_mask).to(device=device, non_blocking=non_blocking).bool(),
         action_categorical=raw_features.index_select(-1, categorical_columns).long(),

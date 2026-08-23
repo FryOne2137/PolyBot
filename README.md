@@ -176,7 +176,10 @@ najlepszy checkpoint otrzymuje pełną bramkę
 `--direct-population-gate-games` (domyślnie 100 gier na przeciwnika), więc czas
 jest przeznaczany na dane treningowe, a nie powtarzane kosztowne ewaluacje. Gry
 treningowe w natywnym `VectorGameEnv` nie mają sztucznego limitu ruchów, a
-bramki direct używają `--direct-gate-max-moves`. PPO próbuje pełną politykę o
+bramki direct również używają natywnego `VectorGameEnv`: dwie równoległe
+partie każdej mapy zamieniają strony pretendenta, a bufory wejściowe są
+ponownie używane i na CUDA przypinane w pamięci hosta. Limit bramki ustawia
+`--direct-gate-max-moves`. PPO próbuje pełną politykę o
 temperaturze `--direct-population-ppo-rollout-temperature`; promocja nadal
 ocenia deterministyczną raw policy.
 
@@ -298,7 +301,7 @@ policy/value. Przed pierwszym SelfPlayPool trzeba wykonać bootstrap
 czym wygaszanie curriculum pozwala zastąpić je strategią wynikającą z wygranych.
 
 Domyślne `--visible-action-history 32` jest używane spójnie przez szybkie PPO,
-objective replay, płaską ewaluację `GameEnv` i `SelfPlayPool`. Wartość `0`
+objective replay, płaską ewaluację `VectorGameEnv` i `SelfPlayPool`. Wartość `0`
 wyłącza pamięć na potrzeby testu porównawczego; wartości większe niż 32
 zwiększają koszt jednowarstwowego attention mniej więcej kwadratowo względem
 długości okna.

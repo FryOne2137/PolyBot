@@ -1846,6 +1846,8 @@ def train_promotion_league(
                                 visible_action_history=(
                                     visible_action_history
                                 ),
+                                num_threads=num_threads,
+                                max_actions=mcts.native_max_actions,
                             )
                             if bool(result.get("valid", 1.0)):
                                 database.finish_evaluation_unrated(
@@ -2086,6 +2088,8 @@ def train_promotion_league(
                                 visible_action_history=(
                                     visible_action_history
                                 ),
+                                num_threads=num_threads,
+                                max_actions=mcts.native_max_actions,
                             )
                             result = {
                                 "opponent_id": opponent_id,
@@ -2307,6 +2311,8 @@ def train_promotion_league(
                                 visible_action_history=(
                                     visible_action_history
                                 ),
+                                num_threads=num_threads,
+                                max_actions=mcts.native_max_actions,
                             )
                             database.finish_evaluation_unrated(
                                 raw_probe_id, raw_probe
@@ -2668,6 +2674,8 @@ def train_promotion_league(
                                 ),
                                 candidate_label=candidate_evaluation_label,
                                 opponent_labels=population_evaluation_labels,
+                                num_threads=num_threads,
+                                max_actions=mcts.native_max_actions,
                             )
                         )
                     population_summary["raw_population_baseline"] = (
@@ -2843,6 +2851,8 @@ def train_promotion_league(
                                 game_callback=record_absorption_gate_game,
                                 candidate_label=candidate_evaluation_label,
                                 opponent_labels=population_evaluation_labels,
+                                num_threads=num_threads,
+                                max_actions=mcts.native_max_actions,
                             )
                             raw_policy_score = float(
                                 absorption_gate.get("model_a_score", 0.0)

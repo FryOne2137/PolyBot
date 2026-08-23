@@ -360,7 +360,14 @@ def main() -> None:
         "--updates", type=int, default=0,
         help="Legacy same-network optimiser updates; keep 0 with --steps 0",
     )
-    parser.add_argument("--num-threads", type=int, help="Persistent native SelfPlayPool worker count")
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        help=(
+            "Native worker count for VectorGameEnv gates and SelfPlayPool; "
+            "default uses available logical CPU cores"
+        ),
+    )
     parser.add_argument("--max-pending-leaves", type=int, default=4, help="Virtual-loss leaves per tree, 1-8")
     parser.add_argument(
         "--visible-action-history",

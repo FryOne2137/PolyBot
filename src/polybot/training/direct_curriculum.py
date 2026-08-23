@@ -240,6 +240,8 @@ def train_direct_policy_curriculum(
             ),
             model_a_label=candidate_label,
             model_b_label=champion_label,
+            num_threads=num_threads,
+            max_actions=max_actions,
         )
         score = float(result["model_a_score"])
         progress = _objective_progress(

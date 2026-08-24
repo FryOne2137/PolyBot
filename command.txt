@@ -199,8 +199,8 @@ python scripts/train_league.py `
   --direct-population-ppo-gae-lambda 0.95 `
   --direct-population-ppo-terminal-advantage-weight 0.75 `
   --direct-population-ppo-top-advantage-fraction 0.50 `
-  --direct-population-ppo-target-kl 0.015 `
-  --direct-population-ppo-hard-kl 0.030 `
+  --direct-population-ppo-target-kl 0.010 `
+  --direct-population-ppo-hard-kl 0.040 `
   --direct-population-ppo-rollout-temperature 0.85 `
   --direct-population-ppo-max-pending-examples 32768 `
   --direct-population-ppo-min-learning-rate 1e-5 `
@@ -227,8 +227,8 @@ python scripts/train_league.py `
   --exploiter-champion-probability 0.75 `
   --exploiter-policy-anchor-weight 0.0 `
   --exploiter-value-anchor-weight 0.0 `
-  --exploiter-ppo-target-kl 0.015 `
-  --exploiter-ppo-hard-kl 0.030 `
+  --exploiter-ppo-target-kl 0.010 `
+  --exploiter-ppo-hard-kl 0.040 `
   --exploiter-ppo-rollout-temperature 1.0 `
   --post-bootstrap-population-steps 6000 `
   --post-bootstrap-population-max-steps 12000 `

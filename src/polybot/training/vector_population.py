@@ -62,6 +62,10 @@ class _PPOExample:
     action_row: int
     old_log_probability: float
     old_value: float
+    # Log probabilities for every legal action in the compact PPO snapshot.
+    # Unlike the selected-action log probability, this permits a real
+    # KL(pi_rollout || pi_current) check over the complete legal policy.
+    old_policy_log_probabilities: np.ndarray | None = None
     advantage: float = 0.0
     return_target: float = 0.0
     # For finished games this is the undiscounted game outcome from the
@@ -242,6 +246,29 @@ def _ppo_batch(
     )
 
 
+def _ppo_policy_reference_batch(examples: Sequence[_PPOExample]) -> np.ndarray:
+    """Pad immutable rollout policies to the batch's legal-action width."""
+    if not examples:
+        raise ValueError("PPO policy-reference batch must not be empty")
+    maximum_actions = max(
+        int(example.observation["action_features"].shape[0])
+        for example in examples
+    )
+    references = np.zeros((len(examples), maximum_actions), dtype=np.float32)
+    for row, example in enumerate(examples):
+        reference = example.old_policy_log_probabilities
+        if reference is None:
+            raise ValueError(
+                "PPO example is missing its full rollout-policy reference"
+            )
+        count = int(reference.size)
+        legal_count = int(example.observation["action_features"].shape[0])
+        if count != legal_count:
+            raise ValueError("PPO policy reference must match its legal actions")
+        references[row, :count] = reference
+    return references
+
+
 def _mark_top_advantage_examples(
     examples: Sequence[_PPOExample],
     fraction: float,
@@ -334,7 +361,7 @@ def _masked_policy_kl(
         reference_log_probabilities.shape != current_logits.shape
         or action_mask.shape != current_logits.shape
     ):
-        raise ValueError("PPG policy tensors must have matching shapes")
+        raise ValueError("policy KL tensors must have matching shapes")
     current_log_probabilities = F.log_softmax(current_logits.float(), dim=-1)
     reference_policy = torch.where(
         action_mask,
@@ -1168,8 +1195,8 @@ def train_vector_population(
     ppo_gae_lambda: float = 0.95,
     ppo_terminal_advantage_weight: float = 0.75,
     ppo_top_advantage_fraction: float = 0.50,
-    ppo_target_kl: float = 0.015,
-    ppo_hard_kl: float = 0.030,
+    ppo_target_kl: float = 0.010,
+    ppo_hard_kl: float = 0.040,
     ppo_min_learning_rate: float = 1.0e-5,
     ppo_lr_backoff: float = 0.5,
     ppo_rollout_temperature: float = 0.85,
@@ -1525,6 +1552,51 @@ def train_vector_population(
             "policy_selected_fraction": 0.0,
         }
         local_updates = 0
+        accepted_epoch_behaviour_kls: list[float] = []
+
+        @torch.no_grad()
+        def rollout_policy_kl() -> float:
+            """Measure exact KL from the immutable rollout policy.
+
+            This is intentionally evaluated after a complete PPO epoch.  A
+            selected-action log-probability proxy can spike for one rare move
+            even when the policy barely changed; conversely it can miss a
+            broad change across legal actions.  The full masked distribution
+            is both the relevant trust-region quantity and stable enough to
+            make a once-per-epoch decision.
+            """
+            total_kl = 0.0
+            total_examples = 0
+            candidate.eval()
+            for start in range(0, len(examples), ppo_minibatch_size):
+                subset = examples[start : start + ppo_minibatch_size]
+                replay_batch = _collate_public_observations(subset)
+                references = _ppo_policy_reference_batch(subset)
+                tensors = _vector_tensors(replay_batch, device, training)
+                reference_tensor = torch.as_tensor(
+                    references, dtype=torch.float32, device=device
+                )
+                output = candidate(
+                    tensors["map_tokens"],
+                    tensors["global_features"],
+                    tensors["action_categorical"],
+                    tensors["action_continuous"],
+                    tensors["action_mask"],
+                    tensors["event_features"],
+                    action_history=tensors["action_history"],
+                    action_history_mask=tensors["action_history_mask"],
+                    include_belief=False,
+                )
+                batch_kl = _masked_policy_kl(
+                    reference_tensor,
+                    output.policy_logits / ppo_rollout_temperature,
+                    tensors["action_mask"],
+                )
+                count = len(subset)
+                total_kl += float(batch_kl.detach().cpu()) * count
+                total_examples += count
+            return total_kl / max(1, total_examples)
+
         for _ in range(ppo_epochs):
             # An epoch may reuse a rollout many times.  If its behaviour KL
             # grows too large, restore only this epoch and lower the learning
@@ -1544,7 +1616,6 @@ def train_vector_population(
             epoch_objective_replay_updates = objective_replay_updates
             epoch_objective_replay_credits = objective_replay_update_credits
             epoch_ema_updates = ema_updates
-            limited_epoch = False
             order = rng.permutation(len(examples))
             for start in range(0, len(order), ppo_minibatch_size):
                 subset = [examples[int(index)] for index in order[start:start + ppo_minibatch_size]]
@@ -1665,42 +1736,6 @@ def train_vector_population(
                     torch.zeros_like(policy_log_probabilities.float()),
                 )
                 champion_kl = (anchor_policy * kl_difference).sum(dim=1).mean()
-                behaviour_kl = 0.5 * (
-                    new_log_probability - old_log_tensor
-                ).square().mean()
-                if float(behaviour_kl.detach().cpu()) > ppo_hard_kl:
-                    restore_model_state(candidate, epoch_start_state)
-                    if ema_model is not None and epoch_start_ema_state is not None:
-                        restore_model_state(ema_model, epoch_start_ema_state)
-                    optimiser.load_state_dict(epoch_optimiser_state)
-                    scaler.load_state_dict(epoch_scaler_state)
-                    totals_local = epoch_totals
-                    local_updates = epoch_local_updates
-                    ppo_updates = epoch_ppo_updates
-                    ppo_policy_samples = epoch_ppo_policy_samples
-                    objective_replay_updates = epoch_objective_replay_updates
-                    objective_replay_update_credits = (
-                        epoch_objective_replay_credits
-                    )
-                    ema_updates = epoch_ema_updates
-                    previous_learning_rate = float(optimiser.param_groups[0]["lr"])
-                    adapted_learning_rate = max(
-                        ppo_min_learning_rate,
-                        previous_learning_rate * ppo_lr_backoff,
-                    )
-                    for parameter_group in optimiser.param_groups:
-                        parameter_group["lr"] = adapted_learning_rate
-                    ppo_behaviour_kl_limits += 1
-                    totals_local["behaviour_kl_limited"] += 1.0
-                    print(
-                        "direct population PPO behaviour-KL limit | "
-                        f"kl={float(behaviour_kl.detach().cpu()):.5f} "
-                        f"hard={ppo_hard_kl:.5f} | restored current epoch | "
-                        f"lr={previous_learning_rate:.2e}->{adapted_learning_rate:.2e}",
-                        flush=True,
-                    )
-                    limited_epoch = True
-                    break
                 kl_multiplier = policy_anchor_weight * max(
                     1.0,
                     float(champion_kl.detach().cpu())
@@ -1786,7 +1821,6 @@ def train_vector_population(
                     "policy_loss": float(policy_loss.detach().cpu()),
                     "value_loss": float(value_loss.detach().cpu()),
                     "champion_kl": float(champion_kl.detach().cpu()),
-                    "behaviour_kl": float(behaviour_kl.detach().cpu()),
                     "clip_fraction": float(
                         ((ratio - 1.0).abs() > ppo_clip_range)
                         .float().mean().detach().cpu()
@@ -1804,12 +1838,59 @@ def train_vector_population(
                 local_updates += 1
                 ppo_updates += 1
                 ppo_policy_samples += int(policy_selected_tensor.sum().item())
-            if limited_epoch:
+            behaviour_kl = rollout_policy_kl()
+            if behaviour_kl > ppo_hard_kl:
+                restore_model_state(candidate, epoch_start_state)
+                if ema_model is not None and epoch_start_ema_state is not None:
+                    restore_model_state(ema_model, epoch_start_ema_state)
+                optimiser.load_state_dict(epoch_optimiser_state)
+                scaler.load_state_dict(epoch_scaler_state)
+                totals_local = epoch_totals
+                local_updates = epoch_local_updates
+                ppo_updates = epoch_ppo_updates
+                ppo_policy_samples = epoch_ppo_policy_samples
+                objective_replay_updates = epoch_objective_replay_updates
+                objective_replay_update_credits = epoch_objective_replay_credits
+                ema_updates = epoch_ema_updates
+                previous_learning_rate = float(optimiser.param_groups[0]["lr"])
+                at_minimum_learning_rate = (
+                    previous_learning_rate <= ppo_min_learning_rate * (1.0 + 1e-8)
+                )
+                adapted_learning_rate = max(
+                    ppo_min_learning_rate,
+                    previous_learning_rate * ppo_lr_backoff,
+                )
+                for parameter_group in optimiser.param_groups:
+                    parameter_group["lr"] = adapted_learning_rate
+                ppo_behaviour_kl_limits += 1
+                totals_local["behaviour_kl_limited"] += 1.0
+                print(
+                    "direct population PPO behaviour-KL limit | "
+                    f"kl={behaviour_kl:.5f} hard={ppo_hard_kl:.5f} | "
+                    "restored current epoch | "
+                    f"lr={previous_learning_rate:.2e}->{adapted_learning_rate:.2e}",
+                    flush=True,
+                )
+                if at_minimum_learning_rate:
+                    print(
+                        "direct population PPO behaviour-KL minimum LR | "
+                        "keeping earlier safe PPO epochs and skipping the "
+                        "remaining PPO epochs for this rollout",
+                        flush=True,
+                    )
+                    break
                 continue
-        return {
+            accepted_epoch_behaviour_kls.append(behaviour_kl)
+        result = {
             name: total / max(1, local_updates)
             for name, total in totals_local.items()
         }
+        result["behaviour_kl"] = float(
+            np.mean(accepted_epoch_behaviour_kls)
+            if accepted_epoch_behaviour_kls
+            else 0.0
+        )
+        return result
 
     def retain_ppg_examples(examples: Sequence[_PPOExample]) -> None:
         """Keep a bounded, rollout-balanced sample for later auxiliary work."""
@@ -2023,6 +2104,9 @@ def train_vector_population(
                 )
                 action_rows = rollout_distribution.sample()
                 old_log_probabilities = rollout_distribution.log_prob(action_rows)
+                rollout_policy_log_probabilities = F.log_softmax(
+                    output.policy_logits / ppo_rollout_temperature, dim=-1
+                )
                 values_before = output.value.float()
             # ``sample`` is intentionally run under ``inference_mode`` because it
             # is behaviour-policy data, not part of the PPO gradient.  Opponent
@@ -2135,6 +2219,9 @@ def train_vector_population(
             candidate_mask = np.zeros(num_envs, dtype=bool)
             candidate_mask[candidate_rows] = True
             old_logs = old_log_probabilities.float().cpu().numpy()
+            old_policy_logs = (
+                rollout_policy_log_probabilities.float().cpu().numpy()
+            )
             old_values = values_before.cpu().numpy()
             for env_id in range(num_envs):
                 example = None
@@ -2147,6 +2234,9 @@ def train_vector_population(
                         action_row=compact_action_row,
                         old_log_probability=float(old_logs[env_id]),
                         old_value=float(old_values[env_id]),
+                        old_policy_log_probabilities=old_policy_logs[
+                            env_id, np.flatnonzero(legal[env_id])
+                        ].copy(),
                     )
                     pending_candidate_examples += 1
                 traces[env_id].append(
@@ -2644,8 +2734,8 @@ def train_direct_population_curriculum(
     ppo_gae_lambda: float = 0.95,
     ppo_terminal_advantage_weight: float = 0.75,
     ppo_top_advantage_fraction: float = 0.50,
-    ppo_target_kl: float = 0.015,
-    ppo_hard_kl: float = 0.030,
+    ppo_target_kl: float = 0.010,
+    ppo_hard_kl: float = 0.040,
     ppo_rollout_temperature: float = 0.85,
     ppo_max_pending_examples: int = 32_768,
     ppo_min_learning_rate: float = 1.0e-5,

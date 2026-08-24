@@ -1822,7 +1822,14 @@ def train_promotion_league(
                             direct_population_summary
                         )
                         if exploiter_source_state is not None:
-                            exploiter = PolicyValueBeliefNet(model_config)
+                            # The main candidate was loaded through
+                            # ``load_model(..., device)``.  A fresh exploiter
+                            # has no such loader call, so put it on the same
+                            # device before its baseline gate creates CUDA
+                            # observation tensors.
+                            exploiter = PolicyValueBeliefNet(model_config).to(
+                                device
+                            ).eval()
                             restore_model_state(exploiter, exploiter_source_state)
                             exploiter_probabilities = (
                                 _champion_focused_probabilities(

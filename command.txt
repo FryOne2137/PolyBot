@@ -142,6 +142,8 @@ python scripts/evaluate.py `
 # objective replay. Jest zauważalnie wolniejszy (około 2-3x na rundę), lecz nie
 # obniża wymagań promocji. Po następnym "challenger retained" podmień tylko
 # numer po --challenger-in na numer wypisany w logu.
+# Po self-play uruchamiana jest też destylacja MCTS. Jej osobna bramka
+# przed/po cofa wyłącznie destylację, jeśli nie poprawi polityki płaskiej.
 python scripts/train_league.py `
   --champion-in models\league\champion-005.pt `
   --challenger-in models\league\champion-challenger-029.pt `
@@ -238,6 +240,15 @@ python scripts/train_league.py `
   --post-bootstrap-champion-probability 0.65 `
   --post-bootstrap-policy-anchor-weight 0.20 `
   --champion-mode flat `
+  --flat-mcts-distill-games 100 `
+  --flat-mcts-distill-simulations 64 `
+  --flat-mcts-distill-updates-per-game 2 `
+  --flat-mcts-distill-gate-games 20 `
+  --flat-mcts-distill-policy-anchor-weight 0.15 `
+  --flat-mcts-distill-value-anchor-weight 0.20 `
+  --flat-mcts-distill-critical-fraction 0.25 `
+  --flat-mcts-distill-critical-minimum-score 0.15 `
+  --flat-mcts-distill-critical-replay-fraction 0.50 `
   --mcts-probe-games 10 `
   --mcts-probe-simulations 32 `
   --mcts-probe-score 0.55 `

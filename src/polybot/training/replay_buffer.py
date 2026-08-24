@@ -37,6 +37,12 @@ class TrainingExample:
     # bridge/terrain relation can be learned.  This is metadata only and is
     # never exposed as a model input.
     bridge_priority: bool = False
+    # A high-confidence MCTS move disagreed with the raw policy at this public
+    # position.  This is replay metadata, not a model input: selective MCTS
+    # distillation can reserve part of a batch for the decisions most likely
+    # to teach a strategically new move.
+    critical_priority: bool = False
+    critical_score: float = 0.0
     # Frozen-champion value distillation is kept separate from the game/MCTS
     # target.  This lets the optimiser improve value estimates while limiting
     # catastrophic drift of the shared representation during a league rung.
@@ -59,12 +65,14 @@ class ReplayBuffer:
         rng: np.random.Generator,
         priority_fraction: float = 0.0,
         bridge_fraction: float = 0.0,
+        critical_fraction: float = 0.0,
     ) -> List[TrainingExample]:
         if len(self._examples) < batch_size:
             raise ValueError("not enough replay examples for this batch")
         rows = list(self._examples)
         priority_count = int(round(batch_size * float(np.clip(priority_fraction, 0.0, 1.0))))
         bridge_count = int(round(batch_size * float(np.clip(bridge_fraction, 0.0, 1.0))))
+        critical_count = int(round(batch_size * float(np.clip(critical_fraction, 0.0, 1.0))))
         priority_indices = np.asarray(
             [
                 index
@@ -77,10 +85,30 @@ class ReplayBuffer:
             [index for index, row in enumerate(rows) if row.bridge_priority],
             dtype=np.int64,
         )
+        critical_indices = np.asarray(
+            [
+                index
+                for index, row in enumerate(rows)
+                if row.critical_priority
+            ],
+            dtype=np.int64,
+        )
         chosen: List[int] = []
+        if critical_indices.size:
+            count = min(critical_count, critical_indices.size, batch_size)
+            chosen.extend(
+                int(index)
+                for index in rng.choice(critical_indices, size=count, replace=False)
+            )
         if bridge_indices.size:
-            count = min(bridge_count, bridge_indices.size, batch_size)
-            chosen.extend(int(index) for index in rng.choice(bridge_indices, size=count, replace=False))
+            available_bridge = np.setdiff1d(
+                bridge_indices, np.asarray(chosen, dtype=np.int64)
+            )
+            count = min(bridge_count, available_bridge.size, batch_size - len(chosen))
+            chosen.extend(
+                int(index)
+                for index in rng.choice(available_bridge, size=count, replace=False)
+            )
         if priority_indices.size:
             available_priority = np.setdiff1d(
                 priority_indices, np.asarray(chosen, dtype=np.int64)

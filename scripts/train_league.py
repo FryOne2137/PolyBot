@@ -387,6 +387,24 @@ def main() -> None:
         "--flat-mcts-distill-value-anchor-weight", type=float, default=0.25,
     )
     parser.add_argument(
+        "--flat-mcts-distill-critical-fraction",
+        type=float,
+        default=0.25,
+        help="Top fraction of candidate MCTS roots eligible as critical decisions",
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-critical-minimum-score",
+        type=float,
+        default=0.15,
+        help="Minimum confident MCTS-vs-policy disagreement score",
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-critical-replay-fraction",
+        type=float,
+        default=0.50,
+        help="Replay-batch share reserved for selected critical MCTS decisions",
+    )
+    parser.add_argument(
         "--mcts-probe-games", type=int, default=10,
         help="Fast paired diagnostic games; 0 disables the MCTS readiness probe",
     )
@@ -695,6 +713,15 @@ def main() -> None:
         ),
         flat_mcts_distill_value_anchor_weight=(
             args.flat_mcts_distill_value_anchor_weight
+        ),
+        flat_mcts_distill_critical_fraction=(
+            args.flat_mcts_distill_critical_fraction
+        ),
+        flat_mcts_distill_critical_minimum_score=(
+            args.flat_mcts_distill_critical_minimum_score
+        ),
+        flat_mcts_distill_critical_replay_fraction=(
+            args.flat_mcts_distill_critical_replay_fraction
         ),
         mcts_probe_games=args.mcts_probe_games,
         mcts_probe_simulations=args.mcts_probe_simulations,

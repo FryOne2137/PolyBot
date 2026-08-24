@@ -475,6 +475,9 @@ def train_promotion_league(
     flat_mcts_distill_gate_games: int = 20,
     flat_mcts_distill_policy_anchor_weight: float = 0.20,
     flat_mcts_distill_value_anchor_weight: float = 0.25,
+    flat_mcts_distill_critical_fraction: float = 0.25,
+    flat_mcts_distill_critical_minimum_score: float = 0.15,
+    flat_mcts_distill_critical_replay_fraction: float = 0.50,
     mcts_probe_games: int = 10,
     mcts_probe_simulations: int = 32,
     mcts_probe_score: float = 0.55,
@@ -526,6 +529,18 @@ def train_promotion_league(
         )
     if flat_mcts_distill_simulations < 1:
         raise ValueError("flat_mcts_distill_simulations must be positive")
+    if not 0.0 <= flat_mcts_distill_critical_fraction <= 1.0:
+        raise ValueError(
+            "flat_mcts_distill_critical_fraction must be between zero and one"
+        )
+    if flat_mcts_distill_critical_minimum_score < 0.0:
+        raise ValueError(
+            "flat_mcts_distill_critical_minimum_score must be non-negative"
+        )
+    if not 0.0 <= flat_mcts_distill_critical_replay_fraction <= 1.0:
+        raise ValueError(
+            "flat_mcts_distill_critical_replay_fraction must be between zero and one"
+        )
     if (
         flat_mcts_distill_gate_games < 2
         or flat_mcts_distill_gate_games % 2
@@ -616,6 +631,12 @@ def train_promotion_league(
         ),
         "flat_mcts_distill_value_anchor_weight": (
             flat_mcts_distill_value_anchor_weight
+        ),
+        "flat_mcts_distill_critical_fraction": (
+            flat_mcts_distill_critical_fraction
+        ),
+        "flat_mcts_distill_critical_replay_fraction": (
+            flat_mcts_distill_critical_replay_fraction
         ),
     }.items():
         if not 0.0 <= value <= 1.0:
@@ -1040,6 +1061,15 @@ def train_promotion_league(
         ),
         "flat_mcts_distill_value_anchor_weight": (
             flat_mcts_distill_value_anchor_weight
+        ),
+        "flat_mcts_distill_critical_fraction": (
+            flat_mcts_distill_critical_fraction
+        ),
+        "flat_mcts_distill_critical_minimum_score": (
+            flat_mcts_distill_critical_minimum_score
+        ),
+        "flat_mcts_distill_critical_replay_fraction": (
+            flat_mcts_distill_critical_replay_fraction
         ),
         "mcts_probe_games": mcts_probe_games,
         "mcts_probe_simulations": mcts_probe_simulations,
@@ -2287,6 +2317,15 @@ def train_promotion_league(
                                 ),
                                 anchor_value_weight=(
                                     flat_mcts_distill_value_anchor_weight
+                                ),
+                                critical_decision_fraction=(
+                                    flat_mcts_distill_critical_fraction
+                                ),
+                                critical_minimum_score=(
+                                    flat_mcts_distill_critical_minimum_score
+                                ),
+                                critical_replay_fraction=(
+                                    flat_mcts_distill_critical_replay_fraction
                                 ),
                                 num_threads=population_workers,
                                 max_pending_leaves=max_pending_leaves,

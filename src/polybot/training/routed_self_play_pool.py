@@ -247,6 +247,66 @@ def _policy_distance(
     return decisions, agreements, l1_sum
 
 
+def _mark_critical_mcts_examples(
+    examples: Sequence[TrainingExample],
+    mcts_policy: np.ndarray,
+    raw_policy: np.ndarray,
+    action_mask: np.ndarray,
+    *,
+    fraction: float,
+    minimum_score: float,
+) -> tuple[int, float]:
+    """Mark the strongest public disagreements between MCTS and the policy.
+
+    The score rewards a confident MCTS recommendation that the raw policy
+    assigns little probability to.  Agreement with MCTS is deliberately not
+    replay-prioritised: it is already represented by ordinary MCTS examples.
+    Selecting a bounded top fraction per vector root avoids filling replay
+    with many near-identical end-turn decisions from one long game.
+    """
+    if len(examples) != int(mcts_policy.shape[0]):
+        raise ValueError("critical MCTS examples must match policy rows")
+    if raw_policy.shape != mcts_policy.shape or action_mask.shape != mcts_policy.shape:
+        raise ValueError("critical MCTS policy tensors must have matching shapes")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("critical MCTS fraction must be between zero and one")
+    if minimum_score < 0.0:
+        raise ValueError("critical MCTS minimum score must be non-negative")
+    scores = np.zeros(len(examples), dtype=np.float32)
+    for index in range(len(examples)):
+        count = int(action_mask[index].sum())
+        if count <= 1:
+            continue
+        search_row = np.asarray(
+            mcts_policy[index, :count], dtype=np.float32
+        ).copy()
+        raw_row = np.asarray(raw_policy[index, :count], dtype=np.float32).copy()
+        search_row /= max(float(search_row.sum()), 1e-8)
+        raw_row /= max(float(raw_row.sum()), 1e-8)
+        search_top = int(search_row.argmax())
+        if search_top == int(raw_row.argmax()):
+            continue
+        # A score of 0.15 requires, for example, MCTS to put 50% probability
+        # on a move that the raw policy assigns at most 20%.
+        scores[index] = search_row[search_top] * max(
+            0.0, float(search_row[search_top] - raw_row[search_top])
+        )
+    for example, score in zip(examples, scores):
+        example.critical_priority = False
+        example.critical_score = float(score)
+    eligible = np.flatnonzero(scores >= minimum_score)
+    if not eligible.size or fraction <= 0.0:
+        return 0, 0.0
+    keep = min(
+        int(eligible.size),
+        max(1, int(np.ceil(len(examples) * fraction))),
+    )
+    selected = eligible[np.argsort(scores[eligible], kind="stable")[-keep:]]
+    for index in selected:
+        examples[int(index)].critical_priority = True
+    return int(selected.size), float(scores[selected].sum())
+
+
 def _validate_agents(agent_ids: np.ndarray, model_count: int, label: str) -> None:
     if agent_ids.size == 0:
         return
@@ -1392,6 +1452,9 @@ def train_population_pool(
     anchor_model: PolicyValueBeliefNet | None = None,
     anchor_policy_weight: float = 0.0,
     anchor_value_weight: float = 0.25,
+    critical_decision_fraction: float = 0.0,
+    critical_minimum_score: float = 0.15,
+    critical_replay_fraction: float = 0.0,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
@@ -1414,6 +1477,12 @@ def train_population_pool(
         raise ValueError("anchor_policy_weight must be between zero and one")
     if not 0.0 <= anchor_value_weight <= 1.0:
         raise ValueError("anchor_value_weight must be between zero and one")
+    if not 0.0 <= critical_decision_fraction <= 1.0:
+        raise ValueError("critical_decision_fraction must be between zero and one")
+    if critical_minimum_score < 0.0:
+        raise ValueError("critical_minimum_score must be non-negative")
+    if not 0.0 <= critical_replay_fraction <= 1.0:
+        raise ValueError("critical_replay_fraction must be between zero and one")
     if anchor_model is candidate:
         raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
     if training.max_replay_epochs <= 0.0:
@@ -1442,6 +1511,9 @@ def train_population_pool(
             "opponent_weights": weights.tolist(),
             "anchor_policy_weight": anchor_policy_weight,
             "anchor_value_weight": anchor_value_weight,
+            "critical_decision_fraction": critical_decision_fraction,
+            "critical_minimum_score": critical_minimum_score,
+            "critical_replay_fraction": critical_replay_fraction,
         },
     )
     candidate.to(device)
@@ -1467,6 +1539,8 @@ def train_population_pool(
     anchor_decisions = 0
     anchor_agreements = 0
     anchor_l1_sum = 0.0
+    critical_decisions = 0
+    critical_score_sum = 0.0
     total_moves = 0
     score_sum = 0.0
     opponent_stats = [
@@ -1492,6 +1566,7 @@ def train_population_pool(
                 rng,
                 training.priority_replay_fraction,
                 training.bridge_replay_fraction,
+                critical_replay_fraction,
             )
             losses.append(
                 train_batch(candidate, optimiser, stack_examples(batch, device), training)
@@ -1690,6 +1765,19 @@ def train_population_pool(
                         anchor_decisions += measured[0]
                         anchor_agreements += measured[1]
                         anchor_l1_sum += measured[2]
+                    raw_candidate_policy = None
+                    if critical_decision_fraction > 0.0:
+                        # The candidate's unsearched policy is the apprentice
+                        # we want to improve.  Compare it with the completed
+                        # MCTS root only after search; the root policy itself
+                        # stays the target stored by _root_examples.
+                        candidate.eval()
+                        raw_candidate_policy = _reference_policy(
+                            candidate,
+                            candidate_request,
+                            device,
+                            training,
+                        )
                     candidate_examples = _root_examples(
                         candidate_request,
                         candidate_root,
@@ -1700,6 +1788,21 @@ def train_population_pool(
                         anchor_value=anchor_value,
                         anchor_value_weight=anchor_value_weight,
                     )
+                    if raw_candidate_policy is not None:
+                        marked, score_sum = _mark_critical_mcts_examples(
+                            candidate_examples,
+                            np.asarray(
+                                candidate_root["policy"], dtype=np.float32
+                            ),
+                            raw_candidate_policy,
+                            np.asarray(
+                                candidate_root["action_mask"], dtype=bool
+                            ),
+                            fraction=critical_decision_fraction,
+                            minimum_score=critical_minimum_score,
+                        )
+                        critical_decisions += marked
+                        critical_score_sum += score_sum
                     root_values = np.asarray(root["root_value"], dtype=np.float32)
                     for env, example in zip(candidate_rows, candidate_examples):
                         example.bootstrap_value = float(root_values[env])
@@ -1768,6 +1871,11 @@ def train_population_pool(
                     anchor_agreements / max(1, anchor_decisions)
                 ),
                 champion_anchor_mean_l1=(anchor_l1_sum / max(1, anchor_decisions)),
+                critical_mcts_decisions=critical_decisions,
+                critical_mcts_mean_score=(
+                    critical_score_sum / max(1, critical_decisions)
+                ),
+                critical_mcts_replay_fraction=critical_replay_fraction,
                 mean_score=score_sum / max(1, completed_count),
                 belief_rejected_particles=search.counters.belief_rejected_particles,
                 belief_rejected_envs=search.counters.belief_rejected_envs,
@@ -1814,6 +1922,16 @@ def train_population_pool(
         ),
         "population_pool_anchor_mean_l1": float(
             anchor_l1_sum / max(1, anchor_decisions)
+        ),
+        "population_pool_critical_mcts_decisions": float(critical_decisions),
+        "population_pool_critical_mcts_mean_score": float(
+            critical_score_sum / max(1, critical_decisions)
+        ),
+        "population_pool_critical_mcts_replay_fraction": float(
+            critical_replay_fraction
+        ),
+        "population_pool_critical_mcts_selection_fraction": float(
+            critical_decision_fraction
         ),
         "population_pool_score": float(score_sum / max(1, games)),
         "population_pool_mean_moves": float(total_moves / max(1, games)),

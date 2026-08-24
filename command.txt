@@ -136,13 +136,15 @@ python scripts/evaluate.py `
 # Płaskie bramki tej komendy automatycznie używają dwóch natywnych batchy
 # VectorGameEnv, buforów reset_into/step_into i pamięci pinned na CUDA. Nie
 # potrzeba osobnej flagi; --num-threads ustawia również workery tych bramek.
-# Aktualny run wznawia champion-005 i tę samą SQLite, aby kod rozpoznał etap
-# champion-population. Po kolejnym awansie podmień tylko --champion-in na
-# najnowszy champion-XXX.pt. Jeżeli nie było promocji, ale
-# log podał "challenger retained", zachowaj tego samego --champion-in i dopisz
-# --challenger-in models\league\champion-challenger-XXX.pt.
+# Ten wariant wznawia challengera-029, wydłuża zarówno self-play, jak i
+# niezależne bramki do 1000 ruchów. Daje też więcej pełnych partii na rundę,
+# większy bufor na niedokończone trajektorie oraz silniejszy event-triggered
+# objective replay. Jest zauważalnie wolniejszy (około 2-3x na rundę), lecz nie
+# obniża wymagań promocji. Po następnym "challenger retained" podmień tylko
+# numer po --challenger-in na numer wypisany w logu.
 python scripts/train_league.py `
   --champion-in models\league\champion-005.pt `
+  --challenger-in models\league\champion-challenger-029.pt `
   --checkpoint-dir models\league `
   --checkpoint-prefix champion `
   --league-db models\league\league.sqlite3 `
@@ -168,7 +170,7 @@ python scripts/train_league.py `
   --direct-actor-block-steps 500 `
   --direct-actor-max-steps 5000 `
   --direct-gate-games 30 `
-  --direct-gate-max-moves 700 `
+  --direct-gate-max-moves 1000 `
   --direct-gate-score 0.50 `
   --direct-policy-anchor-weight 0.75 `
   --direct-value-anchor-weight 0.50 `
@@ -180,9 +182,9 @@ python scripts/train_league.py `
   --direct-readiness-patience 2 `
   --direct-regression-patience 2 `
   --direct-population-envs 128 `
-  --direct-population-steps 6000 `
-  --direct-population-block-steps 6000 `
-  --direct-population-max-steps 12000 `
+  --direct-population-steps 9000 `
+  --direct-population-block-steps 9000 `
+  --direct-population-max-steps 18000 `
   --direct-population-gate-games 100 `
   --direct-population-diagnostic-gate-games 20 `
   --direct-population-gate-score 0.50 `
@@ -202,16 +204,16 @@ python scripts/train_league.py `
   --direct-population-ppo-target-kl 0.010 `
   --direct-population-ppo-hard-kl 0.040 `
   --direct-population-ppo-rollout-temperature 0.85 `
-  --direct-population-ppo-max-pending-examples 32768 `
+  --direct-population-ppo-max-pending-examples 65536 `
   --direct-population-ppo-min-learning-rate 1e-5 `
   --direct-population-ppo-lr-backoff 0.50 `
-  --direct-population-objective-replay-horizon 16 `
-  --direct-population-objective-replay-capacity 512 `
-  --direct-population-objective-replay-batch-size 32 `
-  --direct-population-objective-replay-interval 16 `
-  --direct-population-objective-replay-weight 0.35 `
+  --direct-population-objective-replay-horizon 32 `
+  --direct-population-objective-replay-capacity 4096 `
+  --direct-population-objective-replay-batch-size 64 `
+  --direct-population-objective-replay-interval 8 `
+  --direct-population-objective-replay-weight 0.50 `
   --direct-population-objective-replay-recency 0.92 `
-  --direct-population-objective-replay-max-epochs 4 `
+  --direct-population-objective-replay-max-epochs 6 `
   --direct-population-ppg `
   --direct-population-ppg-interval 8 `
   --direct-population-ppg-buffer-capacity 8192 `
@@ -222,7 +224,7 @@ python scripts/train_league.py `
   --direct-population-ppg-policy-kl-weight 1.0 `
   --direct-population-ppg-value-weight 1.0 `
   --direct-population-ema `
-  --direct-population-ema-decay 0.999 `
+  --direct-population-ema-decay 0.995 `
   --breakthrough-exploiter `
   --exploiter-champion-probability 0.75 `
   --exploiter-policy-anchor-weight 0.0 `
@@ -230,11 +232,11 @@ python scripts/train_league.py `
   --exploiter-ppo-target-kl 0.010 `
   --exploiter-ppo-hard-kl 0.040 `
   --exploiter-ppo-rollout-temperature 1.0 `
-  --post-bootstrap-population-steps 6000 `
-  --post-bootstrap-population-max-steps 12000 `
+  --post-bootstrap-population-steps 9000 `
+  --post-bootstrap-population-max-steps 18000 `
   --post-bootstrap-objective-steps 0 `
   --post-bootstrap-champion-probability 0.65 `
-  --post-bootstrap-policy-anchor-weight 0.35 `
+  --post-bootstrap-policy-anchor-weight 0.20 `
   --champion-mode flat `
   --mcts-probe-games 10 `
   --mcts-probe-simulations 32 `
@@ -275,7 +277,7 @@ python scripts/train_league.py `
   --exploration-rate 0.15 `
   --td-lambda 1.0 `
   --learning-rate 5e-5 `
-  --max-moves 700 `
+  --max-moves 1000 `
   --map-size 11 `
   --map-type lakes `
   --seed 91337 `

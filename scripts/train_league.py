@@ -387,6 +387,18 @@ def main() -> None:
         "--flat-mcts-distill-value-anchor-weight", type=float, default=0.25,
     )
     parser.add_argument(
+        "--flat-mcts-distill-max-envs",
+        type=int,
+        default=16,
+        help="Maximum concurrent MCTS games during distillation; bounds CUDA memory",
+    )
+    parser.add_argument(
+        "--flat-mcts-distill-max-moves",
+        type=int,
+        default=600,
+        help="MCTS-teacher horizon; independent from the longer flat self-play horizon",
+    )
+    parser.add_argument(
         "--flat-mcts-distill-critical-fraction",
         type=float,
         default=0.25,
@@ -714,6 +726,8 @@ def main() -> None:
         flat_mcts_distill_value_anchor_weight=(
             args.flat_mcts_distill_value_anchor_weight
         ),
+        flat_mcts_distill_max_envs=args.flat_mcts_distill_max_envs,
+        flat_mcts_distill_max_moves=args.flat_mcts_distill_max_moves,
         flat_mcts_distill_critical_fraction=(
             args.flat_mcts_distill_critical_fraction
         ),

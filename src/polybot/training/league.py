@@ -6,6 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
+import torch
+
 from ..config import MCTSConfig, TrainingConfig
 from ..evaluation.matches import evaluate_direct_matches
 from ..infrastructure.device import select_device
@@ -475,6 +477,8 @@ def train_promotion_league(
     flat_mcts_distill_gate_games: int = 20,
     flat_mcts_distill_policy_anchor_weight: float = 0.20,
     flat_mcts_distill_value_anchor_weight: float = 0.25,
+    flat_mcts_distill_max_envs: int = 16,
+    flat_mcts_distill_max_moves: int = 600,
     flat_mcts_distill_critical_fraction: float = 0.25,
     flat_mcts_distill_critical_minimum_score: float = 0.15,
     flat_mcts_distill_critical_replay_fraction: float = 0.50,
@@ -529,6 +533,10 @@ def train_promotion_league(
         )
     if flat_mcts_distill_simulations < 1:
         raise ValueError("flat_mcts_distill_simulations must be positive")
+    if flat_mcts_distill_max_envs < 1:
+        raise ValueError("flat_mcts_distill_max_envs must be positive")
+    if flat_mcts_distill_max_moves < 1:
+        raise ValueError("flat_mcts_distill_max_moves must be positive")
     if not 0.0 <= flat_mcts_distill_critical_fraction <= 1.0:
         raise ValueError(
             "flat_mcts_distill_critical_fraction must be between zero and one"
@@ -1052,6 +1060,8 @@ def train_promotion_league(
         "champion_mode": champion_mode,
         "flat_mcts_distill_games": flat_mcts_distill_games,
         "flat_mcts_distill_simulations": flat_mcts_distill_simulations,
+        "flat_mcts_distill_max_envs": flat_mcts_distill_max_envs,
+        "flat_mcts_distill_max_moves": flat_mcts_distill_max_moves,
         "flat_mcts_distill_updates_per_game": (
             flat_mcts_distill_updates_per_game
         ),
@@ -2287,6 +2297,12 @@ def train_promotion_league(
                             )
 
                         try:
+                            # MCTS leaf tensors scale with the number of live
+                            # roots.  The flat-policy PPO stage has just used
+                            # CUDA heavily, so release its cached blocks before
+                            # starting the deliberately smaller search batch.
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
                             distillation_mcts = replace(
                                 mcts,
                                 simulations=flat_mcts_distill_simulations,
@@ -2301,6 +2317,7 @@ def train_promotion_league(
                                 replace(
                                     round_training,
                                     seed=flat_mcts_distill_training_seed,
+                                    max_moves=flat_mcts_distill_max_moves,
                                 ),
                                 model_config,
                                 distillation_mcts,
@@ -2331,7 +2348,9 @@ def train_promotion_league(
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
-                                max_envs=num_envs,
+                                max_envs=min(
+                                    num_envs, flat_mcts_distill_max_envs
+                                ),
                                 game_callback=(
                                     record_flat_distillation_game
                                 ),
@@ -2397,6 +2416,10 @@ def train_promotion_league(
                                 "league flat MCTS distillation | "
                                 f"before={float(distillation_decision['before_score']):.4f} | "
                                 f"after={float(distillation_decision['after_score']):.4f} | "
+                                "critical="
+                                f"{int(distillation_training.get('population_pool_critical_mcts_decisions', 0.0))} | "
+                                "critical_mean="
+                                f"{float(distillation_training.get('population_pool_critical_mcts_mean_score', 0.0)):.4f} | "
                                 f"accepted={int(accepted_distillation)}",
                                 flush=True,
                             )

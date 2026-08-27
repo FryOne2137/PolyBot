@@ -414,6 +414,10 @@ def train_promotion_league(
     direct_population_steps: int = 0,
     direct_population_max_steps: int = 10_000,
     direct_population_block_steps: int = 1_000,
+    direct_population_branch_count: int = 1,
+    direct_population_branch_steps: int = 2_000,
+    direct_population_branch_gate_games: int = 20,
+    direct_population_branch_min_champion_score: float = 0.50,
     direct_population_gate_games: int = 100,
     direct_population_diagnostic_gate_games: int = 20,
     direct_population_gate_score: float = 0.50,
@@ -788,6 +792,22 @@ def train_promotion_league(
         raise ValueError(
             "direct_population_max_steps must not be smaller than its minimum"
         )
+    if direct_population_branch_count < 1:
+        raise ValueError("direct_population_branch_count must be positive")
+    if direct_population_branch_count > 1:
+        if direct_population_branch_steps < 1:
+            raise ValueError("direct_population_branch_steps must be positive")
+        if (
+            direct_population_branch_gate_games < 2
+            or direct_population_branch_gate_games % 2
+        ):
+            raise ValueError(
+                "direct_population_branch_gate_games must be positive and even"
+            )
+    if not 0.0 <= direct_population_branch_min_champion_score <= 1.0:
+        raise ValueError(
+            "direct_population_branch_min_champion_score must be between zero and one"
+        )
     if post_bootstrap_population_steps < 0:
         raise ValueError("post_bootstrap_population_steps must not be negative")
     if post_bootstrap_population_max_steps < post_bootstrap_population_steps:
@@ -932,6 +952,12 @@ def train_promotion_league(
         "direct_population_steps": direct_population_steps,
         "direct_population_max_steps": direct_population_max_steps,
         "direct_population_block_steps": direct_population_block_steps,
+        "direct_population_branch_count": direct_population_branch_count,
+        "direct_population_branch_steps": direct_population_branch_steps,
+        "direct_population_branch_gate_games": direct_population_branch_gate_games,
+        "direct_population_branch_min_champion_score": (
+            direct_population_branch_min_champion_score
+        ),
         "direct_population_gate_games": direct_population_gate_games,
         "direct_population_diagnostic_gate_games": (
             direct_population_diagnostic_gate_games
@@ -1198,11 +1224,27 @@ def train_promotion_league(
                     )
                     previous_challenger_path = challenger_path
                     previous_challenger_id = challenger_id
-                    candidate_source = previous_challenger_path or champion_path
-                    candidate_parent_id = previous_challenger_id or champion_id
+                    # Independent branch selection deliberately starts every
+                    # round from the frozen champion.  A merely safe
+                    # challenger (for example 0.46 against the champion) is
+                    # not allowed to drift further away for the next round.
+                    fresh_branch_round = direct_population_branch_count > 1
+                    candidate_source = (
+                        champion_path
+                        if fresh_branch_round
+                        else previous_challenger_path or champion_path
+                    )
+                    candidate_parent_id = (
+                        champion_id
+                        if fresh_branch_round
+                        else previous_challenger_id or champion_id
+                    )
                     candidate_source_kind = (
                         "challenger"
-                        if previous_challenger_path is not None
+                        if (
+                            previous_challenger_path is not None
+                            and not fresh_branch_round
+                        )
                         else "champion"
                     )
                     candidate_evaluation_label = (
@@ -1700,32 +1742,89 @@ def train_promotion_league(
                                 game=row,
                             )
 
-                        direct_population_summary = (
-                            train_direct_population_curriculum(
+                        def train_population_stage(
+                            stage_candidate: PolicyValueBeliefNet,
+                            *,
+                            seed: int,
+                            minimum_steps: int,
+                            maximum_steps: int,
+                            gate_games: int,
+                            diagnostic_gate_games: int,
+                            gate_seed: int,
+                            stage_name: str,
+                            label: str,
+                        ) -> Dict[str, Any]:
+                            def record_stage_gate_game(
+                                stage: str,
+                                block: int,
+                                opponent_index: int,
+                                game: Mapping[str, Any],
+                            ) -> None:
+                                decorated = dict(game)
+                                decorated["curriculum_stage"] = stage
+                                decorated["curriculum_block"] = int(block)
+                                phase_prefix = (
+                                    "direct_population_gate"
+                                    if stage_name == "main"
+                                    else f"direct_population_{stage_name}_gate"
+                                )
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    phase=f"{phase_prefix}_{stage}_{block}",
+                                    model_a_id=candidate_id,
+                                    model_b_id=population_ids[opponent_index],
+                                    game=decorated,
+                                )
+
+                            def record_stage_training_game(
+                                block: int, game: Mapping[str, Any]
+                            ) -> None:
+                                opponent_index = int(
+                                    game.get("opponent_model_index", 0)
+                                )
+                                decorated = dict(game)
+                                decorated["curriculum_block"] = int(block)
+                                if stage_name != "main":
+                                    decorated["training_branch"] = stage_name
+                                phase_prefix = (
+                                    "direct_population_training"
+                                    if stage_name == "main"
+                                    else f"direct_population_{stage_name}_training"
+                                )
+                                database.record_match(
+                                    run_id=database_run_id,
+                                    round_id=round_id,
+                                    phase=f"{phase_prefix}_{block}",
+                                    model_a_id=candidate_id,
+                                    model_b_id=population_ids[opponent_index],
+                                    game=decorated,
+                                )
+
+                            return train_direct_population_curriculum(
                                 replace(
                                     round_training,
-                                    seed=direct_population_training_seed,
+                                    seed=seed,
                                     max_moves=direct_gate_max_moves,
                                 ),
                                 model_config,
-                                candidate,
+                                stage_candidate,
                                 champion,
                                 frozen_models,
                                 probabilities,
                                 num_envs=direct_population_envs,
-                                minimum_steps=effective_population_steps,
-                                maximum_steps=effective_population_max_steps,
-                                block_steps=direct_population_block_steps,
+                                minimum_steps=minimum_steps,
+                                maximum_steps=maximum_steps,
+                                block_steps=min(
+                                    direct_population_block_steps,
+                                    maximum_steps,
+                                ),
                                 num_threads=num_threads,
                                 max_actions=mcts.native_max_actions,
-                                visible_action_history=(
-                                    visible_action_history
-                                ),
-                                gate_games=direct_population_gate_games,
-                                diagnostic_gate_games=(
-                                    direct_population_diagnostic_gate_games
-                                ),
-                                gate_seed=direct_population_gate_seed,
+                                visible_action_history=visible_action_history,
+                                gate_games=gate_games,
+                                diagnostic_gate_games=diagnostic_gate_games,
+                                gate_seed=gate_seed,
                                 gate_score=direct_population_gate_score,
                                 historical_score_floor=(
                                     direct_population_historical_floor
@@ -1745,9 +1844,7 @@ def train_promotion_league(
                                 policy_anchor_weight=(
                                     effective_policy_anchor_weight
                                 ),
-                                value_anchor_weight=(
-                                    direct_value_anchor_weight
-                                ),
+                                value_anchor_weight=direct_value_anchor_weight,
                                 opponent_policy_weight=(
                                     effective_population_opponent_policy_weight
                                 ),
@@ -1795,9 +1892,7 @@ def train_promotion_league(
                                 ppo_min_learning_rate=(
                                     direct_population_ppo_min_learning_rate
                                 ),
-                                ppo_lr_backoff=(
-                                    direct_population_ppo_lr_backoff
-                                ),
+                                ppo_lr_backoff=direct_population_ppo_lr_backoff,
                                 objective_replay_horizon=(
                                     direct_population_objective_replay_horizon
                                 ),
@@ -1842,22 +1937,180 @@ def train_promotion_league(
                                 ),
                                 ema_enabled=direct_population_ema_enabled,
                                 ema_decay=direct_population_ema_decay,
-                                gate_game_callback=(
-                                    record_direct_population_gate_game
-                                ),
-                                training_game_callback=(
-                                    record_direct_population_training_game
-                                ),
-                                candidate_label=candidate_evaluation_label,
-                                opponent_labels=(
-                                    population_evaluation_labels
-                                ),
+                                gate_game_callback=record_stage_gate_game,
+                                training_game_callback=record_stage_training_game,
+                                candidate_label=label,
+                                opponent_labels=population_evaluation_labels,
                                 run=run.child(
                                     f"round_{round_index:03d}/"
-                                    "direct_population"
+                                    f"direct_population_{stage_name}"
                                 ),
                             )
-                        )
+
+                        branch_records: list[Dict[str, float | int | bool]] = []
+                        if direct_population_branch_count > 1:
+                            source_state = model_state_on_cpu(candidate)
+                            branch_winner: Dict[str, Any] | None = None
+                            for branch_index in range(
+                                direct_population_branch_count
+                            ):
+                                branch = PolicyValueBeliefNet(model_config).to(
+                                    device
+                                ).eval()
+                                restore_model_state(branch, source_state)
+                                branch_seed = _offset_seed(
+                                    direct_population_training_seed,
+                                    (branch_index + 1) * 1_500_007,
+                                )
+                                branch_summary = train_population_stage(
+                                    branch,
+                                    seed=branch_seed,
+                                    minimum_steps=direct_population_branch_steps,
+                                    maximum_steps=direct_population_branch_steps,
+                                    gate_games=direct_population_branch_gate_games,
+                                    diagnostic_gate_games=(
+                                        direct_population_branch_gate_games
+                                    ),
+                                    gate_seed=_offset_seed(
+                                        direct_population_gate_seed,
+                                        (branch_index + 1) * 10_000_019,
+                                    ),
+                                    stage_name=f"branch_{branch_index + 1:02d}",
+                                    label=(
+                                        f"{candidate_evaluation_label} "
+                                        f"branch-{branch_index + 1}"
+                                    ),
+                                )
+                                champion_match = evaluate_direct_population_matches(
+                                    replace(
+                                        round_training,
+                                        seed=branch_seed,
+                                        max_moves=direct_gate_max_moves,
+                                    ),
+                                    branch,
+                                    [champion],
+                                    [1.0],
+                                    games=direct_population_branch_gate_games,
+                                    gate_seed=_offset_seed(
+                                        direct_population_gate_seed,
+                                        900_000_001 + branch_index,
+                                    ),
+                                    visible_action_history=(
+                                        visible_action_history
+                                    ),
+                                    candidate_label=(
+                                        f"{candidate_evaluation_label} "
+                                        f"branch-{branch_index + 1}"
+                                    ),
+                                    opponent_labels=[champion_path.stem],
+                                    num_threads=num_threads,
+                                    max_actions=mcts.native_max_actions,
+                                )
+                                champion_score = float(
+                                    champion_match["model_a_score"]
+                                )
+                                population_branch_score = float(
+                                    branch_summary[
+                                        "direct_population_full_gate_score"
+                                    ]
+                                )
+                                eligible = bool(
+                                    branch_summary[
+                                        "direct_population_full_gate_selected"
+                                    ]
+                                ) and (
+                                    champion_score
+                                    >= direct_population_branch_min_champion_score
+                                )
+                                record = {
+                                    "branch": branch_index + 1,
+                                    "champion_score": champion_score,
+                                    "population_score": population_branch_score,
+                                    "eligible": eligible,
+                                }
+                                branch_records.append(record)
+                                print(
+                                    "league branch "
+                                    f"{branch_index + 1}/"
+                                    f"{direct_population_branch_count} | "
+                                    f"champion={champion_score:.4f} | "
+                                    f"population={population_branch_score:.4f} | "
+                                    f"eligible={int(eligible)}",
+                                    flush=True,
+                                )
+                                if eligible and (
+                                    branch_winner is None
+                                    or (
+                                        champion_score,
+                                        population_branch_score,
+                                    )
+                                    > (
+                                        branch_winner["champion_score"],
+                                        branch_winner["population_score"],
+                                    )
+                                ):
+                                    branch_winner = {
+                                        "state": model_state_on_cpu(branch),
+                                        "branch": branch_index + 1,
+                                        "champion_score": champion_score,
+                                        "population_score": population_branch_score,
+                                    }
+                                del branch
+                            round_training_summary[
+                                "direct_population_branches"
+                            ] = branch_records
+                            if branch_winner is None:
+                                print(
+                                    "league branch selection | no branch met "
+                                    "the champion development floor; skipping "
+                                    "long PPO/PPG phase",
+                                    flush=True,
+                                )
+                                direct_population_summary = {
+                                    "direct_population_branch_selected": 0.0,
+                                    "direct_population_full_gate_selected": 0.0,
+                                }
+                            else:
+                                restore_model_state(candidate, branch_winner["state"])
+                                print(
+                                    "league branch selection | winner="
+                                    f"{branch_winner['branch']} | champion="
+                                    f"{branch_winner['champion_score']:.4f} | "
+                                    "starting long PPO/PPG phase",
+                                    flush=True,
+                                )
+                                direct_population_summary = train_population_stage(
+                                    candidate,
+                                    seed=direct_population_training_seed,
+                                    minimum_steps=effective_population_steps,
+                                    maximum_steps=(
+                                        effective_population_max_steps
+                                    ),
+                                    gate_games=direct_population_gate_games,
+                                    diagnostic_gate_games=(
+                                        direct_population_diagnostic_gate_games
+                                    ),
+                                    gate_seed=direct_population_gate_seed,
+                                    stage_name="main",
+                                    label=candidate_evaluation_label,
+                                )
+                                direct_population_summary[
+                                    "direct_population_branch_selected"
+                                ] = float(branch_winner["branch"])
+                        else:
+                            direct_population_summary = train_population_stage(
+                                candidate,
+                                seed=direct_population_training_seed,
+                                minimum_steps=effective_population_steps,
+                                maximum_steps=effective_population_max_steps,
+                                gate_games=direct_population_gate_games,
+                                diagnostic_gate_games=(
+                                    direct_population_diagnostic_gate_games
+                                ),
+                                gate_seed=direct_population_gate_seed,
+                                stage_name="main",
+                                label=candidate_evaluation_label,
+                            )
                         direct_population_main_summary = dict(
                             direct_population_summary
                         )
@@ -2582,18 +2835,22 @@ def train_promotion_league(
                         )
                         flat_promoted = bool(decision["promoted"])
                         promoted = flat_promoted
-                        continuation_action = _challenger_continuation_action(
-                            valid=not flat_invalid,
-                            candidate_score=last_candidate_score,
-                            population_score=last_population_score,
-                            minimum_historical_score=(
-                                minimum_historical_score
-                            ),
-                            historical_score_floor=historical_score_floor,
-                            has_previous_challenger=(
-                                previous_challenger_path is not None
-                                and previous_challenger_id is not None
-                            ),
+                        continuation_action = (
+                            "none"
+                            if fresh_branch_round
+                            else _challenger_continuation_action(
+                                valid=not flat_invalid,
+                                candidate_score=last_candidate_score,
+                                population_score=last_population_score,
+                                minimum_historical_score=(
+                                    minimum_historical_score
+                                ),
+                                historical_score_floor=historical_score_floor,
+                                has_previous_challenger=(
+                                    previous_challenger_path is not None
+                                    and previous_challenger_id is not None
+                                ),
+                            )
                         )
                         retain_challenger = continuation_action == "candidate"
                         continue_previous_challenger = (

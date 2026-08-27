@@ -148,6 +148,22 @@ def main() -> None:
         "--direct-population-block-steps", type=int, default=1_000,
     )
     parser.add_argument(
+        "--direct-population-branch-count", type=int, default=1,
+        help="Independent short PPO/PPG candidates started from the champion before the long phase",
+    )
+    parser.add_argument(
+        "--direct-population-branch-steps", type=int, default=2_000,
+        help="PPO/PPG steps for each short candidate branch",
+    )
+    parser.add_argument(
+        "--direct-population-branch-gate-games", type=int, default=20,
+        help="Paired held-out games against the champion used to select a branch",
+    )
+    parser.add_argument(
+        "--direct-population-branch-min-champion-score", type=float, default=0.50,
+        help="Minimum short-gate score versus the champion required before long training",
+    )
+    parser.add_argument(
         "--direct-population-gate-games", type=int, default=100,
         help="Paired games per population checkpoint selection gate",
     )
@@ -575,6 +591,14 @@ def main() -> None:
         direct_population_steps=args.direct_population_steps,
         direct_population_max_steps=args.direct_population_max_steps,
         direct_population_block_steps=args.direct_population_block_steps,
+        direct_population_branch_count=args.direct_population_branch_count,
+        direct_population_branch_steps=args.direct_population_branch_steps,
+        direct_population_branch_gate_games=(
+            args.direct_population_branch_gate_games
+        ),
+        direct_population_branch_min_champion_score=(
+            args.direct_population_branch_min_champion_score
+        ),
         direct_population_gate_games=args.direct_population_gate_games,
         direct_population_diagnostic_gate_games=(
             args.direct_population_diagnostic_gate_games

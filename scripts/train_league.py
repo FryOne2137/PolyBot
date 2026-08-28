@@ -82,6 +82,24 @@ def main() -> None:
         default=True,
         help="Freeze the model while one full MCTS generation is collected, then train from that fixed replay",
     )
+    parser.add_argument(
+        "--population-mcts-critical-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train MCTS generations only on high-confidence decisions that disagree with raw policy",
+    )
+    parser.add_argument(
+        "--population-mcts-critical-fraction", type=float, default=0.25,
+        help="Maximum fraction of each MCTS root batch retained as confident targets",
+    )
+    parser.add_argument(
+        "--population-mcts-critical-minimum-score", type=float, default=0.25,
+        help="Minimum MCTS-vs-raw disagreement confidence for a retained target",
+    )
+    parser.add_argument(
+        "--population-mcts-critical-replay-fraction", type=float, default=1.0,
+        help="Replay share reserved for retained MCTS decisions",
+    )
     parser.add_argument("--pfsp-alpha", type=float, default=2.0)
     parser.add_argument("--champion-probability", type=float, default=0.40)
     parser.add_argument("--minimum-sampling-probability", type=float, default=0.05)
@@ -562,6 +580,16 @@ def main() -> None:
         population_workers=args.population_workers,
         population_max_envs=args.population_max_envs,
         population_offline_collection=args.population_offline_collection,
+        population_mcts_critical_only=args.population_mcts_critical_only,
+        population_mcts_critical_fraction=(
+            args.population_mcts_critical_fraction
+        ),
+        population_mcts_critical_minimum_score=(
+            args.population_mcts_critical_minimum_score
+        ),
+        population_mcts_critical_replay_fraction=(
+            args.population_mcts_critical_replay_fraction
+        ),
         pfsp_alpha=args.pfsp_alpha,
         champion_probability=args.champion_probability,
         minimum_sampling_probability=args.minimum_sampling_probability,

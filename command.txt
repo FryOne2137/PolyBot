@@ -285,8 +285,9 @@ python scripts/train_league.py `
 python scripts/league_report.py `
   --league-db models\league\league.sqlite3
 
-# 5a. Główny trening z celami MCTS (zamiast PPO/PPG). Każdy ruch kandydata
-# dostaje policy target z rozkładu odwiedzin drzewa oraz value target z wyniku
+# 5a. Selektywna destylacja MCTS. Pełne polityki drzewa przy 64 symulacjach są
+# zbyt rozproszone na mapie z dużą liczbą ruchów, dlatego do replayu trafiają
+# wyłącznie pewne decyzje MCTS różniące się od raw policy. Value target to wynik
 # partii. Najpierw cała generacja jest zbierana zamrożonym modelem, a dopiero
 # potem model uczy się z nieruchomego replayu. Rung jest zachowywany tylko wtedy, gdy search i płaska polityka nie
 # pogorszą się na niezależnych mapach. 64 symulacje i 16 równoległych gier są
@@ -299,10 +300,14 @@ python scripts/train_league.py `
   --league-db models\league\league.sqlite3 `
   --population-size 6 `
   --population-games 24 `
-  --population-updates-per-game 6 `
+  --population-updates-per-game 1 `
   --population-workers 16 `
   --population-max-envs 16 `
   --population-offline-collection `
+  --population-mcts-critical-only `
+  --population-mcts-critical-fraction 0.25 `
+  --population-mcts-critical-minimum-score 0.25 `
+  --population-mcts-critical-replay-fraction 1.0 `
   --pfsp-alpha 2.0 `
   --champion-probability 0.40 `
   --minimum-sampling-probability 0.05 `

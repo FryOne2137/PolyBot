@@ -1455,6 +1455,7 @@ def train_population_pool(
     critical_decision_fraction: float = 0.0,
     critical_minimum_score: float = 0.15,
     critical_replay_fraction: float = 0.0,
+    critical_only: bool = False,
     offline_collection: bool = False,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
@@ -1490,6 +1491,10 @@ def train_population_pool(
         raise ValueError("critical_minimum_score must be non-negative")
     if not 0.0 <= critical_replay_fraction <= 1.0:
         raise ValueError("critical_replay_fraction must be between zero and one")
+    if critical_only and critical_decision_fraction <= 0.0:
+        raise ValueError(
+            "critical_only requires a positive critical_decision_fraction"
+        )
     if anchor_model is candidate:
         raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
     if training.max_replay_epochs <= 0.0:
@@ -1521,6 +1526,7 @@ def train_population_pool(
             "critical_decision_fraction": critical_decision_fraction,
             "critical_minimum_score": critical_minimum_score,
             "critical_replay_fraction": critical_replay_fraction,
+            "critical_only": critical_only,
             "offline_collection": offline_collection,
         },
     )
@@ -1559,6 +1565,7 @@ def train_population_pool(
     anchor_l1_sum = 0.0
     critical_decisions = 0
     critical_score_sum = 0.0
+    discarded_noncritical_examples = 0
     total_moves = 0
     score_sum = 0.0
     opponent_stats = [
@@ -1649,6 +1656,16 @@ def train_population_pool(
                     finished = _finish_trajectory(
                         trajectories[env], value_target_training, exact
                     )
+                    if critical_only:
+                        original_count = len(finished)
+                        finished = [
+                            example
+                            for example in finished
+                            if example.critical_priority
+                        ]
+                        discarded_noncritical_examples += (
+                            original_count - len(finished)
+                        )
                     replay.extend(finished)
                     examples_count += len(finished)
                     trajectories[env].clear()
@@ -1693,6 +1710,16 @@ def train_population_pool(
                         finished = _finish_trajectory(
                             trajectories[int(env)], value_target_training, None
                         )
+                        if critical_only:
+                            original_count = len(finished)
+                            finished = [
+                                example
+                                for example in finished
+                                if example.critical_priority
+                            ]
+                            discarded_noncritical_examples += (
+                                original_count - len(finished)
+                            )
                         replay.extend(finished)
                         examples_count += len(finished)
                         trajectories[int(env)].clear()
@@ -1904,6 +1931,8 @@ def train_population_pool(
                     critical_score_sum / max(1, critical_decisions)
                 ),
                 critical_mcts_replay_fraction=critical_replay_fraction,
+                critical_mcts_only=float(critical_only),
+                discarded_noncritical_examples=discarded_noncritical_examples,
                 mean_score=score_sum / max(1, completed_count),
                 belief_rejected_particles=search.counters.belief_rejected_particles,
                 belief_rejected_envs=search.counters.belief_rejected_envs,
@@ -1957,6 +1986,10 @@ def train_population_pool(
         ),
         "population_pool_critical_mcts_replay_fraction": float(
             critical_replay_fraction
+        ),
+        "population_pool_critical_only": float(critical_only),
+        "population_pool_discarded_noncritical_examples": float(
+            discarded_noncritical_examples
         ),
         "population_pool_critical_mcts_selection_fraction": float(
             critical_decision_fraction

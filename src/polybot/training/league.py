@@ -311,6 +311,10 @@ def _validate_options(
     population_updates_per_game: int,
     population_workers: int,
     population_max_envs: int,
+    population_mcts_critical_only: bool,
+    population_mcts_critical_fraction: float,
+    population_mcts_critical_minimum_score: float,
+    population_mcts_critical_replay_fraction: float,
     pfsp_alpha: float,
     champion_probability: float,
     minimum_sampling_probability: float,
@@ -342,6 +346,22 @@ def _validate_options(
         raise ValueError("population_workers must be positive")
     if population_max_envs < 1:
         raise ValueError("population_max_envs must be positive")
+    if not 0.0 <= population_mcts_critical_fraction <= 1.0:
+        raise ValueError(
+            "population_mcts_critical_fraction must be between zero and one"
+        )
+    if population_mcts_critical_minimum_score < 0.0:
+        raise ValueError(
+            "population_mcts_critical_minimum_score must be non-negative"
+        )
+    if not 0.0 <= population_mcts_critical_replay_fraction <= 1.0:
+        raise ValueError(
+            "population_mcts_critical_replay_fraction must be between zero and one"
+        )
+    if population_mcts_critical_only and population_mcts_critical_fraction <= 0.0:
+        raise ValueError(
+            "population_mcts_critical_only requires positive critical fraction"
+        )
     if pfsp_alpha <= 0.0:
         raise ValueError("pfsp_alpha must be positive")
     if elo_k <= 0.0:
@@ -382,6 +402,10 @@ def train_promotion_league(
     population_workers: int = 16,
     population_max_envs: int = 16,
     population_offline_collection: bool = True,
+    population_mcts_critical_only: bool = True,
+    population_mcts_critical_fraction: float = 0.25,
+    population_mcts_critical_minimum_score: float = 0.25,
+    population_mcts_critical_replay_fraction: float = 1.0,
     pfsp_alpha: float = 2.0,
     champion_probability: float = 0.40,
     minimum_sampling_probability: float = 0.05,
@@ -525,6 +549,14 @@ def train_promotion_league(
         population_updates_per_game=population_updates_per_game,
         population_workers=population_workers,
         population_max_envs=population_max_envs,
+        population_mcts_critical_only=population_mcts_critical_only,
+        population_mcts_critical_fraction=population_mcts_critical_fraction,
+        population_mcts_critical_minimum_score=(
+            population_mcts_critical_minimum_score
+        ),
+        population_mcts_critical_replay_fraction=(
+            population_mcts_critical_replay_fraction
+        ),
         pfsp_alpha=pfsp_alpha,
         champion_probability=champion_probability,
         minimum_sampling_probability=minimum_sampling_probability,
@@ -912,6 +944,14 @@ def train_promotion_league(
         "population_workers": population_workers,
         "population_max_envs": population_max_envs,
         "population_offline_collection": population_offline_collection,
+        "population_mcts_critical_only": population_mcts_critical_only,
+        "population_mcts_critical_fraction": population_mcts_critical_fraction,
+        "population_mcts_critical_minimum_score": (
+            population_mcts_critical_minimum_score
+        ),
+        "population_mcts_critical_replay_fraction": (
+            population_mcts_critical_replay_fraction
+        ),
         "pfsp_alpha": pfsp_alpha,
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
@@ -3463,6 +3503,16 @@ def train_promotion_league(
                                 anchor_model=champion,
                                 anchor_policy_weight=champion_anchor_weight,
                                 anchor_value_weight=champion_value_anchor_weight,
+                                critical_decision_fraction=(
+                                    population_mcts_critical_fraction
+                                ),
+                                critical_minimum_score=(
+                                    population_mcts_critical_minimum_score
+                                ),
+                                critical_replay_fraction=(
+                                    population_mcts_critical_replay_fraction
+                                ),
+                                critical_only=population_mcts_critical_only,
                                 num_threads=population_workers,
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,

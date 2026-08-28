@@ -100,6 +100,22 @@ def main() -> None:
         "--population-mcts-critical-replay-fraction", type=float, default=1.0,
         help="Replay share reserved for retained MCTS decisions",
     )
+    parser.add_argument(
+        "--population-mcts-reanalyse-path", type=Path,
+        help="Persistent critical MCTS positions (default: <checkpoint-dir>/mcts-reanalyse.pkl)",
+    )
+    parser.add_argument(
+        "--population-mcts-reanalyse-capacity", type=int, default=4096,
+        help="Maximum durable critical MCTS positions retained between league runs",
+    )
+    parser.add_argument(
+        "--population-mcts-reanalyse-positions", type=int, default=8,
+        help="Old positions re-searched by the current candidate before each MCTS generation",
+    )
+    parser.add_argument(
+        "--population-mcts-reanalyse-replay-fraction", type=float, default=0.50,
+        help="Minimum replay-batch share reserved for freshly reanalysed positions",
+    )
     parser.add_argument("--pfsp-alpha", type=float, default=2.0)
     parser.add_argument("--champion-probability", type=float, default=0.40)
     parser.add_argument("--minimum-sampling-probability", type=float, default=0.05)
@@ -589,6 +605,16 @@ def main() -> None:
         ),
         population_mcts_critical_replay_fraction=(
             args.population_mcts_critical_replay_fraction
+        ),
+        population_mcts_reanalyse_path=args.population_mcts_reanalyse_path,
+        population_mcts_reanalyse_capacity=(
+            args.population_mcts_reanalyse_capacity
+        ),
+        population_mcts_reanalyse_positions=(
+            args.population_mcts_reanalyse_positions
+        ),
+        population_mcts_reanalyse_replay_fraction=(
+            args.population_mcts_reanalyse_replay_fraction
         ),
         pfsp_alpha=args.pfsp_alpha,
         champion_probability=args.champion_probability,

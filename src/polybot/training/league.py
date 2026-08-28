@@ -315,6 +315,9 @@ def _validate_options(
     population_mcts_critical_fraction: float,
     population_mcts_critical_minimum_score: float,
     population_mcts_critical_replay_fraction: float,
+    population_mcts_reanalyse_capacity: int,
+    population_mcts_reanalyse_positions: int,
+    population_mcts_reanalyse_replay_fraction: float,
     pfsp_alpha: float,
     champion_probability: float,
     minimum_sampling_probability: float,
@@ -362,6 +365,14 @@ def _validate_options(
         raise ValueError(
             "population_mcts_critical_only requires positive critical fraction"
         )
+    if population_mcts_reanalyse_capacity < 1:
+        raise ValueError("population_mcts_reanalyse_capacity must be positive")
+    if population_mcts_reanalyse_positions < 0:
+        raise ValueError("population_mcts_reanalyse_positions must not be negative")
+    if not 0.0 <= population_mcts_reanalyse_replay_fraction <= 1.0:
+        raise ValueError(
+            "population_mcts_reanalyse_replay_fraction must be between zero and one"
+        )
     if pfsp_alpha <= 0.0:
         raise ValueError("pfsp_alpha must be positive")
     if elo_k <= 0.0:
@@ -406,6 +417,10 @@ def train_promotion_league(
     population_mcts_critical_fraction: float = 0.25,
     population_mcts_critical_minimum_score: float = 0.25,
     population_mcts_critical_replay_fraction: float = 1.0,
+    population_mcts_reanalyse_path: Path | None = None,
+    population_mcts_reanalyse_capacity: int = 4_096,
+    population_mcts_reanalyse_positions: int = 8,
+    population_mcts_reanalyse_replay_fraction: float = 0.50,
     pfsp_alpha: float = 2.0,
     champion_probability: float = 0.40,
     minimum_sampling_probability: float = 0.05,
@@ -556,6 +571,11 @@ def train_promotion_league(
         ),
         population_mcts_critical_replay_fraction=(
             population_mcts_critical_replay_fraction
+        ),
+        population_mcts_reanalyse_capacity=population_mcts_reanalyse_capacity,
+        population_mcts_reanalyse_positions=population_mcts_reanalyse_positions,
+        population_mcts_reanalyse_replay_fraction=(
+            population_mcts_reanalyse_replay_fraction
         ),
         pfsp_alpha=pfsp_alpha,
         champion_probability=champion_probability,
@@ -910,6 +930,11 @@ def train_promotion_league(
             raise FileNotFoundError(f"population checkpoint does not exist: {path}")
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    population_mcts_reanalyse_path = (
+        population_mcts_reanalyse_path
+        if population_mcts_reanalyse_path is not None
+        else checkpoint_dir / "mcts-reanalyse.pkl"
+    )
     database_path = database_path or checkpoint_dir / "league.sqlite3"
     resolved_evaluation_seed = _offset_seed(evaluation_seed, 0)
     device = select_device(training.device)
@@ -951,6 +976,12 @@ def train_promotion_league(
         ),
         "population_mcts_critical_replay_fraction": (
             population_mcts_critical_replay_fraction
+        ),
+        "population_mcts_reanalyse_path": population_mcts_reanalyse_path,
+        "population_mcts_reanalyse_capacity": population_mcts_reanalyse_capacity,
+        "population_mcts_reanalyse_positions": population_mcts_reanalyse_positions,
+        "population_mcts_reanalyse_replay_fraction": (
+            population_mcts_reanalyse_replay_fraction
         ),
         "pfsp_alpha": pfsp_alpha,
         "champion_probability": champion_probability,
@@ -2648,6 +2679,17 @@ def train_promotion_league(
                                 critical_replay_fraction=(
                                     flat_mcts_distill_critical_replay_fraction
                                 ),
+                                critical_only=True,
+                                reanalysis_path=population_mcts_reanalyse_path,
+                                reanalysis_capacity=(
+                                    population_mcts_reanalyse_capacity
+                                ),
+                                reanalysis_positions=(
+                                    population_mcts_reanalyse_positions
+                                ),
+                                reanalysis_replay_fraction=(
+                                    population_mcts_reanalyse_replay_fraction
+                                ),
                                 num_threads=population_workers,
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
@@ -2655,6 +2697,7 @@ def train_promotion_league(
                                 max_envs=min(
                                     num_envs, flat_mcts_distill_max_envs
                                 ),
+                                offline_collection=True,
                                 game_callback=(
                                     record_flat_distillation_game
                                 ),
@@ -3513,6 +3556,16 @@ def train_promotion_league(
                                     population_mcts_critical_replay_fraction
                                 ),
                                 critical_only=population_mcts_critical_only,
+                                reanalysis_path=population_mcts_reanalyse_path,
+                                reanalysis_capacity=(
+                                    population_mcts_reanalyse_capacity
+                                ),
+                                reanalysis_positions=(
+                                    population_mcts_reanalyse_positions
+                                ),
+                                reanalysis_replay_fraction=(
+                                    population_mcts_reanalyse_replay_fraction
+                                ),
                                 num_threads=population_workers,
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,

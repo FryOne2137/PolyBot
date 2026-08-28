@@ -140,9 +140,15 @@ python scripts/evaluate.py `
 # krótkie gałęzie PPO/PPG. Tylko gałąź, która na osobnych mapach osiągnie
 # co najmniej remis z championem, dostaje długi etap 12000-18000 kroków oraz
 # pełną bramkę awansu. Słaby challenger nie jest już kontynuowany między
-# rundami. MCTS i wolny exploiter są wyłączone: dotąd nie dawały stabilnego
-# wzrostu płaskiej polityki. --direct-gate-max-moves jest konieczny, bo ten
-# etap ma osobny limit ruchów niezależny od --max-moves.
+# rundami. Po PPO/PPG uruchamia się mała, selektywna destylacja MCTS: do nauki
+# trafiają wyłącznie pewne decyzje, z którymi raw policy się nie zgadza.
+# Krytyczne pozycje są trwałe w models\league\mcts-reanalyse.pkl; w kolejnych
+# rundach osiem z nich jest odtwarzanych z seeda i analizowanych ponownie przez
+# aktualny MCTS. Search używa próbki 32 najlepszych + 8 losowych legalnych akcji
+# oraz obowiązkowych ruchów taktycznych, zamiast rozmywać target po całej
+# przestrzeni. Bramka raw policy nadal cofa destylację, jeśli ta nie pomaga.
+# --direct-gate-max-moves jest konieczny, bo ten etap ma osobny limit ruchów
+# niezależny od --max-moves.
 python scripts/train_league.py `
   --champion-in models\league\champion-007.pt `
   --checkpoint-dir models\league `
@@ -235,7 +241,19 @@ python scripts/train_league.py `
   --post-bootstrap-champion-probability 0.65 `
   --post-bootstrap-policy-anchor-weight 0.20 `
   --champion-mode flat `
-  --flat-mcts-distill-games 0 `
+  --flat-mcts-distill-games 24 `
+  --flat-mcts-distill-simulations 32 `
+  --flat-mcts-distill-updates-per-game 1 `
+  --flat-mcts-distill-gate-games 20 `
+  --flat-mcts-distill-max-envs 16 `
+  --flat-mcts-distill-max-moves 1000 `
+  --flat-mcts-distill-critical-fraction 0.25 `
+  --flat-mcts-distill-critical-minimum-score 0.25 `
+  --flat-mcts-distill-critical-replay-fraction 1.0 `
+  --population-mcts-reanalyse-path models\league\mcts-reanalyse.pkl `
+  --population-mcts-reanalyse-capacity 4096 `
+  --population-mcts-reanalyse-positions 8 `
+  --population-mcts-reanalyse-replay-fraction 0.50 `
   --mcts-probe-games 0 `
   --mcts-probe-simulations 32 `
   --mcts-probe-score 0.55 `
@@ -262,8 +280,8 @@ python scripts/train_league.py `
   --simulations 32 `
   --particles 2 `
   --mcts-max-actions 1024 `
-  --mcts-top-actions 0 `
-  --mcts-random-actions 0 `
+  --mcts-top-actions 32 `
+  --mcts-random-actions 8 `
   --strategic-prior-weight 0.50 `
   --teacher-prior-weight 0.10 `
   --batch-size 64 `
@@ -285,7 +303,7 @@ python scripts/train_league.py `
 python scripts/league_report.py `
   --league-db models\league\league.sqlite3
 
-# 5a. Selektywna destylacja MCTS. Pełne polityki drzewa przy 64 symulacjach są
+# 5a. Historyczna drabina MCTS-only. Pełne polityki drzewa przy 64 symulacjach są
 # zbyt rozproszone na mapie z dużą liczbą ruchów, dlatego do replayu trafiają
 # wyłącznie pewne decyzje MCTS różniące się od raw policy. Value target to wynik
 # partii. Najpierw cała generacja jest zbierana zamrożonym modelem, a dopiero
@@ -293,6 +311,7 @@ python scripts/league_report.py `
 # pogorszą się na niezależnych mapach. 64 symulacje i 16 równoległych gier są
 # bezpiecznym punktem startowym dla GPU z 8 GB VRAM. Jeśli wystąpi OOM, zmień
 # wyłącznie --population-max-envs na 8. Nie uruchamiaj równolegle z blokiem 5.
+# Używaj bloku 5; ten wariant zostawiony jest wyłącznie do porównań historycznych.
 python scripts/train_league.py `
   --champion-in models\league\champion-007.pt `
   --checkpoint-dir models\league `

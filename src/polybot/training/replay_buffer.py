@@ -43,6 +43,10 @@ class TrainingExample:
     # to teach a strategically new move.
     critical_priority: bool = False
     critical_score: float = 0.0
+    # A retained critical position whose MCTS target was recomputed in a later
+    # league generation.  Sampling it explicitly lets expensive reanalysis
+    # influence more than one optimisation batch without dominating fresh data.
+    reanalysis_priority: bool = False
     # Frozen-champion value distillation is kept separate from the game/MCTS
     # target.  This lets the optimiser improve value estimates while limiting
     # catastrophic drift of the shared representation during a league rung.
@@ -66,6 +70,7 @@ class ReplayBuffer:
         priority_fraction: float = 0.0,
         bridge_fraction: float = 0.0,
         critical_fraction: float = 0.0,
+        reanalysis_fraction: float = 0.0,
     ) -> List[TrainingExample]:
         if len(self._examples) < batch_size:
             raise ValueError("not enough replay examples for this batch")
@@ -73,6 +78,7 @@ class ReplayBuffer:
         priority_count = int(round(batch_size * float(np.clip(priority_fraction, 0.0, 1.0))))
         bridge_count = int(round(batch_size * float(np.clip(bridge_fraction, 0.0, 1.0))))
         critical_count = int(round(batch_size * float(np.clip(critical_fraction, 0.0, 1.0))))
+        reanalysis_count = int(round(batch_size * float(np.clip(reanalysis_fraction, 0.0, 1.0))))
         priority_indices = np.asarray(
             [
                 index
@@ -93,12 +99,29 @@ class ReplayBuffer:
             ],
             dtype=np.int64,
         )
+        reanalysis_indices = np.asarray(
+            [
+                index
+                for index, row in enumerate(rows)
+                if row.reanalysis_priority
+            ],
+            dtype=np.int64,
+        )
         chosen: List[int] = []
-        if critical_indices.size:
-            count = min(critical_count, critical_indices.size, batch_size)
+        if reanalysis_indices.size:
+            count = min(reanalysis_count, reanalysis_indices.size, batch_size)
             chosen.extend(
                 int(index)
-                for index in rng.choice(critical_indices, size=count, replace=False)
+                for index in rng.choice(reanalysis_indices, size=count, replace=False)
+            )
+        if critical_indices.size:
+            available_critical = np.setdiff1d(
+                critical_indices, np.asarray(chosen, dtype=np.int64)
+            )
+            count = min(critical_count, available_critical.size, batch_size - len(chosen))
+            chosen.extend(
+                int(index)
+                for index in rng.choice(available_critical, size=count, replace=False)
             )
         if bridge_indices.size:
             available_bridge = np.setdiff1d(

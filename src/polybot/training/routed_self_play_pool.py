@@ -7,7 +7,9 @@ scatters neural outputs back to the original native order.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Sequence
 
 import numpy as np
@@ -19,6 +21,7 @@ from ..data.polyenv_features import native_batch_to_tensors, stack_examples
 from ..infrastructure.device import select_device
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..planning.belief_mcts import BeliefMCTS
 from ..planning.action_pruning import (
     ActionPruningStats,
     prune_search_logits,
@@ -38,6 +41,7 @@ from .belief_recovery import (
     replacement_seeds,
 )
 from .optimisation import train_batch
+from .persistent_reanalysis import PersistentReanalyseBuffer, ReanalysePosition
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .run_artifacts import TrainingRun
 from .self_play_pool_train import (
@@ -305,6 +309,98 @@ def _mark_critical_mcts_examples(
     for index in selected:
         examples[int(index)].critical_priority = True
     return int(selected.size), float(scores[selected].sum())
+
+
+def _reanalyse_critical_positions(
+    positions: Sequence[ReanalysePosition],
+    *,
+    candidate: PolicyValueBeliefNet,
+    training: TrainingConfig,
+    mcts: MCTSConfig,
+    device: torch.device,
+    minimum_score: float,
+) -> tuple[list[TrainingExample], int]:
+    """Refresh old MCTS targets by replaying their public game prefixes.
+
+    PolyEnv game states are not serialisable through ``SelfPlayPool``.  Its
+    scalar ``GameEnv`` is deterministic from map seed plus legal action ids,
+    however, so a retained critical position can be reconstructed exactly and
+    searched again by the current apprentice.  The terminal value target is
+    intentionally retained from the original completed game; only the stale
+    MCTS policy target is reanalysed.
+    """
+    if not positions:
+        return [], 0
+    try:
+        from PolyEnv import Bardur, GameEnv, Imperius
+    except ImportError as error:  # pragma: no cover - depends on local binding
+        raise RuntimeError("PolyEnv GameEnv is required for MCTS reanalysis") from error
+
+    planner = BeliefMCTS(
+        candidate,
+        device,
+        replace(mcts, temperature=0.0),
+        map_size=training.map_size,
+        map_type=training.map_type,
+    )
+    refreshed: list[TrainingExample] = []
+    failed = 0
+    candidate.eval()
+    for position in positions:
+        try:
+            env = GameEnv(
+                seed=int(position.map_seed),
+                map_size=int(training.map_size),
+                players=(Bardur, Imperius),
+                map_type=training.map_type,
+            )
+            for action_id in position.action_prefix:
+                result = env.step_fast(int(action_id))
+                if not bool(result[0]):
+                    raise RuntimeError("stored MCTS action was rejected during replay")
+            if env.is_done() or int(env.current_player()) != int(position.player_id):
+                raise RuntimeError("stored MCTS position no longer has its candidate turn")
+            decision = planner.decide(env)
+            previous = position.example
+            visits = np.asarray(decision.visit_counts, dtype=np.float32)
+            if visits.shape != previous.policy_target.shape:
+                raise RuntimeError("replayed MCTS action layout differs from retained target")
+            if float(visits.sum()) <= 0.0:
+                visits = np.asarray(decision.priors, dtype=np.float32)
+            visits /= max(float(visits.sum()), 1e-8)
+            tensors = stack_examples([previous], device)
+            with torch.inference_mode():
+                output = candidate(
+                    tensors.map_tokens,
+                    tensors.global_features,
+                    tensors.action_categorical,
+                    tensors.action_continuous,
+                    tensors.action_mask,
+                    tensors.event_features,
+                    action_history=tensors.action_history,
+                    action_history_mask=tensors.action_history_mask,
+                    include_belief=False,
+                )
+            raw = torch.softmax(
+                output.policy_logits[0, : visits.size].float(), dim=-1
+            ).cpu().numpy()
+            top = int(visits.argmax())
+            score = float(visits[top] * max(0.0, visits[top] - raw[top]))
+            if score < minimum_score or top == int(raw.argmax()):
+                continue
+            updated = copy.deepcopy(previous)
+            updated.policy_target = visits.astype(np.float32, copy=False)
+            updated.critical_priority = True
+            updated.critical_score = score
+            updated.reanalysis_priority = True
+            position.example = copy.deepcopy(updated)
+            position.refreshes += 1
+            refreshed.append(updated)
+        except Exception:
+            # One replay can become invalid after a PolyEnv action-id format
+            # change.  Keep the rest of the persistent buffer usable.
+            failed += 1
+    return refreshed, failed
 
 
 def _validate_agents(agent_ids: np.ndarray, model_count: int, label: str) -> None:
@@ -1456,6 +1552,10 @@ def train_population_pool(
     critical_minimum_score: float = 0.15,
     critical_replay_fraction: float = 0.0,
     critical_only: bool = False,
+    reanalysis_path: Path | None = None,
+    reanalysis_capacity: int = 4_096,
+    reanalysis_positions: int = 0,
+    reanalysis_replay_fraction: float = 0.0,
     offline_collection: bool = False,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
@@ -1491,6 +1591,14 @@ def train_population_pool(
         raise ValueError("critical_minimum_score must be non-negative")
     if not 0.0 <= critical_replay_fraction <= 1.0:
         raise ValueError("critical_replay_fraction must be between zero and one")
+    if reanalysis_capacity < 1:
+        raise ValueError("reanalysis_capacity must be positive")
+    if reanalysis_positions < 0:
+        raise ValueError("reanalysis_positions must not be negative")
+    if not 0.0 <= reanalysis_replay_fraction <= 1.0:
+        raise ValueError("reanalysis_replay_fraction must be between zero and one")
+    if reanalysis_positions and reanalysis_path is None:
+        raise ValueError("reanalysis_positions requires a persistent reanalysis_path")
     if critical_only and critical_decision_fraction <= 0.0:
         raise ValueError(
             "critical_only requires a positive critical_decision_fraction"
@@ -1527,6 +1635,10 @@ def train_population_pool(
             "critical_minimum_score": critical_minimum_score,
             "critical_replay_fraction": critical_replay_fraction,
             "critical_only": critical_only,
+            "reanalysis_path": str(reanalysis_path) if reanalysis_path else "",
+            "reanalysis_capacity": reanalysis_capacity,
+            "reanalysis_positions": reanalysis_positions,
+            "reanalysis_replay_fraction": reanalysis_replay_fraction,
             "offline_collection": offline_collection,
         },
     )
@@ -1553,12 +1665,31 @@ def train_population_pool(
     )
     replay = ReplayBuffer(training.replay_capacity)
     rng = np.random.default_rng(training.seed ^ 0x91A6E)
+    reanalysis_store = (
+        PersistentReanalyseBuffer(reanalysis_path, reanalysis_capacity)
+        if reanalysis_path is not None
+        else None
+    )
+    reanalysis_loaded = reanalysis_store.load() if reanalysis_store else 0
+    reanalysis_refreshed = 0
+    reanalysis_failed = 0
+    if reanalysis_store is not None and reanalysis_positions:
+        reanalysed, reanalysis_failed = _reanalyse_critical_positions(
+            reanalysis_store.sample(reanalysis_positions, rng),
+            candidate=candidate,
+            training=training,
+            mcts=mcts,
+            device=device,
+            minimum_score=critical_minimum_score,
+        )
+        replay.extend(reanalysed)
+        reanalysis_refreshed = len(reanalysed)
     losses: list[Dict[str, float]] = []
     updates = 0
     completed_count = 0
     terminal_count = 0
     truncated_count = 0
-    examples_count = 0
+    examples_count = reanalysis_refreshed
     decisions = 0
     anchor_decisions = 0
     anchor_agreements = 0
@@ -1576,6 +1707,7 @@ def train_population_pool(
     recovery_seed_cursor = 0
     reserved_seed_set = {int(value) for value in reserved_seeds}
     recovery_seed_history: set[int] = set()
+    new_reanalysis_positions: list[ReanalysePosition] = []
 
     def optimise_until(target: int) -> None:
         nonlocal updates
@@ -1592,6 +1724,7 @@ def train_population_pool(
                 training.priority_replay_fraction,
                 training.bridge_replay_fraction,
                 critical_replay_fraction,
+                reanalysis_replay_fraction,
             )
             losses.append(
                 train_batch(candidate, optimiser, stack_examples(batch, device), training)
@@ -1626,6 +1759,10 @@ def train_population_pool(
             request = search.reset(seeds, assignments)
             pending: list[tuple[TrainingExample | None, int, float] | None] = [None] * count
             trajectories: list[list[Transition]] = [[] for _ in range(count)]
+            action_prefixes: list[list[int]] = [[] for _ in range(count)]
+            critical_prefixes: list[dict[int, tuple[int, ...]]] = [
+                {} for _ in range(count)
+            ]
             done = np.zeros(count, dtype=bool)
             moves = np.zeros(count, dtype=np.int32)
             records: dict[int, Dict[str, Any]] = {}
@@ -1666,6 +1803,18 @@ def train_population_pool(
                         discarded_noncritical_examples += (
                             original_count - len(finished)
                         )
+                    if exact is not None:
+                        for example in finished:
+                            prefix = critical_prefixes[env].get(id(example))
+                            if prefix is not None:
+                                new_reanalysis_positions.append(
+                                    ReanalysePosition(
+                                        example=copy.deepcopy(example),
+                                        map_seed=int(seeds[env]),
+                                        action_prefix=prefix,
+                                        player_id=int(example.player_id),
+                                    )
+                                )
                     replay.extend(finished)
                     examples_count += len(finished)
                     trajectories[env].clear()
@@ -1723,6 +1872,8 @@ def train_population_pool(
                         replay.extend(finished)
                         examples_count += len(finished)
                         trajectories[int(env)].clear()
+                        action_prefixes[int(env)].clear()
+                        critical_prefixes[int(env)].clear()
                         pending[int(env)] = None
                         records.pop(int(env), None)
                     search.counters.belief_discarded_prefixes += discarded_prefixes
@@ -1858,6 +2009,10 @@ def train_population_pool(
                     for env, example in zip(candidate_rows, candidate_examples):
                         example.bootstrap_value = float(root_values[env])
                         examples_by_env[int(env)] = example
+                        if example.critical_priority:
+                            critical_prefixes[int(env)][id(example)] = tuple(
+                                action_prefixes[int(env)]
+                            )
                     decisions += len(candidate_examples)
                 rewards = (
                     np.zeros(active_rows.size, dtype=np.float32)
@@ -1879,6 +2034,8 @@ def train_population_pool(
                     np.asarray(root["state_id"], dtype=np.uint64),
                     request,
                 )
+                for env in active_rows:
+                    action_prefixes[int(env)].append(int(actions[int(env)]))
                 moves[active] += 1
                 vector_iteration += 1
                 if vector_iteration == 1 or vector_iteration % 25 == 0:
@@ -1933,6 +2090,12 @@ def train_population_pool(
                 critical_mcts_replay_fraction=critical_replay_fraction,
                 critical_mcts_only=float(critical_only),
                 discarded_noncritical_examples=discarded_noncritical_examples,
+                reanalysis_loaded=reanalysis_loaded,
+                reanalysis_refreshed=reanalysis_refreshed,
+                reanalysis_failed=reanalysis_failed,
+                reanalysis_buffer_size=(
+                    len(reanalysis_store.positions) if reanalysis_store else 0
+                ),
                 mean_score=score_sum / max(1, completed_count),
                 belief_rejected_particles=search.counters.belief_rejected_particles,
                 belief_rejected_envs=search.counters.belief_rejected_envs,
@@ -1960,6 +2123,9 @@ def train_population_pool(
             routing.add(search.counters)
 
     optimise_until(games * updates_per_game)
+    if reanalysis_store is not None:
+        reanalysis_store.extend(new_reanalysis_positions)
+        reanalysis_store.save()
     summary: Dict[str, float | str] = {
         "population_pool_games": float(games),
         "population_pool_terminals": float(terminal_count),
@@ -1995,6 +2161,13 @@ def train_population_pool(
             critical_decision_fraction
         ),
         "population_pool_offline_collection": float(offline_collection),
+        "population_pool_reanalysis_loaded": float(reanalysis_loaded),
+        "population_pool_reanalysis_refreshed": float(reanalysis_refreshed),
+        "population_pool_reanalysis_failed": float(reanalysis_failed),
+        "population_pool_reanalysis_saved": float(len(new_reanalysis_positions)),
+        "population_pool_reanalysis_buffer_size": float(
+            len(reanalysis_store.positions) if reanalysis_store else 0
+        ),
         "population_pool_score": float(score_sum / max(1, games)),
         "population_pool_mean_moves": float(total_moves / max(1, games)),
         "population_pool_leaf_rows": float(routing.leaf_rows),

@@ -381,6 +381,7 @@ def train_promotion_league(
     population_updates_per_game: int = 0,
     population_workers: int = 16,
     population_max_envs: int = 16,
+    population_offline_collection: bool = True,
     pfsp_alpha: float = 2.0,
     champion_probability: float = 0.40,
     minimum_sampling_probability: float = 0.05,
@@ -910,6 +911,7 @@ def train_promotion_league(
         "population_updates_per_game": population_updates_per_game,
         "population_workers": population_workers,
         "population_max_envs": population_max_envs,
+        "population_offline_collection": population_offline_collection,
         "pfsp_alpha": pfsp_alpha,
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
@@ -1234,7 +1236,10 @@ def train_promotion_league(
                     # round from the frozen champion.  A merely safe
                     # challenger (for example 0.46 against the champion) is
                     # not allowed to drift further away for the next round.
-                    fresh_branch_round = direct_population_branch_count > 1
+                    fresh_branch_round = (
+                        direct_population_branch_count > 1
+                        or champion_mode == "mcts"
+                    )
                     candidate_source = (
                         champion_path
                         if fresh_branch_round
@@ -3463,6 +3468,7 @@ def train_promotion_league(
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
                                 max_envs=min(num_envs, population_max_envs),
+                                offline_collection=population_offline_collection,
                                 game_callback=record_training_game,
                                 reserved_seeds=evaluation_map_seeds,
                                 run=run.child(
@@ -3660,30 +3666,16 @@ def train_promotion_league(
                     last_training = dict(round_training_summary)
 
                     if not completed_mcts_curriculum:
-                        retain_mcts_challenger = (
-                            best_raw_policy_score >= 0.50
-                            and best_raw_worst_score
-                            >= direct_population_historical_floor
-                            and best_raw_city_capture_rate
-                            >= direct_readiness_city_captures_per_game
-                            and best_raw_completion_rate
-                            >= direct_readiness_completion_rate
+                        # A failed MCTS generation is not evidence for a
+                        # useful challenger.  The rung has already restored
+                        # ``best_mcts_state``; discard the candidate instead
+                        # of serialising that rollback as a misleading new
+                        # challenger for the next generation.
+                        database.finalise_candidate(
+                            candidate_id, promoted_path=None
                         )
-                        if retain_mcts_challenger:
-                            retained_path = _next_checkpoint_path(
-                                checkpoint_dir,
-                                f"{checkpoint_prefix}-challenger",
-                            )
-                            save_model(retained_path, candidate, model_config)
-                            database.retain_candidate(candidate_id, retained_path)
-                            challenger_path = retained_path
-                            challenger_id = candidate_id
-                        else:
-                            database.finalise_candidate(
-                                candidate_id, promoted_path=None
-                            )
-                            challenger_path = None
-                            challenger_id = None
+                        challenger_path = None
+                        challenger_id = None
                         last_candidate_score = 0.0
                         last_population_score = 0.0
                         mcts_gate_summary = {
@@ -3699,9 +3691,7 @@ def train_promotion_league(
                             "mcts_ladder_required": float(
                                 expected_mcts_rungs
                             ),
-                            "retained_challenger": float(
-                                retain_mcts_challenger
-                            ),
+                            "retained_challenger": 0.0,
                             "reason": "mcts_curriculum_incomplete",
                         }
                         database.finish_round(
@@ -3714,9 +3704,7 @@ def train_promotion_league(
                         run.log(
                             round=round_index,
                             mcts_ready_for_promotion_gate=0.0,
-                            retained_challenger=float(
-                                retain_mcts_challenger
-                            ),
+                            retained_challenger=0.0,
                             promoted=0.0,
                             promotions=promotions,
                         )
@@ -3783,7 +3771,7 @@ def train_promotion_league(
                             max_pending_leaves=max_pending_leaves,
                             visible_action_history=visible_action_history,
                             belief_retries=belief_retries,
-                            max_envs=num_envs,
+                            max_envs=min(num_envs, population_max_envs),
                             game_callback=record_evaluation_game,
                             model_a_label=candidate_evaluation_label,
                             model_b_label=opponent_path.stem,

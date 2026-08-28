@@ -7,7 +7,7 @@ scatters neural outputs back to the original native order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Mapping, Sequence
 
 import numpy as np
@@ -1455,6 +1455,7 @@ def train_population_pool(
     critical_decision_fraction: float = 0.0,
     critical_minimum_score: float = 0.15,
     critical_replay_fraction: float = 0.0,
+    offline_collection: bool = False,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
@@ -1464,7 +1465,13 @@ def train_population_pool(
     reserved_seeds: Sequence[int] = (),
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
-    """Train candidate agent 0 against PFSP with frozen-policy retention."""
+    """Train candidate agent 0 against PFSP with frozen-policy retention.
+
+    When ``offline_collection`` is set, MCTS generates a complete fixed
+    generation before any optimiser step.  This is the stable policy-iteration
+    mode: every root target in the replay buffer comes from the same frozen
+    apprentice, rather than a network that changes game by game.
+    """
     if games < 0 or updates_per_game < 0:
         raise ValueError("games and updates_per_game must not be negative")
     if games == 0:
@@ -1514,7 +1521,18 @@ def train_population_pool(
             "critical_decision_fraction": critical_decision_fraction,
             "critical_minimum_score": critical_minimum_score,
             "critical_replay_fraction": critical_replay_fraction,
+            "offline_collection": offline_collection,
         },
+    )
+    value_target_training = (
+        replace(
+            training,
+            shaping_target_weight=0.0,
+            reward_discount=1.0,
+            td_lambda=1.0,
+        )
+        if offline_collection
+        else training
     )
     candidate.to(device)
     frozen = []
@@ -1628,7 +1646,9 @@ def train_population_pool(
                         if newly_terminal[env]
                         else None
                     )
-                    finished = _finish_trajectory(trajectories[env], training, exact)
+                    finished = _finish_trajectory(
+                        trajectories[env], value_target_training, exact
+                    )
                     replay.extend(finished)
                     examples_count += len(finished)
                     trajectories[env].clear()
@@ -1638,7 +1658,8 @@ def train_population_pool(
                         truncated_count += 1
                     else:
                         terminal_count += 1
-                    optimise_until(completed_count * updates_per_game)
+                    if not offline_collection:
+                        optimise_until(completed_count * updates_per_game)
                     progress.update(1)
                 active = ~done
                 if not active.any():
@@ -1669,7 +1690,9 @@ def train_population_pool(
                     discarded_prefixes = 0
                     for env in active_reset_rows:
                         discarded_prefixes += int(bool(trajectories[int(env)]))
-                        finished = _finish_trajectory(trajectories[int(env)], training, None)
+                        finished = _finish_trajectory(
+                            trajectories[int(env)], value_target_training, None
+                        )
                         replay.extend(finished)
                         examples_count += len(finished)
                         trajectories[int(env)].clear()
@@ -1703,7 +1726,8 @@ def train_population_pool(
                         belief_discarded_prefixes=search.counters.belief_discarded_prefixes,
                         belief_root_decisions=search.counters.root_env_decisions,
                     )
-                    optimise_until(completed_count * updates_per_game)
+                    if not offline_collection:
+                        optimise_until(completed_count * updates_per_game)
                     if recovery_rate_exceeded(
                         search.counters.belief_slot_resets,
                         search.counters.root_env_decisions,
@@ -1808,7 +1832,11 @@ def train_population_pool(
                         example.bootstrap_value = float(root_values[env])
                         examples_by_env[int(env)] = example
                     decisions += len(candidate_examples)
-                rewards = _dense_shaped_rewards(request, active_rows, action_rows)
+                rewards = (
+                    np.zeros(active_rows.size, dtype=np.float32)
+                    if offline_collection
+                    else _dense_shaped_rewards(request, active_rows, action_rows)
+                )
                 actors = np.asarray(request["to_play"], dtype=np.int32)
                 for offset, env in enumerate(active_rows):
                     example = examples_by_env.get(int(env))
@@ -1933,6 +1961,7 @@ def train_population_pool(
         "population_pool_critical_mcts_selection_fraction": float(
             critical_decision_fraction
         ),
+        "population_pool_offline_collection": float(offline_collection),
         "population_pool_score": float(score_sum / max(1, games)),
         "population_pool_mean_moves": float(total_moves / max(1, games)),
         "population_pool_leaf_rows": float(routing.leaf_rows),

@@ -76,6 +76,12 @@ def main() -> None:
         "--population-max-envs", type=int, default=16,
         help="Maximum concurrent MCTS games during population training; bounds CUDA memory",
     )
+    parser.add_argument(
+        "--population-offline-collection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze the model while one full MCTS generation is collected, then train from that fixed replay",
+    )
     parser.add_argument("--pfsp-alpha", type=float, default=2.0)
     parser.add_argument("--champion-probability", type=float, default=0.40)
     parser.add_argument("--minimum-sampling-probability", type=float, default=0.05)
@@ -555,6 +561,7 @@ def main() -> None:
         population_updates_per_game=args.population_updates_per_game,
         population_workers=args.population_workers,
         population_max_envs=args.population_max_envs,
+        population_offline_collection=args.population_offline_collection,
         pfsp_alpha=args.pfsp_alpha,
         champion_probability=args.champion_probability,
         minimum_sampling_probability=args.minimum_sampling_probability,

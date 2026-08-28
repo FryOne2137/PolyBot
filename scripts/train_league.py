@@ -72,6 +72,10 @@ def main() -> None:
         "--population-workers", type=int, default=16,
         help="Persistent native SelfPlayPool worker threads for population games",
     )
+    parser.add_argument(
+        "--population-max-envs", type=int, default=16,
+        help="Maximum concurrent MCTS games during population training; bounds CUDA memory",
+    )
     parser.add_argument("--pfsp-alpha", type=float, default=2.0)
     parser.add_argument("--champion-probability", type=float, default=0.40)
     parser.add_argument("--minimum-sampling-probability", type=float, default=0.05)
@@ -550,6 +554,7 @@ def main() -> None:
         population_games=args.population_games,
         population_updates_per_game=args.population_updates_per_game,
         population_workers=args.population_workers,
+        population_max_envs=args.population_max_envs,
         pfsp_alpha=args.pfsp_alpha,
         champion_probability=args.champion_probability,
         minimum_sampling_probability=args.minimum_sampling_probability,

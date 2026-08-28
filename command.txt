@@ -285,6 +285,76 @@ python scripts/train_league.py `
 python scripts/league_report.py `
   --league-db models\league\league.sqlite3
 
+# 5a. Główny trening z celami MCTS (zamiast PPO/PPG). Każdy ruch kandydata
+# dostaje policy target z rozkładu odwiedzin drzewa oraz value target z wyniku
+# partii. Rung jest zachowywany tylko wtedy, gdy search i płaska polityka nie
+# pogorszą się na niezależnych mapach. 64 symulacje i 16 równoległych gier są
+# bezpiecznym punktem startowym dla GPU z 8 GB VRAM. Jeśli wystąpi OOM, zmień
+# wyłącznie --population-max-envs na 8. Nie uruchamiaj równolegle z blokiem 5.
+python scripts/train_league.py `
+  --champion-in models\league\champion-007.pt `
+  --checkpoint-dir models\league `
+  --checkpoint-prefix champion `
+  --league-db models\league\league.sqlite3 `
+  --population-size 6 `
+  --population-games 24 `
+  --population-updates-per-game 6 `
+  --population-workers 16 `
+  --population-max-envs 16 `
+  --pfsp-alpha 2.0 `
+  --champion-probability 0.40 `
+  --minimum-sampling-probability 0.05 `
+  --champion-anchor-weight 0.10 `
+  --champion-value-anchor-weight 0.10 `
+  --direct-population-steps 0 `
+  --direct-population-max-steps 0 `
+  --post-bootstrap-population-steps 0 `
+  --post-bootstrap-population-max-steps 0 `
+  --champion-mode mcts `
+  --flat-mcts-distill-games 0 `
+  --mcts-probe-games 0 `
+  --mcts-simulation-ladder 64 `
+  --mcts-gate-games 20 `
+  --mcts-gate-score 0.50 `
+  --direct-population-gate-games 100 `
+  --direct-population-historical-floor 0.45 `
+  --rounds 8 `
+  --promotion-games 100 `
+  --promotion-score 0.55 `
+  --promotion-lower-bound 0.50 `
+  --historical-games 20 `
+  --population-score 0.52 `
+  --historical-score-floor 0.45 `
+  --evaluation-seed 1500000007 `
+  --evaluation-seed-stride 20000033 `
+  --round-seed-stride 10000019 `
+  --num-envs 128 `
+  --steps 0 `
+  --updates 0 `
+  --num-threads 16 `
+  --max-pending-leaves 8 `
+  --visible-action-history 32 `
+  --belief-retries 4 `
+  --simulations 64 `
+  --particles 2 `
+  --mcts-max-actions 1024 `
+  --mcts-top-actions 0 `
+  --mcts-random-actions 0 `
+  --strategic-prior-weight 0.50 `
+  --teacher-prior-weight 0.10 `
+  --batch-size 64 `
+  --replay-capacity 100000 `
+  --max-replay-epochs 3 `
+  --exploration-rate 0.10 `
+  --td-lambda 1.0 `
+  --learning-rate 2e-5 `
+  --max-moves 1000 `
+  --direct-gate-max-moves 1000 `
+  --map-size 11 `
+  --map-type lakes `
+  --seed 91337 `
+  --device cuda
+
 # 6. Zalecany bezpieczny upgrade teachera pełnym pipeline. Model wyjściowy
 # zostanie kandydatem tylko po wygraniu sparowanego testu; przy porażce nadal
 # będzie poprawnym checkpointem championa.

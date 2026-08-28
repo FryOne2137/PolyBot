@@ -310,6 +310,7 @@ def _validate_options(
     population_games: int,
     population_updates_per_game: int,
     population_workers: int,
+    population_max_envs: int,
     pfsp_alpha: float,
     champion_probability: float,
     minimum_sampling_probability: float,
@@ -339,6 +340,8 @@ def _validate_options(
         raise ValueError("population games and updates must not be negative")
     if population_games and population_workers < 1:
         raise ValueError("population_workers must be positive")
+    if population_max_envs < 1:
+        raise ValueError("population_max_envs must be positive")
     if pfsp_alpha <= 0.0:
         raise ValueError("pfsp_alpha must be positive")
     if elo_k <= 0.0:
@@ -377,6 +380,7 @@ def train_promotion_league(
     population_games: int = 0,
     population_updates_per_game: int = 0,
     population_workers: int = 16,
+    population_max_envs: int = 16,
     pfsp_alpha: float = 2.0,
     champion_probability: float = 0.40,
     minimum_sampling_probability: float = 0.05,
@@ -519,6 +523,7 @@ def train_promotion_league(
         population_games=population_games,
         population_updates_per_game=population_updates_per_game,
         population_workers=population_workers,
+        population_max_envs=population_max_envs,
         pfsp_alpha=pfsp_alpha,
         champion_probability=champion_probability,
         minimum_sampling_probability=minimum_sampling_probability,
@@ -904,6 +909,7 @@ def train_promotion_league(
         "population_games": population_games,
         "population_updates_per_game": population_updates_per_game,
         "population_workers": population_workers,
+        "population_max_envs": population_max_envs,
         "pfsp_alpha": pfsp_alpha,
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
@@ -3456,7 +3462,7 @@ def train_promotion_league(
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
-                                max_envs=num_envs,
+                                max_envs=min(num_envs, population_max_envs),
                                 game_callback=record_training_game,
                                 reserved_seeds=evaluation_map_seeds,
                                 run=run.child(
@@ -3502,7 +3508,7 @@ def train_promotion_league(
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
-                                max_envs=num_envs,
+                                max_envs=min(num_envs, population_max_envs),
                                 game_callback=record_rung_gate_game,
                                 model_a_label=candidate_evaluation_label,
                                 model_b_label=champion_path.stem,

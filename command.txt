@@ -309,7 +309,7 @@ python scripts/train_league.py `
 python scripts/league_report.py `
   --league-db models\league\league.sqlite3
 
-# 5a. Historyczna drabina MCTS-only. Pełne polityki drzewa przy 64 symulacjach są
+# 5a. Historyczna drabina MCTS-only. Pełne polityki drzewa przy 64 symulacjach są lol
 # zbyt rozproszone na mapie z dużą liczbą ruchów, dlatego do replayu trafiają
 # wyłącznie pewne decyzje MCTS różniące się od raw policy. Value target to wynik
 # partii. Najpierw cała generacja jest zbierana zamrożonym modelem, a dopiero

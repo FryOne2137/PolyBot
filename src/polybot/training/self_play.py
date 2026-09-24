@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +20,7 @@ from ..planning.belief_mcts import BeliefMCTS
 from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .rewards import RewardShaper
 from .economy_value import economy_value
+from .mcts_exploration import self_play_temperature
 from .replay_buffer import TrainingExample
 
 
@@ -92,6 +94,7 @@ class SelfPlayRunner:
         winner = -1
         opponent_actions = 0
         max_moves = self.training.max_moves
+        base_mcts_config = self.planner.config
 
         while not env.is_done() and moves < max_moves:
             packet = env.model_request_numpy()
@@ -104,6 +107,10 @@ class SelfPlayRunner:
 
             decision = None
             if is_model_turn:
+                self.planner.config = replace(
+                    base_mcts_config,
+                    temperature=self_play_temperature(base_mcts_config, moves),
+                )
                 decision = self.planner.decide(env, on_progress=report_search)
                 action_row = decision.action_row
                 if rng.random() < self.training.exploration_rate:

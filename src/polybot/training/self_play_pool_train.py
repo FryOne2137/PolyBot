@@ -33,6 +33,7 @@ from ..planning.action_pruning import (
     restrict_root_policy_to_candidates,
 )
 from .global_mcts_train import _native_leaf_bias
+from .mcts_exploration import add_dirichlet_noise_to_root_logits, self_play_temperature
 from .belief_recovery import (
     BeliefQualityError,
     capped_update_target,
@@ -182,7 +183,7 @@ def _root_examples(
 def _sample_root_rows(
     root: Dict[str, np.ndarray],
     rng: np.random.Generator,
-    temperature: float,
+    temperature: float | np.ndarray,
     request: Dict[str, np.ndarray] | None = None,
     exploration_rate: float = 0.0,
 ) -> np.ndarray:
@@ -199,7 +200,17 @@ def _sample_root_rows(
             weights = np.full(count, 1.0 / count, dtype=np.float64)
         else:
             weights = weights / total
-        row = int(weights.argmax()) if temperature <= 1e-5 else int(rng.choice(count, p=weights))
+        row_temperature = (
+            float(np.asarray(temperature)[index])
+            if np.asarray(temperature).ndim
+            else float(temperature)
+        )
+        if row_temperature <= 1e-5:
+            row = int(weights.argmax())
+        else:
+            sampled = np.power(weights, 1.0 / row_temperature)
+            sampled /= max(float(sampled.sum()), 1e-8)
+            row = int(rng.choice(count, p=sampled))
         if request is not None and exploration_rate > 0.0 and rng.random() < exploration_rate:
             actions = np.asarray(request["action_features"], dtype=np.int64)[index, :count]
             bias = (
@@ -481,6 +492,10 @@ def train_self_play_pool(
         raise ValueError("training.max_moves must be positive")
     if mcts.simulations < 1:
         raise ValueError("MCTS simulations must be positive")
+    if not 0.0 <= mcts.root_dirichlet_epsilon <= 1.0:
+        raise ValueError("MCTS root_dirichlet_epsilon must be between zero and one")
+    if mcts.root_dirichlet_epsilon > 0.0 and mcts.root_dirichlet_concentration <= 0.0:
+        raise ValueError("MCTS root_dirichlet_concentration must be positive when root noise is enabled")
     if mcts.search_top_actions < 0 or mcts.search_random_actions < 0:
         raise ValueError("MCTS action candidate counts must not be negative")
     if not 1 <= max_pending_leaves <= 8:
@@ -1074,9 +1089,20 @@ def train_self_play_pool(
                             root_candidate_action_ids[int(env)] = action_ids[
                                 local, selected_cpu[local]
                             ].copy()
+                native_logits = logits.float().cpu().numpy()
+                if wave == 0:
+                    # This is the first expansion of each root; adding noise
+                    # here changes the search tree itself, never evaluation.
+                    add_dirichlet_noise_to_root_logits(
+                        native_logits,
+                        leaf_tensors.action_mask.cpu().numpy(),
+                        rng,
+                        epsilon=mcts.root_dirichlet_epsilon,
+                        concentration=mcts.root_dirichlet_concentration,
+                    )
                 pool.expand_and_backup(
                     np.asarray(leaf_batch["leaf_id"], dtype=np.uint64),
-                    logits.float().cpu().numpy(),
+                    native_logits,
                     leaf_output.value.float().cpu().numpy(),
                 )
                 del logits, leaf_output, leaf_tensors
@@ -1153,7 +1179,10 @@ def train_self_play_pool(
             action_rows = _sample_root_rows(
                 root,
                 rng,
-                mcts.temperature,
+                np.asarray(
+                    [self_play_temperature(mcts, int(move)) for move in episode_moves],
+                    dtype=np.float64,
+                ),
                 request=request,
                 exploration_rate=training.exploration_rate * curriculum_scale,
             )

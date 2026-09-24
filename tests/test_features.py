@@ -1,5 +1,6 @@
 import numpy as np
 
+from polybot.config import MCTSConfig
 from polybot.data.polyenv_features import (
     action_features,
     event_action_history,
@@ -7,6 +8,11 @@ from polybot.data.polyenv_features import (
     global_features_from_obs,
     vector_event_action_history,
     vector_event_summary,
+)
+from polybot.training.mcts_exploration import (
+    add_dirichlet_noise_to_root_logits,
+    mix_dirichlet_root_prior,
+    self_play_temperature,
 )
 
 
@@ -22,6 +28,37 @@ def test_action_features_preserve_legal_action_row_count():
     assert continuous.shape[0] == 2
     assert categorical[0, 0] == 0
     assert categorical[1, 0] == 3
+
+
+def test_dirichlet_root_noise_keeps_a_legal_probability_distribution():
+    prior = np.asarray([0.70, 0.20, 0.10], dtype=np.float64)
+    noisy = mix_dirichlet_root_prior(
+        prior, np.random.default_rng(7), epsilon=0.25, concentration=10.0
+    )
+
+    assert np.isclose(noisy.sum(), 1.0)
+    assert np.all(noisy > 0.0)
+    assert not np.allclose(noisy, prior)
+
+
+def test_dirichlet_noise_leaves_padded_logits_untouched():
+    logits = np.asarray([[2.0, -4.0, 0.0, 9.0]], dtype=np.float32)
+    mask = np.asarray([[True, False, True, False]])
+    original = logits.copy()
+
+    add_dirichlet_noise_to_root_logits(
+        logits, mask, np.random.default_rng(21), epsilon=0.25, concentration=10.0
+    )
+
+    np.testing.assert_array_equal(logits[~mask], original[~mask])
+    np.testing.assert_allclose(np.exp(logits[0, mask[0]]).sum(), 1.0, atol=1e-6)
+
+
+def test_self_play_temperature_becomes_greedy_after_opening():
+    config = MCTSConfig(temperature=0.8, temperature_drop_move=3, late_temperature=0.0)
+
+    assert self_play_temperature(config, 2) == 0.8
+    assert self_play_temperature(config, 3) == 0.0
 
 
 def test_global_feature_vector_is_stable_when_optional_obs_keys_are_absent():

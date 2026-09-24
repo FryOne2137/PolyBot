@@ -34,6 +34,16 @@ class MCTSConfig:
     # Number of selected MCTS leaves evaluated in one neural-network forward
     # pass.  It changes throughput, not the information exposed to search.
     inference_batch_size: int = 32
+    # AlphaZero-style self-play exploration.  It is consumed explicitly by
+    # training loops only; evaluators never mix noise into a root prior.
+    root_dirichlet_epsilon: float = 0.25
+    # Total, not per-action, Dirichlet concentration.  A fixed total remains
+    # well behaved when PolyEnv exposes a variable number of legal actions.
+    root_dirichlet_concentration: float = 10.0
+    # Sample from MCTS visits in the opening, then choose the best visit.  A
+    # value of zero preserves the old single-temperature behaviour.
+    temperature_drop_move: int = 20
+    late_temperature: float = 0.0
     # A global self-play decision creates a short-lived MctsPool. ``None``
     # resolves to one C++ thread there, avoiding OS resource exhaustion from
     # repeatedly creating a hardware-sized native worker pool.
@@ -105,7 +115,7 @@ class TrainingConfig:
     teacher_policy_target_weight: float = 0.10
     # During early self-play, occasionally execute a strategic legal action
     # instead of the current MCTS choice to create non-draw training data.
-    exploration_rate: float = 0.20
+    exploration_rate: float = 0.05
     # Fraction of each training batch reserved for rare strategic/terminal
     # examples, while the rest stays uniformly sampled for stability.
     priority_replay_fraction: float = 0.35

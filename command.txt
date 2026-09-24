@@ -4,6 +4,12 @@
 # python -m pip install --no-build-isolation --no-deps --force-reinstall .
 # cd <sciezka-do-PolyBot>
 
+# Jeśli istnieje już zweryfikowany champion, NIE uruchamiaj bloków 1--3 od
+# zera. Przejdź od razu do bloku 6: zachowuje on championa jako zamrożonego
+# przeciwnika i kotwicę, a zapisuje nowego kandydata pod osobną nazwą.
+# Bloki 1--3 są wyłącznie dla pierwszego modelu, gdy nie ma policy/value
+# checkpointu zdolnego do ukończenia partii.
+
 # 1. Dłuższy warm-up strukturalnego belief world od zera. Smoke checkpoint
 # miał tylko 1000 pozycji; nie zamrażamy po nim losowego jeszcze backbone'u.
 # Wykresy: runs\belief\train (kolejne uruchomienie: train2, train3, ...).
@@ -381,13 +387,15 @@ python scripts/train_league.py `
   --seed 91337 `
   --device cuda
 
-# 6. Zalecany bezpieczny upgrade teachera pełnym pipeline. Model wyjściowy
-# zostanie kandydatem tylko po wygraniu sparowanego testu; przy porażce nadal
-# będzie poprawnym checkpointem championa.
+# 6. Zalecany bezpieczny upgrade istniejącego championa pełnym pipeline.
+# Nie nadpisuj wejściowego pliku: model wyjściowy jest osobnym kandydatem.
+# Pipeline zaczyna od kopii championa i promuje kandydata dopiero po wygraniu
+# sparowanego testu; przy porażce model wyjściowy nadal zawiera championa.
+# Dirichlet działa wyłącznie w self-play, a bramka jest deterministyczna.
 python scripts/train_pipeline.py `
-  --model-in models\teacher-structured-v1.pt `
-  --model-out models\champion-v2.pt `
-  --champion-model models\teacher-structured-v1.pt `
+  --model-in models\league\champion-007.pt `
+  --model-out models\league\champion-008-azexplore.pt `
+  --champion-model models\league\champion-007.pt `
   --belief-positions 0 `
   --teacher-games 0 `
   --vector-teacher-steps 0 `
@@ -399,7 +407,12 @@ python scripts/train_pipeline.py `
   --refinement-updates-per-game 4 `
   --teacher-replay-fraction 0.35 `
   --teacher-policy-target-weight 0.15 `
-  --exploration-rate 0.10 `
+  --root-dirichlet-epsilon 0.25 `
+  --root-dirichlet-concentration 10 `
+  --temperature 1.0 `
+  --temperature-drop-move 20 `
+  --late-temperature 0.0 `
+  --exploration-rate 0.05 `
   --priority-replay-fraction 0.50 `
   --td-lambda 1.0 `
   --simulations 32 `

@@ -41,6 +41,7 @@ from .belief_recovery import (
     replacement_seeds,
 )
 from .optimisation import train_batch
+from .mcts_exploration import add_dirichlet_noise_to_root_logits, self_play_temperature
 from .persistent_reanalysis import PersistentReanalyseBuffer, ReanalysePosition
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .run_artifacts import TrainingRun
@@ -559,6 +560,8 @@ class RoutedPoolSearch:
             self._action_generator.manual_seed(int(seed) ^ 0x5EA2C11)
         self._capture_root_candidates = False
         self._root_candidate_action_ids: dict[int, np.ndarray] = {}
+        self._root_noise_enabled = False
+        self._root_noise_rng = np.random.default_rng(int(seed) ^ 0xA17C0DE)
         for model in self.models:
             model.to(self.device).eval()
         map_type = MapType.Drylands if training.map_type == "drylands" else MapType.Lakes
@@ -874,6 +877,14 @@ class RoutedPoolSearch:
                         ].copy()
             logits[rows] = routed_logits.float().cpu().numpy()
             values[rows] = output.value.float().cpu().numpy()
+        if self._capture_root_candidates and self._root_noise_enabled:
+            add_dirichlet_noise_to_root_logits(
+                logits,
+                np.asarray(batch["action_mask"], dtype=bool),
+                self._root_noise_rng,
+                epsilon=self.mcts.root_dirichlet_epsilon,
+                concentration=self.mcts.root_dirichlet_concentration,
+            )
         self.pool.expand_and_backup(
             np.asarray(batch["leaf_id"], dtype=np.uint64), logits, values
         )
@@ -886,6 +897,7 @@ class RoutedPoolSearch:
         root_temperature: float,
         belief_temperature: float,
         prior_scale: float,
+        root_noise: bool = False,
     ) -> Dict[str, np.ndarray]:
         """Run routed belief completion and MCTS for one vector decision."""
         for model in self.models:
@@ -896,6 +908,9 @@ class RoutedPoolSearch:
         self.pool.all_player_belief_requests_into(self.all_players)
         all_players = self.all_players
         active = np.asarray(active, dtype=bool)
+        # Search objects are also used by promotion gates. Noise is opt-in so
+        # those fixed-seed evaluations remain deterministic.
+        self._root_noise_enabled = bool(root_noise)
         self.counters.root_env_decisions += int(active.sum())
 
         def learned_rows(rows: np.ndarray, attempt: int) -> np.ndarray:
@@ -1087,7 +1102,7 @@ def _sample_active_rows(
     active_rows: np.ndarray,
     rng: np.random.Generator,
     *,
-    temperature: float,
+    temperature: float | np.ndarray,
     exploration_rate: float,
 ) -> np.ndarray:
     """Choose MCTS actions, with optional visible strategic exploration."""
@@ -1105,10 +1120,17 @@ def _sample_active_rows(
             weights.fill(1.0 / count)
         else:
             weights /= total
-        if temperature <= 1e-5:
+        row_temperature = (
+            float(np.asarray(temperature)[env])
+            if np.asarray(temperature).ndim
+            else float(temperature)
+        )
+        if row_temperature <= 1e-5:
             row = int(weights.argmax())
         else:
-            row = int(rng.choice(count, p=weights))
+            sampled = np.power(weights, 1.0 / row_temperature)
+            sampled /= max(float(sampled.sum()), 1e-8)
+            row = int(rng.choice(count, p=sampled))
         if exploration_rate > 0.0 and rng.random() < exploration_rate:
             action = features[env, :count]
             bias = (
@@ -1838,6 +1860,7 @@ def train_population_pool(
                         root_temperature=1.0,
                         belief_temperature=max(mcts.temperature, 0.35),
                         prior_scale=curriculum,
+                        root_noise=True,
                     )
                 except BeliefRecoveryRequired as error:
                     reset_rows, active_reset_rows, inactive_reset_rows = partition_recovery_envs(
@@ -1935,7 +1958,10 @@ def train_population_pool(
                     request,
                     active_rows,
                     rng,
-                    temperature=mcts.temperature,
+                    temperature=np.asarray(
+                        [self_play_temperature(mcts, int(move)) for move in moves],
+                        dtype=np.float64,
+                    ),
                     exploration_rate=training.exploration_rate * curriculum,
                 )
                 root_agents = np.asarray(request["agent_id"], dtype=np.int32)

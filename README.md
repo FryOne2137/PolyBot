@@ -295,6 +295,21 @@ już remisu w lossie value. Zamrożony `--anchor-model` zachowuje część polic
 poprzednika w targetach. Ręczne priory wyszukiwania są wygaszane do zera, a
 ewaluacja porównuje same checkpointy bez wspólnej heurystyki.
 
+### Eksploracja AlphaZero
+
+Podczas zbierania self-play PolyBot miesza prior **tylko w korzeniu** z
+szumem Dirichleta (`--root-dirichlet-epsilon`, domyślnie `0.25`).
+`--root-dirichlet-concentration` jest całkowitą koncentracją rozdzielaną na
+liczbę legalnych akcji, dzięki czemu eksploracja nie znika na pozycjach z
+setkami ruchów. Pierwsze `--temperature-drop-move` decyzji (domyślnie 20)
+jest próbkowanych z wizyt MCTS o temperaturze `--temperature`; później
+`--late-temperature 0` wybiera najczęściej odwiedzaną gałąź. Bramka,
+ewaluator i interaktywne rozgrywki nie włączają tego szumu.
+
+Ręczny `--exploration-rate` pozostał wyłącznie jako niewielki bootstrap
+(domyślnie 0.05), ale Dirichlet jest głównym źródłem późniejszej eksploracji:
+wpływa na samo drzewo i jego target wizyt, zamiast zastępować ruch po searchu.
+
 Checkpoint tworzony wyłącznie przez belief warm-up nie ma jeszcze kompetentnej
 policy/value. Przed pierwszym SelfPlayPool trzeba wykonać bootstrap
 `train_teacher.py`; self-play zaczyna wtedy od zachowania „idź do celu”, po

@@ -50,6 +50,11 @@ def main() -> None:
     parser.add_argument("--td-lambda", type=float, default=0.95, help="Blend terminal returns with MCTS value bootstraps.")
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2, help="Per-player ISMCTS belief particles (K)")
+    parser.add_argument("--temperature", type=float, default=1.0, help="MCTS visit-sampling temperature before the drop move.")
+    parser.add_argument("--temperature-drop-move", type=int, default=20, help="Use --late-temperature from this move onward; 0 keeps one temperature.")
+    parser.add_argument("--late-temperature", type=float, default=0.0, help="MCTS visit-sampling temperature after --temperature-drop-move.")
+    parser.add_argument("--root-dirichlet-epsilon", type=float, default=0.25, help="Self-play-only root-prior noise share; 0 disables it.")
+    parser.add_argument("--root-dirichlet-concentration", type=float, default=10.0, help="Total Dirichlet concentration across legal root actions.")
     parser.add_argument("--mcts-threads", type=int, help="Accepted for config compatibility; use --num-threads for this pool")
     parser.add_argument("--mcts-max-actions", type=int, default=1024)
     parser.add_argument(

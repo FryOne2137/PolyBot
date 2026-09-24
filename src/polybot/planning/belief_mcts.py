@@ -17,6 +17,10 @@ from ..data.polyenv_features import (
     visible_events_or_empty,
 )
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..training.mcts_exploration import (
+    add_dirichlet_noise_to_root_logits,
+    mix_dirichlet_root_prior,
+)
 from .batched_inference import BatchedInference, NativeLeafInference
 
 
@@ -110,6 +114,8 @@ class BeliefMCTS:
         native_leaf_inference: Optional[NativeLeafInference] = None,
         map_size: int = 11,
         map_type: str = "lakes",
+        root_noise: bool = False,
+        root_noise_rng: np.random.Generator | None = None,
     ) -> None:
         self.model = model
         self.device = device
@@ -118,7 +124,22 @@ class BeliefMCTS:
         self.native_leaf_inference = native_leaf_inference
         self.map_size = map_size
         self.map_type = map_type
+        # Explicit opt-in keeps evaluation and interactive MCTS deterministic.
+        self.root_noise = bool(root_noise)
+        self._root_noise_rng = root_noise_rng or np.random.default_rng()
         self._reported_particle_errors: set[str] = set()
+
+    def _noisy_root_priors(self, priors: Dict[int, float]) -> Dict[int, float]:
+        if not self.root_noise or not priors:
+            return priors
+        action_ids = np.asarray(list(priors), dtype=np.int64)
+        mixed = mix_dirichlet_root_prior(
+            np.asarray([priors[int(action)] for action in action_ids], dtype=np.float64),
+            self._root_noise_rng,
+            epsilon=self.config.root_dirichlet_epsilon,
+            concentration=self.config.root_dirichlet_concentration,
+        )
+        return {int(action): float(probability) for action, probability in zip(action_ids, mixed)}
 
     @torch.inference_mode()
     def _evaluate_packet(
@@ -359,6 +380,7 @@ class BeliefMCTS:
             raise RuntimeError("PolyEnv returned no legal actions")
         root_events = visible_events_or_empty(env)
         root_priors, completed_particles = self._root_priors_and_particles(root_packet, root_events)
+        root_priors = self._noisy_root_priors(root_priors)
         root_player = int(root_packet["obs"].get("current_player", env.current_player()))
         belief_envs: List[object] = []
         for completed in completed_particles:
@@ -393,6 +415,14 @@ class BeliefMCTS:
                 logits, values = self.native_leaf_inference.evaluate(leaves)
             else:
                 logits, values = self._evaluate_native_leaves_direct(leaves)
+            if evaluations == 0 and self.root_noise:
+                add_dirichlet_noise_to_root_logits(
+                    logits,
+                    np.asarray(leaves["action_mask"], dtype=bool),
+                    self._root_noise_rng,
+                    epsilon=self.config.root_dirichlet_epsilon,
+                    concentration=self.config.root_dirichlet_concentration,
+                )
             pool.expand_and_backup(
                 leaf_ids,
                 logits,
@@ -434,6 +464,7 @@ class BeliefMCTS:
             raise RuntimeError("PolyEnv returned no legal actions")
         root_events = visible_events_or_empty(env)
         root_priors, completed_particles = self._root_priors_and_particles(root_packet, root_events)
+        root_priors = self._noisy_root_priors(root_priors)
         # Rollouts may prune/adjust a node.  Keep the policy evaluated on the
         # authoritative observation immutable for final targets and fallback.
         root_player = int(root_packet["obs"].get("current_player", env.current_player()))

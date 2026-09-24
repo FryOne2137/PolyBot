@@ -152,6 +152,8 @@ def train_self_play(
             native_leaf_inference=native_leaf_inference,
             map_size=training.map_size,
             map_type=training.map_type,
+            root_noise=True,
+            root_noise_rng=np.random.default_rng((training.seed + game_index) ^ 0xD1A1C1E7),
         )
         runner = SelfPlayRunner(planner, training, logger=None)
         examples, metrics = runner.play_game(

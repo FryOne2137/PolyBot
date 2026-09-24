@@ -21,6 +21,11 @@ from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.heuristic_policy import choose_teacher_action, teacher_policy
 from .optimisation import train_batch
+from .mcts_exploration import (
+    add_dirichlet_noise_to_root_logits,
+    mix_dirichlet_root_prior,
+    self_play_temperature,
+)
 from .replay_buffer import ReplayBuffer, TrainingExample
 from .rewards import RewardShaper
 from .run_artifacts import TrainingRun
@@ -118,7 +123,9 @@ def _search_action(
     policy = weights / max(float(weights.sum()), 1e-8)
     if mcts.temperature <= 1e-5:
         return int(policy.argmax()), policy
-    return int(rng.choice(len(policy), p=policy)), policy
+    sampled = np.power(policy, 1.0 / mcts.temperature)
+    sampled /= max(float(sampled.sum()), 1e-8)
+    return int(rng.choice(len(policy), p=sampled)), policy
 
 
 @torch.inference_mode()
@@ -158,7 +165,13 @@ def _plan_many(
         model_prior = probabilities[row, :count]
         teacher_prior = teacher_policy(packet)
         anchor = float(np.clip(config.teacher_prior_weight, 0.0, 1.0))
-        root_priors.append((1.0 - anchor) * model_prior + anchor * teacher_prior)
+        prior = (1.0 - anchor) * model_prior + anchor * teacher_prior
+        root_priors.append(mix_dirichlet_root_prior(
+            prior,
+            episodes[row].rng,
+            epsilon=config.root_dirichlet_epsilon,
+            concentration=config.root_dirichlet_concentration,
+        ))
 
     belief_envs: List[object] = []
     owners: List[int] = []
@@ -195,7 +208,7 @@ def _plan_many(
     # per particle tree, so running it ``simulations`` times accidentally
     # multiplied the requested budget by ``particles``. Divide it here.
     waves = max(1, int(np.ceil(config.simulations / max(1, config.particles))))
-    for _ in range(waves):
+    for wave in range(waves):
         leaves = pool.select_leaves()
         leaf_ids = np.asarray(leaves["leaf_id"])
         if leaf_ids.size == 0:
@@ -211,8 +224,20 @@ def _plan_many(
             leaf_tensors.action_categorical, leaf_tensors.action_continuous, leaf_tensors.action_mask,
             config.teacher_prior_weight, config.strategic_prior_weight,
         ).to(leaf_output.policy_logits.dtype)
+        leaf_logits = leaf_logits.float().cpu().numpy()
+        if wave == 0:
+            # The first native wave expands the root of every detached belief
+            # world. Perturbing these priors before backup is genuine
+            # AlphaZero exploration, unlike overriding a played move later.
+            add_dirichlet_noise_to_root_logits(
+                leaf_logits,
+                leaf_tensors.action_mask.cpu().numpy(),
+                episodes[0].rng,
+                epsilon=config.root_dirichlet_epsilon,
+                concentration=config.root_dirichlet_concentration,
+            )
         pool.expand_and_backup(
-            leaf_ids, leaf_logits.float().cpu().numpy(),
+            leaf_ids, leaf_logits,
             leaf_output.value.float().cpu().numpy(),
         )
 
@@ -449,14 +474,22 @@ def train_global_mcts_self_play(
                 for index, visits, priors, _ in _plan_many(
                     episodes, frozen_models[frozen_index], device, training, search_mcts,
                 ):
-                    row, _ = _search_action(visits, priors, episodes[index].rng, search_mcts)
+                    action_mcts = replace(
+                        search_mcts,
+                        temperature=self_play_temperature(search_mcts, episodes[index].moves),
+                    )
+                    row, _ = _search_action(visits, priors, episodes[index].rng, action_mcts)
                     _apply_action(episodes[index], row, False, None, training)
             if model_turns:
                 for index, visits, priors, bootstrap_value in _plan_many(
                     model_turns, model, device, training, search_mcts
                 ):
                     episode = model_turns[index]
-                    _, search_policy = _search_action(visits, priors, episode.rng, search_mcts)
+                    action_mcts = replace(
+                        search_mcts,
+                        temperature=self_play_temperature(search_mcts, episode.moves),
+                    )
+                    _, search_policy = _search_action(visits, priors, episode.rng, action_mcts)
                     policy = search_policy
                     # Keep a small teacher floor after the exploration/search
                     # curriculum ends. Otherwise the final online updates are
@@ -468,7 +501,7 @@ def train_global_mcts_self_play(
                     if target_anchor:
                         teacher_target = teacher_policy(episode.env.model_request_numpy())
                         policy = (1.0 - target_anchor) * policy + target_anchor * teacher_target
-                    row, _ = _search_action(visits, priors, episode.rng, search_mcts)
+                    row, _ = _search_action(visits, priors, episode.rng, action_mcts)
                     if episode.rng.random() < training.exploration_rate * curriculum_scale:
                         bias = strategic_action_bias(episode.env.model_request_numpy())
                         weights = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))

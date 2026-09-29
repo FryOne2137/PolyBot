@@ -94,6 +94,7 @@ from polybot.training.vector_population import (
     _PPGTargetExample,
     _PPOExample,
     _PPOTransition,
+    _TerminalValueCalibration,
     _ppo_batch,
     _ppo_snapshot,
     _finish_ppo_trace,
@@ -204,6 +205,35 @@ def test_promoted_lineage_skips_teacher_and_actor_for_champion_population():
     assert controls["population_max_steps"] == 8_000
     assert controls["policy_anchor_weight"] == 0.50
     assert controls["population_teacher_weight"] == 0.05
+
+
+def test_promoted_recovery_restores_dense_curriculum_with_anchor_controls():
+    controls = _curriculum_controls(
+        champion_status="promoted",
+        direct_teacher_steps=2_000,
+        direct_actor_steps=1_000,
+        direct_actor_max_steps=5_000,
+        direct_population_steps=9_000,
+        direct_population_max_steps=18_000,
+        direct_policy_anchor_weight=0.30,
+        direct_population_teacher_weight=0.25,
+        direct_population_opponent_policy_weight=0.0,
+        post_bootstrap_population_steps=12_000,
+        post_bootstrap_population_max_steps=18_000,
+        post_bootstrap_policy_anchor_weight=0.20,
+        post_bootstrap_teacher_weight=0.0,
+        post_bootstrap_opponent_policy_weight=0.0,
+        direct_objective_steps=1_000,
+        refresh_promoted_curriculum=True,
+    )
+
+    assert controls["phase"] == "promoted_recovery"
+    assert controls["post_bootstrap"]
+    assert controls["teacher_steps"] == 2_000
+    assert controls["objective_steps"] == 1_000
+    assert controls["actor_steps"] == 1_000
+    assert controls["population_steps"] == 9_000
+    assert controls["policy_anchor_weight"] == 0.30
 
 
 def test_population_checkpoint_selection_prioritises_strength_with_safety_floor():
@@ -429,6 +459,25 @@ def test_finished_game_value_target_is_undiscounted_even_when_gae_is_short():
     assert finished == [example]
     assert example.value_target == 1.0
     assert example.return_target != example.value_target
+
+
+def test_terminal_value_calibration_uses_only_terminal_outcomes():
+    calibration = _TerminalValueCalibration()
+    calibration.add(
+        [_PPOExample({"state": np.asarray([10])}, 0, 0.0, -1.0)], -1.0
+    )
+    calibration.add(
+        [_PPOExample({"state": np.asarray([75])}, 0, 0.0, 1.0)], 1.0
+    )
+
+    metrics = calibration.metrics()
+
+    assert metrics["count"] == 2.0
+    assert metrics["mae"] == 0.0
+    assert metrics["rmse"] == 0.0
+    assert metrics["correlation"] == 1.0
+    assert metrics["opening_count"] == 1.0
+    assert metrics["late_count"] == 1.0
 
 
 def test_top_advantage_filter_keeps_only_the_highest_half_for_policy():
@@ -2180,6 +2229,23 @@ def test_action_pruning_random_candidates_are_seeded_and_additive():
     assert stats.random_actions == 2
     assert stats.selected_actions == 8
     assert 0.0 < stats.prior_mass_retained_sum <= 1.0
+
+
+def test_action_pruning_expands_top_k_for_required_prior_mass():
+    logits = torch.tensor([[3.0, 2.0, 1.0, 0.0]])
+    categorical = torch.zeros((1, 4, 12), dtype=torch.long)
+    legal = torch.ones((1, 4), dtype=torch.bool)
+
+    _, selected, stats = prune_search_logits(
+        logits,
+        categorical,
+        legal,
+        top_actions=1,
+        min_prior_mass=0.90,
+    )
+
+    assert selected.sum().item() == 3
+    assert stats.prior_mass_retained_sum >= 0.90
 
 
 def test_zero_top_actions_is_an_exact_backwards_compatible_off_switch():

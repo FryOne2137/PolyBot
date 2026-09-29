@@ -107,6 +107,7 @@ python scripts/evaluate.py `
   --mcts-max-actions 1024 `
   --mcts-top-actions 48 `
   --mcts-random-actions 8 `
+  --mcts-min-prior-mass 0.85 `
   --model-b-mcts-top-actions 0 `
   --model-b-mcts-random-actions 0 `
   --strategic-prior-weight 0.0 `
@@ -142,17 +143,18 @@ python scripts/evaluate.py `
 # Płaskie bramki tej komendy automatycznie używają dwóch natywnych batchy
 # VectorGameEnv, buforów reset_into/step_into i pamięci pinned na CUDA. Nie
 # potrzeba osobnej flagi; --num-threads ustawia również workery tych bramek.
-# Ten wariant zaczyna każdą rundę od champion-007 i buduje trzy niezależne,
-# krótkie gałęzie PPO/PPG. Tylko gałąź, która na osobnych mapach osiągnie
-# co najmniej remis z championem, dostaje długi etap 12000-18000 kroków oraz
-# pełną bramkę awansu. Słaby challenger nie jest już kontynuowany między
-# rundami. Po PPO/PPG uruchamia się mała, selektywna destylacja MCTS: do nauki
-# trafiają wyłącznie pewne decyzje, z którymi raw policy się nie zgadza.
+# Wariant recovery dla championa, którego raw policy/value/belief są jeszcze
+# za słabe jako prior dla MCTS. Każda runda kontynuuje bezpiecznego challengera
+# (jedna gałąź), a --refresh-promoted-curriculum przywraca teacher/objectives/
+# actor-critic także dla promowanego championa. Destylacja MCTS uruchamia się
+# dopiero po sparowanym probe: search musi pobić raw policy na tych samych
+# mapach i osiągnąć --mcts-probe-score. W przeciwnym razie jest pomijana.
 # Krytyczne pozycje są trwałe w models\league\mcts-reanalyse.pkl; w kolejnych
 # rundach osiem z nich jest odtwarzanych z seeda i analizowanych ponownie przez
-# aktualny MCTS. Search używa próbki 32 najlepszych + 8 losowych legalnych akcji
-# oraz obowiązkowych ruchów taktycznych, zamiast rozmywać target po całej
-# przestrzeni. Bramka raw policy nadal cofa destylację, jeśli ta nie pomaga.
+# aktualny MCTS. Search używa co najmniej 32 najlepszych + 8 losowych legalnych
+# akcji; --mcts-min-prior-mass 0.85 rozszerza tę pulę, gdy prior jest płaski.
+# Obowiązkowe ruchy taktyczne pozostają dostępne, a bramka raw policy nadal
+# cofa destylację, jeśli ta nie pomaga.
 # --direct-gate-max-moves jest konieczny, bo ten etap ma osobny limit ruchów
 # niezależny od --max-moves.
 python scripts/train_league.py `
@@ -184,8 +186,8 @@ python scripts/train_league.py `
   --direct-gate-games 30 `
   --direct-gate-max-moves 1000 `
   --direct-gate-score 0.50 `
-  --direct-policy-anchor-weight 0.75 `
-  --direct-value-anchor-weight 0.50 `
+  --direct-policy-anchor-weight 0.30 `
+  --direct-value-anchor-weight 0.20 `
   --direct-teacher-weight 0.50 `
   --direct-shaping-weight 0.20 `
   --direct-readiness-score 0.50 `
@@ -197,7 +199,7 @@ python scripts/train_league.py `
   --direct-population-steps 9000 `
   --direct-population-block-steps 9000 `
   --direct-population-max-steps 18000 `
-  --direct-population-branch-count 3 `
+  --direct-population-branch-count 1 `
   --direct-population-branch-steps 2000 `
   --direct-population-branch-gate-games 20 `
   --direct-population-branch-min-champion-score 0.50 `
@@ -216,10 +218,13 @@ python scripts/train_league.py `
   --direct-population-ppo-gamma 1.0 `
   --direct-population-ppo-gae-lambda 0.95 `
   --direct-population-ppo-terminal-advantage-weight 0.75 `
-  --direct-population-ppo-top-advantage-fraction 0.50 `
+  --direct-population-ppo-top-advantage-fraction 1.0 `
   --direct-population-ppo-target-kl 0.010 `
   --direct-population-ppo-hard-kl 0.040 `
   --direct-population-ppo-rollout-temperature 0.85 `
+  --direct-population-plateau-patience 2 `
+  --direct-population-plateau-temperature-increment 0.10 `
+  --direct-population-plateau-max-temperature 1.20 `
   --direct-population-ppo-max-pending-examples 65536 `
   --direct-population-ppo-min-learning-rate 1e-5 `
   --direct-population-ppo-lr-backoff 0.50 `
@@ -246,6 +251,7 @@ python scripts/train_league.py `
   --post-bootstrap-objective-steps 0 `
   --post-bootstrap-champion-probability 0.65 `
   --post-bootstrap-policy-anchor-weight 0.20 `
+  --refresh-promoted-curriculum `
   --champion-mode flat `
   --flat-mcts-distill-games 24 `
   --flat-mcts-distill-simulations 32 `
@@ -260,7 +266,7 @@ python scripts/train_league.py `
   --population-mcts-reanalyse-capacity 4096 `
   --population-mcts-reanalyse-positions 8 `
   --population-mcts-reanalyse-replay-fraction 0.50 `
-  --mcts-probe-games 0 `
+  --mcts-probe-games 20 `
   --mcts-probe-simulations 32 `
   --mcts-probe-score 0.55 `
   --mcts-probe-min-improvement 0.00 `
@@ -288,6 +294,7 @@ python scripts/train_league.py `
   --mcts-max-actions 1024 `
   --mcts-top-actions 32 `
   --mcts-random-actions 8 `
+  --mcts-min-prior-mass 0.85 `
   --strategic-prior-weight 0.50 `
   --teacher-prior-weight 0.10 `
   --batch-size 64 `

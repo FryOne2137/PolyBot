@@ -62,6 +62,7 @@ def main() -> None:
         help="PolyBot-only quality experiment: top-K policy priors plus mandatory tactics.",
     )
     parser.add_argument("--mcts-random-actions", type=int, default=0)
+    parser.add_argument("--mcts-min-prior-mass", type=float, default=0.0)
     parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
     args = parser.parse_args()

@@ -443,6 +443,9 @@ class SearchCounters:
     search_root_visits: int = 0
     search_outside_candidate_visits: int = 0
     search_unfiltered_choices_outside: int = 0
+    search_root_policy_rows: int = 0
+    search_root_policy_entropy_sum: float = 0.0
+    search_root_top_visit_share_sum: float = 0.0
 
     def add_action_pruning(self, stats: ActionPruningStats) -> None:
         self.search_policy_rows += int(stats.rows)
@@ -456,7 +459,11 @@ class SearchCounters:
     def add(self, other: "SearchCounters") -> None:
         """Merge counters from one short-lived routed pool."""
         for name in self.__dataclass_fields__:
-            if name == "search_prior_mass_retained_sum":
+            if name in {
+                "search_prior_mass_retained_sum",
+                "search_root_policy_entropy_sum",
+                "search_root_top_visit_share_sum",
+            }:
                 setattr(self, name, float(getattr(self, name)) + float(getattr(other, name)))
             else:
                 setattr(self, name, int(getattr(self, name)) + int(getattr(other, name)))
@@ -490,6 +497,14 @@ def _action_pruning_metrics(counters: SearchCounters) -> Dict[str, float]:
         "search_unfiltered_choices_outside_rate": float(
             counters.search_unfiltered_choices_outside
             / max(1, counters.search_restricted_roots)
+        ),
+        "search_root_policy_entropy": float(
+            counters.search_root_policy_entropy_sum
+            / max(1, counters.search_root_policy_rows)
+        ),
+        "search_root_top_visit_share": float(
+            counters.search_root_top_visit_share_sum
+            / max(1, counters.search_root_policy_rows)
         ),
     }
 
@@ -863,6 +878,7 @@ class RoutedPoolSearch:
                 tensors.action_mask,
                 top_actions=self.search_top_actions_by_agent[int(agent)],
                 random_actions=self.search_random_actions_by_agent[int(agent)],
+                min_prior_mass=self.mcts.search_min_prior_mass,
                 generator=self._action_generator,
             )
             self.counters.add_action_pruning(pruning)
@@ -1089,6 +1105,26 @@ class RoutedPoolSearch:
         self.counters.search_unfiltered_choices_outside += (
             restriction.unfiltered_choices_outside
         )
+        root_policy = np.asarray(self.root["policy"], dtype=np.float64)
+        root_mask = np.asarray(self.root["action_mask"], dtype=bool)
+        for env in np.flatnonzero(active):
+            probabilities = root_policy[env, root_mask[env]]
+            total = float(probabilities.sum())
+            if probabilities.size == 0 or total <= 0.0 or not np.isfinite(total):
+                continue
+            probabilities = probabilities / total
+            # Normalize entropy so 0 means one clear action and 1 means a
+            # uniform root, independently of the number of legal actions.
+            if probabilities.size > 1:
+                entropy = -float(np.sum(probabilities * np.log(probabilities + 1e-12)))
+                entropy /= float(np.log(probabilities.size))
+            else:
+                entropy = 0.0
+            self.counters.search_root_policy_rows += 1
+            self.counters.search_root_policy_entropy_sum += entropy
+            self.counters.search_root_top_visit_share_sum += float(
+                probabilities.max()
+            )
         return self.root
 
     def drain_completed(self) -> Dict[str, np.ndarray]:

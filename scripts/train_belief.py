@@ -37,6 +37,14 @@ def main() -> None:
         help="Reset a random warm-up game before late, almost-revealed positions dominate",
     )
     parser.add_argument("--model-in", type=Path, help="Optional checkpoint whose policy/value weights are preserved")
+    parser.add_argument(
+        "--teacher-action-probability", type=float, default=0.0,
+        help="Share of belief-world rollout actions sampled from the public heuristic teacher",
+    )
+    parser.add_argument(
+        "--policy-action-probability", type=float, default=0.0,
+        help="Share of belief-world rollout actions sampled from --model-in policy",
+    )
     parser.add_argument("--model-out", type=Path, default=Path("models/belief.pt"))
     args = parser.parse_args()
     training = training_config_from_args(args)
@@ -54,6 +62,8 @@ def main() -> None:
         model_out=args.model_out,
         model=model,
         preserve_policy_value=args.model_in is not None,
+        teacher_action_probability=args.teacher_action_probability,
+        policy_action_probability=args.policy_action_probability,
         run=training_run_from_args(args, "belief"),
     )
     print_summary(summary)

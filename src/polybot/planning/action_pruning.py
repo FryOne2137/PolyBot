@@ -80,6 +80,7 @@ def prune_search_logits(
     *,
     top_actions: int,
     random_actions: int = 0,
+    min_prior_mass: float = 0.0,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, ActionPruningStats]:
     """Mask leaf priors to top-K plus mandatory and random legal candidates.
@@ -96,6 +97,8 @@ def prune_search_logits(
         raise ValueError("action_mask must match logits [B,A]")
     if top_actions < 0 or random_actions < 0:
         raise ValueError("top_actions and random_actions must not be negative")
+    if not 0.0 <= min_prior_mass <= 1.0:
+        raise ValueError("min_prior_mass must be between zero and one")
 
     legal = action_mask.bool()
     legal_counts = legal.sum(dim=-1)
@@ -128,6 +131,23 @@ def prune_search_logits(
 
     mandatory = mandatory_search_actions(action_categorical, legal)
     selected |= mandatory
+
+    # Adaptive top-K: preserve the fast candidate filter for confident
+    # policies but automatically expose more actions when the prior is flat.
+    # This happens before random exploration so the retained-mass guarantee is
+    # deterministic and directly attributable to the neural distribution.
+    if min_prior_mass > 0.0:
+        probabilities = torch.softmax(safe_logits, dim=-1)
+        ordered = safe_logits.argsort(dim=-1, descending=True)
+        ordered_probabilities = probabilities.gather(1, ordered)
+        cumulative = ordered_probabilities.cumsum(dim=-1)
+        required = (cumulative < min_prior_mass).sum(dim=-1).add_(1)
+        required = torch.minimum(required, legal_counts)
+        ranks = torch.arange(width, device=logits.device).unsqueeze(0)
+        adaptive = ranks < required.unsqueeze(1)
+        adaptive_indices = ordered.masked_fill(~adaptive, 0)
+        selected.scatter_(1, adaptive_indices, adaptive)
+        selected &= legal
 
     random_added = torch.zeros_like(legal)
     if random_actions:

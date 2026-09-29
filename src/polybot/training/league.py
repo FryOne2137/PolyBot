@@ -249,6 +249,7 @@ def _curriculum_controls(
     post_bootstrap_opponent_policy_weight: float,
     direct_objective_steps: int = 0,
     post_bootstrap_objective_steps: int = 0,
+    refresh_promoted_curriculum: bool = False,
 ) -> Dict[str, float | int | str | bool]:
     """Select bootstrap or champion-focused raw-policy training.
 
@@ -257,6 +258,28 @@ def _curriculum_controls(
     trains the candidate to beat the teacher rather than its current parent.
     """
     post_bootstrap = champion_status == "promoted"
+    # A promoted checkpoint is normally mature enough that replaying the
+    # heuristic curriculum would only pull it back toward the teacher.  A
+    # weak-but-promoted checkpoint is the important exception: its policy and
+    # value are not reliable priors for MCTS yet.  Recovery deliberately
+    # re-enables the dense, visible-only curriculum while keeping the frozen
+    # champion as the anchor in the calling code.
+    if post_bootstrap and refresh_promoted_curriculum:
+        return {
+            "phase": "promoted_recovery",
+            "post_bootstrap": True,
+            "teacher_steps": direct_teacher_steps,
+            "objective_steps": direct_objective_steps,
+            "actor_steps": direct_actor_steps,
+            "actor_max_steps": direct_actor_max_steps,
+            "population_steps": direct_population_steps,
+            "population_max_steps": direct_population_max_steps,
+            "policy_anchor_weight": direct_policy_anchor_weight,
+            "population_teacher_weight": direct_population_teacher_weight,
+            "population_opponent_policy_weight": (
+                direct_population_opponent_policy_weight
+            ),
+        }
     if post_bootstrap:
         return {
             "phase": "champion_population",
@@ -483,6 +506,9 @@ def train_promotion_league(
     direct_population_ppo_target_kl: float = 0.010,
     direct_population_ppo_hard_kl: float = 0.040,
     direct_population_ppo_rollout_temperature: float = 0.85,
+    direct_population_plateau_patience: int = 2,
+    direct_population_plateau_temperature_increment: float = 0.10,
+    direct_population_plateau_max_temperature: float = 1.20,
     direct_population_ppo_max_pending_examples: int = 32_768,
     direct_population_ppo_min_learning_rate: float = 1.0e-5,
     direct_population_ppo_lr_backoff: float = 0.5,
@@ -518,6 +544,7 @@ def train_promotion_league(
     post_bootstrap_policy_anchor_weight: float = 0.35,
     post_bootstrap_teacher_weight: float = 0.02,
     post_bootstrap_opponent_policy_weight: float = 0.65,
+    refresh_promoted_curriculum: bool = False,
     champion_mode: str = "flat",
     flat_mcts_distill_games: int = 0,
     flat_mcts_distill_simulations: int = 32,
@@ -589,6 +616,11 @@ def train_promotion_league(
         raise ValueError("champion_mode must be 'flat' or 'mcts'")
     if flat_mcts_distill_games < 0:
         raise ValueError("flat_mcts_distill_games must not be negative")
+    if flat_mcts_distill_games and not mcts_probe_games:
+        raise ValueError(
+            "flat MCTS distillation requires --mcts-probe-games so an "
+            "untrusted search policy cannot teach the raw model"
+        )
     if flat_mcts_distill_games and flat_mcts_distill_updates_per_game < 1:
         raise ValueError(
             "flat MCTS distillation requires positive updates per game"
@@ -747,6 +779,18 @@ def train_promotion_league(
         )
     if not 0.1 <= direct_population_ppo_rollout_temperature <= 2.0:
         raise ValueError("direct population PPO rollout temperature is invalid")
+    if direct_population_plateau_patience < 1:
+        raise ValueError("direct population plateau patience must be positive")
+    if direct_population_plateau_temperature_increment < 0.0:
+        raise ValueError(
+            "direct population plateau temperature increment must not be negative"
+        )
+    if not (
+        direct_population_ppo_rollout_temperature
+        <= direct_population_plateau_max_temperature
+        <= 2.0
+    ):
+        raise ValueError("direct population plateau maximum temperature is invalid")
     if direct_population_ppo_min_learning_rate <= 0.0:
         raise ValueError("direct population PPO minimum learning rate must be positive")
     if not 0.0 < direct_population_ppo_lr_backoff < 1.0:
@@ -1085,6 +1129,13 @@ def train_promotion_league(
         "direct_population_ppo_rollout_temperature": (
             direct_population_ppo_rollout_temperature
         ),
+        "direct_population_plateau_patience": direct_population_plateau_patience,
+        "direct_population_plateau_temperature_increment": (
+            direct_population_plateau_temperature_increment
+        ),
+        "direct_population_plateau_max_temperature": (
+            direct_population_plateau_max_temperature
+        ),
         "direct_population_ppo_max_pending_examples": (
             direct_population_ppo_max_pending_examples
         ),
@@ -1396,6 +1447,9 @@ def train_promotion_league(
                         post_bootstrap_objective_steps=(
                             post_bootstrap_objective_steps
                         ),
+                        refresh_promoted_curriculum=(
+                            refresh_promoted_curriculum
+                        ),
                     )
                     post_bootstrap = bool(controls["post_bootstrap"])
                     if post_bootstrap:
@@ -1560,11 +1614,19 @@ def train_promotion_league(
                         ),
                         flush=True,
                     )
-                    if post_bootstrap:
+                    if curriculum_phase == "champion_population":
                         print(
                             "league curriculum | champion-population | "
                             "teacher/actor skipped | "
                             f"objectives={effective_objective_steps} | "
+                            f"population={effective_population_steps}-"
+                            f"{effective_population_max_steps} steps",
+                            flush=True,
+                        )
+                    elif curriculum_phase == "promoted_recovery":
+                        print(
+                            "league curriculum | promoted recovery | "
+                            "teacher/objectives/actor restored before PPO | "
                             f"population={effective_population_steps}-"
                             f"{effective_population_max_steps} steps",
                             flush=True,
@@ -1967,6 +2029,15 @@ def train_promotion_league(
                                 ),
                                 ppo_rollout_temperature=(
                                     direct_population_ppo_rollout_temperature
+                                ),
+                                plateau_patience=(
+                                    direct_population_plateau_patience
+                                ),
+                                plateau_temperature_increment=(
+                                    direct_population_plateau_temperature_increment
+                                ),
+                                plateau_max_temperature=(
+                                    direct_population_plateau_max_temperature
                                 ),
                                 ppo_max_pending_examples=(
                                     direct_population_ppo_max_pending_examples
@@ -2551,7 +2622,121 @@ def train_promotion_league(
                         )
 
                     flat_distillation_summary: Dict[str, Any] = {}
+                    mcts_distillation_ready = False
                     if champion_mode == "flat" and flat_mcts_distill_games:
+                        # Search is a teacher only when it already improves on
+                        # the raw candidate on exactly the same held-out maps.
+                        # Without this guard a weak policy/value/belief stack
+                        # feeds its own noise back into the raw policy.
+                        raw_probe_id = database.start_evaluation(
+                            round_id,
+                            candidate_id,
+                            champion_id,
+                            "flat_mcts_distillation_raw_readiness",
+                            mcts_probe_seed,
+                            mcts_probe_games,
+                        )
+                        raw_probe = evaluate_direct_matches(
+                            candidate,
+                            champion,
+                            device,
+                            replace(
+                                round_training,
+                                seed=mcts_probe_seed,
+                                max_moves=direct_gate_max_moves,
+                            ),
+                            mcts_probe_games,
+                            model_a_label=candidate_evaluation_label,
+                            model_b_label=champion_path.stem,
+                            visible_action_history=visible_action_history,
+                            num_threads=num_threads,
+                            max_actions=mcts.native_max_actions,
+                        )
+                        database.finish_evaluation_unrated(raw_probe_id, raw_probe)
+                        search_probe_id = database.start_evaluation(
+                            round_id,
+                            candidate_id,
+                            champion_id,
+                            "flat_mcts_distillation_search_readiness",
+                            mcts_probe_seed,
+                            mcts_probe_games,
+                        )
+                        try:
+                            search_probe = evaluate_matches_pool(
+                                candidate,
+                                champion,
+                                replace(
+                                    round_training,
+                                    seed=mcts_probe_seed,
+                                    max_moves=direct_gate_max_moves,
+                                ),
+                                replace(
+                                    evaluation_mcts,
+                                    simulations=mcts_probe_simulations,
+                                ),
+                                mcts_probe_games,
+                                num_threads=num_threads,
+                                max_pending_leaves=max_pending_leaves,
+                                visible_action_history=visible_action_history,
+                                belief_retries=belief_retries,
+                                max_envs=min(num_envs, mcts_probe_games),
+                                model_a_label=candidate_evaluation_label,
+                                model_b_label=champion_path.stem,
+                            )
+                            database.finish_evaluation_unrated(
+                                search_probe_id, search_probe
+                            )
+                        except (BeliefQualityError, BeliefRecoveryRequired) as error:
+                            search_probe = {
+                                "games": 0.0,
+                                "model_a_score": 0.0,
+                                "valid": 0.0,
+                                "invalid_reason": str(error),
+                            }
+                            database.invalidate_evaluation(
+                                search_probe_id, search_probe
+                            )
+                        raw_probe_score = float(raw_probe["model_a_score"])
+                        search_probe_score = float(
+                            search_probe.get("model_a_score", 0.0)
+                        )
+                        mcts_distillation_ready = _mcts_probe_passed(
+                            raw_probe_score,
+                            search_probe_score,
+                            minimum_search_score=mcts_probe_score,
+                            minimum_improvement=mcts_probe_minimum_improvement,
+                            valid=bool(search_probe.get("valid", 1.0)),
+                        )
+                        flat_distillation_summary = {
+                            "enabled": 1.0,
+                            "readiness_passed": float(mcts_distillation_ready),
+                            "raw_readiness": raw_probe,
+                            "search_readiness": search_probe,
+                            "raw_readiness_score": raw_probe_score,
+                            "search_readiness_score": search_probe_score,
+                            "minimum_search_score": float(mcts_probe_score),
+                        }
+                        run.log(
+                            round=round_index,
+                            flat_mcts_distill_readiness_raw=raw_probe_score,
+                            flat_mcts_distill_readiness_search=search_probe_score,
+                            flat_mcts_distill_readiness_passed=float(
+                                mcts_distillation_ready
+                            ),
+                        )
+                        if not mcts_distillation_ready:
+                            print(
+                                "league flat MCTS distillation skipped | "
+                                f"raw={raw_probe_score:.4f} | "
+                                f"search={search_probe_score:.4f} | "
+                                "search is not a reliable teacher yet",
+                                flush=True,
+                            )
+                    if (
+                        champion_mode == "flat"
+                        and flat_mcts_distill_games
+                        and mcts_distillation_ready
+                    ):
                         pre_distillation_state = model_state_on_cpu(candidate)
 
                         def evaluate_flat_distillation(
@@ -2738,6 +2923,7 @@ def train_promotion_league(
                                     candidate, pre_distillation_state
                                 )
                             flat_distillation_summary = {
+                                **flat_distillation_summary,
                                 "enabled": 1.0,
                                 "training": distillation_training,
                                 "before": before_distillation,
@@ -2778,6 +2964,7 @@ def train_promotion_league(
                                 candidate, pre_distillation_state
                             )
                             flat_distillation_summary = {
+                                **flat_distillation_summary,
                                 "enabled": 1.0,
                                 "accepted": False,
                                 "rolled_back": 1.0,

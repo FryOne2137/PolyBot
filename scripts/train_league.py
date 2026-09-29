@@ -287,6 +287,18 @@ def main() -> None:
         "--direct-population-ppo-rollout-temperature", type=float, default=0.85,
     )
     parser.add_argument(
+        "--direct-population-plateau-patience", type=int, default=2,
+        help="Safe non-improving blocks before increasing rollout exploration.",
+    )
+    parser.add_argument(
+        "--direct-population-plateau-temperature-increment",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--direct-population-plateau-max-temperature", type=float, default=1.20,
+    )
+    parser.add_argument(
         "--direct-population-ppo-max-pending-examples", type=int, default=32_768,
         help="RAM safety cap; unfinished trajectories bootstrap only if this is exceeded",
     )
@@ -419,6 +431,15 @@ def main() -> None:
     parser.add_argument(
         "--post-bootstrap-opponent-policy-weight", type=float, default=0.0,
         help="Deprecated: PPO learns only candidate actions",
+    )
+    parser.add_argument(
+        "--refresh-promoted-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Re-enable teacher, objectives and actor-critic for a promoted "
+            "but weak champion before population PPO; use with a frozen anchor"
+        ),
     )
     parser.add_argument(
         "--champion-mode",
@@ -559,6 +580,10 @@ def main() -> None:
     parser.add_argument(
         "--mcts-random-actions", type=int, default=0,
         help="Extra random legal candidates per leaf in addition to top-K and mandatory tactics.",
+    )
+    parser.add_argument(
+        "--mcts-min-prior-mass", type=float, default=0.0,
+        help="Expand top-K until this neural prior mass is retained; 0 disables adaptive expansion.",
     )
     parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
@@ -725,6 +750,15 @@ def main() -> None:
         direct_population_ppo_rollout_temperature=(
             args.direct_population_ppo_rollout_temperature
         ),
+        direct_population_plateau_patience=(
+            args.direct_population_plateau_patience
+        ),
+        direct_population_plateau_temperature_increment=(
+            args.direct_population_plateau_temperature_increment
+        ),
+        direct_population_plateau_max_temperature=(
+            args.direct_population_plateau_max_temperature
+        ),
         direct_population_ppo_max_pending_examples=(
             args.direct_population_ppo_max_pending_examples
         ),
@@ -806,6 +840,7 @@ def main() -> None:
         post_bootstrap_opponent_policy_weight=(
             args.post_bootstrap_opponent_policy_weight
         ),
+        refresh_promoted_curriculum=args.refresh_promoted_curriculum,
         champion_mode=args.champion_mode,
         flat_mcts_distill_games=args.flat_mcts_distill_games,
         flat_mcts_distill_simulations=(

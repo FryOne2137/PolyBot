@@ -55,6 +55,10 @@ class MCTSConfig:
     # and validates the full legal-action list.
     search_top_actions: int = 0
     search_random_actions: int = 0
+    # When a weak policy is flat, top-K alone can discard a good move before
+    # MCTS has any opportunity to inspect it.  A positive floor expands top-K
+    # until the retained neural prior mass reaches this value.
+    search_min_prior_mass: float = 0.0
     # Applied only to already legal, visible capture actions in MCTS.
     capture_city_prior_bonus: float = 2.0
     capture_capital_prior_bonus: float = 4.0

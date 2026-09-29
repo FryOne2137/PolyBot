@@ -21,6 +21,7 @@ from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from ..planning.heuristic_policy import choose_teacher_action
 from .optimisation import belief_loss
 from .replay_buffer import TrainingExample
 from .run_artifacts import TrainingRun
@@ -109,6 +110,54 @@ def _belief_update(
     return float(loss.detach().cpu())
 
 
+@torch.inference_mode()
+def _belief_rollout_action(
+    env: object,
+    example: TrainingExample,
+    model: PolicyValueBeliefNet | None,
+    device: torch.device,
+    rng: np.random.Generator,
+    *,
+    teacher_action_probability: float,
+    policy_action_probability: float,
+) -> tuple[int, str]:
+    """Choose a legal rollout action without exposing hidden state to policy.
+
+    Belief labels remain ``full_map_numpy()`` only.  The action source changes
+    merely the *distribution of naturally encountered fog states*: teacher
+    reaches useful public objectives, the frozen/current policy visits its own
+    states and random play preserves coverage of unusual legal branches.
+    """
+    packet = env.model_request_numpy()
+    action_ids = np.asarray(packet["actions"]["action_id"], dtype=np.int64)
+    if not action_ids.size:
+        raise RuntimeError("belief warm-up environment returned no legal actions")
+    draw = float(rng.random())
+    if draw < teacher_action_probability:
+        row = choose_teacher_action(packet, rng)
+        return int(action_ids[row]), "teacher"
+    if draw < teacher_action_probability + policy_action_probability:
+        if model is None:
+            raise RuntimeError("policy belief rollout requires a model")
+        batch = stack_examples([example], device)
+        model.eval()
+        output = model(
+            batch["map_tokens"],
+            batch["global_features"],
+            batch["action_categorical"],
+            batch["action_continuous"],
+            batch["action_mask"],
+            batch["event_features"],
+            action_history=batch["action_history"],
+            action_history_mask=batch["action_history_mask"],
+            include_belief=False,
+        )
+        probabilities = torch.softmax(output.policy_logits[0].float(), dim=-1)
+        row = int(torch.multinomial(probabilities, 1).item())
+        return int(action_ids[row]), "policy"
+    return int(rng.choice(action_ids)), "random"
+
+
 def warmup_belief(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -119,9 +168,11 @@ def warmup_belief(
     model_out: Optional[Path] = None,
     model: PolicyValueBeliefNet | None = None,
     preserve_policy_value: bool = False,
+    teacher_action_probability: float = 0.0,
+    policy_action_probability: float = 0.0,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
-    """Learn belief on naturally foggy, action-diverse random positions.
+    """Learn belief on naturally foggy states from mixed public rollouts.
 
     Late random games reveal almost every tile and make map completion a
     trivial all-visible task.  Limiting their horizon and requiring a minimum
@@ -132,6 +183,14 @@ def warmup_belief(
         raise ValueError("min_hidden_tiles must be non-negative")
     if max_moves_per_world < 1:
         raise ValueError("max_moves_per_world must be positive")
+    if not 0.0 <= teacher_action_probability <= 1.0:
+        raise ValueError("teacher_action_probability must be between zero and one")
+    if not 0.0 <= policy_action_probability <= 1.0:
+        raise ValueError("policy_action_probability must be between zero and one")
+    if teacher_action_probability + policy_action_probability > 1.0:
+        raise ValueError("belief rollout probabilities must sum to at most one")
+    if policy_action_probability and model is None:
+        raise ValueError("policy_action_probability requires model")
     seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "belief")
@@ -144,6 +203,8 @@ def warmup_belief(
             "min_hidden_tiles": min_hidden_tiles,
             "max_moves_per_world": max_moves_per_world,
             "preserve_policy_value": preserve_policy_value,
+            "teacher_action_probability": teacher_action_probability,
+            "policy_action_probability": policy_action_probability,
             "model_out": model_out,
         },
     )
@@ -166,6 +227,7 @@ def warmup_belief(
     environment_index = 0
     moves_in_world = 0
     accepted_hidden_tiles: List[int] = []
+    rollout_sources = {"random": 0, "teacher": 0, "policy": 0}
     progress_description = f"belief warm-up ({device})"
     try:
         with tqdm(
@@ -189,8 +251,17 @@ def warmup_belief(
 
                 pending.append(example)
                 accepted_hidden_tiles.append(hidden_tiles)
-                legal_ids = np.asarray(env.model_request_numpy()["actions"]["action_id"], dtype=np.int64)
-                env.step_fast(int(rng.choice(legal_ids)))
+                action_id, action_source = _belief_rollout_action(
+                    env,
+                    example,
+                    model,
+                    device,
+                    rng,
+                    teacher_action_probability=teacher_action_probability,
+                    policy_action_probability=policy_action_probability,
+                )
+                rollout_sources[action_source] += 1
+                env.step_fast(action_id)
                 moves_in_world += 1
 
                 if len(pending) == batch_size:
@@ -203,6 +274,9 @@ def warmup_belief(
                         belief_loss=latest_loss,
                         hidden_tiles=hidden_tiles,
                         mean_hidden_tiles=float(np.mean(accepted_hidden_tiles)),
+                        belief_rollout_random=float(rollout_sources["random"]),
+                        belief_rollout_teacher=float(rollout_sources["teacher"]),
+                        belief_rollout_policy=float(rollout_sources["policy"]),
                     )
                     progress.set_postfix(
                         belief_loss=f"{latest_loss:.4f}",
@@ -236,6 +310,9 @@ def warmup_belief(
         "mean_hidden_tiles": float(np.mean(accepted_hidden_tiles)) if accepted_hidden_tiles else 0.0,
         "min_hidden_tiles": float(min_hidden_tiles),
         "preserved_policy_value": float(preserve_policy_value),
+        "belief_rollout_random": float(rollout_sources["random"]),
+        "belief_rollout_teacher": float(rollout_sources["teacher"]),
+        "belief_rollout_policy": float(rollout_sources["policy"]),
     }
     summary["run_dir"] = str(run.finish(summary))
     return summary

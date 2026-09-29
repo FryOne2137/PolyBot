@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Deque, Dict, Mapping, Sequence
 
 import numpy as np
@@ -89,6 +89,101 @@ class _PPOTransition:
     sign: float
     terminal: bool
     candidate_example: _PPOExample | None
+
+
+@dataclass
+class _TerminalValueCalibration:
+    """Streaming calibration of public-state value predictions.
+
+    Values are recorded only for trajectories that genuinely terminated.  A
+    block boundary bootstrap is useful for PPO throughput but is not a valid
+    label for deciding whether value is trustworthy enough for MCTS.
+    """
+
+    count: int = 0
+    absolute_error_sum: float = 0.0
+    squared_error_sum: float = 0.0
+    prediction_sum: float = 0.0
+    outcome_sum: float = 0.0
+    prediction_square_sum: float = 0.0
+    outcome_square_sum: float = 0.0
+    prediction_outcome_sum: float = 0.0
+    phase_calibrations: dict[str, _TerminalValueCalibration] = field(
+        default_factory=dict
+    )
+
+    def add(
+        self,
+        examples: Sequence[_PPOExample],
+        outcome: float,
+        *,
+        record_phases: bool = True,
+    ) -> None:
+        if not examples:
+            return
+        predictions = np.clip(
+            np.asarray([example.old_value for example in examples], dtype=np.float64),
+            -1.0,
+            1.0,
+        )
+        target = float(np.clip(outcome, -1.0, 1.0))
+        self.count += int(predictions.size)
+        self.absolute_error_sum += float(np.abs(predictions - target).sum())
+        self.squared_error_sum += float(np.square(predictions - target).sum())
+        self.prediction_sum += float(predictions.sum())
+        self.outcome_sum += target * float(predictions.size)
+        self.prediction_square_sum += float(np.square(predictions).sum())
+        self.outcome_square_sum += target * target * float(predictions.size)
+        self.prediction_outcome_sum += target * float(predictions.sum())
+
+        if record_phases:
+            for example in examples:
+                state = np.asarray(example.observation.get("state", ()))
+                if state.size == 0:
+                    continue
+                turn = int(state.reshape(-1)[0])
+                phase = "opening" if turn < 20 else "mid" if turn < 60 else "late"
+                calibration = self.phase_calibrations.setdefault(
+                    phase, _TerminalValueCalibration()
+                )
+                calibration.add([example], target, record_phases=False)
+
+    def metrics(self, *, include_phases: bool = True) -> Dict[str, float]:
+        if not self.count:
+            base = {"count": 0.0, "mae": 0.0, "rmse": 0.0, "correlation": 0.0}
+        else:
+            count = float(self.count)
+            prediction_mean = self.prediction_sum / count
+            outcome_mean = self.outcome_sum / count
+            prediction_variance = max(
+                0.0, self.prediction_square_sum / count - prediction_mean**2
+            )
+            outcome_variance = max(
+                0.0, self.outcome_square_sum / count - outcome_mean**2
+            )
+            covariance = (
+                self.prediction_outcome_sum / count - prediction_mean * outcome_mean
+            )
+            denominator = float(np.sqrt(prediction_variance * outcome_variance))
+            base = {
+                "count": count,
+                "mae": self.absolute_error_sum / count,
+                "rmse": float(np.sqrt(self.squared_error_sum / count)),
+                "correlation": (
+                    covariance / denominator if denominator > 1e-12 else 0.0
+                ),
+            }
+        if include_phases:
+            for phase, calibration in self.phase_calibrations.items():
+                base.update(
+                    {
+                        f"{phase}_{name}": value
+                        for name, value in calibration.metrics(
+                            include_phases=False
+                        ).items()
+                    }
+                )
+        return base
 
 
 @dataclass(frozen=True)
@@ -1466,6 +1561,7 @@ def train_vector_population(
     episode_moves = np.zeros(num_envs, dtype=np.int32)
     episode_numbers = np.zeros(num_envs, dtype=np.int64)
     completed_games = wins = losses = draws = 0
+    value_calibration = _TerminalValueCalibration()
     candidate_turns = opponent_turns = 0
     ppo_samples = ppo_updates = ppo_rollouts = 0
     ppo_policy_samples = 0
@@ -2276,6 +2372,7 @@ def train_vector_population(
                         ppo_terminal_advantage_weight
                     ),
                 )
+                value_calibration.add(finished_examples, candidate_outcome)
                 completed_examples.extend(finished_examples)
                 pending_candidate_examples -= len(finished_examples)
                 traces[int(env_id)].clear()
@@ -2530,6 +2627,10 @@ def train_vector_population(
         ),
         "direct_population_ema_updates": float(ema_updates),
         **{
+            "direct_population_value_calibration_" + name: value
+            for name, value in value_calibration.metrics().items()
+        },
+        **{
             "direct_population_ppo_" + name: value / divisor
             for name, value in totals.items()
         },
@@ -2737,6 +2838,9 @@ def train_direct_population_curriculum(
     ppo_target_kl: float = 0.010,
     ppo_hard_kl: float = 0.040,
     ppo_rollout_temperature: float = 0.85,
+    plateau_patience: int = 2,
+    plateau_temperature_increment: float = 0.10,
+    plateau_max_temperature: float = 1.20,
     ppo_max_pending_examples: int = 32_768,
     ppo_min_learning_rate: float = 1.0e-5,
     ppo_lr_backoff: float = 0.5,
@@ -2819,6 +2923,15 @@ def train_direct_population_curriculum(
         raise ValueError("PPO KL thresholds must satisfy 0 < target <= hard")
     if not 0.1 <= ppo_rollout_temperature <= 2.0:
         raise ValueError("ppo_rollout_temperature must be between 0.1 and 2.0")
+    if plateau_patience < 1:
+        raise ValueError("plateau_patience must be positive")
+    if plateau_temperature_increment < 0.0:
+        raise ValueError("plateau_temperature_increment must not be negative")
+    if not ppo_rollout_temperature <= plateau_max_temperature <= 2.0:
+        raise ValueError(
+            "plateau_max_temperature must be at least the initial rollout temperature "
+            "and no greater than 2.0"
+        )
     if ppo_min_learning_rate <= 0.0:
         raise ValueError("ppo_min_learning_rate must be positive")
     if not 0.0 < ppo_lr_backoff < 1.0:
@@ -2916,6 +3029,9 @@ def train_direct_population_curriculum(
             "ppo_target_kl": ppo_target_kl,
             "ppo_hard_kl": ppo_hard_kl,
             "ppo_rollout_temperature": ppo_rollout_temperature,
+            "plateau_patience": plateau_patience,
+            "plateau_temperature_increment": plateau_temperature_increment,
+            "plateau_max_temperature": plateau_max_temperature,
             "ppo_max_pending_examples": ppo_max_pending_examples,
             "ppo_min_learning_rate": ppo_min_learning_rate,
             "ppo_lr_backoff": ppo_lr_backoff,
@@ -2958,6 +3074,9 @@ def train_direct_population_curriculum(
     accepted_blocks = selected_blocks = rollback_blocks = 0
     consecutive_regressions = 0
     maximum_consecutive_regressions = 0
+    current_ppo_rollout_temperature = float(ppo_rollout_temperature)
+    plateau_blocks = 0
+    plateau_adjustments = 0
     gate_rows: list[Dict[str, Any]] = []
 
     def gate(
@@ -3177,7 +3296,7 @@ def train_direct_population_curriculum(
             ppo_hard_kl=ppo_hard_kl,
             ppo_min_learning_rate=ppo_min_learning_rate,
             ppo_lr_backoff=ppo_lr_backoff,
-            ppo_rollout_temperature=ppo_rollout_temperature,
+            ppo_rollout_temperature=current_ppo_rollout_temperature,
             ppo_max_pending_examples=ppo_max_pending_examples,
             objective_replay_horizon=objective_replay_horizon,
             objective_replay_capacity=objective_replay_capacity,
@@ -3228,6 +3347,31 @@ def train_direct_population_curriculum(
                 direct_population_ppo_learning_rate=current_ppo_learning_rate,
             )
         accepted = gate("population", block)
+        selected = bool(gate_rows[-1]["selected"])
+        if accepted and selected:
+            plateau_blocks = 0
+        elif accepted:
+            plateau_blocks += 1
+            if plateau_blocks >= plateau_patience:
+                previous_temperature = current_ppo_rollout_temperature
+                current_ppo_rollout_temperature = min(
+                    plateau_max_temperature,
+                    current_ppo_rollout_temperature + plateau_temperature_increment,
+                )
+                plateau_blocks = 0
+                if current_ppo_rollout_temperature > previous_temperature + 1e-12:
+                    plateau_adjustments += 1
+                    run.log(
+                        direct_population_plateau_temperature_adjustment=1.0,
+                        direct_population_plateau_previous_temperature=(
+                            previous_temperature
+                        ),
+                        direct_population_ppo_rollout_temperature=(
+                            current_ppo_rollout_temperature
+                        ),
+                    )
+        else:
+            plateau_blocks = 0
         if (
             completed >= minimum_steps
             and not accepted
@@ -3422,6 +3566,26 @@ def train_direct_population_curriculum(
         restore_model_state(candidate, parent_state)
         ready = False
         best_meets_readiness = False
+    calibration_count = float(sum(
+        float(row.get("direct_population_value_calibration_count", 0.0))
+        for row in training_rows
+    ))
+    calibration_mae = (
+        sum(
+            float(row.get("direct_population_value_calibration_mae", 0.0))
+            * float(row.get("direct_population_value_calibration_count", 0.0))
+            for row in training_rows
+        )
+        / max(1.0, calibration_count)
+    )
+    calibration_rmse = float(np.sqrt(
+        sum(
+            float(row.get("direct_population_value_calibration_rmse", 0.0)) ** 2
+            * float(row.get("direct_population_value_calibration_count", 0.0))
+            for row in training_rows
+        )
+        / max(1.0, calibration_count)
+    ))
     summary: Dict[str, Any] = {
         "direct_population_minimum_steps": float(minimum_steps),
         "direct_population_maximum_steps": float(maximum_steps),
@@ -3475,6 +3639,15 @@ def train_direct_population_curriculum(
             for item in final_candidates
         ],
         "direct_population_ppo_learning_rate_final": current_ppo_learning_rate,
+        "direct_population_ppo_rollout_temperature_final": (
+            current_ppo_rollout_temperature
+        ),
+        "direct_population_plateau_temperature_adjustments": float(
+            plateau_adjustments
+        ),
+        "direct_population_value_calibration_count": calibration_count,
+        "direct_population_value_calibration_mae": calibration_mae,
+        "direct_population_value_calibration_rmse": calibration_rmse,
         "direct_population_ppo_gamma": float(ppo_gamma),
         "direct_population_ppo_terminal_advantage_weight": float(
             ppo_terminal_advantage_weight

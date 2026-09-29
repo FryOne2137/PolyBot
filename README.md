@@ -184,18 +184,16 @@ temperaturze `--direct-population-ppo-rollout-temperature`; promocja nadal
 ocenia deterministyczną raw policy.
 
 Domyślny `--champion-mode flat` pozostawia promocję całkowicie zależną od
-surowej polityki. Opcjonalne `--flat-mcts-distill-games N` uruchamia przed nią
-Expert Iteration: belief-MCTS tworzy mocniejsze targety, a sieć uczy się je
-wykonywać bez search. Przed i po destylacji działa ta sama sparowana bramka
-`--flat-mcts-distill-gate-games`; jeśli raw policy nie poprawi wyniku przeciw
-championowi, wszystkie aktualizacje MCTS są cofane. Końcowa bramka nadal używa
-wyłącznie surowej polityki przeciw championowi i całej historycznej populacji.
-Tylko po bezpiecznym, realnym awansie uruchamiany jest krótki,
-beztreningowy probe: `--mcts-probe-games 10` przy
-`--mcts-probe-simulations 32`. Raw policy i search@32 grają na tych samych
-sparowanych mapach. Probe przechodzi tylko wtedy, gdy search@32 osiąga co
-najmniej `--mcts-probe-score` i jest ściśle lepszy od raw policy o więcej niż
-`--mcts-probe-min-improvement`. Nie wykonuje aktualizacji ani nie zmienia Elo.
+surowej polityki. Opcjonalne `--flat-mcts-distill-games N` uruchamia Expert
+Iteration tylko po obowiązkowym probe (`--mcts-probe-games >= 2`): raw policy
+i search@N grają na tych samych sparowanych mapach, a search musi osiągnąć co
+najmniej `--mcts-probe-score` oraz być ściśle lepszy od raw policy o więcej niż
+`--mcts-probe-min-improvement`. Gdy probe nie przejdzie, destylacja jest
+pomijana — nie wolno uczyć surowej policy z zaszumionego drzewa. Po
+destylacji działa ta sama sparowana bramka `--flat-mcts-distill-gate-games`;
+jeśli raw policy nie poprawi wyniku przeciw championowi, wszystkie aktualizacje
+MCTS są cofane. Końcowa bramka nadal używa wyłącznie surowej polityki przeciw
+championowi i całej historycznej populacji.
 
 Po `--mcts-probe-patience` kolejnych sukcesach SQLite oznacza lineage jako
 `mcts_ready`. Status jest wyłącznie zgodą na przyszły eksperyment, w którym

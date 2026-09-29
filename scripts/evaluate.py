@@ -10,7 +10,7 @@ from _bootstrap import add_local_source_root
 add_local_source_root()
 
 from polybot.config import MCTSConfig
-from polybot.evaluation.matches import evaluate_matches
+from polybot.evaluation.matches import evaluate_direct_matches, evaluate_matches
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.training.cli import add_environment_options, print_summary, training_config_from_args
@@ -22,6 +22,12 @@ def main() -> None:
     add_environment_options(parser)
     parser.add_argument("--model-a", type=Path, required=True)
     parser.add_argument("--model-b", type=Path, help="optional MCTS opponent; default is random")
+    parser.add_argument(
+        "--mode",
+        choices=("mcts", "flat"),
+        default="mcts",
+        help="Evaluate full search or the raw greedy policy without MCTS",
+    )
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
@@ -36,6 +42,7 @@ def main() -> None:
         help="PolyBot-only candidate-prior experiment; applies to both neural players.",
     )
     parser.add_argument("--mcts-random-actions", type=int, default=0)
+    parser.add_argument("--mcts-min-prior-mass", type=float, default=0.0)
     parser.add_argument(
         "--model-b-mcts-top-actions", type=int,
         help="Override model B only; use 0 to compare filtered A against full-search B.",
@@ -59,6 +66,23 @@ def main() -> None:
     device = select_device(training.device)
     model_a, _ = load_model(args.model_a, device)
     model_b = load_model(args.model_b, device)[0] if args.model_b is not None else None
+    if args.mode == "flat":
+        if model_b is None:
+            parser.error("--mode flat requires --model-b")
+        summary = evaluate_direct_matches(
+            model_a,
+            model_b,
+            device,
+            training,
+            args.games,
+            model_a_label=args.model_a.stem,
+            model_b_label=args.model_b.stem,
+            visible_action_history=args.visible_action_history,
+            num_threads=args.mcts_threads,
+            max_actions=args.mcts_max_actions,
+        )
+        print_summary(summary)
+        return
     # Greedy selection makes repeated evaluation on the same seeds comparable.
     mcts = MCTSConfig(
         simulations=args.simulations,
@@ -69,6 +93,7 @@ def main() -> None:
         native_max_actions=args.mcts_max_actions,
         search_top_actions=args.mcts_top_actions,
         search_random_actions=args.mcts_random_actions,
+        search_min_prior_mass=args.mcts_min_prior_mass,
         strategic_prior_weight=args.strategic_prior_weight,
         teacher_prior_weight=args.teacher_prior_weight,
     )

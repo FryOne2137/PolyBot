@@ -196,14 +196,19 @@ MCTS są cofane. Końcowa bramka nadal używa wyłącznie surowej polityki przec
 championowi i całej historycznej populacji.
 
 Po `--mcts-probe-patience` kolejnych sukcesach SQLite oznacza lineage jako
-`mcts_ready`. Status jest wyłącznie zgodą na przyszły eksperyment, w którym
-MCTS może zostać użyty jako nauczyciel; nie jest bramką promocji i nie zmienia
-raw-policy championa. Jeżeli search nie pomaga, nie jest używany do treningu.
+`mcts_ready`. W trybie `--champion-mode auto` kolejna runda automatycznie
+przechodzi z flat recovery do zamrożonej generacji MCTS: najpierw zbierany jest
+cały replay przez niezmieniany model, dopiero potem uczy się challenger. Musi
+on przejść zarówno bramkę search, jak i raw-policy absorption; przy porażce
+waga wraca do ostatniego bezpiecznego stanu. Stan jest zapisany przy
+checkpointcie, więc restart ligi nie cofa go do trybu flat. Jeżeli search nie
+pomaga przed pierwszym przejściem, auto pozostaje w recovery i nie używa go do
+treningu. Po przejściu nieudany rung wraca natomiast do poprzedniego
+MCTS-ready championa.
 
-Ciężka historyczna drabina pozostaje dostępna przez `--champion-mode mcts`, ale
-zalecana komenda PPO ustawia `--population-games 0`. Dzięki temu jedynym kosztem
-MCTS w rundzie jest krótki, niezależny probe, a wszystkie właściwe aktualizacje
-odbywają się w szybkim `VectorGameEnv`.
+Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
+`auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
+nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.
 
 Probe i opcjonalne gry MCTS przeciw populacji korzystają z natywnego
 `SelfPlayPool`. `agent_id` wybiera właściwy checkpoint osobno dla każdego

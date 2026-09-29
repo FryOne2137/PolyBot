@@ -165,6 +165,24 @@ def _mcts_probe_passed(
     )
 
 
+def _round_champion_mode(
+    requested_mode: str,
+    capability: Mapping[str, Any] | None,
+) -> str:
+    """Resolve one league round without losing an earned MCTS transition.
+
+    ``auto`` remains a raw-policy curriculum until its protected champion has
+    a persisted, successful MCTS probe.  MCTS promotions write that capability
+    to their own checkpoint too, so a resumed league run stays in absorption
+    mode rather than silently returning to raw-only training.
+    """
+    if requested_mode == "auto":
+        return "mcts" if bool(capability and capability.get("mcts_ready")) else "flat"
+    if requested_mode in {"flat", "mcts"}:
+        return requested_mode
+    raise ValueError("requested_mode must be 'flat', 'mcts' or 'auto'")
+
+
 def _flat_distillation_gate_decision(
     before_score: float,
     after_score: float,
@@ -612,8 +630,16 @@ def train_promotion_league(
     )
     if not checkpoint_prefix:
         raise ValueError("checkpoint_prefix must not be empty")
-    if champion_mode not in {"flat", "mcts"}:
-        raise ValueError("champion_mode must be 'flat' or 'mcts'")
+    if champion_mode not in {"flat", "mcts", "auto"}:
+        raise ValueError("champion_mode must be 'flat', 'mcts' or 'auto'")
+    if champion_mode == "auto" and population_games < 1:
+        raise ValueError(
+            "champion_mode='auto' requires positive population_games for MCTS absorption"
+        )
+    if champion_mode == "auto" and mcts_probe_games < 2:
+        raise ValueError(
+            "champion_mode='auto' requires at least two MCTS probe games"
+        )
     if flat_mcts_distill_games < 0:
         raise ValueError("flat_mcts_distill_games must not be negative")
     if flat_mcts_distill_games and not mcts_probe_games:
@@ -956,7 +982,7 @@ def train_promotion_league(
     # Flat-only runs without a readiness probe do not need the native routed
     # MCTS binding at all.
     if (
-        champion_mode == "mcts"
+        champion_mode in {"mcts", "auto"}
         or mcts_probe_games
         or steps
         or population_games
@@ -1354,13 +1380,34 @@ def train_promotion_league(
                     )
                     previous_challenger_path = challenger_path
                     previous_challenger_id = challenger_id
+                    champion_capability = database.model_capability(champion_id)
+                    round_champion_mode = _round_champion_mode(
+                        champion_mode, champion_capability
+                    )
+                    round_training_summary["champion_mode"] = {
+                        "requested": champion_mode,
+                        "effective": round_champion_mode,
+                        "mcts_ready": float(
+                            bool(
+                                champion_capability
+                                and champion_capability.get("mcts_ready")
+                            )
+                        ),
+                    }
+                    if champion_mode == "auto":
+                        print(
+                            "league auto mode | "
+                            f"effective={round_champion_mode} | "
+                            f"mcts_ready={int(round_training_summary['champion_mode']['mcts_ready'])}",
+                            flush=True,
+                        )
                     # Independent branch selection deliberately starts every
                     # round from the frozen champion.  A merely safe
                     # challenger (for example 0.46 against the champion) is
                     # not allowed to drift further away for the next round.
                     fresh_branch_round = (
                         direct_population_branch_count > 1
-                        or champion_mode == "mcts"
+                        or round_champion_mode == "mcts"
                     )
                     candidate_source = (
                         champion_path
@@ -1449,8 +1496,30 @@ def train_promotion_league(
                         ),
                         refresh_promoted_curriculum=(
                             refresh_promoted_curriculum
+                            and not (
+                                champion_mode == "auto"
+                                and round_champion_mode == "mcts"
+                            )
                         ),
                     )
+                    if champion_mode == "auto" and round_champion_mode == "mcts":
+                        # The preceding flat rounds already established the
+                        # raw backbone and MCTS capability.  Start the next
+                        # generation from a frozen champion immediately;
+                        # repeating PPO here would change the collector before
+                        # it has produced one fixed MCTS replay generation.
+                        controls = {
+                            **controls,
+                            "phase": "mcts_absorption",
+                            "teacher_steps": 0,
+                            "objective_steps": 0,
+                            "actor_steps": 0,
+                            "actor_max_steps": 0,
+                            "population_steps": 0,
+                            "population_max_steps": 0,
+                            "population_teacher_weight": 0.0,
+                            "population_opponent_policy_weight": 0.0,
+                        }
                     post_bootstrap = bool(controls["post_bootstrap"])
                     if post_bootstrap:
                         probabilities = _champion_focused_probabilities(
@@ -1631,6 +1700,12 @@ def train_promotion_league(
                             f"{effective_population_max_steps} steps",
                             flush=True,
                         )
+                    elif curriculum_phase == "mcts_absorption":
+                        print(
+                            "league curriculum | auto MCTS absorption | "
+                            "frozen generator collection before optimisation",
+                            flush=True,
+                        )
 
                     direct_summary: Dict[str, Any] = {}
                     if (
@@ -1724,7 +1799,7 @@ def train_promotion_league(
                         not direct_enabled
                         or bool(direct_summary.get("direct_ready", 0.0))
                     )
-                    if not direct_ready and champion_mode == "mcts":
+                    if not direct_ready and round_champion_mode == "mcts":
                         # MCTS is deliberately unavailable until the raw
                         # network can expand and finish games on held-out maps.
                         # Preserve a non-regressing challenger so the next
@@ -2518,7 +2593,7 @@ def train_promotion_league(
                         }
                     )
                     direct_population_ready = (
-                        not bool(direct_population_steps)
+                        not bool(effective_population_steps)
                         or bool(
                             direct_population_summary.get(
                                 "direct_population_ready", 0.0
@@ -2527,7 +2602,7 @@ def train_promotion_league(
                     )
                     if (
                         not direct_population_ready
-                        and champion_mode == "mcts"
+                        and round_champion_mode == "mcts"
                     ):
                         best_population_score = float(
                             direct_population_summary.get(
@@ -2623,7 +2698,10 @@ def train_promotion_league(
 
                     flat_distillation_summary: Dict[str, Any] = {}
                     mcts_distillation_ready = False
-                    if champion_mode == "flat" and flat_mcts_distill_games:
+                    if (
+                        round_champion_mode == "flat"
+                        and flat_mcts_distill_games
+                    ):
                         # Search is a teacher only when it already improves on
                         # the raw candidate on exactly the same held-out maps.
                         # Without this guard a weak policy/value/belief stack
@@ -2733,7 +2811,7 @@ def train_promotion_league(
                                 flush=True,
                             )
                     if (
-                        champion_mode == "flat"
+                        round_champion_mode == "flat"
                         and flat_mcts_distill_games
                         and mcts_distillation_ready
                     ):
@@ -2985,7 +3063,7 @@ def train_promotion_league(
                             "flat_mcts_distillation"
                         ] = flat_distillation_summary
 
-                    if champion_mode == "flat":
+                    if round_champion_mode == "flat":
                         # Flat-policy strength is the only promotion authority
                         # in this mode. Optional search distillation above must
                         # first improve the raw apprentice; the later probe can
@@ -3508,6 +3586,7 @@ def train_promotion_league(
                         run.log(
                             round=round_index,
                             champion_mode_flat=1.0,
+                            champion_mode_auto_flat=float(champion_mode == "auto"),
                             candidate_score=last_candidate_score,
                             population_score=last_population_score,
                             promoted=float(promoted),
@@ -4146,6 +4225,34 @@ def train_promotion_league(
                         promoted_path = _next_checkpoint_path(checkpoint_dir, checkpoint_prefix)
                         save_model(promoted_path, candidate, model_config)
                         database.finalise_candidate(candidate_id, promoted_path=promoted_path)
+                        if champion_mode == "auto":
+                            # The accepted absorption ladder is the evidence
+                            # that this new checkpoint may itself generate the
+                            # next frozen MCTS generation. Persist it on the
+                            # promoted child so the mode survives restarts.
+                            database.record_mcts_capability(
+                                candidate_id,
+                                games=mcts_gate_games,
+                                simulations=int(population_rungs[-1]),
+                                raw_score=best_raw_policy_score,
+                                search_score=best_mcts_score,
+                                streak=mcts_probe_patience,
+                                ready=True,
+                                evaluation_active=True,
+                                summary={
+                                    "source": "auto_mcts_absorption",
+                                    "accepted_rungs": float(
+                                        population_summary[
+                                            "mcts_ladder_accepted"
+                                        ]
+                                    ),
+                                    "required_rungs": float(
+                                        expected_mcts_rungs
+                                    ),
+                                    "raw_policy_score": best_raw_policy_score,
+                                    "mcts_score": best_mcts_score,
+                                },
+                            )
                         champion_path = promoted_path
                         champion_id = candidate_id
                         challenger_path = None

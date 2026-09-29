@@ -121,19 +121,19 @@ python scripts/evaluate.py `
 # ruchów prowadzących do celu. Po pierwszym awansie teacher i actor-critic są
 # pomijane, ale działa mały refresh objectives; champion dostaje 65% gier, a
 # populacja trenuje 6000-12000 kroków przeciw championowi i historii.
-# Początkowo o awansie decyduje wyłącznie płaska polityka. Dopiero po realnym
-# płaskim awansie wykonywane jest 10 sparowanych gier przy 32 symulacjach;
+# Tryb auto zaczyna od płaskiej policy. Dopiero po dwóch kolejnych udanych
+# sparowanych probe'ach przy 32 symulacjach przechodzi do zamrożonych generacji
+# MCTS; wcześniejsze rundy nadal promuje wyłącznie raw policy.
 # search@32 musi ściśle pobić raw policy na tych samych mapach.
-# Dwa kolejne udane probe'y zapisują status MCTS-ready. Od następnej rundy MCTS
-# staje się dodatkową bramką awansu; nieudany probe zachowuje starego championa
-# i zapisuje płaskiego kandydata jako challengera. Dlatego komenda ma co najmniej
-# 3 rundy: dwie mogą potwierdzić gotowość, a trzecia już użyć nowej bramki.
+# Dwa kolejne udane probe'y zapisują status MCTS-ready. Od następnej rundy jest
+# wykonywane frozen MCTS collection → fixed replay → aktualizacja challengera;
+# nieudany rung wraca do poprzedniego MCTS-ready championa. Dlatego komenda ma
+# co najmniej 3 rundy: dwie mogą potwierdzić gotowość, a trzecia ją wykorzystać.
 # Bramka populacji priorytetowo traktuje wynik gry; przejęcia i completion są
 # tie-breakerami, a historyczny floor pozostaje twardym zabezpieczeniem. PPO
 # używa wyniku całej partii dla value/PPG, gamma=1, wygaszanego shaping i EMA.
-# Włączona druga, swobodna linia exploiter gra głównie z championem bez kotwic;
-# nadal musi przejść tę samą niezależną bramkę. Ciężka drabina MCTS jest
-# wyłączona przez --population-games 0.
+# Główna linia jest pojedyncza i kontynuowana między rundami. Generacje MCTS są
+# uruchamiane dopiero automatycznie po probe'ach, nigdy na słabym backbone'u.
 # Checkpointy
 # po promocji trafią
 # do models\league\, pełna historia do models\league\league.sqlite3, a wykresy
@@ -163,9 +163,15 @@ python scripts/train_league.py `
   --checkpoint-prefix champion `
   --league-db models\league\league.sqlite3 `
   --population-size 6 `
-  --population-games 0 `
-  --population-updates-per-game 0 `
+  --population-games 128 `
+  --population-updates-per-game 1 `
   --population-workers 16 `
+  --population-max-envs 16 `
+  --population-offline-collection `
+  --population-mcts-critical-only `
+  --population-mcts-critical-fraction 0.25 `
+  --population-mcts-critical-minimum-score 0.25 `
+  --population-mcts-critical-replay-fraction 1.0 `
   --pfsp-alpha 2.0 `
   --champion-probability 0.40 `
   --minimum-sampling-probability 0.05 `
@@ -252,7 +258,7 @@ python scripts/train_league.py `
   --post-bootstrap-champion-probability 0.65 `
   --post-bootstrap-policy-anchor-weight 0.20 `
   --refresh-promoted-curriculum `
-  --champion-mode flat `
+  --champion-mode auto `
   --flat-mcts-distill-games 24 `
   --flat-mcts-distill-simulations 32 `
   --flat-mcts-distill-updates-per-game 1 `
@@ -271,6 +277,9 @@ python scripts/train_league.py `
   --mcts-probe-score 0.55 `
   --mcts-probe-min-improvement 0.00 `
   --mcts-probe-patience 2 `
+  --mcts-simulation-ladder 32 `
+  --mcts-gate-games 20 `
+  --mcts-gate-score 0.50 `
   --rounds 12 `
   --promotion-games 100 `
   --promotion-score 0.55 `

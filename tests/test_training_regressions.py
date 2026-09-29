@@ -56,6 +56,7 @@ from polybot.training.league import (
     _flat_distillation_gate_decision,
     _mcts_probe_passed,
     _promotion_gate_decision,
+    _round_champion_mode,
     _select_exploiter_checkpoint,
     train_promotion_league,
 )
@@ -234,6 +235,13 @@ def test_promoted_recovery_restores_dense_curriculum_with_anchor_controls():
     assert controls["actor_steps"] == 1_000
     assert controls["population_steps"] == 9_000
     assert controls["policy_anchor_weight"] == 0.30
+
+
+def test_auto_mode_uses_persisted_capability_to_switch_to_mcts():
+    assert _round_champion_mode("auto", None) == "flat"
+    assert _round_champion_mode("auto", {"mcts_ready": 0}) == "flat"
+    assert _round_champion_mode("auto", {"mcts_ready": 1}) == "mcts"
+    assert _round_champion_mode("flat", {"mcts_ready": 1}) == "flat"
 
 
 def test_population_checkpoint_selection_prioritises_strength_with_safety_floor():

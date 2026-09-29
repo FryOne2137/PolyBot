@@ -65,7 +65,10 @@ def main() -> None:
     parser.add_argument("--population-size", type=int, default=6)
     parser.add_argument(
         "--population-games", type=int, default=0,
-        help="MCTS training games; keep 0 while --champion-mode flat",
+        help=(
+            "MCTS games per absorption generation; use 0 only for raw flat mode "
+            "and a positive value for mcts/auto"
+        ),
     )
     parser.add_argument("--population-updates-per-game", type=int, default=2)
     parser.add_argument(
@@ -443,9 +446,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--champion-mode",
-        choices=("flat", "mcts"),
+        choices=("flat", "mcts", "auto"),
         default="flat",
-        help="Flat promotes by raw policy; mcts enables the legacy search ladder",
+        help=(
+            "flat promotes by raw policy; mcts enables the search ladder; "
+            "auto switches from flat to frozen MCTS generations after persisted probes"
+        ),
     )
     parser.add_argument(
         "--flat-mcts-distill-games", type=int, default=0,

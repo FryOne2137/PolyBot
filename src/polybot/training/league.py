@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
@@ -34,6 +35,22 @@ from .vector_population import (
 
 
 _MAX_SEED = 2**31 - 1
+
+
+def _load_belief_apprentice_state(path: Path) -> Dict[str, Any]:
+    """Load the small, non-authoritative calibration marker safely."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _save_belief_apprentice_state(path: Path, state: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(dict(state), indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _offset_seed(seed: int, offset: int) -> int:
@@ -446,6 +463,9 @@ def train_promotion_league(
     max_pending_leaves: int,
     visible_action_history: int,
     belief_retries: int,
+    belief_apprentice_path: Path | None = None,
+    belief_action_equivalence_target: float = 0.10,
+    belief_action_equivalence_min_particles: int = 512,
     database_path: Path | None = None,
     population_model_paths: Sequence[Path] = (),
     population_size: int = 6,
@@ -970,6 +990,10 @@ def train_promotion_league(
         raise ValueError(
             "direct_population_regression_patience must be positive"
         )
+    if not 0.0 <= belief_action_equivalence_target <= 1.0:
+        raise ValueError("belief_action_equivalence_target must be between zero and one")
+    if belief_action_equivalence_min_particles < 1:
+        raise ValueError("belief_action_equivalence_min_particles must be positive")
     ladder = tuple(int(value) for value in mcts_simulation_ladder)
     if any(value < 1 for value in ladder) or tuple(sorted(set(ladder))) != ladder:
         raise ValueError("mcts_simulation_ladder must be strictly increasing")
@@ -1006,6 +1030,14 @@ def train_promotion_league(
         else checkpoint_dir / "mcts-reanalyse.pkl"
     )
     database_path = database_path or checkpoint_dir / "league.sqlite3"
+    belief_apprentice_path = (
+        belief_apprentice_path
+        if belief_apprentice_path is not None
+        else checkpoint_dir / f"{checkpoint_prefix}-belief-apprentice.pt"
+    )
+    belief_apprentice_state_path = belief_apprentice_path.with_suffix(
+        belief_apprentice_path.suffix + ".json"
+    )
     resolved_evaluation_seed = _offset_seed(evaluation_seed, 0)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "league")
@@ -1405,14 +1437,33 @@ def train_promotion_league(
                     # round from the frozen champion.  A merely safe
                     # challenger (for example 0.46 against the champion) is
                     # not allowed to drift further away for the next round.
+                    belief_apprentice_state = _load_belief_apprentice_state(
+                        belief_apprentice_state_path
+                    )
+                    apprentice_matches_champion = (
+                        belief_apprentice_path.exists()
+                        and belief_apprentice_state.get("champion_path")
+                        == str(champion_path.resolve())
+                    )
+                    belief_calibration_required = (
+                        round_champion_mode == "mcts"
+                        and not (
+                            apprentice_matches_champion
+                            and bool(belief_apprentice_state.get("ready", False))
+                        )
+                    )
                     fresh_branch_round = (
                         direct_population_branch_count > 1
                         or round_champion_mode == "mcts"
                     )
                     candidate_source = (
-                        champion_path
-                        if fresh_branch_round
-                        else previous_challenger_path or champion_path
+                        belief_apprentice_path
+                        if round_champion_mode == "mcts" and apprentice_matches_champion
+                        else (
+                            champion_path
+                            if fresh_branch_round
+                            else previous_challenger_path or champion_path
+                        )
                     )
                     candidate_parent_id = (
                         champion_id
@@ -1420,12 +1471,16 @@ def train_promotion_league(
                         else previous_challenger_id or champion_id
                     )
                     candidate_source_kind = (
-                        "challenger"
-                        if (
-                            previous_challenger_path is not None
-                            and not fresh_branch_round
+                        "belief-apprentice"
+                        if candidate_source == belief_apprentice_path
+                        else (
+                            "challenger"
+                            if (
+                                previous_challenger_path is not None
+                                and not fresh_branch_round
+                            )
+                            else "champion"
                         )
-                        else "champion"
                     )
                     candidate_evaluation_label = (
                         f"pretendent {candidate_source.stem}"
@@ -3668,6 +3723,7 @@ def train_promotion_league(
                         "mcts_ladder_accepted": 0.0,
                         "mcts_ladder_rollbacks": 0.0,
                     }
+                    belief_calibration_summary: Dict[str, Any] | None = None
                     # A failed first MCTS rung must return to the last state
                     # proven safe against the raw-policy population gate, not
                     # to an optional ungated legacy self-play snapshot.
@@ -3761,9 +3817,49 @@ def train_promotion_league(
                                     rung_index * 2_000_003,
                                 ),
                             )
+                            # Until a model can reconstruct particles whose
+                            # action set matches its public observation, MCTS
+                            # visits are not a trustworthy policy teacher.
+                            # Calibrate only the belief-specific decoder and
+                            # public-action conditioning; policy/value and
+                            # the shared encoder remain frozen.
+                            if belief_calibration_required:
+                                rung_training = replace(
+                                    rung_training,
+                                    policy_weight=0.0,
+                                    value_weight=0.0,
+                                    belief_weight=max(1.0, rung_training.belief_weight),
+                                    engine_action_constraint_weight=max(
+                                        1.0,
+                                        rung_training.engine_action_constraint_weight,
+                                    ),
+                                    bridge_constraint_weight=max(
+                                        0.25,
+                                        rung_training.bridge_constraint_weight,
+                                    ),
+                                )
                             rung_mcts = replace(
                                 mcts,
                                 simulations=int(simulations),
+                                # A calibration generation needs diverse,
+                                # real legal observations rather than a
+                                # policy-biased subset.  It does not train a
+                                # policy target, so no top-K speed shortcut.
+                                search_top_actions=(
+                                    0
+                                    if belief_calibration_required
+                                    else mcts.search_top_actions
+                                ),
+                                search_random_actions=(
+                                    0
+                                    if belief_calibration_required
+                                    else mcts.search_random_actions
+                                ),
+                                search_min_prior_mass=(
+                                    0.0
+                                    if belief_calibration_required
+                                    else mcts.search_min_prior_mass
+                                ),
                                 # The direct curriculum must first prove that
                                 # the neural policy/value help search. Manual
                                 # priors are therefore reduced rung by rung.
@@ -3810,27 +3906,47 @@ def train_promotion_league(
                                 opponent_models=frozen_models,
                                 opponent_weights=probabilities,
                                 anchor_model=champion,
-                                anchor_policy_weight=champion_anchor_weight,
-                                anchor_value_weight=champion_value_anchor_weight,
+                                anchor_policy_weight=(
+                                    0.0
+                                    if belief_calibration_required
+                                    else champion_anchor_weight
+                                ),
+                                anchor_value_weight=(
+                                    0.0
+                                    if belief_calibration_required
+                                    else champion_value_anchor_weight
+                                ),
                                 critical_decision_fraction=(
-                                    population_mcts_critical_fraction
+                                    0.0
+                                    if belief_calibration_required
+                                    else population_mcts_critical_fraction
                                 ),
                                 critical_minimum_score=(
                                     population_mcts_critical_minimum_score
                                 ),
                                 critical_replay_fraction=(
-                                    population_mcts_critical_replay_fraction
+                                    0.0
+                                    if belief_calibration_required
+                                    else population_mcts_critical_replay_fraction
                                 ),
-                                critical_only=population_mcts_critical_only,
+                                critical_only=(
+                                    False
+                                    if belief_calibration_required
+                                    else population_mcts_critical_only
+                                ),
                                 reanalysis_path=population_mcts_reanalyse_path,
                                 reanalysis_capacity=(
                                     population_mcts_reanalyse_capacity
                                 ),
                                 reanalysis_positions=(
-                                    population_mcts_reanalyse_positions
+                                    0
+                                    if belief_calibration_required
+                                    else population_mcts_reanalyse_positions
                                 ),
                                 reanalysis_replay_fraction=(
-                                    population_mcts_reanalyse_replay_fraction
+                                    0.0
+                                    if belief_calibration_required
+                                    else population_mcts_reanalyse_replay_fraction
                                 ),
                                 num_threads=population_workers,
                                 max_pending_leaves=max_pending_leaves,
@@ -3838,12 +3954,72 @@ def train_promotion_league(
                                 belief_retries=belief_retries,
                                 max_envs=min(num_envs, population_max_envs),
                                 offline_collection=population_offline_collection,
+                                belief_only=belief_calibration_required,
                                 game_callback=record_training_game,
                                 reserved_seeds=evaluation_map_seeds,
                                 run=run.child(
                                     f"round_{round_index:03d}/mcts_rung_{rung_index + 1:02d}"
                                 ),
                             )
+                            if belief_calibration_required:
+                                checked = int(
+                                    rung_summary.get(
+                                        "belief_action_equivalence_checked_particles",
+                                        0.0,
+                                    )
+                                )
+                                rejected = int(
+                                    rung_summary.get(
+                                        "belief_action_equivalence_rejected_particles",
+                                        0.0,
+                                    )
+                                )
+                                rate = float(rejected / max(1, checked))
+                                ready = bool(
+                                    checked >= belief_action_equivalence_min_particles
+                                    and rate <= belief_action_equivalence_target
+                                )
+                                save_model(belief_apprentice_path, candidate, model_config)
+                                _save_belief_apprentice_state(
+                                    belief_apprentice_state_path,
+                                    {
+                                        "champion_path": str(champion_path.resolve()),
+                                        "ready": ready,
+                                        "checked_particles": checked,
+                                        "rejected_particles": rejected,
+                                        "rejection_rate": rate,
+                                        "target_rejection_rate": (
+                                            belief_action_equivalence_target
+                                        ),
+                                        "minimum_particles": (
+                                            belief_action_equivalence_min_particles
+                                        ),
+                                        "round": round_index,
+                                    },
+                                )
+                                belief_calibration_summary = {
+                                    "path": str(belief_apprentice_path),
+                                    "ready": float(ready),
+                                    "checked_particles": float(checked),
+                                    "rejected_particles": float(rejected),
+                                    "rejection_rate": rate,
+                                    "target_rejection_rate": (
+                                        belief_action_equivalence_target
+                                    ),
+                                    "training": rung_summary,
+                                }
+                                population_summary["belief_calibration"] = (
+                                    belief_calibration_summary
+                                )
+                                print(
+                                    "league belief calibration | "
+                                    f"action mismatch={rate:.2%} "
+                                    f"({rejected}/{checked}) | "
+                                    f"ready={int(ready)} | saved "
+                                    f"{belief_apprentice_path}",
+                                    flush=True,
+                                )
+                                break
                             gate_mcts = replace(
                                 evaluation_mcts,
                                 simulations=int(simulations),
@@ -4015,6 +4191,41 @@ def train_promotion_league(
                             )
                             if not accepted:
                                 break
+                    if belief_calibration_summary is not None:
+                        round_training_summary["population"] = population_summary
+                        database.finalise_candidate(candidate_id, promoted_path=None)
+                        database.finish_round(
+                            round_id,
+                            champion_id,
+                            False,
+                            round_training_summary,
+                            {
+                                "promoted": 0.0,
+                                "valid": 1.0,
+                                "reason": "belief_calibration",
+                                "belief_calibration": belief_calibration_summary,
+                            },
+                        )
+                        run.log(
+                            round=round_index,
+                            belief_calibration=1.0,
+                            belief_action_equivalence_rate=(
+                                belief_calibration_summary["rejection_rate"]
+                            ),
+                            belief_action_equivalence_ready=(
+                                belief_calibration_summary["ready"]
+                            ),
+                            promoted=0.0,
+                        )
+                        database.flush()
+                        last_training = dict(round_training_summary)
+                        last_candidate_score = 0.0
+                        last_population_score = 0.0
+                        challenger_path = None
+                        challenger_id = None
+                        del candidate, champion, frozen_models
+                        continue
+
                     expected_mcts_rungs = sum(
                         int(rung_games > 0)
                         for rung_games in population_game_allocations

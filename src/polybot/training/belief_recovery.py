@@ -274,6 +274,73 @@ def ismcts_rejected_envs(
     )
 
 
+def ismcts_action_difference_rejections(
+    pool: object,
+    state_ids: np.ndarray,
+    particles: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int, tuple[Mapping[str, Any], ...]]:
+    """Reject particles whose public legal-action set differs from the root.
+
+    The PolyEnv method is a rules-oracle query only: it returns public action
+    signatures, never a hidden-world target.  Keeping this check before
+    ``submit_beliefs`` prevents MCTS from assigning visits to routes or builds
+    that only exist in a hallucinated determinisation.
+    """
+    ids = np.ascontiguousarray(state_ids, dtype=np.uint64)
+    completed = np.ascontiguousarray(particles, dtype=np.int32)
+    if completed.ndim != 5 or completed.shape[0] != ids.size:
+        raise ValueError("ISMCTS particles must have shape [B,P,K,T,23]")
+    method = getattr(pool, "ismcts_belief_action_differences", None)
+    if not callable(method):
+        return (
+            np.empty(0, dtype=np.int32),
+            np.zeros(completed.shape[:3], dtype=bool),
+            0,
+            (),
+        )
+    records = method(ids, completed)
+    if isinstance(records, Mapping):
+        records = records.get("differences", records.get("records", ()))
+    if records is None:
+        records = ()
+    rejection_mask = np.zeros(completed.shape[:3], dtype=bool)
+    diagnostics: list[Mapping[str, Any]] = []
+    for raw in records:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError(
+                "PolyEnv ismcts_belief_action_differences must return mapping rows"
+            )
+        env = int(raw.get("env_id", -1))
+        player = int(raw.get("player", -1))
+        particle = int(raw.get("particle", -1))
+        if not (
+            0 <= env < completed.shape[0]
+            and 0 <= player < completed.shape[1]
+            and 0 <= particle < completed.shape[2]
+        ):
+            raise RuntimeError(
+                "PolyEnv action-difference record has invalid env/player/particle indices"
+            )
+        missing = tuple(raw.get("missing_actions", ()) or ())
+        extra = tuple(raw.get("extra_actions", ()) or ())
+        invalid = bool(raw.get("invalid_state", False))
+        if not (missing or extra or invalid):
+            continue
+        rejection_mask[env, player, particle] = True
+        diagnostics.append({
+            "accepted": False,
+            "env_id": env,
+            "player": player,
+            "particle": particle,
+            "reason": str(raw.get("reason", "legal_action_mismatch")),
+            "missing_actions": missing,
+            "extra_actions": extra,
+            "invalid_state": invalid,
+        })
+    rejected = np.flatnonzero(rejection_mask.any(axis=(1, 2))).astype(np.int32)
+    return rejected, rejection_mask, int(rejection_mask.sum()), tuple(diagnostics)
+
+
 def capped_update_target(
     requested_updates: int,
     example_count: int,

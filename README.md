@@ -290,6 +290,23 @@ liści MCTS. Po zakończeniu MCTS PolyEnv udostępnia wyłącznie dla lossu beli
 etykiety `belief_targets_numpy()`: nie są one przekazywane do `submit_beliefs`,
 policy ani MCTS, więc nie mogą wpłynąć na zagrany ruch.
 
+### Kalibracja belief przed destylacją MCTS
+
+Jeżeli PolyEnv udostępnia `ismcts_belief_action_differences`, PolyBot sprawdza
+przed `submit_beliefs` pełny publiczny zbiór legalnych akcji dla każdego
+particle. Hipoteza z brakującą albo dodatkową akcją jest losowana ponownie;
+po wyczerpaniu retry slot jest resetowany, a nie przekazywany do MCTS. Chroni
+to drzewo przed wymyśloną drogą, przejściem lub budową.
+
+Liga prowadzi ponadto osobny checkpoint `*-belief-apprentice.pt`. Dopóki jego
+`belief_action_equivalence_rejection_rate` nie spadnie poniżej domyślnego 10%
+na co najmniej 512 particle, aktualizowane są wyłącznie moduły belief — policy,
+value oraz champion pozostają zamrożone. Checkpoint jest zachowywany pomiędzy
+rundami, także gdy kandydat nie byłby gotowy do promocji. Dopiero po tej
+kalibracji MCTS może być targetem dla policy/value. Ścieżkę i próg regulują
+`--belief-apprentice-path`, `--belief-action-equivalence-target` oraz
+`--belief-action-equivalence-min-particles`.
+
 Optymalizacja jest przeplatana z rolloutami: gdy kończy się partia, jej wynik
 jest propagowany przez decyzje z bootstrapem MCTS (`TD(0.95)`), model dostaje
 zaplanowaną porcję aktualizacji, a kolejne ruchy generuje nowszy kandydat.

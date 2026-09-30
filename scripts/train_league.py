@@ -86,6 +86,18 @@ def main() -> None:
         help="Freeze the model while one full MCTS generation is collected, then train from that fixed replay",
     )
     parser.add_argument(
+        "--belief-apprentice-path", type=Path,
+        help="Persistent calibration checkpoint; defaults to <checkpoint-dir>/<prefix>-belief-apprentice.pt.",
+    )
+    parser.add_argument(
+        "--belief-action-equivalence-target", type=float, default=0.10,
+        help="Maximum initial particle action-mismatch rate before MCTS policy distillation begins.",
+    )
+    parser.add_argument(
+        "--belief-action-equivalence-min-particles", type=int, default=512,
+        help="Minimum checked candidate particles required to finish belief calibration.",
+    )
+    parser.add_argument(
         "--population-mcts-critical-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -624,6 +636,13 @@ def main() -> None:
         max_pending_leaves=args.max_pending_leaves,
         visible_action_history=args.visible_action_history,
         belief_retries=args.belief_retries,
+        belief_apprentice_path=args.belief_apprentice_path,
+        belief_action_equivalence_target=(
+            args.belief_action_equivalence_target
+        ),
+        belief_action_equivalence_min_particles=(
+            args.belief_action_equivalence_min_particles
+        ),
         database_path=args.league_db,
         population_model_paths=args.population_model,
         population_size=args.population_size,

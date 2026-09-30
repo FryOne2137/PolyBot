@@ -40,6 +40,7 @@ from polybot.training.belief_recovery import (
     BeliefRecoveryRequired,
     _invalid_unit_token_details,
     capped_update_target,
+    ismcts_action_difference_rejections,
     effective_replay_epochs,
     ismcts_rejected_envs,
     particle_temperature,
@@ -1734,6 +1735,46 @@ def test_underscored_legal_action_diagnostic_is_not_classified_as_other():
     )
 
     assert kind == "legal_actions"
+
+
+def test_public_action_difference_rejects_only_the_mismatched_particle():
+    class _Pool:
+        @staticmethod
+        def ismcts_belief_action_differences(state_ids, particles):
+            assert state_ids.dtype == np.uint64
+            assert particles.dtype == np.int32
+            return [{
+                "env_id": 0,
+                "player": 1,
+                "particle": 0,
+                "missing_actions": [{"source_index": 4, "target_index": 8}],
+                "extra_actions": [{"source_index": 8, "target_index": 4}],
+            }]
+
+    rejected, mask, count, details = ismcts_action_difference_rejections(
+        _Pool(),
+        np.asarray([77], dtype=np.uint64),
+        np.zeros((1, 2, 2, 9, 23), dtype=np.int32),
+    )
+
+    np.testing.assert_array_equal(rejected, [0])
+    assert mask[0, 1, 0]
+    assert not mask[0, 1, 1]
+    assert count == 1
+    assert len(details[0]["missing_actions"]) == 1
+
+
+def test_missing_public_action_difference_api_keeps_backward_compatibility():
+    rejected, mask, count, details = ismcts_action_difference_rejections(
+        object(),
+        np.asarray([77], dtype=np.uint64),
+        np.zeros((1, 2, 1, 9, 23), dtype=np.int32),
+    )
+
+    assert rejected.size == 0
+    assert not mask.any()
+    assert count == 0
+    assert details == ()
 
 
 def test_evaluation_exhaustion_keeps_diagnostics_from_every_same_state_cycle():

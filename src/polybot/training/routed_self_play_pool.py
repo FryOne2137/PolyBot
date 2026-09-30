@@ -33,6 +33,7 @@ from .belief_recovery import (
     BeliefRecoveryRequired,
     capped_update_target,
     effective_replay_epochs,
+    ismcts_action_difference_rejections,
     ismcts_rejected_envs,
     particle_temperature,
     partition_recovery_envs,
@@ -436,6 +437,9 @@ class SearchCounters:
     engine_action_constraint_extra_actions: int = 0
     engine_action_constraint_tiles: int = 0
     engine_action_constraint_score_sum: float = 0.0
+    belief_action_equivalence_checked_particles: int = 0
+    belief_action_equivalence_rejected_particles: int = 0
+    belief_action_equivalence_rejected_envs: int = 0
     root_env_decisions: int = 0
     search_policy_rows: int = 0
     search_pruned_rows: int = 0
@@ -657,8 +661,7 @@ class RoutedPoolSearch:
 
     def _capture_engine_action_constraints(
         self,
-        state_ids: np.ndarray,
-        particles: np.ndarray,
+        differences: Sequence[Mapping[str, Any]],
         active: np.ndarray,
         actors: np.ndarray,
         request: Mapping[str, np.ndarray],
@@ -680,22 +683,10 @@ class RoutedPoolSearch:
         )
         if not self.collect_engine_action_constraints:
             return
-        differences = self.pool.ismcts_belief_action_differences(
-            np.ascontiguousarray(state_ids, dtype=np.uint64),
-            np.ascontiguousarray(particles, dtype=np.int32),
-        )
-        if isinstance(differences, Mapping):
-            differences = differences.get("differences", ())
-        if differences is None:
-            differences = ()
         candidate_agents = np.asarray(request["agent_id"], dtype=np.int32) == 0
         tiles = maps.shape[1]
         self.counters.engine_action_constraint_queries += 1
         for raw in differences:
-            if not isinstance(raw, Mapping):
-                raise RuntimeError(
-                    "PolyEnv ismcts_belief_action_differences must return mapping rows"
-                )
             env = int(raw.get("env_id", -1))
             player = int(raw.get("player", -1))
             if (
@@ -1051,8 +1042,27 @@ class RoutedPoolSearch:
 
         all_rows = np.arange(self.num_envs, dtype=np.int32)
         particles = np.ascontiguousarray(learned_rows(all_rows, 0))
+        (
+            initial_action_rejected_rows,
+            initial_action_rejected_mask,
+            initial_action_rejected_particles,
+            initial_action_diagnostics,
+        ) = ismcts_action_difference_rejections(self.pool, state_ids, particles)
+        candidate_active = active & (
+            np.asarray(request["agent_id"], dtype=np.int32) == 0
+        )
+        self.counters.belief_action_equivalence_checked_particles += int(
+            candidate_active.sum() * particle_count
+        )
+        candidate_rows = np.flatnonzero(candidate_active)
+        if candidate_rows.size:
+            self.counters.belief_action_equivalence_rejected_particles += int(
+                initial_action_rejected_mask[
+                    candidate_rows, actors[candidate_rows]
+                ].sum()
+            )
         self._capture_engine_action_constraints(
-            state_ids, particles, active, actors, request
+            initial_action_diagnostics, active, actors, request
         )
         submitted = False
         last_error: ValueError | None = None
@@ -1063,6 +1073,45 @@ class RoutedPoolSearch:
             getattr(self.pool, "ismcts_belief_acceptance_mask", None)
         )
         for attempt in range(self.belief_retries + 1):
+            if attempt == 0:
+                action_rejected_rows = initial_action_rejected_rows
+                action_rejected_mask = initial_action_rejected_mask
+                action_rejected_particles = initial_action_rejected_particles
+                action_diagnostics = initial_action_diagnostics
+            else:
+                (
+                    action_rejected_rows,
+                    action_rejected_mask,
+                    action_rejected_particles,
+                    action_diagnostics,
+                ) = ismcts_action_difference_rejections(
+                    self.pool, state_ids, particles
+                )
+            if action_rejected_rows.size:
+                retry_pending_envs = int(action_rejected_rows.size)
+                diagnostics = action_diagnostics
+                last_error = ValueError(
+                    "ismcts_belief_action_differences rejected action-mismatched particles"
+                )
+                self.counters.belief_action_equivalence_rejected_envs += int(
+                    action_rejected_rows.size
+                )
+                self.counters.belief_rejections += int(action_rejected_rows.size)
+                self.counters.belief_rejected_envs += int(action_rejected_rows.size)
+                self.counters.belief_rejected_particles += int(
+                    action_rejected_particles
+                )
+                if attempt < self.belief_retries:
+                    self.counters.belief_retries += int(action_rejected_rows.size)
+                    self.counters.belief_resampled_envs += int(action_rejected_rows.size)
+                    fresh = learned_rows(action_rejected_rows, attempt + 1)
+                    replace_rejected_particles(
+                        particles, action_rejected_rows, action_rejected_mask, fresh
+                    )
+                    continue
+                rejected_rows = action_rejected_rows
+                rejected_mask = action_rejected_mask
+                break
             if has_acceptance_mask:
                 rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
                     self.pool, state_ids, particles, submit_failed=False
@@ -1127,18 +1176,36 @@ class RoutedPoolSearch:
             )
             fallback_error: ValueError | None = None
             fallback_preflight_rejected = False
-            if has_acceptance_mask:
-                rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
-                    self.pool, state_ids, particles, submit_failed=False
+            (
+                rejected_rows,
+                rejected_mask,
+                rejected_particles,
+                diagnostics,
+            ) = ismcts_action_difference_rejections(self.pool, state_ids, particles)
+            if rejected_rows.size:
+                fallback_preflight_rejected = True
+                fallback_error = ValueError(
+                    "ismcts_belief_action_differences rejected conservative particles"
                 )
-                if rejected_rows.size:
-                    fallback_preflight_rejected = True
-                    fallback_error = ValueError(
-                        "ismcts_belief_acceptance_mask rejected conservative particles"
+                self.counters.belief_action_equivalence_rejected_envs += int(
+                    rejected_rows.size
+                )
+                self.counters.belief_rejections += int(rejected_rows.size)
+                self.counters.belief_rejected_envs += int(rejected_rows.size)
+                self.counters.belief_rejected_particles += int(rejected_particles)
+            if has_acceptance_mask:
+                if fallback_error is None:
+                    rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
+                        self.pool, state_ids, particles, submit_failed=False
                     )
-                    self.counters.belief_rejections += int(rejected_rows.size)
-                    self.counters.belief_rejected_envs += int(rejected_rows.size)
-                    self.counters.belief_rejected_particles += int(rejected_particles)
+                    if rejected_rows.size:
+                        fallback_preflight_rejected = True
+                        fallback_error = ValueError(
+                            "ismcts_belief_acceptance_mask rejected conservative particles"
+                        )
+                        self.counters.belief_rejections += int(rejected_rows.size)
+                        self.counters.belief_rejected_envs += int(rejected_rows.size)
+                        self.counters.belief_rejected_particles += int(rejected_particles)
             if fallback_error is None:
                 try:
                     self.pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
@@ -1719,6 +1786,7 @@ def train_population_pool(
     reanalysis_positions: int = 0,
     reanalysis_replay_fraction: float = 0.0,
     offline_collection: bool = False,
+    belief_only: bool = False,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
@@ -1806,6 +1874,7 @@ def train_population_pool(
             "reanalysis_positions": reanalysis_positions,
             "reanalysis_replay_fraction": reanalysis_replay_fraction,
             "offline_collection": offline_collection,
+            "belief_only": belief_only,
         },
     )
     value_target_training = (
@@ -1819,13 +1888,18 @@ def train_population_pool(
         else training
     )
     candidate.to(device)
+    # Calibration must not silently degrade the champion's policy/value via
+    # the shared encoder.  Learn only the explicit belief decoder and its
+    # public-action conditioning until action-equivalence is demonstrated.
+    for name, parameter in candidate.named_parameters():
+        parameter.requires_grad_(not belief_only or name.startswith("belief_"))
     frozen = []
     for model in opponent_models:
         frozen.append(_freeze_reference_model(model, device))
     if anchor_model is not None:
         anchor_model = _freeze_reference_model(anchor_model, device)
     optimiser = torch.optim.AdamW(
-        candidate.parameters(),
+        [parameter for parameter in candidate.parameters() if parameter.requires_grad],
         lr=training.learning_rate,
         weight_decay=training.weight_decay,
     )
@@ -2279,6 +2353,12 @@ def train_population_pool(
                 mean_score=score_sum / max(1, completed_count),
                 belief_rejected_particles=search.counters.belief_rejected_particles,
                 belief_rejected_envs=search.counters.belief_rejected_envs,
+                belief_action_equivalence_checked_particles=(
+                    search.counters.belief_action_equivalence_checked_particles
+                ),
+                belief_action_equivalence_rejected_particles=(
+                    search.counters.belief_action_equivalence_rejected_particles
+                ),
                 belief_resampled_envs=search.counters.belief_resampled_envs,
                 belief_retry_successes=search.counters.belief_retry_successes,
                 belief_conservative_attempts=search.counters.belief_conservative_attempts,
@@ -2370,6 +2450,19 @@ def train_population_pool(
         "population_pool_belief_rejections": float(routing.belief_rejections),
         "belief_rejected_particles": float(routing.belief_rejected_particles),
         "belief_rejected_envs": float(routing.belief_rejected_envs),
+        "belief_action_equivalence_checked_particles": float(
+            routing.belief_action_equivalence_checked_particles
+        ),
+        "belief_action_equivalence_rejected_particles": float(
+            routing.belief_action_equivalence_rejected_particles
+        ),
+        "belief_action_equivalence_rejected_envs": float(
+            routing.belief_action_equivalence_rejected_envs
+        ),
+        "belief_action_equivalence_rejection_rate": float(
+            routing.belief_action_equivalence_rejected_particles
+            / max(1, routing.belief_action_equivalence_checked_particles)
+        ),
         "belief_resampled_envs": float(routing.belief_resampled_envs),
         "belief_retry_successes": float(routing.belief_retry_successes),
         "belief_conservative_attempts": float(routing.belief_conservative_attempts),

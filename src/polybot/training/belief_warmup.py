@@ -85,6 +85,7 @@ def _belief_update(
     optimiser: torch.optim.Optimizer,
     examples: List[TrainingExample],
     device: torch.device,
+    training: TrainingConfig,
 ) -> float:
     batch = stack_examples(examples, device)
     model.train()
@@ -102,6 +103,9 @@ def _belief_update(
         output.belief_logits,
         batch["full_map_target"],
         batch["hidden_mask"],
+        batch["action_categorical"],
+        batch["action_mask"],
+        training.legal_action_belief_weight,
     )
     optimiser.zero_grad(set_to_none=True)
     loss.backward()
@@ -265,7 +269,7 @@ def warmup_belief(
                 moves_in_world += 1
 
                 if len(pending) == batch_size:
-                    latest_loss = _belief_update(model, optimiser, pending, device)
+                    latest_loss = _belief_update(model, optimiser, pending, device, training)
                     losses.append(latest_loss)
                     pending.clear()
                     run.log(
@@ -290,7 +294,7 @@ def warmup_belief(
                 position += 1
 
         if pending:
-            latest_loss = _belief_update(model, optimiser, pending, device)
+            latest_loss = _belief_update(model, optimiser, pending, device, training)
             losses.append(latest_loss)
             run.log(
                 position=positions,

@@ -695,6 +695,52 @@ def test_pool_value_target_keeps_a_separate_frozen_predecessor_anchor():
     assert example.anchor_value_loss_weight == 0.50
 
 
+def test_pool_engine_action_constraint_marks_hidden_action_endpoint():
+    request = {
+        "map_tokens": np.zeros((1, 2, 23), dtype=np.int32),
+        "state": np.zeros((1, 9), dtype=np.int32),
+        "action_features": np.zeros((1, 1, 17), dtype=np.int32),
+        "action_mask": np.ones((1, 1), dtype=bool),
+        "to_play": np.zeros(1, dtype=np.int32),
+    }
+    request["map_tokens"][0, 0, 0] = 1
+    root = {"policy": np.ones((1, 1), dtype=np.float32)}
+    focus = np.asarray([[False, True]], dtype=bool)
+    example = _root_examples(
+        request, root, TrainingConfig(), np.zeros((1, 2, 23), dtype=np.int32),
+        engine_action_constraint_tiles=focus,
+        engine_action_constraint_scores=np.asarray([3.0], dtype=np.float32),
+    )[0]
+
+    assert example.engine_action_constraint_priority
+    assert example.engine_action_constraint_score == 3.0
+    assert example.engine_action_constraint_tiles.tolist() == [False, True]
+    assert stack_examples([example], torch.device("cpu"))["engine_action_constraint_mask"].tolist() == [[False, True]]
+
+
+def test_engine_action_constraint_loss_trains_only_focused_hidden_belief():
+    example = _example(0)
+    example.engine_action_constraint_tiles = np.ones(1, dtype=bool)
+    example.engine_action_constraint_priority = True
+    model = PolicyValueBeliefNet(
+        ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    )
+    optimiser = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    result = train_batch(
+        model,
+        optimiser,
+        stack_examples([example], torch.device("cpu")),
+        TrainingConfig(
+            belief_weight=0.0,
+            engine_action_constraint_weight=1.0,
+            bridge_constraint_weight=0.0,
+        ),
+    )
+
+    assert result["belief_engine_action_constraint_loss"] > 0.0
+
+
 def test_value_anchor_coefficient_is_not_cancelled_by_loss_normalisation():
     example = _example(0)
     example.value_loss_weight = 0.0
@@ -1738,6 +1784,46 @@ def test_belief_loss_ignores_runtime_ids_and_decoder_owned_fields():
             assert feature_logits.grad is None
 
 
+def test_belief_loss_upweights_hidden_public_action_targets():
+    target = torch.zeros((1, 2, 23), dtype=torch.long)
+    hidden = torch.ones((1, 2), dtype=torch.bool)
+    logits = [
+        torch.zeros((1, 2, largest + 2), requires_grad=True)
+        for largest in MAP_FEATURE_MAX
+    ]
+    with torch.no_grad():
+        # Tile 0 is predicted correctly while the public action targets tile
+        # 1, whose terrain class is intentionally predicted incorrectly.
+        logits[19][0, 0, 1] = 4.0
+        logits[19][0, 1, 0] = 4.0
+    actions = torch.full((1, 1, 12), -1, dtype=torch.long)
+    actions[0, 0, 2] = 1
+    mask = torch.ones((1, 1), dtype=torch.bool)
+
+    plain = belief_loss(logits, target, hidden)
+    weighted = belief_loss(
+        logits, target, hidden, actions, mask, legal_action_weight=2.0
+    )
+
+    assert weighted > plain
+
+
+def test_belief_action_evidence_marks_public_move_source_and_target():
+    actions = torch.full((1, 1, 12), -1, dtype=torch.long)
+    actions[0, 0, 0] = 0  # move
+    actions[0, 0, 1] = 0
+    actions[0, 0, 2] = 3
+    evidence = PolicyValueBeliefNet._belief_action_tile_evidence(
+        actions, torch.ones((1, 1), dtype=torch.bool), tiles=4
+    )
+
+    # Token class zero is reserved for -1, hence public type 0 occupies 1.
+    type_count = 11
+    assert evidence.shape == (1, 4, 2 * type_count)
+    assert evidence[0, 0, 1] == 1.0
+    assert evidence[0, 3, type_count + 1] == 1.0
+
+
 def test_single_environment_advantage_normalisation_stays_finite():
     advantage = torch.tensor([0.75])
     normalised = _normalise_advantage(advantage)
@@ -2172,6 +2258,25 @@ def test_bridge_positions_receive_their_configured_replay_reservation():
     )
 
     assert sum(row.bridge_priority for row in sampled) >= 4
+
+
+def test_engine_action_constraint_positions_receive_replay_reservation():
+    replay = ReplayBuffer(32)
+    rows = [_example(0) for _ in range(20)]
+    for row in rows[:6]:
+        row.engine_action_constraint_priority = True
+        row.engine_action_constraint_tiles = np.ones(1, dtype=bool)
+    replay.extend(rows)
+
+    sampled = replay.sample(
+        10,
+        np.random.default_rng(7),
+        priority_fraction=0.0,
+        bridge_fraction=0.0,
+        engine_action_constraint_fraction=0.4,
+    )
+
+    assert sum(row.engine_action_constraint_priority for row in sampled) >= 4
 
 
 def _pruning_packet() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

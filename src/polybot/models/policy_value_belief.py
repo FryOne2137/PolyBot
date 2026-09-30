@@ -256,6 +256,14 @@ class PolicyValueBeliefNet(nn.Module):
         # information spatial, e.g. a legal movement/attack constrains what
         # can plausibly occupy neighbouring hidden tiles.
         self.belief_action_norm = nn.LayerNorm(d_model)
+        # A token for an action can tell the decoder that *some* source and
+        # target exist, but an explicit tile-local map lets it learn the
+        # complementary signal too: an adjacent hidden tile with no matching
+        # move target is evidence that it is blocked.  Both source and target
+        # channels are public information derived solely from legal actions.
+        self.belief_action_evidence = nn.Linear(
+            2 * (ACTION_FEATURE_MAX[0] + 2), d_model
+        )
         self.belief_action_to_tile = nn.MultiheadAttention(
             d_model, config.attention_heads, dropout=config.dropout, batch_first=True
         )
@@ -266,6 +274,10 @@ class PolicyValueBeliefNet(nn.Module):
         # safely, then learn the new public action conditioning gradually.
         nn.init.zeros_(self.belief_action_gate[-1].weight)
         nn.init.zeros_(self.belief_action_gate[-1].bias)
+        # Preserve existing checkpoints until belief-only warm-up trains this
+        # new public-action feature path.
+        nn.init.zeros_(self.belief_action_evidence.weight)
+        nn.init.zeros_(self.belief_action_evidence.bias)
         # Entity fields are decoded conditionally: settlement type determines
         # the city attributes, while unit type determines HP/owner/origin
         # attributes. Zero-initialised context tables preserve old checkpoints
@@ -434,7 +446,51 @@ class PolicyValueBeliefNet(nn.Module):
         )
         if no_actions.any():
             attended = attended.masked_fill(no_actions[:, None, None], 0.0)
-        return tile_states + self.belief_action_gate(self.belief_action_norm(attended))
+        evidence = self._belief_action_tile_evidence(
+            action_categorical, action_mask, tile_states.shape[1]
+        )
+        return (
+            tile_states
+            + self.belief_action_evidence(evidence)
+            + self.belief_action_gate(self.belief_action_norm(attended))
+        )
+
+    @staticmethod
+    def _belief_action_tile_evidence(
+        action_categorical: torch.Tensor,
+        action_mask: torch.Tensor,
+        tiles: int,
+    ) -> torch.Tensor:
+        """Encode public action source/target incidence at each map tile.
+
+        The representation deliberately says only that an action is public
+        and legal.  It never distinguishes why an alternative action is
+        absent, so the belief head must infer whether a hidden blocker is a
+        unit, terrain, or another game-rule constraint from supervised maps.
+        """
+        if action_categorical.ndim != 3 or action_mask.shape != action_categorical.shape[:2]:
+            raise ValueError("belief action evidence expects [batch, actions, features] and matching mask")
+        batch, actions, _ = action_categorical.shape
+        type_count = ACTION_FEATURE_MAX[0] + 2
+        channels = 2 * type_count
+        evidence = torch.zeros(
+            (batch, tiles * channels),
+            dtype=torch.float32,
+            device=action_categorical.device,
+        )
+        action_types = _indices(action_categorical[..., 0], ACTION_FEATURE_MAX[0])
+        for role, column in enumerate((1, 2)):
+            indexes = action_categorical[..., column]
+            valid = action_mask & (indexes >= 0) & (indexes < tiles)
+            if not bool(valid.any()):
+                continue
+            combined = (
+                indexes.clamp(0, max(0, tiles - 1)) * channels
+                + action_types.clamp(0, type_count - 1)
+                + role * type_count
+            )
+            evidence.scatter_add_(1, combined, valid.to(evidence.dtype))
+        return evidence.view(batch, tiles, channels).clamp_max_(1.0)
 
     def _structured_belief_logits(self, tile_states: torch.Tensor) -> List[torch.Tensor]:
         """Decode cities and units in a valid dependency order.

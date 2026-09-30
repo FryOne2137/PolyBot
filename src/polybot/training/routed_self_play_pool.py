@@ -430,6 +430,12 @@ class SearchCounters:
     belief_conservative_attempts: int = 0
     belief_slot_resets: int = 0
     belief_discarded_prefixes: int = 0
+    engine_action_constraint_queries: int = 0
+    engine_action_constraint_particles: int = 0
+    engine_action_constraint_missing_actions: int = 0
+    engine_action_constraint_extra_actions: int = 0
+    engine_action_constraint_tiles: int = 0
+    engine_action_constraint_score_sum: float = 0.0
     root_env_decisions: int = 0
     search_policy_rows: int = 0
     search_pruned_rows: int = 0
@@ -463,6 +469,7 @@ class SearchCounters:
                 "search_prior_mass_retained_sum",
                 "search_root_policy_entropy_sum",
                 "search_root_top_visit_share_sum",
+                "engine_action_constraint_score_sum",
             }:
                 setattr(self, name, float(getattr(self, name)) + float(getattr(other, name)))
             else:
@@ -524,6 +531,7 @@ class RoutedPoolSearch:
         visible_action_history: int,
         belief_retries: int,
         seed: int,
+        collect_engine_action_constraints: bool = False,
         search_top_actions_by_agent: Sequence[int] | None = None,
         search_random_actions_by_agent: Sequence[int] | None = None,
     ) -> None:
@@ -568,6 +576,7 @@ class RoutedPoolSearch:
         self.num_envs = int(num_envs)
         self.max_pending_leaves = int(max_pending_leaves)
         self.belief_retries = int(belief_retries)
+        self.collect_engine_action_constraints = bool(collect_engine_action_constraints)
         self.counters = SearchCounters()
         self._action_generator: torch.Generator | None = None
         if self.device.type in ("cpu", "cuda"):
@@ -595,6 +604,14 @@ class RoutedPoolSearch:
             require_all_actions=True,
         )
         self.pool.configure_search(self.max_pending_leaves, 1.0, 0, 0)
+        if self.collect_engine_action_constraints and not callable(
+            getattr(self.pool, "ismcts_belief_action_differences", None)
+        ):
+            raise RuntimeError(
+                "Installed PolyEnv is missing SelfPlayPool."
+                "ismcts_belief_action_differences required by "
+                "--engine-action-constraint-weight"
+            )
         self.request, request_owners = _allocate_native_buffers(
             self.pool, "belief_batch_spec", self.device
         )
@@ -620,6 +637,12 @@ class RoutedPoolSearch:
             leaf_owners,
             completed_owners,
         )
+        self.last_engine_action_constraint_tiles = np.zeros(
+            (self.num_envs, training.map_size * training.map_size), dtype=bool
+        )
+        self.last_engine_action_constraint_scores = np.zeros(
+            self.num_envs, dtype=np.float32
+        )
 
     def reset(self, seeds: np.ndarray, assignments: np.ndarray) -> Dict[str, np.ndarray]:
         seeds = np.ascontiguousarray(seeds, dtype=np.uint32)
@@ -631,6 +654,84 @@ class RoutedPoolSearch:
         _validate_agents(assignments, len(self.models), "assignments")
         self.pool.reset_into(self.request, seeds=seeds, agent_ids=assignments)
         return self.request
+
+    def _capture_engine_action_constraints(
+        self,
+        state_ids: np.ndarray,
+        particles: np.ndarray,
+        active: np.ndarray,
+        actors: np.ndarray,
+        request: Mapping[str, np.ndarray],
+    ) -> None:
+        """Turn PolyEnv action differences into fog-safe replay focus masks.
+
+        PolyEnv only returns public action signatures.  The normal supervised
+        belief target remains the sole source of map labels, while this method
+        tells PolyBot which hidden source/target endpoints deserve the extra
+        loss.  It intentionally runs once for the original learned particles,
+        before acceptance retries erase the useful mismatch signal.
+        """
+        maps = np.asarray(request["map_tokens"], dtype=np.int32)
+        self.last_engine_action_constraint_tiles = np.zeros(
+            maps.shape[:2], dtype=bool
+        )
+        self.last_engine_action_constraint_scores = np.zeros(
+            maps.shape[0], dtype=np.float32
+        )
+        if not self.collect_engine_action_constraints:
+            return
+        differences = self.pool.ismcts_belief_action_differences(
+            np.ascontiguousarray(state_ids, dtype=np.uint64),
+            np.ascontiguousarray(particles, dtype=np.int32),
+        )
+        if isinstance(differences, Mapping):
+            differences = differences.get("differences", ())
+        if differences is None:
+            differences = ()
+        candidate_agents = np.asarray(request["agent_id"], dtype=np.int32) == 0
+        tiles = maps.shape[1]
+        self.counters.engine_action_constraint_queries += 1
+        for raw in differences:
+            if not isinstance(raw, Mapping):
+                raise RuntimeError(
+                    "PolyEnv ismcts_belief_action_differences must return mapping rows"
+                )
+            env = int(raw.get("env_id", -1))
+            player = int(raw.get("player", -1))
+            if (
+                env < 0 or env >= maps.shape[0] or not active[env]
+                or not candidate_agents[env] or player != int(actors[env])
+            ):
+                continue
+            missing = tuple(raw.get("missing_actions", ()) or ())
+            extra = tuple(raw.get("extra_actions", ()) or ())
+            if not missing and not extra:
+                continue
+            self.counters.engine_action_constraint_particles += 1
+            self.counters.engine_action_constraint_missing_actions += len(missing)
+            self.counters.engine_action_constraint_extra_actions += len(extra)
+            # Extra actions are more dangerous: MCTS can otherwise choose a
+            # move unavailable in the real public state.
+            score = float(len(missing) + 2 * len(extra))
+            self.last_engine_action_constraint_scores[env] += score
+            self.counters.engine_action_constraint_score_sum += score
+            before = bool(self.last_engine_action_constraint_tiles[env].any())
+            for action in (*missing, *extra):
+                if not isinstance(action, Mapping):
+                    continue
+                for key in ("source_index", "target_index"):
+                    index = int(action.get(key, -1))
+                    if 0 <= index < tiles and maps[env, index, 0] == 0:
+                        self.last_engine_action_constraint_tiles[env, index] = True
+            if not self.last_engine_action_constraint_tiles[env].any() and not before:
+                # Some actions depend on a path or a rule whose causal tile is
+                # not one of the public endpoints. Keep the signal truthful by
+                # falling back to all hidden tiles of this *mismatched* public
+                # position, rather than inventing a local movement rule.
+                self.last_engine_action_constraint_tiles[env] = maps[env, :, 0] == 0
+        self.counters.engine_action_constraint_tiles += int(
+            self.last_engine_action_constraint_tiles.sum()
+        )
 
     @torch.inference_mode()
     def _actor_particles(
@@ -950,6 +1051,9 @@ class RoutedPoolSearch:
 
         all_rows = np.arange(self.num_envs, dtype=np.int32)
         particles = np.ascontiguousarray(learned_rows(all_rows, 0))
+        self._capture_engine_action_constraints(
+            state_ids, particles, active, actors, request
+        )
         submitted = False
         last_error: ValueError | None = None
         rejected_rows = all_rows
@@ -1649,6 +1753,10 @@ def train_population_pool(
         raise ValueError("critical_minimum_score must be non-negative")
     if not 0.0 <= critical_replay_fraction <= 1.0:
         raise ValueError("critical_replay_fraction must be between zero and one")
+    if not 0.0 <= training.engine_action_constraint_replay_fraction <= 1.0:
+        raise ValueError(
+            "engine_action_constraint_replay_fraction must be between zero and one"
+        )
     if reanalysis_capacity < 1:
         raise ValueError("reanalysis_capacity must be positive")
     if reanalysis_positions < 0:
@@ -1783,6 +1891,7 @@ def train_population_pool(
                 training.bridge_replay_fraction,
                 critical_replay_fraction,
                 reanalysis_replay_fraction,
+                training.engine_action_constraint_replay_fraction,
             )
             losses.append(
                 train_batch(candidate, optimiser, stack_examples(batch, device), training)
@@ -1813,6 +1922,9 @@ def train_population_pool(
                 visible_action_history=visible_action_history,
                 belief_retries=belief_retries,
                 seed=int(seeds[0]),
+                collect_engine_action_constraints=(
+                    training.engine_action_constraint_weight > 0.0
+                ),
             )
             request = search.reset(seeds, assignments)
             pending: list[tuple[TrainingExample | None, int, float] | None] = [None] * count
@@ -2051,6 +2163,12 @@ def train_population_pool(
                         anchor_policy_weight=anchor_policy_weight,
                         anchor_value=anchor_value,
                         anchor_value_weight=anchor_value_weight,
+                        engine_action_constraint_tiles=(
+                            search.last_engine_action_constraint_tiles[candidate_rows]
+                        ),
+                        engine_action_constraint_scores=(
+                            search.last_engine_action_constraint_scores[candidate_rows]
+                        ),
                     )
                     if raw_candidate_policy is not None:
                         marked, score_sum = _mark_critical_mcts_examples(
@@ -2166,6 +2284,19 @@ def train_population_pool(
                 belief_conservative_attempts=search.counters.belief_conservative_attempts,
                 belief_slot_resets=search.counters.belief_slot_resets,
                 belief_discarded_prefixes=search.counters.belief_discarded_prefixes,
+                belief_engine_action_constraint_particles=(
+                    search.counters.engine_action_constraint_particles
+                ),
+                belief_engine_action_constraint_missing_actions=(
+                    search.counters.engine_action_constraint_missing_actions
+                ),
+                belief_engine_action_constraint_extra_actions=(
+                    search.counters.engine_action_constraint_extra_actions
+                ),
+                belief_engine_action_constraint_score=(
+                    search.counters.engine_action_constraint_score_sum
+                    / max(1, search.counters.engine_action_constraint_particles)
+                ),
                 belief_reset_rate=(
                     search.counters.belief_slot_resets
                     / max(1, search.counters.root_env_decisions)
@@ -2244,6 +2375,25 @@ def train_population_pool(
         "belief_conservative_attempts": float(routing.belief_conservative_attempts),
         "belief_slot_resets": float(routing.belief_slot_resets),
         "belief_discarded_prefixes": float(routing.belief_discarded_prefixes),
+        "belief_engine_action_constraint_queries": float(
+            routing.engine_action_constraint_queries
+        ),
+        "belief_engine_action_constraint_particles": float(
+            routing.engine_action_constraint_particles
+        ),
+        "belief_engine_action_constraint_missing_actions": float(
+            routing.engine_action_constraint_missing_actions
+        ),
+        "belief_engine_action_constraint_extra_actions": float(
+            routing.engine_action_constraint_extra_actions
+        ),
+        "belief_engine_action_constraint_tiles": float(
+            routing.engine_action_constraint_tiles
+        ),
+        "belief_engine_action_constraint_score": float(
+            routing.engine_action_constraint_score_sum
+            / max(1, routing.engine_action_constraint_particles)
+        ),
         "belief_reset_rate": float(
             routing.belief_slot_resets / max(1, routing.root_env_decisions)
         ),

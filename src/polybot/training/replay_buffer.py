@@ -37,6 +37,12 @@ class TrainingExample:
     # bridge/terrain relation can be learned.  This is metadata only and is
     # never exposed as a model input.
     bridge_priority: bool = False
+    # PolyEnv found at least one missing or extra public action for a sampled
+    # belief particle. ``engine_action_constraint_tiles`` is a fog-safe mask
+    # of the public action endpoints implicated by those differences.
+    engine_action_constraint_priority: bool = False
+    engine_action_constraint_tiles: np.ndarray | None = None
+    engine_action_constraint_score: float = 0.0
     # A high-confidence MCTS move disagreed with the raw policy at this public
     # position.  This is replay metadata, not a model input: selective MCTS
     # distillation can reserve part of a batch for the decisions most likely
@@ -71,6 +77,7 @@ class ReplayBuffer:
         bridge_fraction: float = 0.0,
         critical_fraction: float = 0.0,
         reanalysis_fraction: float = 0.0,
+        engine_action_constraint_fraction: float = 0.0,
     ) -> List[TrainingExample]:
         if len(self._examples) < batch_size:
             raise ValueError("not enough replay examples for this batch")
@@ -79,6 +86,7 @@ class ReplayBuffer:
         bridge_count = int(round(batch_size * float(np.clip(bridge_fraction, 0.0, 1.0))))
         critical_count = int(round(batch_size * float(np.clip(critical_fraction, 0.0, 1.0))))
         reanalysis_count = int(round(batch_size * float(np.clip(reanalysis_fraction, 0.0, 1.0))))
+        constraint_count = int(round(batch_size * float(np.clip(engine_action_constraint_fraction, 0.0, 1.0))))
         priority_indices = np.asarray(
             [
                 index
@@ -107,6 +115,10 @@ class ReplayBuffer:
             ],
             dtype=np.int64,
         )
+        constraint_indices = np.asarray(
+            [index for index, row in enumerate(rows) if row.engine_action_constraint_priority],
+            dtype=np.int64,
+        )
         chosen: List[int] = []
         if reanalysis_indices.size:
             count = min(reanalysis_count, reanalysis_indices.size, batch_size)
@@ -131,6 +143,15 @@ class ReplayBuffer:
             chosen.extend(
                 int(index)
                 for index in rng.choice(available_bridge, size=count, replace=False)
+            )
+        if constraint_indices.size:
+            available_constraint = np.setdiff1d(
+                constraint_indices, np.asarray(chosen, dtype=np.int64)
+            )
+            count = min(constraint_count, available_constraint.size, batch_size - len(chosen))
+            chosen.extend(
+                int(index)
+                for index in rng.choice(available_constraint, size=count, replace=False)
             )
         if priority_indices.size:
             available_priority = np.setdiff1d(

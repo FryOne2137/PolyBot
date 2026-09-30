@@ -111,6 +111,10 @@ def belief_loss(
     belief_logits: Iterable[torch.Tensor],
     full_map_target: torch.Tensor,
     hidden_mask: torch.Tensor,
+    action_categorical: torch.Tensor | None = None,
+    action_mask: torch.Tensor | None = None,
+    legal_action_weight: float = 0.0,
+    example_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Field-aware cross-entropy for semantic values on hidden tiles.
 
@@ -121,12 +125,37 @@ def belief_loss(
     to place actual cities and units instead of only terrain. Runtime IDs and
     fields not sampled by the belief-world decoder contribute no gradient.
     """
+    if legal_action_weight < 0.0:
+        raise ValueError("legal_action_weight must not be negative")
+    if example_weights is not None and example_weights.shape != hidden_mask.shape[:1]:
+        raise ValueError("example_weights must have shape [batch]")
     logits_by_feature = tuple(belief_logits)
     if len(logits_by_feature) != len(MAP_FEATURE_MAX):
         raise ValueError(
             f"belief_loss expected {len(MAP_FEATURE_MAX)} feature heads, "
             f"got {len(logits_by_feature)}"
         )
+    action_targets = torch.zeros_like(hidden_mask, dtype=torch.bool)
+    if (
+        legal_action_weight > 0.0
+        and action_categorical is not None
+        and action_mask is not None
+    ):
+        if action_categorical.shape[:2] != action_mask.shape:
+            raise ValueError("action_categorical and action_mask must agree")
+        tiles = hidden_mask.shape[1]
+        targets = action_categorical[..., 2]
+        valid = action_mask.bool() & (targets >= 0) & (targets < tiles)
+        if bool(valid.any()):
+            action_counts = torch.zeros(
+                hidden_mask.shape, dtype=torch.long, device=hidden_mask.device
+            )
+            action_counts.scatter_add_(
+                1,
+                targets.clamp(0, max(0, tiles - 1)),
+                valid.to(torch.long),
+            )
+            action_targets = action_counts > 0
     feature_losses = []
     for column in sorted(BELIEF_LOSS_FEATURES):
         logits = logits_by_feature[column]
@@ -140,6 +169,12 @@ def belief_loss(
             loss_mask = loss_mask & (full_map_target[..., 4] >= 1)
 
         weights = torch.ones_like(per_tile)
+        if legal_action_weight:
+            weights = weights * (
+                1.0 + float(legal_action_weight) * action_targets.to(weights.dtype)
+            )
+        if example_weights is not None:
+            weights = weights * example_weights.to(weights.dtype).unsqueeze(1)
         if column == 14:
             weights = torch.where(full_map_target[..., 14] != 0, weights * 4.0, weights)
         elif column == 4:
@@ -158,6 +193,10 @@ def train_batch(
     """Optimise policy, value and belief objectives on one padded batch."""
     if config.bridge_constraint_weight < 0.0:
         raise ValueError("bridge_constraint_weight must not be negative")
+    if config.legal_action_belief_weight < 0.0:
+        raise ValueError("legal_action_belief_weight must not be negative")
+    if config.engine_action_constraint_weight < 0.0:
+        raise ValueError("engine_action_constraint_weight must not be negative")
     model.train()
     output = model(
         batch["map_tokens"],
@@ -205,7 +244,26 @@ def train_batch(
             )
             * anchor_value_weights
         ).mean()
-    belief = belief_loss(output.belief_logits, batch["full_map_target"], batch["hidden_mask"])
+    belief = belief_loss(
+        output.belief_logits,
+        batch["full_map_target"],
+        batch["hidden_mask"],
+        batch["action_categorical"],
+        batch["action_mask"],
+        config.legal_action_belief_weight,
+    )
+    # PolyEnv has already compared the detached sampled particle with the
+    # real public action set.  Its mismatch endpoints are only a *focus mask*;
+    # ground-truth map labels remain the target and all gradients stay here in
+    # PolyBot.  This avoids guessing why an action is absent in Polytopia.
+    engine_constraint = belief_loss(
+        output.belief_logits,
+        batch["full_map_target"],
+        batch["hidden_mask"] & batch["engine_action_constraint_mask"],
+        example_weights=(
+            1.0 + batch["engine_action_constraint_score"].clamp(0.0, 4.0)
+        ),
+    )
     bridge = bridge_constraint_loss(
         output.belief_logits[19],
         batch["map_tokens"],
@@ -220,6 +278,7 @@ def train_batch(
         + config.value_weight * value
         + anchor_value
         + config.belief_weight * belief
+        + config.engine_action_constraint_weight * engine_constraint
         + config.bridge_constraint_weight * bridge
     )
 
@@ -234,5 +293,6 @@ def train_batch(
         "value_loss": float(value.detach().cpu()),
         "value_anchor_loss": float(anchor_value.detach().cpu()),
         "belief_loss": float(belief.detach().cpu()),
+        "belief_engine_action_constraint_loss": float(engine_constraint.detach().cpu()),
         "bridge_constraint_loss": float(bridge.detach().cpu()),
     }

@@ -97,6 +97,8 @@ def _root_examples(
     anchor_policy_weight: float = 0.0,
     anchor_value: np.ndarray | None = None,
     anchor_value_weight: float = 0.0,
+    engine_action_constraint_tiles: np.ndarray | None = None,
+    engine_action_constraint_scores: np.ndarray | None = None,
 ) -> List[TrainingExample]:
     """Create records from public MCTS roots plus training-only belief labels.
 
@@ -170,6 +172,20 @@ def _root_examples(
             action_history=histories[index].astype(np.float32, copy=True),
             action_history_mask=history_masks[index].copy(),
             bridge_priority=bridge_priority,
+            engine_action_constraint_priority=(
+                engine_action_constraint_tiles is not None
+                and bool(np.asarray(engine_action_constraint_tiles[index], dtype=bool).any())
+            ),
+            engine_action_constraint_tiles=(
+                None
+                if engine_action_constraint_tiles is None
+                else np.asarray(engine_action_constraint_tiles[index], dtype=bool).copy()
+            ),
+            engine_action_constraint_score=(
+                0.0
+                if engine_action_constraint_scores is None
+                else float(engine_action_constraint_scores[index])
+            ),
             anchor_value_target=(
                 float(anchor_value[index]) if anchor_value is not None else 0.0
             ),

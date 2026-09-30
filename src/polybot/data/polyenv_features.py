@@ -580,6 +580,15 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
     events_ = np.stack([row.event_features for row in rows]).astype(np.float32)
     full_maps = np.stack([row.full_map_target for row in rows]).astype(np.int64)
     hidden = np.stack([row.hidden_mask for row in rows]).astype(bool)
+    constraint_masks = np.stack([
+        np.zeros_like(row.hidden_mask, dtype=bool)
+        if getattr(row, "engine_action_constraint_tiles", None) is None
+        else np.asarray(row.engine_action_constraint_tiles, dtype=bool)
+        for row in rows
+    ])
+    constraint_scores = np.asarray([
+        getattr(row, "engine_action_constraint_score", 0.0) for row in rows
+    ], dtype=np.float32)
     values = np.asarray([row.value_target for row in rows], dtype=np.float32)
     value_weights = np.asarray([row.value_loss_weight for row in rows], dtype=np.float32)
     anchor_values = np.asarray(
@@ -631,4 +640,10 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
         ),
         "full_map_target": torch.as_tensor(full_maps, dtype=torch.long, device=device),
         "hidden_mask": torch.as_tensor(hidden, dtype=torch.bool, device=device),
+        "engine_action_constraint_mask": torch.as_tensor(
+            constraint_masks, dtype=torch.bool, device=device
+        ),
+        "engine_action_constraint_score": torch.as_tensor(
+            constraint_scores, dtype=torch.float32, device=device
+        ),
     }

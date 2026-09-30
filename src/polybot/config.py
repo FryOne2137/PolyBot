@@ -93,6 +93,15 @@ class TrainingConfig:
     policy_weight: float = 1.0
     value_weight: float = 1.0
     belief_weight: float = 0.35
+    # Legal actions are a public fog observation.  Give hidden tiles named by
+    # those actions extra belief supervision so the decoder learns, for
+    # example, that a missing/available move constrains an unseen destination.
+    legal_action_belief_weight: float = 2.0
+    # PolyEnv can compare a sampled belief particle with the public legal
+    # action set of the live SelfPlayPool state.  The resulting action
+    # differences focus an additional supervised belief loss on hidden action
+    # endpoints; the engine itself never receives model losses or gradients.
+    engine_action_constraint_weight: float = 0.25
     # Geometry-aware auxiliary belief objective.  In particular, a visible
     # Build Bridge action constrains the hidden cardinal neighbours of its
     # water tile; learning the relation directly is much more sample-efficient
@@ -126,6 +135,7 @@ class TrainingConfig:
     # Positions containing a legal bridge or supervised hidden bridge geometry
     # are rare but disproportionately important for action-safe ISMCTS.
     bridge_replay_fraction: float = 0.25
+    engine_action_constraint_replay_fraction: float = 0.25
     # Bound repeated sampling when belief failures leave only a small replay.
     # Six means that, on average, one newly collected example can contribute
     # to at most six optimiser-batch exposures in this training phase.

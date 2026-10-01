@@ -515,6 +515,15 @@ default Monte Carlo target it is not discounted by game length. Small logged
 shaping terms make early exploration less sparse; they do not replace the
 terminal objective.
 
+Every belief update also logs terrain-only diagnostics, evaluated exclusively
+on tiles hidden in the input: `belief_hidden_terrain_accuracy`,
+`belief_hidden_terrain_nll`, per-class accuracy/support, and
+`belief_bridge_geometry_accuracy`/`nll`. The parallel
+`belief_action_constraint_terrain_*` metrics cover only hidden tiles selected
+because a sampled particle changed the public legal-action set. These are
+evaluation metrics, not extra losses; NLL is the primary measure for particle
+quality because ISMCTS samples from the predicted distribution.
+
 ## Factorized legal-action policy
 
 The default new model does not run action-to-map attention for every legal

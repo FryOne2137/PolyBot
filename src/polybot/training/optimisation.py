@@ -29,6 +29,166 @@ BELIEF_LOSS_FEATURES = frozenset(
 BELIEF_RUNTIME_ID_FEATURES = frozenset((6, 15, 22))
 
 
+def _terrain_slice_metrics(
+    prefix: str,
+    terrain_logits: torch.Tensor,
+    full_map_target: torch.Tensor,
+    mask: torch.Tensor,
+) -> Dict[str, float]:
+    """Return proper-scoring and top-1 terrain metrics for one tile slice.
+
+    Class zero represents the decoder's ``-1``/unavailable value, so it is
+    deliberately not a terrain-validation label. A complete PolyEnv map has
+    terrain values 1..4; excluding anything else makes an accidental partial
+    label visible through the ``*_samples`` counter instead of making the
+    accuracy look better than it is.
+    """
+    terrain = full_map_target[..., 19]
+    valid = mask.bool() & (terrain >= 1) & (terrain <= 4)
+    samples = int(valid.sum().item())
+    result: Dict[str, float] = {f"{prefix}_samples": float(samples)}
+    class_names = ((1, "water"), (2, "land"), (3, "terrain_3"), (4, "terrain_4"))
+    if samples == 0:
+        result[f"{prefix}_accuracy"] = 0.0
+        result[f"{prefix}_nll"] = 0.0
+        for _, name in class_names:
+            result[f"{prefix}_{name}_samples"] = 0.0
+            result[f"{prefix}_{name}_accuracy"] = 0.0
+        return result
+
+    labels = terrain + 1  # class zero is the -1 decoder sentinel
+    predicted = terrain_logits.argmax(dim=-1) - 1
+    result[f"{prefix}_accuracy"] = float(
+        (predicted[valid] == terrain[valid]).float().mean().item()
+    )
+    result[f"{prefix}_nll"] = float(
+        F.cross_entropy(terrain_logits[valid], labels[valid], reduction="mean").item()
+    )
+    for terrain_id, name in class_names:
+        class_mask = valid & (terrain == terrain_id)
+        class_samples = int(class_mask.sum().item())
+        result[f"{prefix}_{name}_samples"] = float(class_samples)
+        result[f"{prefix}_{name}_accuracy"] = (
+            float((predicted[class_mask] == terrain_id).float().mean().item())
+            if class_samples
+            else 0.0
+        )
+    return result
+
+
+@torch.no_grad()
+def belief_terrain_metrics(
+    terrain_logits: torch.Tensor,
+    map_tokens: torch.Tensor,
+    full_map_target: torch.Tensor,
+    hidden_mask: torch.Tensor,
+    engine_action_constraint_mask: torch.Tensor | None,
+    map_size: int,
+) -> Dict[str, float]:
+    """Measure terrain quality on tiles that were hidden in the input.
+
+    These are diagnostics, never optimisation objectives. NLL evaluates the
+    full predicted distribution, which matters for particle sampling; top-1
+    accuracy alone would reward an overconfident single-map guess under fog.
+    The action-constraint subset shows quality exactly where a particle had
+    changed the public legal-action set.
+    """
+    if terrain_logits.ndim != 3 or terrain_logits.shape[:2] != hidden_mask.shape:
+        raise ValueError("terrain logits and hidden mask must have shape [batch, tiles]")
+    if map_tokens.shape[:2] != hidden_mask.shape or full_map_target.shape[:2] != hidden_mask.shape:
+        raise ValueError("terrain metric tensors must agree on [batch, tiles]")
+
+    result = _terrain_slice_metrics(
+        "belief_hidden_terrain", terrain_logits, full_map_target, hidden_mask
+    )
+    constraint_mask = (
+        torch.zeros_like(hidden_mask, dtype=torch.bool)
+        if engine_action_constraint_mask is None
+        else engine_action_constraint_mask.bool()
+    )
+    if constraint_mask.shape != hidden_mask.shape:
+        raise ValueError("engine action constraint mask must have shape [batch, tiles]")
+    result.update(
+        _terrain_slice_metrics(
+            "belief_action_constraint_terrain",
+            terrain_logits,
+            full_map_target,
+            hidden_mask & constraint_mask,
+        )
+    )
+
+    _, tiles, _ = terrain_logits.shape
+    if map_size < 1 or map_size * map_size != tiles:
+        result["belief_bridge_geometry_samples"] = 0.0
+        result["belief_bridge_geometry_accuracy"] = 0.0
+        result["belief_bridge_geometry_nll"] = 0.0
+        return result
+
+    probabilities = torch.softmax(terrain_logits, dim=-1)
+    predicted_landish_probability = probabilities[..., 3:6].sum(dim=-1)
+    predicted_terrain = terrain_logits.argmax(dim=-1) - 1
+    predicted_landish = (predicted_terrain >= 2) & (predicted_terrain <= 4)
+    known = map_tokens[..., 0] == 1
+    observed_landish = (map_tokens[..., 19] >= 2) & (map_tokens[..., 19] <= 4)
+    landish_probability = torch.where(
+        known,
+        observed_landish.to(predicted_landish_probability.dtype),
+        predicted_landish_probability,
+    )
+    landish = torch.where(known, observed_landish, predicted_landish)
+    target_landish = (full_map_target[..., 19] >= 2) & (full_map_target[..., 19] <= 4)
+
+    indexes = torch.arange(tiles, device=terrain_logits.device)
+    rows = torch.div(indexes, map_size, rounding_mode="floor")
+    columns = indexes.remainder(map_size)
+    north_south_available = (rows > 0) & (rows + 1 < map_size)
+    east_west_available = (columns > 0) & (columns + 1 < map_size)
+    north = (indexes - map_size).clamp(0, tiles - 1)
+    south = (indexes + map_size).clamp(0, tiles - 1)
+    west = (indexes - 1).clamp(0, tiles - 1)
+    east = (indexes + 1).clamp(0, tiles - 1)
+
+    ns_probability = landish_probability[:, north] * landish_probability[:, south]
+    ew_probability = landish_probability[:, west] * landish_probability[:, east]
+    ns_probability = ns_probability * north_south_available.to(ns_probability.dtype)
+    ew_probability = ew_probability * east_west_available.to(ew_probability.dtype)
+    predicted_valid_probability = (
+        1.0 - (1.0 - ns_probability) * (1.0 - ew_probability)
+    ).clamp(1e-6, 1.0 - 1e-6)
+    predicted_valid = (
+        (landish[:, north] & landish[:, south] & north_south_available)
+        | (landish[:, west] & landish[:, east] & east_west_available)
+    )
+    target_valid = (
+        (target_landish[:, north] & target_landish[:, south] & north_south_available)
+        | (target_landish[:, west] & target_landish[:, east] & east_west_available)
+    )
+    hidden_neighbour = (
+        ((hidden_mask[:, north] | hidden_mask[:, south]) & north_south_available)
+        | ((hidden_mask[:, west] | hidden_mask[:, east]) & east_west_available)
+    )
+    candidates = known & (map_tokens[..., 19] == 1) & hidden_neighbour
+    samples = int(candidates.sum().item())
+    result["belief_bridge_geometry_samples"] = float(samples)
+    result["belief_bridge_geometry_accuracy"] = (
+        float((predicted_valid[candidates] == target_valid[candidates]).float().mean().item())
+        if samples
+        else 0.0
+    )
+    result["belief_bridge_geometry_nll"] = (
+        float(
+            F.binary_cross_entropy(
+                predicted_valid_probability[candidates],
+                target_valid[candidates].to(predicted_valid_probability.dtype),
+                reduction="mean",
+            ).item()
+        )
+        if samples
+        else 0.0
+    )
+    return result
+
+
 def bridge_constraint_loss(
     terrain_logits: torch.Tensor,
     map_tokens: torch.Tensor,
@@ -273,6 +433,14 @@ def train_batch(
         batch["action_mask"],
         config.map_size,
     )
+    terrain_metrics = belief_terrain_metrics(
+        output.belief_logits[19],
+        batch["map_tokens"],
+        batch["full_map_target"],
+        batch["hidden_mask"],
+        batch.get("engine_action_constraint_mask"),
+        config.map_size,
+    )
     total = (
         config.policy_weight * policy
         + config.value_weight * value
@@ -287,7 +455,7 @@ def train_batch(
     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimiser.step()
 
-    return {
+    result = {
         "loss": float(total.detach().cpu()),
         "policy_loss": float(policy.detach().cpu()),
         "value_loss": float(value.detach().cpu()),
@@ -296,3 +464,5 @@ def train_batch(
         "belief_engine_action_constraint_loss": float(engine_constraint.detach().cpu()),
         "bridge_constraint_loss": float(bridge.detach().cpu()),
     }
+    result.update(terrain_metrics)
+    return result

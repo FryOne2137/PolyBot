@@ -65,6 +65,7 @@ from polybot.training.league_db import LeagueDatabase
 from polybot.training.optimisation import (
     BELIEF_LOSS_FEATURES,
     BELIEF_RUNTIME_ID_FEATURES,
+    belief_terrain_metrics,
     belief_loss,
     bridge_constraint_loss,
     train_batch,
@@ -1847,6 +1848,36 @@ def test_belief_loss_upweights_hidden_public_action_targets():
     )
 
     assert weighted > plain
+
+
+def test_belief_terrain_metrics_report_hidden_action_and_bridge_quality():
+    # 3x3 board: centre is visible water; its north/south hidden neighbours
+    # are land, so the bridge geometry label is true.
+    observed = torch.full((1, 9, 23), -1, dtype=torch.long)
+    observed[..., 0] = 0
+    observed[:, 4, 0] = 1
+    observed[:, 4, 19] = 1
+    target = observed.clone()
+    target[..., 19] = 1
+    target[:, 1, 19] = 2
+    target[:, 7, 19] = 2
+    hidden = observed[..., 0] == 0
+    logits = torch.zeros((1, 9, 6))
+    logits[..., 2] = 12.0  # terrain id 1 / water
+    logits[:, 1, 3] = 20.0  # terrain id 2 / land
+    logits[:, 7, 3] = 20.0
+    focus = torch.zeros_like(hidden)
+    focus[:, 1] = True
+
+    metrics = belief_terrain_metrics(logits, observed, target, hidden, focus, 3)
+
+    assert metrics["belief_hidden_terrain_samples"] == 8.0
+    assert metrics["belief_hidden_terrain_accuracy"] == 1.0
+    assert metrics["belief_hidden_terrain_nll"] < 0.01
+    assert metrics["belief_action_constraint_terrain_samples"] == 1.0
+    assert metrics["belief_action_constraint_terrain_accuracy"] == 1.0
+    assert metrics["belief_bridge_geometry_samples"] == 1.0
+    assert metrics["belief_bridge_geometry_accuracy"] == 1.0
 
 
 def test_belief_action_evidence_marks_public_move_source_and_target():

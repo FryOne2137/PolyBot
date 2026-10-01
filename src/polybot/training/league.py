@@ -474,6 +474,7 @@ def train_promotion_league(
     population_workers: int = 16,
     population_max_envs: int = 16,
     population_offline_collection: bool = True,
+    population_belief_search_mode: str = "strict",
     population_mcts_critical_only: bool = True,
     population_mcts_critical_fraction: float = 0.25,
     population_mcts_critical_minimum_score: float = 0.25,
@@ -994,6 +995,10 @@ def train_promotion_league(
         raise ValueError("belief_action_equivalence_target must be between zero and one")
     if belief_action_equivalence_min_particles < 1:
         raise ValueError("belief_action_equivalence_min_particles must be positive")
+    if population_belief_search_mode not in {"strict", "root_shield"}:
+        raise ValueError(
+            "population_belief_search_mode must be 'strict' or 'root_shield'"
+        )
     ladder = tuple(int(value) for value in mcts_simulation_ladder)
     if any(value < 1 for value in ladder) or tuple(sorted(set(ladder))) != ladder:
         raise ValueError("mcts_simulation_ladder must be strictly increasing")
@@ -1071,6 +1076,7 @@ def train_promotion_league(
         "population_workers": population_workers,
         "population_max_envs": population_max_envs,
         "population_offline_collection": population_offline_collection,
+        "population_belief_search_mode": population_belief_search_mode,
         "population_mcts_critical_only": population_mcts_critical_only,
         "population_mcts_critical_fraction": population_mcts_critical_fraction,
         "population_mcts_critical_minimum_score": (
@@ -3952,6 +3958,15 @@ def train_promotion_league(
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
+                                # Calibration is deliberately strict: it
+                                # measures whether the apprentice can model
+                                # public action evidence. The fast shield is
+                                # for ordinary policy/value data generation.
+                                belief_action_mode=(
+                                    "strict"
+                                    if belief_calibration_required
+                                    else population_belief_search_mode
+                                ),
                                 max_envs=min(num_envs, population_max_envs),
                                 offline_collection=population_offline_collection,
                                 belief_only=belief_calibration_required,

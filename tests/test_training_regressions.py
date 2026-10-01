@@ -79,6 +79,7 @@ from polybot.training.routed_self_play_pool import (
     _paired_pool_schedule,
     _policy_distance,
     _reference_policy,
+    shield_root_policy_with_public_actions,
 )
 from polybot.training.self_play_pool_train import (
     _belief_rejection_kind,
@@ -2491,3 +2492,50 @@ def test_root_policy_fails_open_when_candidate_capture_is_unavailable():
     np.testing.assert_allclose(root["policy"], [[0.4, 0.6]])
     assert stats.roots == 0
     assert stats.missing_roots == 1
+
+
+def test_root_shield_restores_public_action_order_and_hides_hallucinations():
+    root = {
+        "action_id": np.asarray([[99, 10, 11, -1]], dtype=np.int32),
+        "action_mask": np.asarray([[True, True, True, False]]),
+        "visit_count": np.asarray([[7, 4, 2, 0]], dtype=np.int32),
+        "policy": np.asarray([[0.5, 0.3, 0.2, 0.0]], dtype=np.float32),
+    }
+    request = {
+        "action_id": np.asarray([[10, 12, -1, -1]], dtype=np.int32),
+        "action_mask": np.asarray([[True, True, False, False]]),
+    }
+
+    stats = shield_root_policy_with_public_actions(
+        root, request, np.asarray([True])
+    )
+
+    np.testing.assert_array_equal(root["action_id"], [[10, 12, -1, -1]])
+    np.testing.assert_array_equal(root["action_mask"], [[True, True, False, False]])
+    np.testing.assert_allclose(root["policy"], [[1.0, 0.0, 0.0, 0.0]])
+    np.testing.assert_array_equal(root["visit_count"], [[4, 0, 0, 0]])
+    assert stats.roots == 1
+    assert stats.missing_public_actions == 1
+    assert stats.hallucinated_actions == 2
+    assert stats.uniform_fallbacks == 0
+
+
+def test_root_shield_uses_public_uniform_policy_when_particle_root_has_no_overlap():
+    root = {
+        "action_id": np.asarray([[99, -1]], dtype=np.int32),
+        "action_mask": np.asarray([[True, False]]),
+        "policy": np.asarray([[1.0, 0.0]], dtype=np.float32),
+    }
+    request = {
+        "action_id": np.asarray([[10, 12]], dtype=np.int32),
+        "action_mask": np.asarray([[True, True]]),
+    }
+
+    stats = shield_root_policy_with_public_actions(
+        root, request, np.asarray([True])
+    )
+
+    np.testing.assert_allclose(root["policy"], [[0.5, 0.5]])
+    assert stats.missing_public_actions == 2
+    assert stats.hallucinated_actions == 1
+    assert stats.uniform_fallbacks == 1

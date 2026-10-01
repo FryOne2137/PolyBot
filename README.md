@@ -307,6 +307,16 @@ kalibracji MCTS może być targetem dla policy/value. Ścieżkę i próg reguluj
 `--belief-apprentice-path`, `--belief-action-equivalence-target` oraz
 `--belief-action-equivalence-min-particles`.
 
+Po kalibracji liga może użyć `--population-belief-search-mode root_shield`.
+Tryb zachowuje strict checker dla kalibracji i ewaluacji, lecz podczas zwykłego
+generowania policy/value nie losuje ponownie particle'a tylko dlatego, że jego
+zbiór akcji różni się od publicznej obserwacji. Po MCTS PolyBot przepisuje
+policy korzenia na dokładną, publiczną kolejność `action_id` z PolyEnv; ruch
+wykonany oraz target replay są więc zawsze legalne. Mismatch nadal zasila
+`engine_action_constraint_loss` i metryki `root_shield_*`. Błędy strukturalne
+particle'a nadal przechodzą przez strict recovery — root shield nie wyłącza
+walidacji mapy.
+
 Optymalizacja jest przeplatana z rolloutami: gdy kończy się partia, jej wynik
 jest propagowany przez decyzje z bootstrapem MCTS (`TD(0.95)`), model dostaje
 zaplanowaną porcję aktualizacji, a kolejne ruchy generuje nowszy kandydat.

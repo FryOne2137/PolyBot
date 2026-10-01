@@ -440,6 +440,14 @@ class SearchCounters:
     belief_action_equivalence_checked_particles: int = 0
     belief_action_equivalence_rejected_particles: int = 0
     belief_action_equivalence_rejected_envs: int = 0
+    # ``root_shield`` keeps public action legality authoritative even when a
+    # learned determinisation has a different private action set. These are
+    # separate from action-pruning counters: shielding corrects a belief
+    # mismatch, whereas pruning is an optional policy-speed heuristic.
+    root_shielded_roots: int = 0
+    root_shield_missing_public_actions: int = 0
+    root_shield_hallucinated_actions: int = 0
+    root_shield_uniform_fallbacks: int = 0
     root_env_decisions: int = 0
     search_policy_rows: int = 0
     search_pruned_rows: int = 0
@@ -517,7 +525,131 @@ def _action_pruning_metrics(counters: SearchCounters) -> Dict[str, float]:
             counters.search_root_top_visit_share_sum
             / max(1, counters.search_root_policy_rows)
         ),
+        "root_shielded_roots": float(counters.root_shielded_roots),
+        "root_shield_missing_public_actions": float(
+            counters.root_shield_missing_public_actions
+        ),
+        "root_shield_hallucinated_actions": float(
+            counters.root_shield_hallucinated_actions
+        ),
+        "root_shield_uniform_fallbacks": float(
+            counters.root_shield_uniform_fallbacks
+        ),
     }
+
+
+@dataclass(frozen=True)
+class RootShieldStats:
+    """Additive diagnostics from projecting an MCTS root onto public actions."""
+
+    roots: int = 0
+    missing_public_actions: int = 0
+    hallucinated_actions: int = 0
+    uniform_fallbacks: int = 0
+
+
+def shield_root_policy_with_public_actions(
+    root: Mapping[str, np.ndarray],
+    request: Mapping[str, np.ndarray],
+    active: np.ndarray,
+) -> RootShieldStats:
+    """Make the executed root policy exactly match PolyEnv's public actions.
+
+    An ISMCTS particle is allowed to be wrong about hidden state, but it must
+    never add or remove an action available to the real player. This routine
+    runs *after* native search, maps retained visit mass by stable action id,
+    and restores the public action order used by replay and ``step_into``.
+    Missing public actions receive zero visit mass; a fully incompatible root
+    falls back to a public uniform distribution. The chosen action is thus
+    always legal without regenerating a particle.
+    """
+    required = ("action_id", "action_mask", "policy")
+    if any(name not in root for name in required) or any(
+        name not in request for name in required[:2]
+    ):
+        raise ValueError("root shield requires action_id, action_mask and policy packets")
+    root_ids = np.asarray(root["action_id"])
+    root_mask = np.asarray(root["action_mask"], dtype=bool)
+    policy = np.asarray(root["policy"])
+    visit_count = (
+        None
+        if "visit_count" not in root
+        else np.asarray(root["visit_count"])
+    )
+    public_ids = np.asarray(request["action_id"])
+    public_mask = np.asarray(request["action_mask"], dtype=bool)
+    enabled = np.asarray(active, dtype=bool)
+    if (
+        root_ids.shape != root_mask.shape
+        or root_ids.shape != policy.shape
+        or (visit_count is not None and visit_count.shape != root_ids.shape)
+        or public_ids.shape != public_mask.shape
+        or root_ids.shape[0] != public_ids.shape[0]
+        or enabled.shape != (root_ids.shape[0],)
+    ):
+        raise ValueError("root shield packets must agree on batch rows and action shapes")
+
+    roots = missing = hallucinated = fallbacks = 0
+    for env in np.flatnonzero(enabled):
+        public_positions = np.flatnonzero(public_mask[env])
+        if public_positions.size == 0:
+            raise RuntimeError(f"live root {env} has no public legal actions")
+        if public_positions.size > root_ids.shape[1]:
+            raise RuntimeError("public action packet exceeds root-policy capacity")
+        native_positions = np.flatnonzero(root_mask[env])
+        native_ids = root_ids[env, native_positions]
+        native_policy = policy[env, native_positions]
+        native_visits = (
+            None if visit_count is None else visit_count[env, native_positions]
+        )
+        public_action_ids = public_ids[env, public_positions]
+        # Action ids are stable and unique inside one native packet. ``dict``
+        # avoids assuming that an incompatible particle kept the same order.
+        visit_mass = {
+            int(action_id): float(probability)
+            for action_id, probability in zip(native_ids, native_policy)
+        }
+        visits_by_id = (
+            {}
+            if native_visits is None
+            else {
+                int(action_id): int(visits)
+                for action_id, visits in zip(native_ids, native_visits)
+            }
+        )
+        public_id_set = {int(action_id) for action_id in public_action_ids}
+        missing += sum(int(action_id) not in visit_mass for action_id in public_id_set)
+        hallucinated += sum(int(action_id) not in public_id_set for action_id in native_ids)
+
+        # Replay rows assume root policy column j corresponds to public action
+        # column j. Compact the root packet into that public order instead of
+        # leaving holes in ``action_mask``.
+        root_ids[env].fill(-1)
+        root_mask[env].fill(False)
+        policy[env].fill(0.0)
+        if visit_count is not None:
+            visit_count[env].fill(0)
+        count = int(public_action_ids.size)
+        root_ids[env, :count] = public_action_ids
+        root_mask[env, :count] = True
+        if visit_count is not None:
+            visit_count[env, :count] = np.asarray(
+                [visits_by_id.get(int(action_id), 0) for action_id in public_action_ids],
+                dtype=visit_count.dtype,
+            )
+        masses = np.asarray(
+            [visit_mass.get(int(action_id), 0.0) for action_id in public_action_ids],
+            dtype=policy.dtype,
+        )
+        total = float(masses.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            masses.fill(1.0 / count)
+            fallbacks += 1
+        else:
+            masses /= total
+        policy[env, :count] = masses
+        roots += 1
+    return RootShieldStats(roots, missing, hallucinated, fallbacks)
 
 
 class RoutedPoolSearch:
@@ -535,6 +667,7 @@ class RoutedPoolSearch:
         visible_action_history: int,
         belief_retries: int,
         seed: int,
+        belief_action_mode: str = "strict",
         collect_engine_action_constraints: bool = False,
         search_top_actions_by_agent: Sequence[int] | None = None,
         search_random_actions_by_agent: Sequence[int] | None = None,
@@ -547,6 +680,8 @@ class RoutedPoolSearch:
             raise ValueError("max_pending_leaves must be between one and eight")
         if belief_retries < 0:
             raise ValueError("belief_retries must not be negative")
+        if belief_action_mode not in {"strict", "root_shield"}:
+            raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
         if mcts.search_top_actions < 0 or mcts.search_random_actions < 0:
             raise ValueError("MCTS action candidate counts must not be negative")
         Bardur, Imperius, MapType, SelfPlayPool = _pool_types()
@@ -580,6 +715,7 @@ class RoutedPoolSearch:
         self.num_envs = int(num_envs)
         self.max_pending_leaves = int(max_pending_leaves)
         self.belief_retries = int(belief_retries)
+        self.belief_action_mode = str(belief_action_mode)
         self.collect_engine_action_constraints = bool(collect_engine_action_constraints)
         self.counters = SearchCounters()
         self._action_generator: torch.Generator | None = None
@@ -1064,6 +1200,7 @@ class RoutedPoolSearch:
         self._capture_engine_action_constraints(
             initial_action_diagnostics, active, actors, request
         )
+        strict_action_equivalence = self.belief_action_mode == "strict"
         submitted = False
         last_error: ValueError | None = None
         rejected_rows = all_rows
@@ -1087,7 +1224,7 @@ class RoutedPoolSearch:
                 ) = ismcts_action_difference_rejections(
                     self.pool, state_ids, particles
                 )
-            if action_rejected_rows.size:
+            if strict_action_equivalence and action_rejected_rows.size:
                 retry_pending_envs = int(action_rejected_rows.size)
                 diagnostics = action_diagnostics
                 last_error = ValueError(
@@ -1176,23 +1313,24 @@ class RoutedPoolSearch:
             )
             fallback_error: ValueError | None = None
             fallback_preflight_rejected = False
-            (
-                rejected_rows,
-                rejected_mask,
-                rejected_particles,
-                diagnostics,
-            ) = ismcts_action_difference_rejections(self.pool, state_ids, particles)
-            if rejected_rows.size:
-                fallback_preflight_rejected = True
-                fallback_error = ValueError(
-                    "ismcts_belief_action_differences rejected conservative particles"
-                )
-                self.counters.belief_action_equivalence_rejected_envs += int(
-                    rejected_rows.size
-                )
-                self.counters.belief_rejections += int(rejected_rows.size)
-                self.counters.belief_rejected_envs += int(rejected_rows.size)
-                self.counters.belief_rejected_particles += int(rejected_particles)
+            if strict_action_equivalence:
+                (
+                    rejected_rows,
+                    rejected_mask,
+                    rejected_particles,
+                    diagnostics,
+                ) = ismcts_action_difference_rejections(self.pool, state_ids, particles)
+                if rejected_rows.size:
+                    fallback_preflight_rejected = True
+                    fallback_error = ValueError(
+                        "ismcts_belief_action_differences rejected conservative particles"
+                    )
+                    self.counters.belief_action_equivalence_rejected_envs += int(
+                        rejected_rows.size
+                    )
+                    self.counters.belief_rejections += int(rejected_rows.size)
+                    self.counters.belief_rejected_envs += int(rejected_rows.size)
+                    self.counters.belief_rejected_particles += int(rejected_particles)
             if has_acceptance_mask:
                 if fallback_error is None:
                     rejected_rows, rejected_mask, rejected_particles, diagnostics = ismcts_rejected_envs(
@@ -1251,6 +1389,18 @@ class RoutedPoolSearch:
             self._expand_leaves(leaf_count, prior_scale)
         self._capture_root_candidates = False
         self.pool.root_policy_into(self.root, temperature=root_temperature)
+        if self.belief_action_mode == "root_shield":
+            shield = shield_root_policy_with_public_actions(
+                self.root, request, active
+            )
+            self.counters.root_shielded_roots += shield.roots
+            self.counters.root_shield_missing_public_actions += (
+                shield.missing_public_actions
+            )
+            self.counters.root_shield_hallucinated_actions += (
+                shield.hallucinated_actions
+            )
+            self.counters.root_shield_uniform_fallbacks += shield.uniform_fallbacks
         action_counts = np.asarray(self.root["action_mask"], dtype=np.uint8).sum(axis=1)
         empty_live = np.flatnonzero(active & (action_counts == 0))
         if empty_live.size:
@@ -1791,6 +1941,7 @@ def train_population_pool(
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
     belief_retries: int = 4,
+    belief_action_mode: str = "strict",
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
     reserved_seeds: Sequence[int] = (),
@@ -1811,6 +1962,8 @@ def train_population_pool(
         raise ValueError("population training requires at least one opponent model")
     if max_envs < 1:
         raise ValueError("max_envs must be positive")
+    if belief_action_mode not in {"strict", "root_shield"}:
+        raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
     if not 0.0 <= anchor_policy_weight <= 1.0:
         raise ValueError("anchor_policy_weight must be between zero and one")
     if not 0.0 <= anchor_value_weight <= 1.0:
@@ -1875,6 +2028,7 @@ def train_population_pool(
             "reanalysis_replay_fraction": reanalysis_replay_fraction,
             "offline_collection": offline_collection,
             "belief_only": belief_only,
+            "belief_action_mode": belief_action_mode,
         },
     )
     value_target_training = (
@@ -1996,6 +2150,7 @@ def train_population_pool(
                 visible_action_history=visible_action_history,
                 belief_retries=belief_retries,
                 seed=int(seeds[0]),
+                belief_action_mode=belief_action_mode,
                 collect_engine_action_constraints=(
                     training.engine_action_constraint_weight > 0.0
                 ),
@@ -2446,6 +2601,7 @@ def train_population_pool(
         "population_pool_leaf_rows": float(routing.leaf_rows),
         "population_pool_leaf_waves": float(routing.leaf_waves),
         "population_pool_belief_retries": float(routing.belief_retries),
+        "population_pool_belief_action_mode": belief_action_mode,
         "population_pool_belief_fallback_rows": float(routing.belief_fallback_rows),
         "population_pool_belief_rejections": float(routing.belief_rejections),
         "belief_rejected_particles": float(routing.belief_rejected_particles),

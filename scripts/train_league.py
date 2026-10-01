@@ -86,6 +86,16 @@ def main() -> None:
         help="Freeze the model while one full MCTS generation is collected, then train from that fixed replay",
     )
     parser.add_argument(
+        "--population-belief-search-mode",
+        choices=("strict", "root_shield"),
+        default="strict",
+        help=(
+            "strict retries action-mismatched particles; root_shield keeps the "
+            "public PolyEnv root actions authoritative and uses mismatch only "
+            "for belief supervision/diagnostics during ordinary MCTS training"
+        ),
+    )
+    parser.add_argument(
         "--belief-apprentice-path", type=Path,
         help="Persistent calibration checkpoint; defaults to <checkpoint-dir>/<prefix>-belief-apprentice.pt.",
     )
@@ -651,6 +661,7 @@ def main() -> None:
         population_workers=args.population_workers,
         population_max_envs=args.population_max_envs,
         population_offline_collection=args.population_offline_collection,
+        population_belief_search_mode=args.population_belief_search_mode,
         population_mcts_critical_only=args.population_mcts_critical_only,
         population_mcts_critical_fraction=(
             args.population_mcts_critical_fraction

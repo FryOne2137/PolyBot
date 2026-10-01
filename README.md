@@ -206,6 +206,18 @@ pomaga przed pierwszym przejściem, auto pozostaje w recovery i nie używa go do
 treningu. Po przejściu nieudany rung wraca natomiast do poprzedniego
 MCTS-ready championa.
 
+W zwykłej generacji MCTS domyślnie działa selective MCTS. PolyBot najpierw
+wykonuje tani, publiczny forward surowej policy, a następnie kieruje do
+natywnego `SelfPlayPool.select_leaves_masked_into()` tylko najbardziej
+niepewne, strategiczne i losowo audytowane sloty. Pozostałe sloty wykonują
+legalną direct policy. Wszystkie ruchy nadal uczą belief i value, lecz policy
+otrzymuje target wyłącznie z odwiedzonych rootów MCTS — direct policy nie jest
+destylowana sama do siebie. Ustawienia to
+`--population-selective-mcts-fraction` (domyślnie 0.25),
+`--population-selective-mcts-minimum-envs` i
+`--population-selective-mcts-audit-fraction`. Strict belief calibration oraz
+sparowane bramki nadal używają pełnego MCTS.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

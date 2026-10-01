@@ -376,9 +376,18 @@ def train_batch(
         policy_log_probabilities,
         torch.zeros_like(policy_log_probabilities),
     )
-    policy = -(
+    per_example_policy = -(
         batch["policy_target"] * valid_log_probabilities
-    ).sum(dim=-1).mean()
+    ).sum(dim=-1)
+    policy_weights = batch.get("policy_loss_weight")
+    if policy_weights is None:
+        policy = per_example_policy.mean()
+    else:
+        policy_weights = policy_weights.to(per_example_policy.dtype)
+        policy = (
+            (per_example_policy * policy_weights).sum()
+            / policy_weights.sum().clamp_min(1.0)
+        )
     per_example_value = F.smooth_l1_loss(
         output.value, batch["value_target"], reduction="none"
     )

@@ -72,6 +72,8 @@ from polybot.training.optimisation import (
 )
 from polybot.training.replay_buffer import ReplayBuffer, TrainingExample
 from polybot.training.routed_self_play_pool import (
+    RoutedPoolSearch,
+    SearchCounters,
     _evaluation_pair_rows,
     _evaluation_search_with_recovery,
     _freeze_reference_model,
@@ -651,6 +653,63 @@ def test_zero_weight_removes_truncated_example_from_value_loss():
     )
 
     assert result["value_loss"] == 0.0
+
+
+def test_zero_policy_weight_keeps_belief_value_rows_out_of_policy_loss():
+    example = _example(0)
+    example.policy_loss_weight = 0.0
+    model = PolicyValueBeliefNet(
+        ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    )
+    optimiser = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    result = train_batch(
+        model,
+        optimiser,
+        stack_examples([example], torch.device("cpu")),
+        TrainingConfig(belief_weight=0.0, value_weight=0.0),
+    )
+
+    assert result["policy_loss"] == 0.0
+
+
+def test_selective_mcts_mask_uses_public_raw_uncertainty_and_audit():
+    search = object.__new__(RoutedPoolSearch)
+    search.num_envs = 4
+    search.counters = SearchCounters()
+    raw_policy = np.asarray(
+        [
+            [0.99, 0.01, 0.0],  # confident: normally direct
+            [0.50, 0.50, 0.0],  # ambiguous: should be selected
+            [0.34, 0.33, 0.33], # most uncertain: should be selected
+            [0.90, 0.10, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    values = np.zeros(4, dtype=np.float32)
+    search.direct_policy_value = lambda request, rows: (raw_policy.copy(), values.copy())
+    request = {
+        "action_mask": np.asarray(
+            [[1, 1, 0], [1, 1, 0], [1, 1, 1], [1, 1, 0]], dtype=np.uint8
+        ),
+        "action_features": np.zeros((4, 3, 17), dtype=np.int32),
+        "agent_id": np.asarray([0, 1, 0, 1], dtype=np.int32),
+    }
+
+    selected, policy, returned_values = search.selective_mcts_mask(
+        request,
+        np.asarray([True, True, True, False]),
+        fraction=2.0 / 3.0,
+        minimum_envs=0,
+        audit_fraction=0.0,
+        rng=np.random.default_rng(7),
+    )
+
+    assert selected.tolist() == [False, True, True, False]
+    np.testing.assert_array_equal(policy, raw_policy)
+    np.testing.assert_array_equal(returned_values, values)
+    assert search.counters.selective_mcts_decisions == 2
+    assert search.counters.direct_policy_decisions == 1
 
 
 def test_pool_policy_target_keeps_a_frozen_predecessor_anchor():

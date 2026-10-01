@@ -590,6 +590,10 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
         getattr(row, "engine_action_constraint_score", 0.0) for row in rows
     ], dtype=np.float32)
     values = np.asarray([row.value_target for row in rows], dtype=np.float32)
+    policy_weights = np.asarray(
+        [getattr(row, "policy_loss_weight", 1.0) for row in rows],
+        dtype=np.float32,
+    )
     value_weights = np.asarray([row.value_loss_weight for row in rows], dtype=np.float32)
     anchor_values = np.asarray(
         [getattr(row, "anchor_value_target", 0.0) for row in rows],
@@ -630,6 +634,9 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
         "action_continuous": torch.as_tensor(conts, dtype=torch.float32, device=device),
         "action_mask": torch.as_tensor(masks, dtype=torch.bool, device=device),
         "policy_target": torch.as_tensor(policies, dtype=torch.float32, device=device),
+        "policy_loss_weight": torch.as_tensor(
+            policy_weights, dtype=torch.float32, device=device
+        ),
         "value_target": torch.as_tensor(values, dtype=torch.float32, device=device),
         "value_loss_weight": torch.as_tensor(value_weights, dtype=torch.float32, device=device),
         "anchor_value_target": torch.as_tensor(

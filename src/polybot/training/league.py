@@ -373,6 +373,9 @@ def _validate_options(
     population_mcts_critical_fraction: float,
     population_mcts_critical_minimum_score: float,
     population_mcts_critical_replay_fraction: float,
+    population_selective_mcts_fraction: float,
+    population_selective_mcts_minimum_envs: int,
+    population_selective_mcts_audit_fraction: float,
     population_mcts_reanalyse_capacity: int,
     population_mcts_reanalyse_positions: int,
     population_mcts_reanalyse_replay_fraction: float,
@@ -422,6 +425,14 @@ def _validate_options(
     if population_mcts_critical_only and population_mcts_critical_fraction <= 0.0:
         raise ValueError(
             "population_mcts_critical_only requires positive critical fraction"
+        )
+    if not 0.0 < population_selective_mcts_fraction <= 1.0:
+        raise ValueError("population_selective_mcts_fraction must be in (0, 1]")
+    if population_selective_mcts_minimum_envs < 0:
+        raise ValueError("population_selective_mcts_minimum_envs must not be negative")
+    if not 0.0 <= population_selective_mcts_audit_fraction <= 1.0:
+        raise ValueError(
+            "population_selective_mcts_audit_fraction must be in [0, 1]"
         )
     if population_mcts_reanalyse_capacity < 1:
         raise ValueError("population_mcts_reanalyse_capacity must be positive")
@@ -479,6 +490,10 @@ def train_promotion_league(
     population_mcts_critical_fraction: float = 0.25,
     population_mcts_critical_minimum_score: float = 0.25,
     population_mcts_critical_replay_fraction: float = 1.0,
+    population_selective_mcts: bool = True,
+    population_selective_mcts_fraction: float = 0.25,
+    population_selective_mcts_minimum_envs: int = 2,
+    population_selective_mcts_audit_fraction: float = 0.05,
     population_mcts_reanalyse_path: Path | None = None,
     population_mcts_reanalyse_capacity: int = 4_096,
     population_mcts_reanalyse_positions: int = 8,
@@ -637,6 +652,13 @@ def train_promotion_league(
         ),
         population_mcts_critical_replay_fraction=(
             population_mcts_critical_replay_fraction
+        ),
+        population_selective_mcts_fraction=population_selective_mcts_fraction,
+        population_selective_mcts_minimum_envs=(
+            population_selective_mcts_minimum_envs
+        ),
+        population_selective_mcts_audit_fraction=(
+            population_selective_mcts_audit_fraction
         ),
         population_mcts_reanalyse_capacity=population_mcts_reanalyse_capacity,
         population_mcts_reanalyse_positions=population_mcts_reanalyse_positions,
@@ -1084,6 +1106,14 @@ def train_promotion_league(
         ),
         "population_mcts_critical_replay_fraction": (
             population_mcts_critical_replay_fraction
+        ),
+        "population_selective_mcts": population_selective_mcts,
+        "population_selective_mcts_fraction": population_selective_mcts_fraction,
+        "population_selective_mcts_minimum_envs": (
+            population_selective_mcts_minimum_envs
+        ),
+        "population_selective_mcts_audit_fraction": (
+            population_selective_mcts_audit_fraction
         ),
         "population_mcts_reanalyse_path": population_mcts_reanalyse_path,
         "population_mcts_reanalyse_capacity": population_mcts_reanalyse_capacity,
@@ -3939,6 +3969,20 @@ def train_promotion_league(
                                     False
                                     if belief_calibration_required
                                     else population_mcts_critical_only
+                                ),
+                                selective_mcts=(
+                                    False
+                                    if belief_calibration_required
+                                    else population_selective_mcts
+                                ),
+                                selective_mcts_fraction=(
+                                    population_selective_mcts_fraction
+                                ),
+                                selective_mcts_minimum_envs=(
+                                    population_selective_mcts_minimum_envs
+                                ),
+                                selective_mcts_audit_fraction=(
+                                    population_selective_mcts_audit_fraction
                                 ),
                                 reanalysis_path=population_mcts_reanalyse_path,
                                 reanalysis_capacity=(

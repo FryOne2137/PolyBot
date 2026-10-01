@@ -26,6 +26,9 @@ class TrainingExample:
     action_history_mask: np.ndarray | None = None
     shaped_reward: float = 0.0
     value_target: float = 0.0
+    # Direct-policy positions still teach the belief and value heads, but
+    # must not distil a policy into itself.  Search positions keep this at 1.
+    policy_loss_weight: float = 1.0
     # Trainer-imposed horizons are not game draws. Their value targets are
     # masked until a genuine terminal result (or an explicit bootstrap) is
     # available, while their policy and belief targets remain useful.

@@ -144,6 +144,8 @@ def _pool_types() -> tuple[Any, Any, Any, Any]:
         "completed_batch_spec",
         "drain_completed_into",
         "reset_slots_into",
+        "select_leaves_masked",
+        "select_leaves_masked_into",
     )
     missing = [name for name in required if not hasattr(SelfPlayPool, name)]
     if missing:
@@ -449,6 +451,14 @@ class SearchCounters:
     root_shield_hallucinated_actions: int = 0
     root_shield_uniform_fallbacks: int = 0
     root_env_decisions: int = 0
+    # Selective MCTS is decided from public root packets before native tree
+    # traversal.  Keep this separate from leaf rows: one selected decision
+    # can produce several native leaves and several search waves.
+    selective_mcts_decisions: int = 0
+    direct_policy_decisions: int = 0
+    selective_mcts_audit_decisions: int = 0
+    selective_raw_entropy_sum: float = 0.0
+    selective_direct_entropy_sum: float = 0.0
     search_policy_rows: int = 0
     search_pruned_rows: int = 0
     search_legal_actions: int = 0
@@ -482,6 +492,8 @@ class SearchCounters:
                 "search_root_policy_entropy_sum",
                 "search_root_top_visit_share_sum",
                 "engine_action_constraint_score_sum",
+                "selective_raw_entropy_sum",
+                "selective_direct_entropy_sum",
             }:
                 setattr(self, name, float(getattr(self, name)) + float(getattr(other, name)))
             else:
@@ -534,6 +546,22 @@ def _action_pruning_metrics(counters: SearchCounters) -> Dict[str, float]:
         ),
         "root_shield_uniform_fallbacks": float(
             counters.root_shield_uniform_fallbacks
+        ),
+        "selective_mcts_decisions": float(counters.selective_mcts_decisions),
+        "direct_policy_decisions": float(counters.direct_policy_decisions),
+        "selective_mcts_fraction": float(
+            counters.selective_mcts_decisions / max(1, counters.root_env_decisions)
+        ),
+        "selective_mcts_audit_decisions": float(
+            counters.selective_mcts_audit_decisions
+        ),
+        "selective_mcts_raw_entropy": float(
+            counters.selective_raw_entropy_sum
+            / max(1, counters.selective_mcts_decisions)
+        ),
+        "direct_policy_raw_entropy": float(
+            counters.selective_direct_entropy_sum
+            / max(1, counters.direct_policy_decisions)
         ),
     }
 
@@ -794,6 +822,211 @@ class RoutedPoolSearch:
         _validate_agents(assignments, len(self.models), "assignments")
         self.pool.reset_into(self.request, seeds=seeds, agent_ids=assignments)
         return self.request
+
+    @torch.inference_mode()
+    def direct_policy_value(
+        self,
+        request: Mapping[str, np.ndarray],
+        rows: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run one fog-safe raw policy/value pass, routed by ``agent_id``.
+
+        The returned arrays retain the full pool row layout so callers can
+        safely merge direct decisions with native MCTS roots.  Padded actions
+        are always zeroed and every legal row is renormalised explicitly;
+        this keeps direct execution anchored to PolyEnv's public action list.
+        """
+        rows = np.asarray(rows, dtype=np.int32)
+        action_mask = np.asarray(request["action_mask"], dtype=bool)
+        policies = np.zeros(action_mask.shape, dtype=np.float32)
+        values = np.zeros(self.num_envs, dtype=np.float32)
+        for model in self.models:
+            model.eval()
+        if rows.size == 0:
+            return policies, values
+        if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= self.num_envs):
+            raise ValueError("direct-policy rows must be valid pool indices")
+        agents = np.asarray(request["agent_id"], dtype=np.int32)
+        _validate_agents(agents[rows], len(self.models), "direct-policy packet")
+        for agent in np.unique(agents[rows]):
+            local = np.flatnonzero(agents[rows] == agent)
+            selected_rows = rows[local]
+            batch = _slice_rows(request, selected_rows)
+            tensors = native_batch_to_tensors(
+                batch, self.device, self.training.map_size, self.training.map_type
+            )
+            output = self.models[int(agent)](
+                tensors.map_tokens,
+                tensors.global_features,
+                tensors.action_categorical,
+                tensors.action_continuous,
+                tensors.action_mask,
+                tensors.event_features,
+                action_history=tensors.action_history,
+                action_history_mask=tensors.action_history_mask,
+                include_belief=False,
+            )
+            logits = output.policy_logits.masked_fill(~tensors.action_mask, float("-inf"))
+            policy = torch.softmax(logits, dim=-1).float().cpu().numpy()
+            policy *= np.asarray(batch["action_mask"], dtype=np.float32)
+            totals = policy.sum(axis=1, keepdims=True)
+            empty = ~np.isfinite(totals[:, 0]) | (totals[:, 0] <= 0.0)
+            if np.any(empty):
+                legal = np.asarray(batch["action_mask"], dtype=bool)
+                policy[empty] = legal[empty].astype(np.float32)
+                totals = policy.sum(axis=1, keepdims=True)
+            policy /= np.maximum(totals, 1.0e-8)
+            policies[selected_rows] = policy
+            values[selected_rows] = output.value.float().reshape(-1).cpu().numpy()
+        return policies, values
+
+    def selective_mcts_mask(
+        self,
+        request: Mapping[str, np.ndarray],
+        active: np.ndarray,
+        *,
+        fraction: float,
+        minimum_envs: int,
+        audit_fraction: float,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Choose a bounded, public-information subset for expensive MCTS.
+
+        Entropy and top-action ambiguity are cheap uncertainty proxies.  A
+        small random audit prevents the policy from avoiding search merely by
+        becoming confidently wrong.  No full-map labels or belief particles
+        participate in this decision.
+        """
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("selective MCTS fraction must be in (0, 1]")
+        if minimum_envs < 0:
+            raise ValueError("selective MCTS minimum_envs must be non-negative")
+        if not 0.0 <= audit_fraction <= 1.0:
+            raise ValueError("selective MCTS audit_fraction must be in [0, 1]")
+        active = np.asarray(active, dtype=bool)
+        if active.shape != (self.num_envs,):
+            raise ValueError("active mask must have shape [num_envs]")
+        active_rows = np.flatnonzero(active).astype(np.int32)
+        policies, values = self.direct_policy_value(request, active_rows)
+        selected = np.zeros(self.num_envs, dtype=bool)
+        if active_rows.size == 0:
+            return selected, policies, values
+        if fraction >= 1.0:
+            selected[active_rows] = True
+        else:
+            action_mask = np.asarray(request["action_mask"], dtype=bool)
+            features = np.asarray(request["action_features"], dtype=np.int64)
+            legal = action_mask[active_rows]
+            raw = policies[active_rows]
+            legal_counts = legal.sum(axis=1)
+            entropy = np.zeros(active_rows.size, dtype=np.float64)
+            top_mass = np.ones(active_rows.size, dtype=np.float64)
+            for index, count in enumerate(legal_counts):
+                count = int(count)
+                if count <= 1:
+                    continue
+                probabilities = raw[index, :count]
+                entropy[index] = -float(
+                    np.sum(probabilities * np.log(np.maximum(probabilities, 1.0e-12)))
+                ) / float(np.log(count))
+                top_mass[index] = float(probabilities.max())
+            # Public strategic actions get a modest deterministic boost.  It
+            # makes the early sparse MCTS budget cover captures, capital
+            # interactions and construction without hard-coding an action.
+            action_types = features[active_rows]
+            strategic = (
+                (action_types[:, :, 0] == 1)
+                | (action_types[:, :, 0] == 8)
+                | (action_types[:, :, 0] == 3)
+            ) & legal
+            strategic_bonus = strategic.any(axis=1).astype(np.float64) * 0.20
+            action_width = np.minimum(1.0, np.log1p(legal_counts) / np.log(16.0))
+            score = entropy + 0.35 * (1.0 - top_mass) + 0.10 * action_width + strategic_bonus
+            target = min(
+                active_rows.size,
+                max(int(minimum_envs), int(np.ceil(active_rows.size * fraction))),
+            )
+            audit_count = min(target, int(np.ceil(active_rows.size * audit_fraction)))
+            if audit_count:
+                audited = np.asarray(
+                    rng.choice(active_rows, size=audit_count, replace=False), dtype=np.int32
+                )
+                selected[audited] = True
+            remaining = active_rows[~selected[active_rows]]
+            take = min(target - int(selected[active_rows].sum()), remaining.size)
+            if take:
+                local_score = score[~selected[active_rows]]
+                chosen = np.argsort(-local_score, kind="stable")[:take]
+                selected[remaining[chosen]] = True
+            # Candidate policy targets are the reason this collection pass
+            # exists.  A global uncertainty ranking can otherwise spend a
+            # small B=8 budget entirely on frozen-opponent turns.  Reserve
+            # one candidate root by replacing the weakest selected opponent
+            # root, without increasing the configured MCTS budget.
+            agents = np.asarray(request["agent_id"], dtype=np.int32)
+            candidate_rows = active_rows[agents[active_rows] == 0]
+            if candidate_rows.size and not selected[candidate_rows].any():
+                candidate_scores = score[agents[active_rows] == 0]
+                candidate = int(candidate_rows[np.argmax(candidate_scores)])
+                selected[candidate] = True
+                selected_active = active_rows[selected[active_rows]]
+                if selected_active.size > target:
+                    removable = selected_active[
+                        agents[selected_active] != 0
+                    ]
+                    if removable.size:
+                        removable_scores = score[
+                            np.isin(active_rows, removable, assume_unique=True)
+                        ]
+                        selected[int(removable[np.argmin(removable_scores)])] = False
+            self.counters.selective_mcts_audit_decisions += int(audit_count)
+
+        entropy_by_row = np.zeros(self.num_envs, dtype=np.float64)
+        action_mask = np.asarray(request["action_mask"], dtype=bool)
+        for env in active_rows:
+            count = int(action_mask[env].sum())
+            if count > 1:
+                p = policies[env, :count]
+                entropy_by_row[env] = -float(
+                    np.sum(p * np.log(np.maximum(p, 1.0e-12))) / np.log(count)
+                )
+        self.counters.selective_mcts_decisions += int(selected[active_rows].sum())
+        self.counters.direct_policy_decisions += int((~selected & active).sum())
+        self.counters.selective_raw_entropy_sum += float(entropy_by_row[selected].sum())
+        self.counters.selective_direct_entropy_sum += float(
+            entropy_by_row[(~selected) & active].sum()
+        )
+        return selected, policies, values
+
+    def _install_direct_root_rows(
+        self,
+        request: Mapping[str, np.ndarray],
+        direct_rows: np.ndarray,
+        policies: np.ndarray,
+        values: np.ndarray,
+    ) -> None:
+        """Make direct rows safe for the common action-sampling path."""
+        rows = np.flatnonzero(np.asarray(direct_rows, dtype=bool))
+        if not rows.size:
+            return
+        public_ids = np.asarray(request["action_id"], dtype=np.int32)
+        public_mask = np.asarray(request["action_mask"], dtype=np.uint8)
+        if public_ids.shape != np.asarray(self.root["action_id"]).shape:
+            raise RuntimeError("direct policy action capacity differs from native root capacity")
+        self.root["action_id"][rows] = public_ids[rows]
+        self.root["action_mask"][rows] = public_mask[rows]
+        self.root["policy"][rows] = np.asarray(policies[rows], dtype=np.float32)
+        if "visit_count" in self.root:
+            self.root["visit_count"][rows] = 0
+        if "root_visit_count" in self.root:
+            self.root["root_visit_count"][rows] = 0
+        if "root_value" in self.root:
+            self.root["root_value"][rows] = np.asarray(values[rows], dtype=np.float32)
+        for name in ("state_id", "episode_id", "agent_id", "map_seed"):
+            if name in self.root and name in request:
+                self.root[name][rows] = np.asarray(request[name])[rows]
+        if "root_player" in self.root:
+            self.root["root_player"][rows] = np.asarray(request["to_play"])[rows]
 
     def _capture_engine_action_constraints(
         self,
@@ -1142,8 +1375,11 @@ class RoutedPoolSearch:
         belief_temperature: float,
         prior_scale: float,
         root_noise: bool = False,
+        mcts_mask: np.ndarray | None = None,
+        direct_policy: np.ndarray | None = None,
+        direct_value: np.ndarray | None = None,
     ) -> Dict[str, np.ndarray]:
-        """Run routed belief completion and MCTS for one vector decision."""
+        """Run full or selective routed belief-MCTS for one vector decision."""
         for model in self.models:
             model.eval()
         state_ids = np.asarray(request["state_id"], dtype=np.uint64)
@@ -1152,6 +1388,32 @@ class RoutedPoolSearch:
         self.pool.all_player_belief_requests_into(self.all_players)
         all_players = self.all_players
         active = np.asarray(active, dtype=bool)
+        if active.shape != (self.num_envs,):
+            raise ValueError("active mask must have shape [num_envs]")
+        if mcts_mask is None:
+            mcts_mask = active.copy()
+        else:
+            mcts_mask = np.asarray(mcts_mask, dtype=bool)
+            if mcts_mask.shape != (self.num_envs,):
+                raise ValueError("mcts_mask must have shape [num_envs]")
+            if np.any(mcts_mask & ~active):
+                raise ValueError("mcts_mask must be a subset of active slots")
+            mcts_mask = mcts_mask.copy()
+        direct_rows = active & ~mcts_mask
+        if direct_rows.any() and (direct_policy is None or direct_value is None):
+            inferred_policy, inferred_value = self.direct_policy_value(
+                request, np.flatnonzero(direct_rows).astype(np.int32)
+            )
+            direct_policy = inferred_policy
+            direct_value = inferred_value
+        if direct_policy is not None:
+            direct_policy = np.asarray(direct_policy, dtype=np.float32)
+            if direct_policy.shape != np.asarray(request["action_mask"]).shape:
+                raise ValueError("direct_policy must match request action_mask")
+        if direct_value is not None:
+            direct_value = np.asarray(direct_value, dtype=np.float32)
+            if direct_value.shape != (self.num_envs,):
+                raise ValueError("direct_value must have shape [num_envs]")
         # Search objects are also used by promotion gates. Noise is opt-in so
         # those fixed-seed evaluations remain deterministic.
         self._root_noise_enabled = bool(root_noise)
@@ -1378,8 +1640,10 @@ class RoutedPoolSearch:
         for wave in range(waves):
             self._capture_root_candidates = wave == 0
             leaf_count = int(
-                self.pool.select_leaves_into(
-                    self.leaves, max_leaves=self.leaf_capacity
+                self.pool.select_leaves_masked_into(
+                    self.leaves,
+                    np.ascontiguousarray(mcts_mask, dtype=np.uint8),
+                    max_leaves=self.leaf_capacity,
                 )
             )
             self.counters.leaf_waves += 1
@@ -1389,9 +1653,14 @@ class RoutedPoolSearch:
             self._expand_leaves(leaf_count, prior_scale)
         self._capture_root_candidates = False
         self.pool.root_policy_into(self.root, temperature=root_temperature)
+        if direct_rows.any():
+            assert direct_policy is not None and direct_value is not None
+            self._install_direct_root_rows(
+                request, direct_rows, direct_policy, direct_value
+            )
         if self.belief_action_mode == "root_shield":
             shield = shield_root_policy_with_public_actions(
-                self.root, request, active
+                self.root, request, mcts_mask
             )
             self.counters.root_shielded_roots += shield.roots
             self.counters.root_shield_missing_public_actions += (
@@ -1402,7 +1671,7 @@ class RoutedPoolSearch:
             )
             self.counters.root_shield_uniform_fallbacks += shield.uniform_fallbacks
         action_counts = np.asarray(self.root["action_mask"], dtype=np.uint8).sum(axis=1)
-        empty_live = np.flatnonzero(active & (action_counts == 0))
+        empty_live = np.flatnonzero(mcts_mask & (action_counts == 0))
         if empty_live.size:
             raise RuntimeError(
                 "SelfPlayPool returned unexpanded live roots: "
@@ -1410,7 +1679,7 @@ class RoutedPoolSearch:
             )
         root_agents = np.asarray(self.root["agent_id"], dtype=np.int32)
         enabled = np.zeros(self.num_envs, dtype=bool)
-        for env in np.flatnonzero(active):
+        for env in np.flatnonzero(mcts_mask):
             agent = int(root_agents[env])
             if 0 <= agent < len(self.search_top_actions_by_agent):
                 enabled[env] = self.search_top_actions_by_agent[agent] > 0
@@ -1428,7 +1697,7 @@ class RoutedPoolSearch:
         )
         root_policy = np.asarray(self.root["policy"], dtype=np.float64)
         root_mask = np.asarray(self.root["action_mask"], dtype=bool)
-        for env in np.flatnonzero(active):
+        for env in np.flatnonzero(mcts_mask):
             probabilities = root_policy[env, root_mask[env]]
             total = float(probabilities.sum())
             if probabilities.size == 0 or total <= 0.0 or not np.isfinite(total):
@@ -1931,6 +2200,10 @@ def train_population_pool(
     critical_minimum_score: float = 0.15,
     critical_replay_fraction: float = 0.0,
     critical_only: bool = False,
+    selective_mcts: bool = False,
+    selective_mcts_fraction: float = 0.25,
+    selective_mcts_minimum_envs: int = 2,
+    selective_mcts_audit_fraction: float = 0.05,
     reanalysis_path: Path | None = None,
     reanalysis_capacity: int = 4_096,
     reanalysis_positions: int = 0,
@@ -1990,6 +2263,12 @@ def train_population_pool(
         raise ValueError(
             "critical_only requires a positive critical_decision_fraction"
         )
+    if not 0.0 < selective_mcts_fraction <= 1.0:
+        raise ValueError("selective_mcts_fraction must be in (0, 1]")
+    if selective_mcts_minimum_envs < 0:
+        raise ValueError("selective_mcts_minimum_envs must not be negative")
+    if not 0.0 <= selective_mcts_audit_fraction <= 1.0:
+        raise ValueError("selective_mcts_audit_fraction must be in [0, 1]")
     if anchor_model is candidate:
         raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
     if training.max_replay_epochs <= 0.0:
@@ -2022,6 +2301,10 @@ def train_population_pool(
             "critical_minimum_score": critical_minimum_score,
             "critical_replay_fraction": critical_replay_fraction,
             "critical_only": critical_only,
+            "selective_mcts": selective_mcts,
+            "selective_mcts_fraction": selective_mcts_fraction,
+            "selective_mcts_minimum_envs": selective_mcts_minimum_envs,
+            "selective_mcts_audit_fraction": selective_mcts_audit_fraction,
             "reanalysis_path": str(reanalysis_path) if reanalysis_path else "",
             "reanalysis_capacity": reanalysis_capacity,
             "reanalysis_positions": reanalysis_positions,
@@ -2197,7 +2480,8 @@ def train_population_pool(
                         finished = [
                             example
                             for example in finished
-                            if example.critical_priority
+                            if example.policy_loss_weight <= 0.0
+                            or example.critical_priority
                         ]
                         discarded_noncritical_examples += (
                             original_count - len(finished)
@@ -2230,6 +2514,22 @@ def train_population_pool(
                 if not active.any():
                     break
                 curriculum = max(0.0, 1.0 - completed_count / max(1, games))
+                mcts_mask = active.copy()
+                direct_policy = None
+                direct_value = None
+                if selective_mcts:
+                    (
+                        mcts_mask,
+                        direct_policy,
+                        direct_value,
+                    ) = search.selective_mcts_mask(
+                        request,
+                        active,
+                        fraction=selective_mcts_fraction,
+                        minimum_envs=selective_mcts_minimum_envs,
+                        audit_fraction=selective_mcts_audit_fraction,
+                        rng=rng,
+                    )
                 try:
                     root = search.search(
                         request,
@@ -2238,6 +2538,9 @@ def train_population_pool(
                         belief_temperature=max(mcts.temperature, 0.35),
                         prior_scale=curriculum,
                         root_noise=True,
+                        mcts_mask=mcts_mask,
+                        direct_policy=direct_policy,
+                        direct_value=direct_value,
                     )
                 except BeliefRecoveryRequired as error:
                     reset_rows, active_reset_rows, inactive_reset_rows = partition_recovery_envs(
@@ -2264,7 +2567,8 @@ def train_population_pool(
                             finished = [
                                 example
                                 for example in finished
-                                if example.critical_priority
+                                if example.policy_loss_weight <= 0.0
+                                or example.critical_priority
                             ]
                             discarded_noncritical_examples += (
                                 original_count - len(finished)
@@ -2372,17 +2676,25 @@ def train_population_pool(
                         anchor_l1_sum += measured[2]
                     raw_candidate_policy = None
                     if critical_decision_fraction > 0.0:
-                        # The candidate's unsearched policy is the apprentice
-                        # we want to improve.  Compare it with the completed
-                        # MCTS root only after search; the root policy itself
-                        # stays the target stored by _root_examples.
-                        candidate.eval()
-                        raw_candidate_policy = _reference_policy(
-                            candidate,
-                            candidate_request,
-                            device,
-                            training,
-                        )
+                        # Direct rows already contain their raw policy in the
+                        # hybrid root.  Run this extra reference forward only
+                        # for MCTS rows, where it measures the actual search
+                        # improvement instead of spending GPU time twice.
+                        candidate_mcts_local = mcts_mask[candidate_rows]
+                        raw_candidate_policy = np.asarray(
+                            candidate_root["policy"], dtype=np.float32
+                        ).copy()
+                        if candidate_mcts_local.any():
+                            candidate.eval()
+                            raw_candidate_policy[candidate_mcts_local] = _reference_policy(
+                                candidate,
+                                _slice_rows(
+                                    candidate_request,
+                                    np.flatnonzero(candidate_mcts_local),
+                                ),
+                                device,
+                                training,
+                            )
                     candidate_examples = _root_examples(
                         candidate_request,
                         candidate_root,
@@ -2414,8 +2726,22 @@ def train_population_pool(
                         )
                         critical_decisions += marked
                         critical_score_sum += score_sum
+                    if selective_mcts:
+                        # The selective scheduler has already paid for these
+                        # roots.  Retain every selected candidate MCTS target
+                        # for policy learning; otherwise the legacy
+                        # disagreement threshold can leave an early run with
+                        # virtually no policy supervision at all.
+                        for local, example in enumerate(candidate_examples):
+                            if mcts_mask[int(candidate_rows[local])]:
+                                example.critical_priority = True
                     root_values = np.asarray(root["root_value"], dtype=np.float32)
                     for env, example in zip(candidate_rows, candidate_examples):
+                        if not mcts_mask[int(env)]:
+                            # A raw policy target is only an action source,
+                            # never a policy teacher.  Keep its belief/value
+                            # supervision but mask policy cross-entropy.
+                            example.policy_loss_weight = 0.0
                         example.bootstrap_value = float(root_values[env])
                         examples_by_env[int(env)] = example
                         if example.critical_priority:
@@ -2587,6 +2913,16 @@ def train_population_pool(
         ),
         "population_pool_critical_mcts_selection_fraction": float(
             critical_decision_fraction
+        ),
+        "population_pool_selective_mcts": float(selective_mcts),
+        "population_pool_selective_mcts_target_fraction": float(
+            selective_mcts_fraction
+        ),
+        "population_pool_selective_mcts_minimum_envs": float(
+            selective_mcts_minimum_envs
+        ),
+        "population_pool_selective_mcts_audit_fraction": float(
+            selective_mcts_audit_fraction
         ),
         "population_pool_offline_collection": float(offline_collection),
         "population_pool_reanalysis_loaded": float(reanalysis_loaded),

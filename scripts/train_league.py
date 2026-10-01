@@ -126,6 +126,24 @@ def main() -> None:
         help="Replay share reserved for retained MCTS decisions",
     )
     parser.add_argument(
+        "--population-selective-mcts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run native MCTS only on uncertain/audited population slots; direct policy handles the rest.",
+    )
+    parser.add_argument(
+        "--population-selective-mcts-fraction", type=float, default=0.25,
+        help="Share of active population slots selected for MCTS before each move.",
+    )
+    parser.add_argument(
+        "--population-selective-mcts-minimum-envs", type=int, default=2,
+        help="Minimum MCTS slots per active SelfPlayPool batch.",
+    )
+    parser.add_argument(
+        "--population-selective-mcts-audit-fraction", type=float, default=0.05,
+        help="Random audit share inside the selected MCTS budget.",
+    )
+    parser.add_argument(
         "--population-mcts-reanalyse-path", type=Path,
         help="Persistent critical MCTS positions (default: <checkpoint-dir>/mcts-reanalyse.pkl)",
     )
@@ -671,6 +689,16 @@ def main() -> None:
         ),
         population_mcts_critical_replay_fraction=(
             args.population_mcts_critical_replay_fraction
+        ),
+        population_selective_mcts=args.population_selective_mcts,
+        population_selective_mcts_fraction=(
+            args.population_selective_mcts_fraction
+        ),
+        population_selective_mcts_minimum_envs=(
+            args.population_selective_mcts_minimum_envs
+        ),
+        population_selective_mcts_audit_fraction=(
+            args.population_selective_mcts_audit_fraction
         ),
         population_mcts_reanalyse_path=args.population_mcts_reanalyse_path,
         population_mcts_reanalyse_capacity=(

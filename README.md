@@ -226,6 +226,13 @@ i pełnej mapy dostępnej tylko jako etykieta treningowa. Dzięki temu słaby va
 nie może od razu zatruć targetów MCTS; `--value-bootstrap-games 0` wyłącza ten
 etap wyłącznie dla świadomych eksperymentów.
 
+`root_shield` nie oznacza, że niezgodna particle może wejść do drzewa. Najpierw
+każda particle musi zachować publiczny zestaw legalnych akcji dla aktywnego
+gracza; w przeciwnym razie jest próbkowana ponownie, a po wyczerpaniu retry
+pozycja jest odrzucana. Osłona rootu pozostaje dodatkową ochroną mapowania
+akcji, ale nie może naprawić wizyt wykonanych w niemożliwym świecie. Dla
+MCTS należy używać `--belief-action-equivalence-target 0.02` lub niżej.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

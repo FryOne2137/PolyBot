@@ -1514,7 +1514,13 @@ class RoutedPoolSearch:
         self._capture_engine_action_constraints(
             initial_action_diagnostics, active, actors, request
         )
-        strict_action_equivalence = self.belief_action_mode == "strict"
+        # A particle which changes the active player's public action set is
+        # not merely a root-display issue: its descendants would be searched
+        # in an impossible world. ``root_shield`` may remap a completed root
+        # policy, but cannot undo visits already backed up through that world.
+        # Therefore every particle entering MCTS must be action-equivalent in
+        # both modes. The modes differ only in the final public-root mapping.
+        require_action_equivalence = True
         submitted = False
         last_error: ValueError | None = None
         rejected_rows = all_rows
@@ -1538,7 +1544,7 @@ class RoutedPoolSearch:
                 ) = ismcts_action_difference_rejections(
                     self.pool, state_ids, particles
                 )
-            if strict_action_equivalence and action_rejected_rows.size:
+            if require_action_equivalence and action_rejected_rows.size:
                 retry_pending_envs = int(action_rejected_rows.size)
                 diagnostics = action_diagnostics
                 last_error = ValueError(
@@ -1627,7 +1633,7 @@ class RoutedPoolSearch:
             )
             fallback_error: ValueError | None = None
             fallback_preflight_rejected = False
-            if strict_action_equivalence:
+            if require_action_equivalence:
                 (
                     rejected_rows,
                     rejected_mask,

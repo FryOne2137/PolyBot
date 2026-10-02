@@ -1461,11 +1461,26 @@ def train_promotion_league(
                         and belief_apprentice_state.get("champion_path")
                         == str(champion_path.resolve())
                     )
+                    apprentice_rejection_rate = float(
+                        belief_apprentice_state.get("rejection_rate", 1.0)
+                    )
+                    apprentice_checked_particles = int(
+                        belief_apprentice_state.get("checked_particles", 0)
+                    )
+                    # A marker created under a loose old threshold must not
+                    # bypass a later, stricter calibration request.
+                    apprentice_meets_current_belief_gate = (
+                        bool(belief_apprentice_state.get("ready", False))
+                        and apprentice_checked_particles
+                        >= belief_action_equivalence_min_particles
+                        and apprentice_rejection_rate
+                        <= belief_action_equivalence_target
+                    )
                     belief_calibration_required = (
                         round_champion_mode == "mcts"
                         and not (
                             apprentice_matches_champion
-                            and bool(belief_apprentice_state.get("ready", False))
+                            and apprentice_meets_current_belief_gate
                         )
                     )
                     fresh_branch_round = (
@@ -4367,6 +4382,12 @@ def train_promotion_league(
                                 max_envs=min(num_envs, population_max_envs),
                                 offline_collection=population_offline_collection,
                                 belief_only=belief_calibration_required,
+                                # Calibration learns whether particles respect
+                                # public action evidence. It does not need a
+                                # tree or MCTS visit targets, so execute raw
+                                # actions after the same strict particle
+                                # validation and keep this stage affordable.
+                                raw_policy_only=belief_calibration_required,
                                 game_callback=record_training_game,
                                 reserved_seeds=evaluation_map_seeds,
                                 run=run.child(

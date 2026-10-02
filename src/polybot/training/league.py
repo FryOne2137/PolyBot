@@ -3866,6 +3866,120 @@ def train_promotion_league(
                     round_training_summary["value_belief_bootstrap"] = (
                         value_bootstrap_summary
                     )
+                    if (
+                        not belief_calibration_required
+                        and value_bootstrap_games
+                        and not population_games
+                    ):
+                        # A bootstrap-only invocation is a diagnostic, not a
+                        # promotion attempt.  Do the same small asymmetric
+                        # test used before an MCTS rung, then stop.  Without
+                        # this branch, population_games=0 would incorrectly
+                        # fall through to the expensive 100-game MCTS gate.
+                        raw_probe = evaluate_direct_matches(
+                            candidate,
+                            champion,
+                            device,
+                            replace(
+                                round_training,
+                                seed=mcts_probe_seed,
+                                max_moves=direct_gate_max_moves,
+                            ),
+                            mcts_probe_games,
+                            model_a_label=candidate_evaluation_label,
+                            model_b_label=champion_path.stem,
+                            visible_action_history=visible_action_history,
+                            num_threads=num_threads,
+                            max_actions=mcts.native_max_actions,
+                        )
+                        search_probe = evaluate_matches_pool(
+                            candidate,
+                            champion,
+                            replace(
+                                round_training,
+                                seed=mcts_probe_seed,
+                                max_moves=direct_gate_max_moves,
+                            ),
+                            replace(
+                                evaluation_mcts,
+                                simulations=int(population_rungs[-1])
+                                if population_rungs else int(mcts.simulations),
+                            ),
+                            mcts_probe_games,
+                            num_threads=num_threads,
+                            max_pending_leaves=max_pending_leaves,
+                            visible_action_history=visible_action_history,
+                            belief_retries=belief_retries,
+                            belief_action_mode=population_belief_search_mode,
+                            model_b_uses_mcts=False,
+                            max_envs=min(num_envs, population_max_envs),
+                            model_a_label=candidate_evaluation_label,
+                            model_b_label=champion_path.stem,
+                        )
+                        raw_score = float(raw_probe.get("model_a_score", 0.0))
+                        search_score = float(
+                            search_probe.get("model_a_score", 0.0)
+                        )
+                        passed = _mcts_probe_passed(
+                            raw_score,
+                            search_score,
+                            minimum_search_score=mcts_probe_score,
+                            minimum_improvement=mcts_probe_minimum_improvement,
+                            valid=bool(search_probe.get("valid", 1.0)),
+                        )
+                        bootstrap_probe = {
+                            "raw": raw_probe,
+                            "search": search_probe,
+                            "raw_score": raw_score,
+                            "search_score": search_score,
+                            "improvement": search_score - raw_score,
+                            "passed": float(passed),
+                            "simulations": float(
+                                population_rungs[-1]
+                                if population_rungs else mcts.simulations
+                            ),
+                        }
+                        round_training_summary["value_belief_bootstrap_probe"] = (
+                            bootstrap_probe
+                        )
+                        database.finalise_candidate(candidate_id, promoted_path=None)
+                        database.finish_round(
+                            round_id,
+                            champion_id,
+                            False,
+                            round_training_summary,
+                            {
+                                "promoted": 0.0,
+                                "valid": float(search_probe.get("valid", 1.0)),
+                                "reason": "value_belief_bootstrap_probe",
+                                "value_belief_bootstrap_probe": bootstrap_probe,
+                            },
+                        )
+                        run.log(
+                            round=round_index,
+                            value_bootstrap_probe=1.0,
+                            value_bootstrap_probe_raw_score=raw_score,
+                            value_bootstrap_probe_search_score=search_score,
+                            value_bootstrap_probe_improvement=(
+                                search_score - raw_score
+                            ),
+                            value_bootstrap_probe_passed=float(passed),
+                            promoted=0.0,
+                        )
+                        database.flush()
+                        print(
+                            "league value/belief bootstrap probe | "
+                            f"search={search_score:.4f} | raw={raw_score:.4f} | "
+                            f"passed={int(passed)} | no promotion",
+                            flush=True,
+                        )
+                        last_training = dict(round_training_summary)
+                        last_candidate_score = search_score
+                        last_population_score = 0.0
+                        challenger_path = None
+                        challenger_id = None
+                        del candidate, champion, frozen_models
+                        continue
                     # Roll back a rejected MCTS rung to the freshly calibrated
                     # raw-policy checkpoint, never to its pre-bootstrap value.
                     direct_population_state = model_state_on_cpu(candidate)

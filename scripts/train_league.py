@@ -556,7 +556,7 @@ def main() -> None:
     parser.add_argument("--mcts-probe-patience", type=int, default=2)
     parser.add_argument(
         "--mcts-simulation-ladder", type=_simulation_ladder,
-        default=(16, 32, 64),
+        default=(32, 64),
         help="Comma-separated search curriculum; every failed rung is rolled back",
     )
     parser.add_argument("--mcts-gate-games", type=int, default=20)

@@ -202,6 +202,14 @@ jest trybem późnej kompresji replay, nie bootstrapu. Logi zawierają m.in.
 braku ich wpływu na policy. Strict belief calibration oraz sparowane bramki
 nadal używają pełnego MCTS.
 
+Przed każdą generacją treningową rung wykonuje dodatkowy preflight na tych
+samych parach seedów: direct policy i MCTS grają przeciw temu samemu
+zamrożonemu championowi. Jeżeli `mcts_preflight_search_score` nie jest wyższy
+od `mcts_preflight_raw_score` i nie osiąga progu `--mcts-probe-score`, rung nie
+zbiera replay ani nie wykonuje optymalizacji. Chroni to model przed uczeniem z
+MCTS, który jest słabszy od własnej policy. Domyślna drabina zaczyna się od
+`32,64`, a nie od 16 symulacji.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

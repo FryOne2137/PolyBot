@@ -1903,6 +1903,7 @@ def evaluate_matches_pool(
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
     belief_retries: int = 4,
+    belief_action_mode: str = "strict",
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
     model_b_search_top_actions: int | None = None,
@@ -1915,6 +1916,8 @@ def evaluate_matches_pool(
         raise ValueError("games must be positive and even for paired evaluation")
     if max_envs < 2:
         raise ValueError("max_envs must be at least two")
+    if belief_action_mode not in {"strict", "root_shield"}:
+        raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
     model_b_top = (
         mcts.search_top_actions
         if model_b_search_top_actions is None
@@ -1987,6 +1990,7 @@ def evaluate_matches_pool(
                 visible_action_history=visible_action_history,
                 belief_retries=evaluation_belief_retries,
                 seed=int(seeds[0]),
+                belief_action_mode=belief_action_mode,
                 search_top_actions_by_agent=(mcts.search_top_actions, model_b_top),
                 search_random_actions_by_agent=(mcts.search_random_actions, model_b_random),
             )

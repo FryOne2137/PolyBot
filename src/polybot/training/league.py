@@ -3734,6 +3734,7 @@ def train_promotion_league(
                         "mcts_ladder": [],
                         "mcts_ladder_accepted": 0.0,
                         "mcts_ladder_rollbacks": 0.0,
+                        "mcts_preflight": [],
                     }
                     belief_calibration_summary: Dict[str, Any] | None = None
                     # A failed first MCTS rung must return to the last state
@@ -3907,6 +3908,134 @@ def train_promotion_league(
                                     model_b_id=opponent_id,
                                     game=row,
                                 )
+
+                            # Search must prove that it improves on the raw
+                            # policy *before* it is allowed to create policy
+                            # targets.  A post-update rollback protects the
+                            # checkpoint, but still wastes a full generation
+                            # learning from a weak tree.  Use paired maps and
+                            # the same frozen champion for both measurements.
+                            preflight: Dict[str, Any] = {}
+                            if not belief_calibration_required and mcts_probe_games:
+                                raw_preflight = evaluate_direct_matches(
+                                    candidate,
+                                    champion,
+                                    device,
+                                    replace(
+                                        rung_training,
+                                        seed=mcts_probe_seed,
+                                        max_moves=direct_gate_max_moves,
+                                    ),
+                                    mcts_probe_games,
+                                    model_a_label=candidate_evaluation_label,
+                                    model_b_label=champion_path.stem,
+                                    visible_action_history=visible_action_history,
+                                    num_threads=num_threads,
+                                    max_actions=mcts.native_max_actions,
+                                )
+                                try:
+                                    search_preflight = evaluate_matches_pool(
+                                        candidate,
+                                        champion,
+                                        replace(
+                                            rung_training,
+                                            seed=mcts_probe_seed,
+                                            max_moves=direct_gate_max_moves,
+                                        ),
+                                        replace(
+                                            evaluation_mcts,
+                                            simulations=int(simulations),
+                                        ),
+                                        mcts_probe_games,
+                                        num_threads=num_threads,
+                                        max_pending_leaves=max_pending_leaves,
+                                        visible_action_history=visible_action_history,
+                                        belief_retries=belief_retries,
+                                        belief_action_mode=(
+                                            population_belief_search_mode
+                                        ),
+                                        max_envs=min(
+                                            num_envs, population_max_envs
+                                        ),
+                                        model_a_label=candidate_evaluation_label,
+                                        model_b_label=champion_path.stem,
+                                    )
+                                except (
+                                    BeliefQualityError,
+                                    BeliefRecoveryRequired,
+                                ) as error:
+                                    search_preflight = {
+                                        "games": 0.0,
+                                        "model_a_score": 0.0,
+                                        "valid": 0.0,
+                                        "invalid_reason": str(error),
+                                    }
+                                raw_preflight_score = float(
+                                    raw_preflight.get("model_a_score", 0.0)
+                                )
+                                search_preflight_score = float(
+                                    search_preflight.get("model_a_score", 0.0)
+                                )
+                                passed_preflight = _mcts_probe_passed(
+                                    raw_preflight_score,
+                                    search_preflight_score,
+                                    minimum_search_score=mcts_probe_score,
+                                    minimum_improvement=(
+                                        mcts_probe_minimum_improvement
+                                    ),
+                                    valid=bool(search_preflight.get("valid", 1.0)),
+                                )
+                                preflight = {
+                                    "performed": 1.0,
+                                    "passed": float(passed_preflight),
+                                    "simulations": float(simulations),
+                                    "raw": raw_preflight,
+                                    "search": search_preflight,
+                                    "raw_score": raw_preflight_score,
+                                    "search_score": search_preflight_score,
+                                    "improvement": (
+                                        search_preflight_score
+                                        - raw_preflight_score
+                                    ),
+                                }
+                                population_summary["mcts_preflight"].append(
+                                    preflight
+                                )
+                                run.log(
+                                    round=round_index,
+                                    mcts_preflight=1.0,
+                                    mcts_preflight_simulations=simulations,
+                                    mcts_preflight_raw_score=raw_preflight_score,
+                                    mcts_preflight_search_score=(
+                                        search_preflight_score
+                                    ),
+                                    mcts_preflight_improvement=(
+                                        search_preflight_score
+                                        - raw_preflight_score
+                                    ),
+                                    mcts_preflight_passed=float(passed_preflight),
+                                )
+                                print(
+                                    f"league MCTS preflight {simulations} | "
+                                    f"search={search_preflight_score:.4f} | "
+                                    f"raw={raw_preflight_score:.4f} | "
+                                    f"passed={int(passed_preflight)}",
+                                    flush=True,
+                                )
+                                if not passed_preflight:
+                                    population_summary["mcts_ladder"].append({
+                                        "simulations": float(simulations),
+                                        "games": float(rung_games),
+                                        "accepted": 0.0,
+                                        "preflight": preflight,
+                                        "reason": "mcts_preflight_not_better_than_raw",
+                                    })
+                                    print(
+                                        "league MCTS preflight failed | "
+                                        "rung skipped without optimisation",
+                                        flush=True,
+                                    )
+                                    break
 
                             rung_summary = train_population_pool(
                                 rung_training,
@@ -4094,6 +4223,7 @@ def train_promotion_league(
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
+                                belief_action_mode=population_belief_search_mode,
                                 max_envs=min(num_envs, population_max_envs),
                                 game_callback=record_rung_gate_game,
                                 model_a_label=candidate_evaluation_label,
@@ -4386,6 +4516,7 @@ def train_promotion_league(
                             max_pending_leaves=max_pending_leaves,
                             visible_action_history=visible_action_history,
                             belief_retries=belief_retries,
+                            belief_action_mode=population_belief_search_mode,
                             max_envs=min(num_envs, population_max_envs),
                             game_callback=record_evaluation_game,
                             model_a_label=candidate_evaluation_label,

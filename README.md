@@ -202,13 +202,22 @@ jest trybem późnej kompresji replay, nie bootstrapu. Logi zawierają m.in.
 braku ich wpływu na policy. Strict belief calibration oraz sparowane bramki
 nadal używają pełnego MCTS.
 
-Przed każdą generacją treningową rung wykonuje dodatkowy preflight na tych
-samych parach seedów: direct policy i MCTS grają przeciw temu samemu
-zamrożonemu championowi. Jeżeli `mcts_preflight_search_score` nie jest wyższy
-od `mcts_preflight_raw_score` i nie osiąga progu `--mcts-probe-score`, rung nie
+Każdy batch raportuje też `value_mae` i `value_bias` oraz osobne metryki
+ukrytej obecności miasta i jednostki: `belief_hidden_city_precision/recall`
+i `belief_hidden_unit_precision/recall`. Dzięki temu teren poprawnie
+odgadnięty przy błędnie rozmieszczonych miastach lub jednostkach nie wygląda
+fałszywie jak dobry belief.
+
+Przed każdą generacją treningową rung wykonuje dodatkowy asymetryczny preflight
+na tych samych parach seedów: candidate direct i candidate MCTS grają osobno
+przeciw temu samemu zamrożonemu championowi **bez** MCTS. Jeżeli
+`mcts_preflight_search_score` nie jest wyższy od
+`mcts_preflight_raw_score` i nie osiąga progu `--mcts-probe-score`, rung nie
 zbiera replay ani nie wykonuje optymalizacji. Chroni to model przed uczeniem z
 MCTS, który jest słabszy od własnej policy. Domyślna drabina zaczyna się od
-`32,64`, a nie od 16 symulacji.
+`32,64`, a nie od 16 symulacji. Gdy słabszy rung nie przejdzie preflight, liga
+nie trenuje na nim, lecz może sprawdzić następny, głębszy rung z tej samej
+drabiny.
 
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;

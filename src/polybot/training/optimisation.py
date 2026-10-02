@@ -189,6 +189,58 @@ def belief_terrain_metrics(
     return result
 
 
+@torch.no_grad()
+def belief_presence_metrics(
+    belief_logits: Iterable[torch.Tensor],
+    full_map_target: torch.Tensor,
+    hidden_mask: torch.Tensor,
+) -> Dict[str, float]:
+    """Measure hidden city/unit placement separately from terrain.
+
+    Legal-action agreement can remain good while particles still put cities or
+    units on the wrong hidden tiles.  These metrics expose exactly that failure
+    mode without adding another training objective or reading hidden state at
+    inference time.
+    """
+    logits = tuple(belief_logits)
+    if len(logits) != len(MAP_FEATURE_MAX):
+        raise ValueError("belief presence metrics require every map feature head")
+    if full_map_target.shape[:2] != hidden_mask.shape:
+        raise ValueError("belief presence targets and hidden mask must agree")
+
+    # PolyEnv uses column 14 value 2 for a city and column 4 values >= 1 for a
+    # unit.  The decoder already trains these rare presence heads with higher
+    # weight; report precision/recall so an all-empty map cannot look good.
+    definitions = (
+        ("belief_hidden_city", 14, full_map_target[..., 14] == 2),
+        ("belief_hidden_unit", 4, full_map_target[..., 4] >= 1),
+    )
+    result: Dict[str, float] = {}
+    valid = hidden_mask.bool()
+    for prefix, column, target in definitions:
+        predicted = logits[column].argmax(dim=-1) - 1
+        predicted_present = (
+            predicted == 2 if column == 14 else predicted >= 1
+        )
+        samples = int(valid.sum().item())
+        positives = int((target & valid).sum().item())
+        predicted_positives = int((predicted_present & valid).sum().item())
+        true_positive = int((target & predicted_present & valid).sum().item())
+        result[f"{prefix}_samples"] = float(samples)
+        result[f"{prefix}_positive_samples"] = float(positives)
+        result[f"{prefix}_predicted_positive_samples"] = float(predicted_positives)
+        result[f"{prefix}_precision"] = float(
+            true_positive / max(1, predicted_positives)
+        )
+        result[f"{prefix}_recall"] = float(true_positive / max(1, positives))
+        result[f"{prefix}_accuracy"] = float(
+            (predicted_present[valid] == target[valid]).float().mean().item()
+            if samples
+            else 0.0
+        )
+    return result
+
+
 def bridge_constraint_loss(
     terrain_logits: torch.Tensor,
     map_tokens: torch.Tensor,
@@ -394,9 +446,17 @@ def train_batch(
     value_weights = batch.get("value_loss_weight")
     if value_weights is None:
         value = per_example_value.mean()
+        metric_value_weights = torch.ones_like(per_example_value)
     else:
         value_weights = value_weights.to(per_example_value.dtype)
         value = (per_example_value * value_weights).sum() / value_weights.sum().clamp_min(1.0)
+        metric_value_weights = value_weights
+    value_error = output.value - batch["value_target"].to(output.value.dtype)
+    value_metric_denominator = metric_value_weights.sum().clamp_min(1.0)
+    value_mae = (
+        value_error.abs() * metric_value_weights
+    ).sum() / value_metric_denominator
+    value_bias = (value_error * metric_value_weights).sum() / value_metric_denominator
     anchor_value = output.value.new_zeros(())
     anchor_value_weights = batch.get("anchor_value_loss_weight")
     anchor_value_targets = batch.get("anchor_value_target")
@@ -450,6 +510,11 @@ def train_batch(
         batch.get("engine_action_constraint_mask"),
         config.map_size,
     )
+    presence_metrics = belief_presence_metrics(
+        output.belief_logits,
+        batch["full_map_target"],
+        batch["hidden_mask"],
+    )
     total = (
         config.policy_weight * policy
         + config.value_weight * value
@@ -468,10 +533,13 @@ def train_batch(
         "loss": float(total.detach().cpu()),
         "policy_loss": float(policy.detach().cpu()),
         "value_loss": float(value.detach().cpu()),
+        "value_mae": float(value_mae.detach().cpu()),
+        "value_bias": float(value_bias.detach().cpu()),
         "value_anchor_loss": float(anchor_value.detach().cpu()),
         "belief_loss": float(belief.detach().cpu()),
         "belief_engine_action_constraint_loss": float(engine_constraint.detach().cpu()),
         "bridge_constraint_loss": float(bridge.detach().cpu()),
     }
     result.update(terrain_metrics)
+    result.update(presence_metrics)
     return result

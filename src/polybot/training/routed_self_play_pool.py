@@ -103,6 +103,7 @@ def _evaluation_search_with_recovery(
     request: Mapping[str, np.ndarray],
     active: np.ndarray,
     *,
+    mcts_mask: np.ndarray | None = None,
     recovery_cycles: int = _EVALUATION_POSITION_RECOVERY_CYCLES,
 ) -> tuple[Dict[str, np.ndarray], tuple[BeliefRecoveryRequired, ...]]:
     """Retry one held-out position without changing its state, map, or seed."""
@@ -117,6 +118,7 @@ def _evaluation_search_with_recovery(
                 root_temperature=0.0,
                 belief_temperature=0.0,
                 prior_scale=0.0,
+                mcts_mask=mcts_mask,
             )
             return root, tuple(failures)
         except BeliefRecoveryRequired as error:
@@ -1904,6 +1906,8 @@ def evaluate_matches_pool(
     visible_action_history: int = 0,
     belief_retries: int = 4,
     belief_action_mode: str = "strict",
+    model_a_uses_mcts: bool = True,
+    model_b_uses_mcts: bool = True,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
     model_b_search_top_actions: int | None = None,
@@ -1911,13 +1915,22 @@ def evaluate_matches_pool(
     model_a_label: str = "model A",
     model_b_label: str = "model B",
 ) -> Dict[str, Any]:
-    """Run deterministic, paired candidate evaluation entirely in native pools."""
+    """Run deterministic paired evaluation with MCTS enabled per model.
+
+    ``model_a_uses_mcts=True, model_b_uses_mcts=False`` measures whether the
+    candidate's tree search is itself stronger than the frozen opponent's raw
+    policy.  This asymmetric probe is required before search visit counts can
+    be trusted as policy targets; MCTS on both sides can otherwise hide an
+    equal search gain behind an unchanged win rate.
+    """
     if games < 2 or games % 2:
         raise ValueError("games must be positive and even for paired evaluation")
     if max_envs < 2:
         raise ValueError("max_envs must be at least two")
     if belief_action_mode not in {"strict", "root_shield"}:
         raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
+    if not model_a_uses_mcts and not model_b_uses_mcts:
+        raise ValueError("evaluate_matches_pool requires MCTS for at least one model")
     model_b_top = (
         mcts.search_top_actions
         if model_b_search_top_actions is None
@@ -2013,11 +2026,17 @@ def evaluate_matches_pool(
                 active = ~done
                 if not active.any():
                     break
+                agent_ids = np.asarray(request["agent_id"], dtype=np.int32)
+                mcts_mask = active & (
+                    ((agent_ids == 0) & bool(model_a_uses_mcts))
+                    | ((agent_ids == 1) & bool(model_b_uses_mcts))
+                )
                 try:
                     root, recovery_failures = _evaluation_search_with_recovery(
                         search,
                         request,
                         active,
+                        mcts_mask=mcts_mask,
                     )
                     evaluation_position_recovery_cycles += len(recovery_failures)
                 except BeliefRecoveryRequired as error:

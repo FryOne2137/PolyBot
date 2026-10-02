@@ -3954,6 +3954,7 @@ def train_promotion_league(
                                         belief_action_mode=(
                                             population_belief_search_mode
                                         ),
+                                        model_b_uses_mcts=False,
                                         max_envs=min(
                                             num_envs, population_max_envs
                                         ),
@@ -4032,10 +4033,11 @@ def train_promotion_league(
                                     })
                                     print(
                                         "league MCTS preflight failed | "
-                                        "rung skipped without optimisation",
+                                        "rung skipped without optimisation; "
+                                        "trying the next search depth",
                                         flush=True,
                                     )
-                                    break
+                                    continue
 
                             rung_summary = train_population_pool(
                                 rung_training,

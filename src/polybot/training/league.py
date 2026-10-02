@@ -286,70 +286,40 @@ def _curriculum_controls(
     post_bootstrap_objective_steps: int = 0,
     refresh_promoted_curriculum: bool = False,
 ) -> Dict[str, float | int | str | bool]:
-    """Select bootstrap or champion-focused raw-policy training.
+    """Keep league learning on the authoritative MCTS self-play path.
 
-    The teacher is valuable only until a model has earned its first league
-    promotion.  Reapplying it to an established champion lineage repeatedly
-    trains the candidate to beat the teacher rather than its current parent.
+    The direct teacher, objective, flat actor-critic and raw-population PPO
+    curricula remain available as standalone tools for a new model.  They are
+    deliberately not part of ``train_league``: an existing checkpoint must
+    receive policy targets from MCTS visit counts and value targets from game
+    outcomes, rather than repeatedly being pulled toward a shaped local
+    reward.  Keeping the parameters accepts old command lines without letting
+    a legacy bootstrap silently block MCTS collection.
     """
-    post_bootstrap = champion_status == "promoted"
-    # A promoted checkpoint is normally mature enough that replaying the
-    # heuristic curriculum would only pull it back toward the teacher.  A
-    # weak-but-promoted checkpoint is the important exception: its policy and
-    # value are not reliable priors for MCTS yet.  Recovery deliberately
-    # re-enables the dense, visible-only curriculum while keeping the frozen
-    # champion as the anchor in the calling code.
-    if post_bootstrap and refresh_promoted_curriculum:
-        return {
-            "phase": "promoted_recovery",
-            "post_bootstrap": True,
-            "teacher_steps": direct_teacher_steps,
-            "objective_steps": direct_objective_steps,
-            "actor_steps": direct_actor_steps,
-            "actor_max_steps": direct_actor_max_steps,
-            "population_steps": direct_population_steps,
-            "population_max_steps": direct_population_max_steps,
-            "policy_anchor_weight": direct_policy_anchor_weight,
-            "population_teacher_weight": direct_population_teacher_weight,
-            "population_opponent_policy_weight": (
-                direct_population_opponent_policy_weight
-            ),
-        }
-    if post_bootstrap:
-        return {
-            "phase": "champion_population",
-            "post_bootstrap": True,
-            "teacher_steps": 0,
-            # The old short-horizon objective stage was not event-selected:
-            # it replayed arbitrary eight-decision windows and consumed about
-            # an hour per round without a reliable lift. Established lineages
-            # now use event-triggered prefix replay inside population play.
-            # Keep the legacy argument for old commands, but never run it.
-            "objective_steps": 0,
-            "actor_steps": 0,
-            "actor_max_steps": 0,
-            "population_steps": post_bootstrap_population_steps,
-            "population_max_steps": post_bootstrap_population_max_steps,
-            "policy_anchor_weight": post_bootstrap_policy_anchor_weight,
-            "population_teacher_weight": post_bootstrap_teacher_weight,
-            "population_opponent_policy_weight": (
-                post_bootstrap_opponent_policy_weight
-            ),
-        }
+    # Parameters remain for backwards-compatible callers and run metadata,
+    # but the league loop never executes their raw-policy stages.
+    _ = (
+        direct_teacher_steps, direct_objective_steps, direct_actor_steps,
+        direct_actor_max_steps, direct_population_steps,
+        direct_population_max_steps, direct_policy_anchor_weight,
+        direct_population_teacher_weight,
+        direct_population_opponent_policy_weight,
+        post_bootstrap_population_steps, post_bootstrap_population_max_steps,
+        post_bootstrap_policy_anchor_weight, post_bootstrap_teacher_weight,
+        post_bootstrap_opponent_policy_weight, refresh_promoted_curriculum,
+    )
     return {
-        "phase": "bootstrap",
-        "post_bootstrap": False,
-        "teacher_steps": direct_teacher_steps,
-        "objective_steps": direct_objective_steps,
-        "actor_steps": direct_actor_steps,
-        "actor_max_steps": direct_actor_max_steps,
-        "population_steps": direct_population_steps,
-        "population_max_steps": direct_population_max_steps,
-        "policy_anchor_weight": direct_policy_anchor_weight,
-        "population_teacher_weight": direct_population_teacher_weight,
-        "population_opponent_policy_weight": (
-            direct_population_opponent_policy_weight
-        ),
+        "phase": "mcts_self_play",
+        "post_bootstrap": champion_status == "promoted",
+        "teacher_steps": 0,
+        "objective_steps": 0,
+        "actor_steps": 0,
+        "actor_max_steps": 0,
+        "population_steps": 0,
+        "population_max_steps": 0,
+        "policy_anchor_weight": 0.0,
+        "population_teacher_weight": 0.0,
+        "population_opponent_policy_weight": 0.0,
     }
 
 
@@ -486,14 +456,14 @@ def train_promotion_league(
     population_max_envs: int = 16,
     population_offline_collection: bool = True,
     population_belief_search_mode: str = "strict",
-    population_mcts_critical_only: bool = True,
+    population_mcts_critical_only: bool = False,
     population_mcts_critical_fraction: float = 0.25,
     population_mcts_critical_minimum_score: float = 0.25,
     population_mcts_critical_replay_fraction: float = 1.0,
     population_selective_mcts: bool = True,
-    population_selective_mcts_fraction: float = 0.25,
+    population_selective_mcts_fraction: float = 0.50,
     population_selective_mcts_minimum_envs: int = 2,
-    population_selective_mcts_audit_fraction: float = 0.05,
+    population_selective_mcts_audit_fraction: float = 0.10,
     population_mcts_reanalyse_path: Path | None = None,
     population_mcts_reanalyse_capacity: int = 4_096,
     population_mcts_reanalyse_positions: int = 8,
@@ -1774,7 +1744,13 @@ def train_promotion_league(
                         ),
                         flush=True,
                     )
-                    if curriculum_phase == "champion_population":
+                    if curriculum_phase == "mcts_self_play":
+                        print(
+                            "league curriculum | MCTS self-play | "
+                            "legacy direct stages skipped",
+                            flush=True,
+                        )
+                    elif curriculum_phase == "champion_population":
                         print(
                             "league curriculum | champion-population | "
                             "teacher/actor skipped | "

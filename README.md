@@ -111,35 +111,12 @@ python scripts/train_self_play.py \
 
 ## Population league and SQLite history
 
-`scripts/train_league.py` zaczyna od szybkiego curriculum bez MCTS w natywnym
-`VectorGameEnv`. Nauczyciel visible-only pokazuje przejmowanie wiosek, ruch do
-widocznych celów, ekonomię i walkę. Po nim działa etap `objectives`: zbiera on
-krótkie, rzeczywiste rollouty z kilku kolejnych decyzji i liczy GAE, dzięki
-czemu sygnał z wioski/miasta dociera także do ruchu, który do niego prowadzi.
-Nie tworzy sztucznych map ani nie czyta ukrytych pól. Dopiero potem actor-critic
-uczy się z własnych akcji. Krótkie, sparowane bramki cofają każdy blok, który
-pogorszył grę względem zamrożonego championa. Direct-play trwa co najmniej
-`--direct-actor-steps`, a w razie potrzeby rośnie do
-`--direct-actor-max-steps`. Baseline chroni wejściowy checkpoint, ale nie jest
-liczony jako wytrenowany sukces. Gotowość wymaga
-`--direct-readiness-patience` zaakceptowanych bramek po aktualizacji. Rollback
-złej próby nie kasuje najlepszego stanu, a po
-`--direct-regression-patience` kolejnych odrzuconych blokach etap kończy się
-wcześniej zamiast marnować resztę budżetu.
-
-Następnie działa drugi szybki etap bez MCTS: kandydat gra surową polityką
-przeciw championowi i historycznym checkpointom dobranym przez PFSP. Tury
-przeciwników wykonują zamrożone modele, a kandydat uczy się własnych akcji,
-wieloetapowej wartości pozycji. Pierwszy model może jeszcze
-korzystać z warm-upu teachera i actor-critic, lecz po pierwszej promocji liga
-automatycznie przechodzi do `champion_population`: teacher i actor-critic są
-pomijane. Population play używa teraz signed PPO/GAE: dla każdego slotu zbiera
-pełny ciąg własnych **i przeciwnika** ruchów, po czym propaguje return do
-decyzji kandydata aż do terminala. Przy zmianie aktywnego gracza znak bootstrapu
-i advantage jest odwracany, więc przegrana po turze przeciwnika nie staje się
-fałszywym dodatnim celem. Standardowe ograniczenie PPO chroni przed zbyt dużą
-zmianą polityki, a KL względem zamrożonego championa ma target i twardy limit.
-Przekroczenie limitu cofa blok i automatycznie obniża learning rate.
+`scripts/train_league.py` uruchamia od razu self-play MCTS. Kandydat uczy się
+policy targetu z odwiedzin MCTS i value targetu z wyniku partii, a champion
+zmienia się wyłącznie po niezależnej ewaluacji. Teacher, objective rollouts,
+flat actor-critic oraz raw-population PPO pozostają jako osobne skrypty dla
+modelu od zera, ale liga ich nie wywołuje: nie mogą zablokować MCTS ani
+nadpisać istniejącego checkpointu lokalnym rewardem.
 PPO jest history-aware: `--visible-action-history H` włącza ostatnie `H`
 zdarzeń bezpiecznych względem mgły wojny (domyślnie 32). `VectorGameEnv`
 zwraca pełniejszy format 26 pól, który PolyBot zamienia na ten sam zwarty token
@@ -212,11 +189,18 @@ natywnego `SelfPlayPool.select_leaves_masked_into()` tylko najbardziej
 niepewne, strategiczne i losowo audytowane sloty. Pozostałe sloty wykonują
 legalną direct policy. Wszystkie ruchy nadal uczą belief i value, lecz policy
 otrzymuje target wyłącznie z odwiedzonych rootów MCTS — direct policy nie jest
-destylowana sama do siebie. Ustawienia to
-`--population-selective-mcts-fraction` (domyślnie 0.25),
+destylowana sama do siebie. Połowa budżetu MCTS jest dodatkowo losowana z
+publicznych decyzji strategicznych (walka z obrażeniami, miasto i konstrukcja),
+więc pewna siebie, lecz błędna policy nie może uniknąć searcha. Ustawienia to
+`--population-selective-mcts-fraction` (domyślnie 0.50),
 `--population-selective-mcts-minimum-envs` i
-`--population-selective-mcts-audit-fraction`. Strict belief calibration oraz
-sparowane bramki nadal używają pełnego MCTS.
+`--population-selective-mcts-audit-fraction` (domyślnie 0.10). Domyślnie replay
+zachowuje zwykłe i krytyczne targety MCTS; `--population-mcts-critical-only`
+jest trybem późnej kompresji replay, nie bootstrapu. Logi zawierają m.in.
+`selective_mcts_strategic_coverage_rate`, `mcts_raw_policy_agreement` i
+`mcts_raw_policy_mean_l1`, dzięki czemu można odróżnić brak danych MCTS od
+braku ich wpływu na policy. Strict belief calibration oraz sparowane bramki
+nadal używają pełnego MCTS.
 
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;

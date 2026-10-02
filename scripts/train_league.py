@@ -110,8 +110,8 @@ def main() -> None:
     parser.add_argument(
         "--population-mcts-critical-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Train MCTS generations only on high-confidence decisions that disagree with raw policy",
+        default=False,
+        help="Keep ordinary MCTS targets too; enable only for a late replay-compression phase",
     )
     parser.add_argument(
         "--population-mcts-critical-fraction", type=float, default=0.25,
@@ -132,7 +132,7 @@ def main() -> None:
         help="Run native MCTS only on uncertain/audited population slots; direct policy handles the rest.",
     )
     parser.add_argument(
-        "--population-selective-mcts-fraction", type=float, default=0.25,
+        "--population-selective-mcts-fraction", type=float, default=0.50,
         help="Share of active population slots selected for MCTS before each move.",
     )
     parser.add_argument(
@@ -140,7 +140,7 @@ def main() -> None:
         help="Minimum MCTS slots per active SelfPlayPool batch.",
     )
     parser.add_argument(
-        "--population-selective-mcts-audit-fraction", type=float, default=0.05,
+        "--population-selective-mcts-audit-fraction", type=float, default=0.10,
         help="Random audit share inside the selected MCTS budget.",
     )
     parser.add_argument(
@@ -480,8 +480,8 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Re-enable teacher, objectives and actor-critic for a promoted "
-            "but weak champion before population PPO; use with a frozen anchor"
+            "Deprecated compatibility option; train_league always uses MCTS "
+            "self-play and ignores legacy direct curricula"
         ),
     )
     parser.add_argument(

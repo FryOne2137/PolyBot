@@ -457,6 +457,10 @@ class SearchCounters:
     selective_mcts_decisions: int = 0
     direct_policy_decisions: int = 0
     selective_mcts_audit_decisions: int = 0
+    # A random stratum of public strategic decisions is searched even when a
+    # weak policy is confidently wrong.  Entropy alone cannot discover those.
+    selective_mcts_strategic_available: int = 0
+    selective_mcts_strategic_coverage_decisions: int = 0
     selective_raw_entropy_sum: float = 0.0
     selective_direct_entropy_sum: float = 0.0
     search_policy_rows: int = 0
@@ -554,6 +558,16 @@ def _action_pruning_metrics(counters: SearchCounters) -> Dict[str, float]:
         ),
         "selective_mcts_audit_decisions": float(
             counters.selective_mcts_audit_decisions
+        ),
+        "selective_mcts_strategic_available": float(
+            counters.selective_mcts_strategic_available
+        ),
+        "selective_mcts_strategic_coverage_decisions": float(
+            counters.selective_mcts_strategic_coverage_decisions
+        ),
+        "selective_mcts_strategic_coverage_rate": float(
+            counters.selective_mcts_strategic_coverage_decisions
+            / max(1, counters.selective_mcts_decisions)
         ),
         "selective_mcts_raw_entropy": float(
             counters.selective_raw_entropy_sum
@@ -930,15 +944,24 @@ class RoutedPoolSearch:
                     np.sum(probabilities * np.log(np.maximum(probabilities, 1.0e-12)))
                 ) / float(np.log(count))
                 top_mass[index] = float(probabilities.max())
-            # Public strategic actions get a modest deterministic boost.  It
-            # makes the early sparse MCTS budget cover captures, capital
-            # interactions and construction without hard-coding an action.
+            # Search a stratified subset of genuinely strategic roots.  An
+            # entropy-only scheduler misses a model which is confidently
+            # wrong; choosing these rows uniformly provides correction data
+            # for combat, city and construction choices without peeking under
+            # fog.  ``end turn`` is intentionally excluded because it is
+            # legal almost everywhere and would defeat this coverage stratum.
             action_types = features[active_rows]
+            action_kind = action_types[:, :, 0]
+            tile_action = action_types[:, :, 8]
+            damage = action_types[:, :, 15]
             strategic = (
-                (action_types[:, :, 0] == 1)
-                | (action_types[:, :, 0] == 8)
-                | (action_types[:, :, 0] == 3)
+                ((action_kind == 1) & (damage > 0))
+                | ((action_kind == 8) & np.isin(tile_action, (10, 11, 12, 14)))
             ) & legal
+            strategic_rows = active_rows[strategic.any(axis=1)]
+            self.counters.selective_mcts_strategic_available += int(
+                strategic_rows.size
+            )
             strategic_bonus = strategic.any(axis=1).astype(np.float64) * 0.20
             action_width = np.minimum(1.0, np.log1p(legal_counts) / np.log(16.0))
             score = entropy + 0.35 * (1.0 - top_mass) + 0.10 * action_width + strategic_bonus
@@ -952,6 +975,24 @@ class RoutedPoolSearch:
                     rng.choice(active_rows, size=audit_count, replace=False), dtype=np.int32
                 )
                 selected[audited] = True
+            # Half of the bounded MCTS budget is stratified public coverage.
+            # The rest remains available for uncertainty ranking, which keeps
+            # the original throughput advantage of selective search.
+            coverage_target = min(
+                target - int(selected[active_rows].sum()),
+                int(np.ceil(target * 0.50)),
+                int((~selected[strategic_rows]).sum()),
+            )
+            if coverage_target:
+                coverage_rows = strategic_rows[~selected[strategic_rows]]
+                covered = np.asarray(
+                    rng.choice(coverage_rows, size=coverage_target, replace=False),
+                    dtype=np.int32,
+                )
+                selected[covered] = True
+                self.counters.selective_mcts_strategic_coverage_decisions += int(
+                    covered.size
+                )
             remaining = active_rows[~selected[active_rows]]
             take = min(target - int(selected[active_rows].sum()), remaining.size)
             if take:
@@ -2201,9 +2242,9 @@ def train_population_pool(
     critical_replay_fraction: float = 0.0,
     critical_only: bool = False,
     selective_mcts: bool = False,
-    selective_mcts_fraction: float = 0.25,
+    selective_mcts_fraction: float = 0.50,
     selective_mcts_minimum_envs: int = 2,
-    selective_mcts_audit_fraction: float = 0.05,
+    selective_mcts_audit_fraction: float = 0.10,
     reanalysis_path: Path | None = None,
     reanalysis_capacity: int = 4_096,
     reanalysis_positions: int = 0,
@@ -2371,6 +2412,9 @@ def train_population_pool(
     anchor_decisions = 0
     anchor_agreements = 0
     anchor_l1_sum = 0.0
+    mcts_raw_decisions = 0
+    mcts_raw_agreements = 0
+    mcts_raw_l1_sum = 0.0
     critical_decisions = 0
     critical_score_sum = 0.0
     discarded_noncritical_examples = 0
@@ -2675,7 +2719,7 @@ def train_population_pool(
                         anchor_agreements += measured[1]
                         anchor_l1_sum += measured[2]
                     raw_candidate_policy = None
-                    if critical_decision_fraction > 0.0:
+                    if critical_decision_fraction > 0.0 or selective_mcts:
                         # Direct rows already contain their raw policy in the
                         # hybrid root.  Run this extra reference forward only
                         # for MCTS rows, where it measures the actual search
@@ -2695,6 +2739,18 @@ def train_population_pool(
                                 device,
                                 training,
                             )
+                            measured = _policy_distance(
+                                np.asarray(
+                                    candidate_root["policy"], dtype=np.float32
+                                )[candidate_mcts_local],
+                                raw_candidate_policy[candidate_mcts_local],
+                                np.asarray(
+                                    candidate_root["action_mask"], dtype=bool
+                                )[candidate_mcts_local],
+                            )
+                            mcts_raw_decisions += measured[0]
+                            mcts_raw_agreements += measured[1]
+                            mcts_raw_l1_sum += measured[2]
                     candidate_examples = _root_examples(
                         candidate_request,
                         candidate_root,
@@ -2818,6 +2874,13 @@ def train_population_pool(
                     anchor_agreements / max(1, anchor_decisions)
                 ),
                 champion_anchor_mean_l1=(anchor_l1_sum / max(1, anchor_decisions)),
+                mcts_raw_policy_agreement=(
+                    mcts_raw_agreements / max(1, mcts_raw_decisions)
+                ),
+                mcts_raw_policy_mean_l1=(
+                    mcts_raw_l1_sum / max(1, mcts_raw_decisions)
+                ),
+                mcts_raw_policy_decisions=mcts_raw_decisions,
                 critical_mcts_decisions=critical_decisions,
                 critical_mcts_mean_score=(
                     critical_score_sum / max(1, critical_decisions)
@@ -2899,6 +2962,13 @@ def train_population_pool(
         ),
         "population_pool_anchor_mean_l1": float(
             anchor_l1_sum / max(1, anchor_decisions)
+        ),
+        "population_pool_mcts_raw_policy_decisions": float(mcts_raw_decisions),
+        "population_pool_mcts_raw_policy_agreement": float(
+            mcts_raw_agreements / max(1, mcts_raw_decisions)
+        ),
+        "population_pool_mcts_raw_policy_mean_l1": float(
+            mcts_raw_l1_sum / max(1, mcts_raw_decisions)
         ),
         "population_pool_critical_mcts_decisions": float(critical_decisions),
         "population_pool_critical_mcts_mean_score": float(

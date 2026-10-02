@@ -181,7 +181,7 @@ def test_post_bootstrap_population_focuses_current_champion_safely():
     assert min(probabilities[1:]) >= 0.05
 
 
-def test_promoted_lineage_skips_teacher_and_actor_for_champion_population():
+def test_league_always_skips_legacy_direct_curricula():
     controls = _curriculum_controls(
         champion_status="promoted",
         direct_teacher_steps=2_000,
@@ -201,19 +201,17 @@ def test_promoted_lineage_skips_teacher_and_actor_for_champion_population():
         post_bootstrap_objective_steps=500,
     )
 
-    assert controls["phase"] == "champion_population"
+    assert controls["phase"] == "mcts_self_play"
     assert controls["teacher_steps"] == 0
-    # Established champions no longer run arbitrary short objective rollouts;
-    # real-event prefix replay happens inside population training instead.
     assert controls["objective_steps"] == 0
     assert controls["actor_steps"] == 0
-    assert controls["population_steps"] == 4_000
-    assert controls["population_max_steps"] == 8_000
-    assert controls["policy_anchor_weight"] == 0.50
-    assert controls["population_teacher_weight"] == 0.05
+    assert controls["population_steps"] == 0
+    assert controls["population_max_steps"] == 0
+    assert controls["policy_anchor_weight"] == 0.0
+    assert controls["population_teacher_weight"] == 0.0
 
 
-def test_promoted_recovery_restores_dense_curriculum_with_anchor_controls():
+def test_legacy_recovery_flag_cannot_restore_direct_curriculum_in_league():
     controls = _curriculum_controls(
         champion_status="promoted",
         direct_teacher_steps=2_000,
@@ -233,13 +231,13 @@ def test_promoted_recovery_restores_dense_curriculum_with_anchor_controls():
         refresh_promoted_curriculum=True,
     )
 
-    assert controls["phase"] == "promoted_recovery"
+    assert controls["phase"] == "mcts_self_play"
     assert controls["post_bootstrap"]
-    assert controls["teacher_steps"] == 2_000
-    assert controls["objective_steps"] == 1_000
-    assert controls["actor_steps"] == 1_000
-    assert controls["population_steps"] == 9_000
-    assert controls["policy_anchor_weight"] == 0.30
+    assert controls["teacher_steps"] == 0
+    assert controls["objective_steps"] == 0
+    assert controls["actor_steps"] == 0
+    assert controls["population_steps"] == 0
+    assert controls["policy_anchor_weight"] == 0.0
 
 
 def test_auto_mode_uses_persisted_capability_to_switch_to_mcts():
@@ -710,6 +708,42 @@ def test_selective_mcts_mask_uses_public_raw_uncertainty_and_audit():
     np.testing.assert_array_equal(returned_values, values)
     assert search.counters.selective_mcts_decisions == 2
     assert search.counters.direct_policy_decisions == 1
+
+
+def test_selective_mcts_covers_confident_public_strategic_roots():
+    search = object.__new__(RoutedPoolSearch)
+    search.num_envs = 4
+    search.counters = SearchCounters()
+    raw_policy = np.asarray(
+        [[0.99, 0.01]] * 4, dtype=np.float32
+    )
+    search.direct_policy_value = lambda request, rows: (
+        raw_policy.copy(), np.zeros(4, dtype=np.float32)
+    )
+    features = np.zeros((4, 2, 17), dtype=np.int32)
+    # Rows 0 and 1 expose a damaging combat action.  They are intentionally
+    # low-entropy so an entropy-only selector would not reliably inspect them.
+    features[:2, 0, 0] = 1
+    features[:2, 0, 15] = 3
+    request = {
+        "action_mask": np.ones((4, 2), dtype=np.uint8),
+        "action_features": features,
+        "agent_id": np.asarray([0, 1, 0, 1], dtype=np.int32),
+    }
+
+    selected, _, _ = search.selective_mcts_mask(
+        request,
+        np.ones(4, dtype=bool),
+        fraction=0.50,
+        minimum_envs=0,
+        audit_fraction=0.0,
+        rng=np.random.default_rng(7),
+    )
+
+    assert selected.sum() == 2
+    assert selected[:2].any()
+    assert search.counters.selective_mcts_strategic_available == 2
+    assert search.counters.selective_mcts_strategic_coverage_decisions == 1
 
 
 def test_pool_policy_target_keeps_a_frozen_predecessor_anchor():

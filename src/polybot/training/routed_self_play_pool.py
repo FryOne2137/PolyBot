@@ -1426,8 +1426,8 @@ class RoutedPoolSearch:
 
         An all-false ``mcts_mask`` is intentionally a raw-policy path. Value/
         belief bootstrap never uses particles for action selection or policy
-        targets; PolyEnv still requires one conservative valid belief solely
-        as a precondition of its checked stepping API.
+        targets. It still runs PolyEnv's normal belief acceptance protocol,
+        because checked stepping requires an action-equivalent belief world.
         """
         for model in self.models:
             model.eval()
@@ -1462,31 +1462,6 @@ class RoutedPoolSearch:
         # those fixed-seed evaluations remain deterministic.
         self._root_noise_enabled = bool(root_noise)
         self.counters.root_env_decisions += int(active.sum())
-        if not mcts_mask.any():
-            # ``step_into_checked`` belongs to PolyEnv's ISMCTS interface and
-            # requires a submitted world even when we intentionally bypass
-            # search. Submit one deterministic conservative world only to
-            # satisfy that engine invariant; the selected action below comes
-            # exclusively from ``direct_policy``.
-            if direct_policy is None or direct_value is None:
-                raise RuntimeError("raw policy path requires direct policy and value")
-            state_ids = np.asarray(request["state_id"], dtype=np.uint64)
-            actors = np.asarray(request["to_play"], dtype=np.int64)
-            self.pool.all_player_belief_requests_into(self.all_players)
-            particles = self._conservative_particles(self.all_players, 1)
-            actor_rows = np.flatnonzero(active).astype(np.int32)
-            if actor_rows.size:
-                actor_particles = self._actor_conservative_particles(
-                    request, actor_rows, 1
-                )
-                particles[actor_rows, actors[actor_rows]] = actor_particles
-            self.pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
-            self.counters.belief_fallback_rows += int(actor_rows.size)
-            self._install_direct_root_rows(
-                request, direct_rows, direct_policy, direct_value
-            )
-            return self.root
-
         state_ids = np.asarray(request["state_id"], dtype=np.uint64)
         actors = np.asarray(request["to_play"], dtype=np.int64)
         particle_count = max(1, int(self.mcts.particles))
@@ -1706,6 +1681,17 @@ class RoutedPoolSearch:
                     f"beliefs ({kind}): {error}{original}{detail}",
                     diagnostics,
                 ) from error
+
+        if not mcts_mask.any():
+            # Beliefs have been accepted by the same retry/fallback protocol
+            # as ordinary root-shield MCTS. Do not select a leaf: actions and
+            # value are copied from the raw policy pass above.
+            if direct_policy is None or direct_value is None:
+                raise RuntimeError("raw policy path requires direct policy and value")
+            self._install_direct_root_rows(
+                request, direct_rows, direct_policy, direct_value
+            )
+            return self.root
 
         waves = 1 + int(
             np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)

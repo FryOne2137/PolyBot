@@ -3778,6 +3778,10 @@ def train_promotion_league(
                             policy_weight=0.0,
                             value_weight=1.0,
                         )
+                        # No MCTS leaves are selected in this stage. One
+                        # accepted particle is nevertheless required by
+                        # PolyEnv before a checked raw-policy step.
+                        bootstrap_mcts = replace(mcts, particles=1)
                         print(
                             "league value/belief bootstrap | "
                             f"raw games={value_bootstrap_games} | "
@@ -3787,7 +3791,7 @@ def train_promotion_league(
                         value_bootstrap_summary = train_population_pool(
                             bootstrap_training,
                             model_config,
-                            mcts,
+                            bootstrap_mcts,
                             games=value_bootstrap_games,
                             updates_per_game=value_bootstrap_updates_per_game,
                             candidate=candidate,
@@ -3810,7 +3814,7 @@ def train_promotion_league(
                             max_pending_leaves=max_pending_leaves,
                             visible_action_history=visible_action_history,
                             belief_retries=belief_retries,
-                            belief_action_mode="strict",
+                            belief_action_mode="root_shield",
                             max_envs=min(num_envs, population_max_envs),
                             game_callback=record_value_bootstrap_game,
                             reserved_seeds=evaluation_map_seeds,

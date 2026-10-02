@@ -1424,10 +1424,10 @@ class RoutedPoolSearch:
     ) -> Dict[str, np.ndarray]:
         """Run full or selective routed belief-MCTS for one vector decision.
 
-        An all-false ``mcts_mask`` is intentionally a cheap raw-policy path.
-        Value/belief bootstrap must be able to collect terminal outcomes from
-        the current policy without paying for particle generation or ever
-        treating those raw actions as MCTS policy targets.
+        An all-false ``mcts_mask`` is intentionally a raw-policy path. Value/
+        belief bootstrap never uses particles for action selection or policy
+        targets; PolyEnv still requires one conservative valid belief solely
+        as a precondition of its checked stepping API.
         """
         for model in self.models:
             model.eval()
@@ -1463,11 +1463,25 @@ class RoutedPoolSearch:
         self._root_noise_enabled = bool(root_noise)
         self.counters.root_env_decisions += int(active.sum())
         if not mcts_mask.any():
-            # Do not submit inferred particles in this path: raw action
-            # collection is deliberately independent of belief quality and
-            # cannot accidentally make an unverified world affect a move.
+            # ``step_into_checked`` belongs to PolyEnv's ISMCTS interface and
+            # requires a submitted world even when we intentionally bypass
+            # search. Submit one deterministic conservative world only to
+            # satisfy that engine invariant; the selected action below comes
+            # exclusively from ``direct_policy``.
             if direct_policy is None or direct_value is None:
                 raise RuntimeError("raw policy path requires direct policy and value")
+            state_ids = np.asarray(request["state_id"], dtype=np.uint64)
+            actors = np.asarray(request["to_play"], dtype=np.int64)
+            self.pool.all_player_belief_requests_into(self.all_players)
+            particles = self._conservative_particles(self.all_players, 1)
+            actor_rows = np.flatnonzero(active).astype(np.int32)
+            if actor_rows.size:
+                actor_particles = self._actor_conservative_particles(
+                    request, actor_rows, 1
+                )
+                particles[actor_rows, actors[actor_rows]] = actor_particles
+            self.pool.submit_beliefs(state_ids, np.ascontiguousarray(particles))
+            self.counters.belief_fallback_rows += int(actor_rows.size)
             self._install_direct_root_rows(
                 request, direct_rows, direct_policy, direct_value
             )

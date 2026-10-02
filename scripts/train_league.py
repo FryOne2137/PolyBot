@@ -72,6 +72,17 @@ def main() -> None:
     )
     parser.add_argument("--population-updates-per-game", type=int, default=2)
     parser.add_argument(
+        "--value-bootstrap-games", type=int, default=64,
+        help=(
+            "Raw-policy games used to calibrate only value and belief before "
+            "MCTS policy distillation; 0 disables this safety bootstrap"
+        ),
+    )
+    parser.add_argument(
+        "--value-bootstrap-updates-per-game", type=int, default=8,
+        help="Optimisation updates per raw bootstrap game (policy loss remains zero)",
+    )
+    parser.add_argument(
         "--population-workers", type=int, default=16,
         help="Persistent native SelfPlayPool worker threads for population games",
     )
@@ -676,6 +687,10 @@ def main() -> None:
         population_size=args.population_size,
         population_games=args.population_games,
         population_updates_per_game=args.population_updates_per_game,
+        value_bootstrap_games=args.value_bootstrap_games,
+        value_bootstrap_updates_per_game=(
+            args.value_bootstrap_updates_per_game
+        ),
         population_workers=args.population_workers,
         population_max_envs=args.population_max_envs,
         population_offline_collection=args.population_offline_collection,

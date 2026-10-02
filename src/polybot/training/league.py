@@ -468,6 +468,8 @@ def train_promotion_league(
     population_mcts_reanalyse_capacity: int = 4_096,
     population_mcts_reanalyse_positions: int = 8,
     population_mcts_reanalyse_replay_fraction: float = 0.50,
+    value_bootstrap_games: int = 64,
+    value_bootstrap_updates_per_game: int = 8,
     pfsp_alpha: float = 2.0,
     champion_probability: float = 0.40,
     minimum_sampling_probability: float = 0.05,
@@ -722,6 +724,12 @@ def train_promotion_league(
         raise ValueError("mcts_probe_simulations must be positive")
     if mcts_probe_patience < 1:
         raise ValueError("mcts_probe_patience must be positive")
+    if value_bootstrap_games < 0 or value_bootstrap_games % 2:
+        raise ValueError("value_bootstrap_games must be non-negative and even")
+    if value_bootstrap_games and value_bootstrap_updates_per_game < 1:
+        raise ValueError(
+            "value_bootstrap_updates_per_game must be positive when bootstrap is enabled"
+        )
     for name, value in {
         "direct_gate_score": direct_gate_score,
         "direct_policy_anchor_weight": direct_policy_anchor_weight,
@@ -1091,6 +1099,8 @@ def train_promotion_league(
         "population_mcts_reanalyse_replay_fraction": (
             population_mcts_reanalyse_replay_fraction
         ),
+        "value_bootstrap_games": value_bootstrap_games,
+        "value_bootstrap_updates_per_game": value_bootstrap_updates_per_game,
         "pfsp_alpha": pfsp_alpha,
         "champion_probability": champion_probability,
         "minimum_sampling_probability": minimum_sampling_probability,
@@ -3697,7 +3707,6 @@ def train_promotion_league(
                         del candidate, champion, frozen_models
                         continue
 
-                    direct_population_state = model_state_on_cpu(candidate)
                     pool_summary: Dict[str, Any] = {}
                     if steps:
                         # This legacy same-network phase is now optional. It is
@@ -3737,6 +3746,125 @@ def train_promotion_league(
                         "mcts_preflight": [],
                     }
                     belief_calibration_summary: Dict[str, Any] | None = None
+                    value_bootstrap_summary: Dict[str, Any] = {}
+                    if not belief_calibration_required and value_bootstrap_games:
+                        # This is not a legacy actor-critic/PPO stage. Both
+                        # players execute their frozen raw policy; every
+                        # collected policy target is masked. Only terminal
+                        # outcome supervision calibrates value, while the
+                        # belief heads keep learning from full-map labels.
+                        def record_value_bootstrap_game(
+                            game: Mapping[str, Any],
+                        ) -> None:
+                            opponent_index = game.get("opponent_model_index")
+                            opponent_id = (
+                                population_ids[int(opponent_index)]
+                                if opponent_index is not None else None
+                            )
+                            database.record_match(
+                                run_id=database_run_id,
+                                round_id=round_id,
+                                phase="value_belief_bootstrap",
+                                model_a_id=candidate_id,
+                                model_b_id=opponent_id,
+                                game=game,
+                            )
+
+                        bootstrap_training = replace(
+                            round_training,
+                            seed=_offset_seed(
+                                population_training_seed, 1_000_003
+                            ),
+                            policy_weight=0.0,
+                            value_weight=1.0,
+                        )
+                        print(
+                            "league value/belief bootstrap | "
+                            f"raw games={value_bootstrap_games} | "
+                            "policy loss=0",
+                            flush=True,
+                        )
+                        value_bootstrap_summary = train_population_pool(
+                            bootstrap_training,
+                            model_config,
+                            mcts,
+                            games=value_bootstrap_games,
+                            updates_per_game=value_bootstrap_updates_per_game,
+                            candidate=candidate,
+                            opponent_models=frozen_models,
+                            opponent_weights=probabilities,
+                            anchor_model=None,
+                            anchor_policy_weight=0.0,
+                            anchor_value_weight=0.0,
+                            critical_decision_fraction=0.0,
+                            critical_replay_fraction=0.0,
+                            critical_only=False,
+                            selective_mcts=False,
+                            reanalysis_path=None,
+                            reanalysis_positions=0,
+                            reanalysis_replay_fraction=0.0,
+                            offline_collection=True,
+                            value_belief_heads_only=True,
+                            raw_policy_only=True,
+                            num_threads=population_workers,
+                            max_pending_leaves=max_pending_leaves,
+                            visible_action_history=visible_action_history,
+                            belief_retries=belief_retries,
+                            belief_action_mode="strict",
+                            max_envs=min(num_envs, population_max_envs),
+                            game_callback=record_value_bootstrap_game,
+                            reserved_seeds=evaluation_map_seeds,
+                            run=run.child(
+                                f"round_{round_index:03d}/value_belief_bootstrap"
+                            ),
+                        )
+                        # The raw policy and encoder were frozen, so this is
+                        # a safe persistent calibration checkpoint even when
+                        # MCTS still fails its preflight. Without saving it,
+                        # every rejected rung would throw away the very value
+                        # evidence needed to make the next preflight better.
+                        save_model(
+                            belief_apprentice_path, candidate, model_config
+                        )
+                        bootstrap_marker = dict(belief_apprentice_state)
+                        bootstrap_marker.update({
+                            "champion_path": str(champion_path.resolve()),
+                            "ready": bool(
+                                bootstrap_marker.get("ready", False)
+                            ),
+                            "value_bootstrap_round": round_index,
+                            "value_bootstrap_games": value_bootstrap_games,
+                            "value_bootstrap_terminals": int(
+                                value_bootstrap_summary.get(
+                                    "population_pool_terminals", 0.0
+                                )
+                            ),
+                            "value_bootstrap_updates": int(
+                                value_bootstrap_summary.get(
+                                    "population_pool_updates", 0.0
+                                )
+                            ),
+                        })
+                        _save_belief_apprentice_state(
+                            belief_apprentice_state_path, bootstrap_marker
+                        )
+                        population_summary["value_belief_bootstrap"] = (
+                            value_bootstrap_summary
+                        )
+                        print(
+                            "league value/belief bootstrap | "
+                            f"terminal={int(value_bootstrap_summary.get('population_pool_terminals', 0.0))}/"
+                            f"{value_bootstrap_games} | "
+                            f"updates={int(value_bootstrap_summary.get('population_pool_updates', 0.0))} | "
+                            f"value_mae={float(value_bootstrap_summary.get('value_mae', 0.0)):.4f}",
+                            flush=True,
+                        )
+                    round_training_summary["value_belief_bootstrap"] = (
+                        value_bootstrap_summary
+                    )
+                    # Roll back a rejected MCTS rung to the freshly calibrated
+                    # raw-policy checkpoint, never to its pre-bootstrap value.
+                    direct_population_state = model_state_on_cpu(candidate)
                     # A failed first MCTS rung must return to the last state
                     # proven safe against the raw-policy population gate, not
                     # to an optional ungated legacy self-play snapshot.

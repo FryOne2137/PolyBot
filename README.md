@@ -219,6 +219,13 @@ MCTS, który jest słabszy od własnej policy. Domyślna drabina zaczyna się od
 nie trenuje na nim, lecz może sprawdzić następny, głębszy rung z tej samej
 drabiny.
 
+Przed tym preflightem liga domyślnie wykonuje `--value-bootstrap-games 64`:
+obie strony grają wyłącznie surową policy, a policy loss każdego zebranego
+ruchu wynosi zero. Uczą się wyłącznie głowice `value` i `belief` z wyniku gry
+i pełnej mapy dostępnej tylko jako etykieta treningowa. Dzięki temu słaby value
+nie może od razu zatruć targetów MCTS; `--value-bootstrap-games 0` wyłącza ten
+etap wyłącznie dla świadomych eksperymentów.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

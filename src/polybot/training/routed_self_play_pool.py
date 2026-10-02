@@ -1422,14 +1422,15 @@ class RoutedPoolSearch:
         direct_policy: np.ndarray | None = None,
         direct_value: np.ndarray | None = None,
     ) -> Dict[str, np.ndarray]:
-        """Run full or selective routed belief-MCTS for one vector decision."""
+        """Run full or selective routed belief-MCTS for one vector decision.
+
+        An all-false ``mcts_mask`` is intentionally a cheap raw-policy path.
+        Value/belief bootstrap must be able to collect terminal outcomes from
+        the current policy without paying for particle generation or ever
+        treating those raw actions as MCTS policy targets.
+        """
         for model in self.models:
             model.eval()
-        state_ids = np.asarray(request["state_id"], dtype=np.uint64)
-        actors = np.asarray(request["to_play"], dtype=np.int64)
-        particle_count = max(1, int(self.mcts.particles))
-        self.pool.all_player_belief_requests_into(self.all_players)
-        all_players = self.all_players
         active = np.asarray(active, dtype=bool)
         if active.shape != (self.num_envs,):
             raise ValueError("active mask must have shape [num_envs]")
@@ -1461,6 +1462,22 @@ class RoutedPoolSearch:
         # those fixed-seed evaluations remain deterministic.
         self._root_noise_enabled = bool(root_noise)
         self.counters.root_env_decisions += int(active.sum())
+        if not mcts_mask.any():
+            # Do not submit inferred particles in this path: raw action
+            # collection is deliberately independent of belief quality and
+            # cannot accidentally make an unverified world affect a move.
+            if direct_policy is None or direct_value is None:
+                raise RuntimeError("raw policy path requires direct policy and value")
+            self._install_direct_root_rows(
+                request, direct_rows, direct_policy, direct_value
+            )
+            return self.root
+
+        state_ids = np.asarray(request["state_id"], dtype=np.uint64)
+        actors = np.asarray(request["to_play"], dtype=np.int64)
+        particle_count = max(1, int(self.mcts.particles))
+        self.pool.all_player_belief_requests_into(self.all_players)
+        all_players = self.all_players
 
         def learned_rows(rows: np.ndarray, attempt: int) -> np.ndarray:
             rows = np.asarray(rows, dtype=np.int32)
@@ -2274,6 +2291,8 @@ def train_population_pool(
     reanalysis_replay_fraction: float = 0.0,
     offline_collection: bool = False,
     belief_only: bool = False,
+    value_belief_heads_only: bool = False,
+    raw_policy_only: bool = False,
     num_threads: int | None = None,
     max_pending_leaves: int = 4,
     visible_action_history: int = 0,
@@ -2290,6 +2309,10 @@ def train_population_pool(
     generation before any optimiser step.  This is the stable policy-iteration
     mode: every root target in the replay buffer comes from the same frozen
     apprentice, rather than a network that changes game by game.
+
+    ``raw_policy_only`` uses the raw policy for both players and masks policy
+    loss for every collected move. Combined with ``value_belief_heads_only``
+    it is a safe value/belief bootstrap before MCTS is allowed to teach policy.
     """
     if games < 0 or updates_per_game < 0:
         raise ValueError("games and updates_per_game must not be negative")
@@ -2333,6 +2356,8 @@ def train_population_pool(
         raise ValueError("selective_mcts_minimum_envs must not be negative")
     if not 0.0 <= selective_mcts_audit_fraction <= 1.0:
         raise ValueError("selective_mcts_audit_fraction must be in [0, 1]")
+    if belief_only and value_belief_heads_only:
+        raise ValueError("belief_only and value_belief_heads_only are exclusive")
     if anchor_model is candidate:
         raise ValueError("anchor_model must be a frozen copy, not the trainable candidate")
     if training.max_replay_epochs <= 0.0:
@@ -2375,6 +2400,8 @@ def train_population_pool(
             "reanalysis_replay_fraction": reanalysis_replay_fraction,
             "offline_collection": offline_collection,
             "belief_only": belief_only,
+            "value_belief_heads_only": value_belief_heads_only,
+            "raw_policy_only": raw_policy_only,
             "belief_action_mode": belief_action_mode,
         },
     )
@@ -2390,10 +2417,15 @@ def train_population_pool(
     )
     candidate.to(device)
     # Calibration must not silently degrade the champion's policy/value via
-    # the shared encoder.  Learn only the explicit belief decoder and its
-    # public-action conditioning until action-equivalence is demonstrated.
+    # the shared encoder. Value bootstrap likewise keeps raw policy behaviour
+    # fixed while learning only outcome/belief heads from actual games.
     for name, parameter in candidate.named_parameters():
-        parameter.requires_grad_(not belief_only or name.startswith("belief_"))
+        trainable = True
+        if belief_only:
+            trainable = name.startswith("belief_")
+        elif value_belief_heads_only:
+            trainable = name.startswith(("value_head", "belief_"))
+        parameter.requires_grad_(trainable)
     frozen = []
     for model in opponent_models:
         frozen.append(_freeze_reference_model(model, device))
@@ -2584,7 +2616,12 @@ def train_population_pool(
                 mcts_mask = active.copy()
                 direct_policy = None
                 direct_value = None
-                if selective_mcts:
+                if raw_policy_only:
+                    mcts_mask = np.zeros(count, dtype=bool)
+                    direct_policy, direct_value = search.direct_policy_value(
+                        request, np.flatnonzero(active).astype(np.int32)
+                    )
+                elif selective_mcts:
                     (
                         mcts_mask,
                         direct_policy,
@@ -2818,8 +2855,9 @@ def train_population_pool(
                     for env, example in zip(candidate_rows, candidate_examples):
                         if not mcts_mask[int(env)]:
                             # A raw policy target is only an action source,
-                            # never a policy teacher.  Keep its belief/value
-                            # supervision but mask policy cross-entropy.
+                            # never an outcome-improved policy teacher. Keep
+                            # its belief/value supervision but mask policy
+                            # cross-entropy, including value bootstrap games.
                             example.policy_loss_weight = 0.0
                         example.bootstrap_value = float(root_values[env])
                         examples_by_env[int(env)] = example
@@ -3017,6 +3055,8 @@ def train_population_pool(
         "population_pool_selective_mcts_audit_fraction": float(
             selective_mcts_audit_fraction
         ),
+        "population_pool_raw_policy_only": float(raw_policy_only),
+        "population_pool_value_belief_heads_only": float(value_belief_heads_only),
         "population_pool_offline_collection": float(offline_collection),
         "population_pool_reanalysis_loaded": float(reanalysis_loaded),
         "population_pool_reanalysis_refreshed": float(reanalysis_refreshed),

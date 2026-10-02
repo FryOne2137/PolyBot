@@ -1047,6 +1047,8 @@ class RoutedPoolSearch:
         direct_rows: np.ndarray,
         policies: np.ndarray,
         values: np.ndarray,
+        *,
+        preserve_native_metadata: bool = False,
     ) -> None:
         """Make direct rows safe for the common action-sampling path."""
         rows = np.flatnonzero(np.asarray(direct_rows, dtype=bool))
@@ -1065,11 +1067,12 @@ class RoutedPoolSearch:
             self.root["root_visit_count"][rows] = 0
         if "root_value" in self.root:
             self.root["root_value"][rows] = np.asarray(values[rows], dtype=np.float32)
-        for name in ("state_id", "episode_id", "agent_id", "map_seed"):
-            if name in self.root and name in request:
-                self.root[name][rows] = np.asarray(request[name])[rows]
-        if "root_player" in self.root:
-            self.root["root_player"][rows] = np.asarray(request["to_play"])[rows]
+        if not preserve_native_metadata:
+            for name in ("state_id", "episode_id", "agent_id", "map_seed"):
+                if name in self.root and name in request:
+                    self.root[name][rows] = np.asarray(request[name])[rows]
+            if "root_player" in self.root:
+                self.root["root_player"][rows] = np.asarray(request["to_play"])[rows]
 
     def _capture_engine_action_constraints(
         self,
@@ -1688,8 +1691,16 @@ class RoutedPoolSearch:
             # value are copied from the raw policy pass above.
             if direct_policy is None or direct_value is None:
                 raise RuntimeError("raw policy path requires direct policy and value")
+            # ``submit_beliefs`` can refresh native root identity. Read it
+            # back before replacing only its action distribution with raw
+            # policy, otherwise the following checked step sees a stale id.
+            self.pool.root_policy_into(self.root, temperature=root_temperature)
             self._install_direct_root_rows(
-                request, direct_rows, direct_policy, direct_value
+                request,
+                direct_rows,
+                direct_policy,
+                direct_value,
+                preserve_native_metadata=True,
             )
             return self.root
 
@@ -1716,7 +1727,11 @@ class RoutedPoolSearch:
         if direct_rows.any():
             assert direct_policy is not None and direct_value is not None
             self._install_direct_root_rows(
-                request, direct_rows, direct_policy, direct_value
+                request,
+                direct_rows,
+                direct_policy,
+                direct_value,
+                preserve_native_metadata=True,
             )
         if self.belief_action_mode == "root_shield":
             shield = shield_root_policy_with_public_actions(

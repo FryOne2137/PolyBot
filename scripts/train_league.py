@@ -123,6 +123,14 @@ def main() -> None:
         help="Fixed-seed post-update belief evaluation games; 0 disables only this diagnostic.",
     )
     parser.add_argument(
+        "--belief-calibration-replay-path", type=Path,
+        help="Persistent supervised belief replay; defaults to <checkpoint-dir>/<prefix>-belief-calibration-replay.pkl.",
+    )
+    parser.add_argument(
+        "--belief-calibration-replay-capacity", type=int, default=50_000,
+        help="Maximum number of recent belief calibration positions retained across runs.",
+    )
+    parser.add_argument(
         "--population-mcts-critical-only",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -691,6 +699,10 @@ def main() -> None:
             args.belief_action_equivalence_min_particles
         ),
         belief_calibration_eval_games=args.belief_calibration_eval_games,
+        belief_calibration_replay_path=args.belief_calibration_replay_path,
+        belief_calibration_replay_capacity=(
+            args.belief_calibration_replay_capacity
+        ),
         database_path=args.league_db,
         population_model_paths=args.population_model,
         population_size=args.population_size,

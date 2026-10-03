@@ -173,3 +173,12 @@ class ReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._examples)
+
+    def snapshot(self) -> List[TrainingExample]:
+        """Return the bounded replay window in chronological order.
+
+        Callers use this only to persist a calibration reservoir between
+        short league invocations.  The examples themselves are immutable from
+        the buffer's point of view, so copying the deque is sufficient.
+        """
+        return list(self._examples)

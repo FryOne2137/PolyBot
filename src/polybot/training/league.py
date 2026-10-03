@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
@@ -27,6 +28,7 @@ from .routed_self_play_pool import (
     train_population_pool,
 )
 from .run_artifacts import TrainingRun
+from .replay_buffer import TrainingExample
 from .self_play_pool_train import train_self_play_pool
 from .vector_population import (
     evaluate_direct_population_matches,
@@ -50,6 +52,41 @@ def _save_belief_apprentice_state(path: Path, state: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(dict(state), indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _load_belief_calibration_replay(
+    path: Path,
+    capacity: int,
+) -> list[TrainingExample]:
+    """Load a bounded local reservoir of supervised fog observations.
+
+    This contains only PolyBot replay examples. It is never an inference
+    input; it prevents a short new seed batch from making the belief decoder
+    forget the maps seen in prior calibration runs.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = pickle.load(handle)
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [example for example in raw if isinstance(example, TrainingExample)][
+        -capacity:
+    ]
+
+
+def _save_belief_calibration_replay(
+    path: Path,
+    examples: Sequence[TrainingExample],
+    capacity: int,
+) -> None:
+    """Atomically retain the most recent, diverse calibration window."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        pickle.dump(list(examples)[-capacity:], handle, protocol=pickle.HIGHEST_PROTOCOL)
     temporary.replace(path)
 
 
@@ -448,6 +485,8 @@ def train_promotion_league(
     belief_action_equivalence_target: float = 0.10,
     belief_action_equivalence_min_particles: int = 512,
     belief_calibration_eval_games: int = 8,
+    belief_calibration_replay_path: Path | None = None,
+    belief_calibration_replay_capacity: int = 50_000,
     database_path: Path | None = None,
     population_model_paths: Sequence[Path] = (),
     population_size: int = 6,
@@ -998,6 +1037,8 @@ def train_promotion_league(
         raise ValueError("belief_action_equivalence_min_particles must be positive")
     if belief_calibration_eval_games < 0:
         raise ValueError("belief_calibration_eval_games must not be negative")
+    if belief_calibration_replay_capacity < 1:
+        raise ValueError("belief_calibration_replay_capacity must be positive")
     if population_belief_search_mode not in {"strict", "root_shield"}:
         raise ValueError(
             "population_belief_search_mode must be 'strict' or 'root_shield'"
@@ -1045,6 +1086,11 @@ def train_promotion_league(
     )
     belief_apprentice_state_path = belief_apprentice_path.with_suffix(
         belief_apprentice_path.suffix + ".json"
+    )
+    belief_calibration_replay_path = (
+        belief_calibration_replay_path
+        if belief_calibration_replay_path is not None
+        else checkpoint_dir / f"{checkpoint_prefix}-belief-calibration-replay.pkl"
     )
     resolved_evaluation_seed = _offset_seed(evaluation_seed, 0)
     device = select_device(training.device)
@@ -1103,6 +1149,8 @@ def train_promotion_league(
             population_mcts_reanalyse_replay_fraction
         ),
         "belief_calibration_eval_games": belief_calibration_eval_games,
+        "belief_calibration_replay_path": str(belief_calibration_replay_path),
+        "belief_calibration_replay_capacity": belief_calibration_replay_capacity,
         "value_bootstrap_games": value_bootstrap_games,
         "value_bootstrap_updates_per_game": value_bootstrap_updates_per_game,
         "pfsp_alpha": pfsp_alpha,
@@ -4327,6 +4375,36 @@ def train_promotion_league(
                                     )
                                     continue
 
+                            calibration_replay: Sequence[TrainingExample] = ()
+                            calibration_replay_saved = [0]
+                            replay_snapshot_callback = None
+                            if belief_calibration_required:
+                                calibration_replay = _load_belief_calibration_replay(
+                                    belief_calibration_replay_path,
+                                    belief_calibration_replay_capacity,
+                                )
+
+                                def persist_calibration_replay(
+                                    examples: Sequence[TrainingExample],
+                                ) -> None:
+                                    _save_belief_calibration_replay(
+                                        belief_calibration_replay_path,
+                                        examples,
+                                        belief_calibration_replay_capacity,
+                                    )
+                                    calibration_replay_saved[0] = min(
+                                        len(examples),
+                                        belief_calibration_replay_capacity,
+                                    )
+
+                                replay_snapshot_callback = persist_calibration_replay
+                                print(
+                                    "league belief replay | "
+                                    f"loaded={len(calibration_replay)} | "
+                                    f"capacity={belief_calibration_replay_capacity}",
+                                    flush=True,
+                                )
+
                             rung_summary = train_population_pool(
                                 rung_training,
                                 model_config,
@@ -4417,11 +4495,19 @@ def train_promotion_league(
                                 raw_policy_only=belief_calibration_required,
                                 game_callback=record_training_game,
                                 reserved_seeds=evaluation_map_seeds,
+                                replay_examples=calibration_replay,
+                                replay_snapshot_callback=replay_snapshot_callback,
                                 run=run.child(
                                     f"round_{round_index:03d}/mcts_rung_{rung_index + 1:02d}"
                                 ),
                             )
                             if belief_calibration_required:
+                                rung_summary["belief_calibration_replay_loaded"] = float(
+                                    len(calibration_replay)
+                                )
+                                rung_summary["belief_calibration_replay_saved"] = float(
+                                    calibration_replay_saved[0]
+                                )
                                 collection_checked = int(
                                     rung_summary.get(
                                         "belief_action_equivalence_checked_particles",
@@ -4590,6 +4676,16 @@ def train_promotion_league(
                                 # collection before asking for another costly
                                 # calibration generation.
                                 diagnostic_fields = (
+                                    (
+                                        "replay_loaded",
+                                        "belief_calibration_replay_loaded",
+                                        ".0f",
+                                    ),
+                                    (
+                                        "replay_saved",
+                                        "belief_calibration_replay_saved",
+                                        ".0f",
+                                    ),
                                     ("updates", "population_pool_updates", ".0f"),
                                     ("belief_loss", "belief_loss", ".4f"),
                                     (

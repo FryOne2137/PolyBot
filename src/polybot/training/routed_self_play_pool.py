@@ -2322,6 +2322,8 @@ def train_population_pool(
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
     reserved_seeds: Sequence[int] = (),
+    replay_examples: Sequence[TrainingExample] = (),
+    replay_snapshot_callback: Callable[[Sequence[TrainingExample]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train candidate agent 0 against PFSP with frozen-policy retention.
@@ -2460,6 +2462,11 @@ def train_population_pool(
         weight_decay=training.weight_decay,
     )
     replay = ReplayBuffer(training.replay_capacity)
+    # A calibration run is deliberately short, but its supervised maps should
+    # not be forgotten when the next CLI invocation starts.  The caller owns
+    # persistence; this generic pool only seeds its bounded in-memory window.
+    if replay_examples:
+        replay.extend(list(replay_examples)[-training.replay_capacity:])
     rng = np.random.default_rng(training.seed ^ 0x91A6E)
     reanalysis_store = (
         PersistentReanalyseBuffer(reanalysis_path, reanalysis_capacity)
@@ -3032,6 +3039,8 @@ def train_population_pool(
     if reanalysis_store is not None:
         reanalysis_store.extend(new_reanalysis_positions)
         reanalysis_store.save()
+    if replay_snapshot_callback is not None:
+        replay_snapshot_callback(replay.snapshot())
     summary: Dict[str, float | str] = {
         "population_pool_games": float(games),
         "population_pool_terminals": float(terminal_count),

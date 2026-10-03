@@ -259,6 +259,13 @@ generowania ukrytej mapy jest niezależna: `--belief-particle-temperature`
 dlatego, że ruchy self-play mają dużą eksplorację — mieszałoby to dwa różne
 źródła losowości i znacząco podnosiło action mismatch.
 
+Kalibracja beliefu utrzymuje też lokalne, ograniczone okno replay
+`<checkpoint-dir>/<prefix>-belief-calibration-replay.pkl` (domyślnie 50 000
+pozycji). Każdy nowy seed jest mieszany z wcześniejszymi obserwacjami przed
+optymalizacją, więc krótki run nie zapomina poprzednich map. Ścieżkę i rozmiar
+okna można zmienić przez `--belief-calibration-replay-path` oraz
+`--belief-calibration-replay-capacity`.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

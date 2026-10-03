@@ -30,6 +30,8 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--legal-action-belief-weight", type=float, default=2.0)
     parser.add_argument("--engine-action-constraint-weight", type=float, default=0.25)
     parser.add_argument("--bridge-constraint-weight", type=float, default=1.0)
+    parser.add_argument("--belief-presence-focal-gamma", type=float, default=1.5)
+    parser.add_argument("--belief-entity-consistency-weight", type=float, default=0.35)
     parser.add_argument("--bridge-replay-fraction", type=float, default=0.25)
     parser.add_argument("--engine-action-constraint-replay-fraction", type=float, default=0.25)
     parser.add_argument("--max-replay-epochs", type=float, default=6.0)
@@ -74,6 +76,8 @@ def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
         legal_action_belief_weight=getattr(args, "legal_action_belief_weight", 2.0),
         engine_action_constraint_weight=getattr(args, "engine_action_constraint_weight", 0.25),
         bridge_constraint_weight=getattr(args, "bridge_constraint_weight", 1.0),
+        belief_presence_focal_gamma=getattr(args, "belief_presence_focal_gamma", 1.5),
+        belief_entity_consistency_weight=getattr(args, "belief_entity_consistency_weight", 0.35),
         bridge_replay_fraction=getattr(args, "bridge_replay_fraction", 0.25),
         engine_action_constraint_replay_fraction=getattr(args, "engine_action_constraint_replay_fraction", 0.25),
         max_replay_epochs=getattr(args, "max_replay_epochs", 6.0),

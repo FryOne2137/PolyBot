@@ -327,6 +327,7 @@ def belief_loss(
     action_mask: torch.Tensor | None = None,
     legal_action_weight: float = 0.0,
     example_weights: torch.Tensor | None = None,
+    presence_focal_gamma: float = 0.0,
 ) -> torch.Tensor:
     """Field-aware cross-entropy for semantic values on hidden tiles.
 
@@ -339,6 +340,8 @@ def belief_loss(
     """
     if legal_action_weight < 0.0:
         raise ValueError("legal_action_weight must not be negative")
+    if presence_focal_gamma < 0.0:
+        raise ValueError("presence_focal_gamma must not be negative")
     if example_weights is not None and example_weights.shape != hidden_mask.shape[:1]:
         raise ValueError("example_weights must have shape [batch]")
     logits_by_feature = tuple(belief_logits)
@@ -391,9 +394,61 @@ def belief_loss(
             weights = torch.where(full_map_target[..., 14] != 0, weights * 4.0, weights)
         elif column == 4:
             weights = torch.where(full_map_target[..., 4] >= 1, weights * 6.0, weights)
+        if column in (4, 14) and presence_focal_gamma:
+            # City/unit presence is sparse. Standard cross entropy is easily
+            # minimised by predicting an empty tile, which can look accurate
+            # while producing unusable ISMCTS worlds. Focal modulation spends
+            # most gradient on the hard presence/absence decisions.
+            target_probability = torch.softmax(logits, dim=-1).gather(
+                -1, labels.unsqueeze(-1)
+            ).squeeze(-1)
+            weights = weights * (1.0 - target_probability).clamp_min(0.0).pow(
+                float(presence_focal_gamma)
+            )
         denominator = (weights * loss_mask).sum().clamp_min(1.0)
         feature_losses.append((per_tile * weights * loss_mask).sum() / denominator)
     return torch.stack(feature_losses).mean()
+
+
+def belief_entity_consistency_loss(
+    belief_logits: Iterable[torch.Tensor],
+    hidden_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Penalise impossible hidden entity combinations without hidden-state input.
+
+    The city/unit attribute heads use entity-conditioned decoder states, but
+    their logits are otherwise unconstrained on empty tiles. This loss makes
+    those heads agree with the sampled presence variables and prevents a city
+    probability from coexisting with water probability. It uses predictions
+    only, so it is valid for every hidden observation and not a second source
+    of privileged map information.
+    """
+    logits = tuple(belief_logits)
+    if len(logits) != len(MAP_FEATURE_MAX):
+        raise ValueError("entity consistency requires every map feature head")
+    hidden = hidden_mask.bool()
+    if not bool(hidden.any()):
+        return logits[0].sum() * 0.0
+
+    city_probability = torch.softmax(logits[14], dim=-1)[..., 3]
+    unit_probability = torch.softmax(logits[4], dim=-1)[..., 2:].sum(dim=-1)
+    # Feature 19 classes are shifted by one: enum terrain=1 (water) is class
+    # index 2. A city must not be placed on predicted water.
+    water_probability = torch.softmax(logits[19], dim=-1)[..., 2]
+    losses = [city_probability * water_probability]
+
+    def undefined_probability(column: int) -> torch.Tensor:
+        return torch.softmax(logits[column], dim=-1)[..., 0]
+
+    # Attributes should be undefined when their owner entity is absent. This
+    # is deliberately one-directional: it does not claim every city/unit has
+    # every attribute populated, so valid sparse engine encodings stay valid.
+    for column in (9, 10, 11, 12, 13, 16, 17):
+        losses.append((1.0 - city_probability) * (1.0 - undefined_probability(column)))
+    for column in (2, 3, 5, 21, 22):
+        losses.append((1.0 - unit_probability) * (1.0 - undefined_probability(column)))
+    stacked = torch.stack(losses, dim=0).mean(dim=0)
+    return stacked[hidden].mean()
 
 
 def train_batch(
@@ -409,6 +464,8 @@ def train_batch(
         raise ValueError("legal_action_belief_weight must not be negative")
     if config.engine_action_constraint_weight < 0.0:
         raise ValueError("engine_action_constraint_weight must not be negative")
+    if config.belief_entity_consistency_weight < 0.0:
+        raise ValueError("belief_entity_consistency_weight must not be negative")
     model.train()
     output = model(
         batch["map_tokens"],
@@ -480,6 +537,7 @@ def train_batch(
         batch["action_categorical"],
         batch["action_mask"],
         config.legal_action_belief_weight,
+        presence_focal_gamma=config.belief_presence_focal_gamma,
     )
     # PolyEnv has already compared the detached sampled particle with the
     # real public action set.  Its mismatch endpoints are only a *focus mask*;
@@ -492,6 +550,10 @@ def train_batch(
         example_weights=(
             1.0 + batch["engine_action_constraint_score"].clamp(0.0, 4.0)
         ),
+        presence_focal_gamma=config.belief_presence_focal_gamma,
+    )
+    entity_consistency = belief_entity_consistency_loss(
+        output.belief_logits, batch["hidden_mask"]
     )
     bridge = bridge_constraint_loss(
         output.belief_logits[19],
@@ -522,6 +584,7 @@ def train_batch(
         + config.belief_weight * belief
         + config.engine_action_constraint_weight * engine_constraint
         + config.bridge_constraint_weight * bridge
+        + config.belief_entity_consistency_weight * entity_consistency
     )
 
     optimiser.zero_grad(set_to_none=True)
@@ -538,6 +601,7 @@ def train_batch(
         "value_anchor_loss": float(anchor_value.detach().cpu()),
         "belief_loss": float(belief.detach().cpu()),
         "belief_engine_action_constraint_loss": float(engine_constraint.detach().cpu()),
+        "belief_entity_consistency_loss": float(entity_consistency.detach().cpu()),
         "bridge_constraint_loss": float(bridge.detach().cpu()),
     }
     result.update(terrain_metrics)

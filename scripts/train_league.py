@@ -119,6 +119,10 @@ def main() -> None:
         help="Minimum checked candidate particles required to finish belief calibration.",
     )
     parser.add_argument(
+        "--belief-calibration-eval-games", type=int, default=8,
+        help="Fixed-seed post-update belief evaluation games; 0 disables only this diagnostic.",
+    )
+    parser.add_argument(
         "--population-mcts-critical-only",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -682,6 +686,7 @@ def main() -> None:
         belief_action_equivalence_min_particles=(
             args.belief_action_equivalence_min_particles
         ),
+        belief_calibration_eval_games=args.belief_calibration_eval_games,
         database_path=args.league_db,
         population_model_paths=args.population_model,
         population_size=args.population_size,

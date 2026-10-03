@@ -447,6 +447,7 @@ def train_promotion_league(
     belief_apprentice_path: Path | None = None,
     belief_action_equivalence_target: float = 0.10,
     belief_action_equivalence_min_particles: int = 512,
+    belief_calibration_eval_games: int = 8,
     database_path: Path | None = None,
     population_model_paths: Sequence[Path] = (),
     population_size: int = 6,
@@ -995,6 +996,8 @@ def train_promotion_league(
         raise ValueError("belief_action_equivalence_target must be between zero and one")
     if belief_action_equivalence_min_particles < 1:
         raise ValueError("belief_action_equivalence_min_particles must be positive")
+    if belief_calibration_eval_games < 0:
+        raise ValueError("belief_calibration_eval_games must not be negative")
     if population_belief_search_mode not in {"strict", "root_shield"}:
         raise ValueError(
             "population_belief_search_mode must be 'strict' or 'root_shield'"
@@ -1099,6 +1102,7 @@ def train_promotion_league(
         "population_mcts_reanalyse_replay_fraction": (
             population_mcts_reanalyse_replay_fraction
         ),
+        "belief_calibration_eval_games": belief_calibration_eval_games,
         "value_bootstrap_games": value_bootstrap_games,
         "value_bootstrap_updates_per_game": value_bootstrap_updates_per_game,
         "pfsp_alpha": pfsp_alpha,
@@ -4395,18 +4399,79 @@ def train_promotion_league(
                                 ),
                             )
                             if belief_calibration_required:
-                                checked = int(
+                                collection_checked = int(
                                     rung_summary.get(
                                         "belief_action_equivalence_checked_particles",
                                         0.0,
                                     )
                                 )
-                                rejected = int(
+                                collection_rejected = int(
                                     rung_summary.get(
                                         "belief_action_equivalence_rejected_particles",
                                         0.0,
                                     )
                                 )
+                                collection_rate = float(
+                                    collection_rejected / max(1, collection_checked)
+                                )
+                                held_out_summary: Dict[str, Any] = {}
+                                if belief_calibration_eval_games:
+                                    # This is deliberately after optimisation
+                                    # and uses a fixed seed schedule. The
+                                    # collection mismatch is measured before
+                                    # its updates, so it cannot say whether
+                                    # this calibration round generalised.
+                                    held_out_summary = train_population_pool(
+                                        replace(
+                                            round_training,
+                                            seed=_offset_seed(
+                                                round_evaluation_seed,
+                                                17_000_003,
+                                            ),
+                                            policy_weight=0.0,
+                                            value_weight=0.0,
+                                        ),
+                                        model_config,
+                                        mcts,
+                                        games=belief_calibration_eval_games,
+                                        updates_per_game=0,
+                                        candidate=candidate,
+                                        opponent_models=frozen_models,
+                                        opponent_weights=probabilities,
+                                        anchor_model=None,
+                                        anchor_policy_weight=0.0,
+                                        anchor_value_weight=0.0,
+                                        critical_decision_fraction=0.0,
+                                        critical_replay_fraction=0.0,
+                                        critical_only=False,
+                                        selective_mcts=False,
+                                        reanalysis_path=None,
+                                        reanalysis_positions=0,
+                                        reanalysis_replay_fraction=0.0,
+                                        offline_collection=True,
+                                        belief_only=True,
+                                        raw_policy_only=True,
+                                        num_threads=population_workers,
+                                        max_pending_leaves=max_pending_leaves,
+                                        visible_action_history=visible_action_history,
+                                        belief_retries=belief_retries,
+                                        belief_action_mode="strict",
+                                        max_envs=min(
+                                            num_envs, population_max_envs
+                                        ),
+                                        reserved_seeds=evaluation_map_seeds,
+                                        run=run.child(
+                                            f"round_{round_index:03d}/belief_held_out"
+                                        ),
+                                    )
+                                checked = int(held_out_summary.get(
+                                    "belief_action_equivalence_checked_particles",
+                                    collection_checked,
+                                ))
+                                rejected = int(held_out_summary.get(
+                                    "belief_action_equivalence_rejected_particles",
+                                    collection_rejected,
+                                ))
                                 rate = float(rejected / max(1, checked))
                                 ready = bool(
                                     checked >= belief_action_equivalence_min_particles
@@ -4421,6 +4486,10 @@ def train_promotion_league(
                                         "checked_particles": checked,
                                         "rejected_particles": rejected,
                                         "rejection_rate": rate,
+                                        "collection_checked_particles": collection_checked,
+                                        "collection_rejected_particles": collection_rejected,
+                                        "collection_rejection_rate": collection_rate,
+                                        "held_out_games": belief_calibration_eval_games,
                                         "target_rejection_rate": (
                                             belief_action_equivalence_target
                                         ),
@@ -4436,6 +4505,10 @@ def train_promotion_league(
                                     "checked_particles": float(checked),
                                     "rejected_particles": float(rejected),
                                     "rejection_rate": rate,
+                                    "collection_checked_particles": float(collection_checked),
+                                    "collection_rejected_particles": float(collection_rejected),
+                                    "collection_rejection_rate": collection_rate,
+                                    "held_out": held_out_summary,
                                     "target_rejection_rate": (
                                         belief_action_equivalence_target
                                     ),
@@ -4446,7 +4519,8 @@ def train_promotion_league(
                                 )
                                 print(
                                     "league belief calibration | "
-                                    f"action mismatch={rate:.2%} "
+                                    f"collection={collection_rate:.2%} | "
+                                    f"held-out mismatch={rate:.2%} "
                                     f"({rejected}/{checked}) | "
                                     f"ready={int(ready)} | saved "
                                     f"{belief_apprentice_path}",

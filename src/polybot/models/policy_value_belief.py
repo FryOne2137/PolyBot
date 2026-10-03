@@ -665,23 +665,44 @@ class PolicyValueBeliefNet(nn.Module):
             dtype=observed.dtype,
             device=observed.device,
         )
-        # One softmax/multinomial per field replaces one per field * particle.
+        # Sample a valid world in dependency order. Terrain/static structure
+        # comes first, then entity presence, then only the attributes owned by
+        # a sampled city/unit. Sampling all heads independently can create a
+        # hidden empty tile whose unobserved attributes nevertheless describe
+        # a city or unit, which makes later structural repair unnecessarily
+        # ambiguous.
         sampled_features: dict[int, torch.Tensor] = {}
         has_hidden = bool(hidden.any())
-        for feature_index in (*SAFE_PARTICLE_FEATURES, 14, *CITY_PARTICLE_FEATURES, *UNIT_PARTICLE_FEATURES):
+
+        def sample_feature(feature_index: int) -> torch.Tensor:
             if has_hidden:
                 logits = belief_logits[feature_index][0, hidden]
                 if temperature <= 0.0:
-                    sampled_features[feature_index] = (logits.argmax(dim=-1) - 1).expand(particles, -1)
-                else:
-                    probabilities = torch.softmax(logits / max(temperature, 1e-4), dim=-1)
-                    sampled_features[feature_index] = (
-                        torch.multinomial(probabilities, particles, replacement=True).transpose(0, 1) - 1
-                    )
-            else:
-                sampled_features[feature_index] = torch.empty(
-                    (particles, 0), dtype=observed.dtype, device=observed.device
-                )
+                    return (logits.argmax(dim=-1) - 1).expand(particles, -1)
+                probabilities = torch.softmax(logits / max(temperature, 1e-4), dim=-1)
+                return torch.multinomial(
+                    probabilities, particles, replacement=True
+                ).transpose(0, 1) - 1
+            return torch.empty((particles, 0), dtype=observed.dtype, device=observed.device)
+
+        for feature_index in SAFE_PARTICLE_FEATURES:
+            sampled_features[feature_index] = sample_feature(feature_index)
+        sampled_features[14] = sample_feature(14)
+        sampled_features[4] = sample_feature(4)
+        city_present = sampled_features[14] == 2
+        unit_present = sampled_features[4] >= 1
+        for feature_index in CITY_PARTICLE_FEATURES:
+            samples = sample_feature(feature_index)
+            sampled_features[feature_index] = torch.where(
+                city_present, samples, torch.full_like(samples, -1)
+            )
+        for feature_index in UNIT_PARTICLE_FEATURES:
+            if feature_index == 4:
+                continue
+            samples = sample_feature(feature_index)
+            sampled_features[feature_index] = torch.where(
+                unit_present, samples, torch.full_like(samples, -1)
+            )
 
         result: List[torch.Tensor] = []
         observed_cpu = observed.to(device="cpu")
@@ -769,19 +790,38 @@ class PolicyValueBeliefNet(nn.Module):
         batch, tiles, _ = observed.shape
         hidden = ~known
         sampled_features: dict[int, torch.Tensor] = {}
-        for feature_index in (*SAFE_PARTICLE_FEATURES, 14, *CITY_PARTICLE_FEATURES, *UNIT_PARTICLE_FEATURES):
+
+        def sample_feature(feature_index: int) -> torch.Tensor:
             logits = belief_logits[feature_index]
             if temperature <= 0.0:
-                samples = logits.argmax(dim=-1) - 1
-            else:
-                scaled = logits / max(float(temperature), 1e-4)
-                probabilities = torch.softmax(scaled, dim=-1).reshape(-1, scaled.shape[-1])
-                samples = torch.multinomial(probabilities, 1).reshape(batch, tiles) - 1
+                return logits.argmax(dim=-1) - 1
+            scaled = logits / max(float(temperature), 1e-4)
+            probabilities = torch.softmax(scaled, dim=-1).reshape(-1, scaled.shape[-1])
+            return torch.multinomial(probabilities, 1).reshape(batch, tiles) - 1
+
+        for feature_index in SAFE_PARTICLE_FEATURES:
+            samples = sample_feature(feature_index)
             sampled_features[feature_index] = samples
             if feature_index in SAFE_PARTICLE_FEATURES:
                 completed[..., feature_index] = torch.where(
                     hidden, samples.to(completed.dtype).clamp_min(0), completed[..., feature_index]
                 )
+        sampled_features[14] = sample_feature(14)
+        sampled_features[4] = sample_feature(4)
+        city_present = sampled_features[14] == 2
+        unit_present = sampled_features[4] >= 1
+        for feature_index in CITY_PARTICLE_FEATURES:
+            samples = sample_feature(feature_index)
+            sampled_features[feature_index] = torch.where(
+                city_present, samples, torch.full_like(samples, -1)
+            )
+        for feature_index in UNIT_PARTICLE_FEATURES:
+            if feature_index == 4:
+                continue
+            samples = sample_feature(feature_index)
+            sampled_features[feature_index] = torch.where(
+                unit_present, samples, torch.full_like(samples, -1)
+            )
         completed[known] = observed[known]
         completed[..., 0] = observed[..., 0]
         # SelfPlayPool needs a CPU ``int32`` packet. Move once before the

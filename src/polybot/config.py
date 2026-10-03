@@ -107,6 +107,12 @@ class TrainingConfig:
     # water tile; learning the relation directly is much more sample-efficient
     # than treating every terrain token as independent.
     bridge_constraint_weight: float = 1.0
+    # Rare hidden cities and units determine routes, captures and builds. A
+    # focal term keeps their presence heads from winning by predicting empty
+    # tiles everywhere; the consistency term prevents structurally impossible
+    # combinations such as a predicted city on predicted water.
+    belief_presence_focal_gamma: float = 1.5
+    belief_entity_consistency_weight: float = 0.35
 
     # Small economy shaping plus explicit strategic capture bonuses. Terminal
     # win/loss always remains +/-1 and is the dominant value target.

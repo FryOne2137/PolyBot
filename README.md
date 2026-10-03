@@ -233,6 +233,17 @@ pozycja jest odrzucana. Osłona rootu pozostaje dodatkową ochroną mapowania
 akcji, ale nie może naprawić wizyt wykonanych w niemożliwym świecie. Dla
 MCTS należy używać `--belief-action-equivalence-target 0.02` lub niżej.
 
+Decoder belief ma też focal loss dla obecności ukrytych miast/jednostek
+(`--belief-presence-focal-gamma`, domyślnie `1.5`) oraz
+`belief_entity_consistency_loss` (`--belief-entity-consistency-weight`,
+domyślnie `0.35`). Ten drugi karze m.in. miasto na przewidywanej wodzie i
+atrybuty miasta/jednostki na tile'u, na którym decoder przewiduje brak encji.
+Particle są próbkowane sekwencyjnie: statyczny teren, obecność encji, następnie
+atrybuty tylko dla faktycznie wylosowanych encji. Log kalibracji zawiera odtąd
+osobno wynik `collection` i stały `held-out mismatch` po aktualizacji;
+parametr `--belief-calibration-eval-games` (domyślnie 8) kontroluje koszt tej
+oceny bez gradientu.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

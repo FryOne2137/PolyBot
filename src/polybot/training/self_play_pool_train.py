@@ -38,6 +38,7 @@ from .belief_recovery import (
     BeliefQualityError,
     capped_update_target,
     effective_replay_epochs,
+    ismcts_action_difference_rejections,
     ismcts_rejected_envs,
     particle_temperature,
     recovery_rate_exceeded,
@@ -373,6 +374,60 @@ def _format_belief_action(action: Dict[str, Any]) -> str:
     return f"{name}(id={action_id}, src={source}, dst={target})"
 
 
+def _engine_action_constraint_targets(
+    differences: Sequence[Mapping[str, Any]],
+    request: Mapping[str, np.ndarray],
+    actors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, int | float]]:
+    """Convert public action mismatches into local hidden-tile focus masks.
+
+    PolyEnv is only the rules oracle here: each record says that a sampled
+    determinization has an extra/missing public action. The supervised map
+    target and the actual loss remain entirely in PolyBot. For endpoint-less
+    path/rule differences, all hidden tiles of that mismatched position are a
+    conservative focus region; no hidden state is invented.
+    """
+    maps = np.asarray(request["map_tokens"], dtype=np.int32)
+    actor_ids = np.asarray(actors, dtype=np.int64)
+    masks = np.zeros(maps.shape[:2], dtype=bool)
+    scores = np.zeros(maps.shape[0], dtype=np.float32)
+    metrics: Dict[str, int | float] = {
+        "particles": 0,
+        "missing_actions": 0,
+        "extra_actions": 0,
+        "score": 0.0,
+    }
+    tiles = maps.shape[1]
+    for raw in differences:
+        env = int(raw.get("env_id", -1))
+        player = int(raw.get("player", -1))
+        if not 0 <= env < maps.shape[0] or player != int(actor_ids[env]):
+            continue
+        missing = tuple(raw.get("missing_actions", ()) or ())
+        extra = tuple(raw.get("extra_actions", ()) or ())
+        if not missing and not extra:
+            continue
+        metrics["particles"] = int(metrics["particles"]) + 1
+        metrics["missing_actions"] = int(metrics["missing_actions"]) + len(missing)
+        metrics["extra_actions"] = int(metrics["extra_actions"]) + len(extra)
+        score = float(len(missing) + 2 * len(extra))
+        scores[env] += score
+        metrics["score"] = float(metrics["score"]) + score
+        had_endpoint = False
+        for action in (*missing, *extra):
+            if not isinstance(action, Mapping):
+                continue
+            for key in ("source_index", "target_index"):
+                index = int(action.get(key, -1))
+                if 0 <= index < tiles and maps[env, index, 0] == 0:
+                    masks[env, index] = True
+                    had_endpoint = True
+        if not had_endpoint and not masks[env].any():
+            masks[env] = maps[env, :, 0] == 0
+    metrics["tiles"] = int(masks.sum())
+    return masks, scores, metrics
+
+
 def _log_belief_reset_diagnostics(
     pool: object,
     state_ids: np.ndarray,
@@ -590,6 +645,17 @@ def train_self_play_pool(
     # The persistent native scheduler can safely use a handful of in-flight
     # leaves per tree; virtual loss prevents duplicate branch work.
     pool.configure_search(max_pending_leaves, 1.0, 0, 0)
+    collect_engine_action_constraints = (
+        training.engine_action_constraint_weight > 0.0
+    )
+    if collect_engine_action_constraints and not callable(
+        getattr(pool, "ismcts_belief_action_differences", None)
+    ):
+        raise RuntimeError(
+            "Installed PolyEnv is missing SelfPlayPool."
+            "ismcts_belief_action_differences required by "
+            "--engine-action-constraint-weight"
+        )
     request, request_owners = _allocate_native_buffers(pool, "belief_batch_spec", device)
     root, root_owners = _allocate_native_buffers(pool, "root_policy_spec", device)
     all_players_buffer, all_player_owners = _allocate_native_buffers(
@@ -642,6 +708,14 @@ def train_self_play_pool(
     anchor_l1_sum = 0.0
     action_pruning = ActionPruningStats()
     root_restriction = RootRestrictionStats()
+    engine_constraint_metrics: Dict[str, float] = {
+        "queries": 0.0,
+        "particles": 0.0,
+        "missing_actions": 0.0,
+        "extra_actions": 0.0,
+        "tiles": 0.0,
+        "score": 0.0,
+    }
     model.eval()
 
     def add_action_pruning(stats: ActionPruningStats) -> None:
@@ -738,6 +812,12 @@ def train_self_play_pool(
             ),
             "curriculum_scale": float(curriculum_scale),
             "mean_leaf_batch": float(np.mean(leaf_counts)) if leaf_counts else 0.0,
+            "belief_engine_action_constraint_queries": engine_constraint_metrics["queries"],
+            "belief_engine_action_constraint_particles": engine_constraint_metrics["particles"],
+            "belief_engine_action_constraint_missing_actions": engine_constraint_metrics["missing_actions"],
+            "belief_engine_action_constraint_extra_actions": engine_constraint_metrics["extra_actions"],
+            "belief_engine_action_constraint_tiles": engine_constraint_metrics["tiles"],
+            "belief_engine_action_constraint_score": engine_constraint_metrics["score"],
         }
         metrics.update(action_pruning_metrics())
         if losses:
@@ -758,6 +838,9 @@ def train_self_play_pool(
                 rng,
                 training.priority_replay_fraction,
                 training.bridge_replay_fraction,
+                engine_action_constraint_fraction=(
+                    training.engine_action_constraint_replay_fraction
+                ),
             )
             losses.append(train_batch(model, optimiser, stack_examples(batch, device), training))
             optimisation_updates += 1
@@ -836,7 +919,9 @@ def train_self_play_pool(
                         model,
                         device,
                         training,
-                        particle_temperature(max(mcts.temperature, 0.35), attempt, particle),
+                        particle_temperature(
+                            mcts.belief_particle_temperature, attempt, particle
+                        ),
                     )
                     for particle in range(particle_count)
                 ], axis=2)
@@ -851,7 +936,9 @@ def train_self_play_pool(
                     actor_completed = model.sample_completed_map_batch_from_belief_logits(
                         local_maps,
                         local_logits,
-                        temperature=particle_temperature(0.0, attempt, particle),
+                        temperature=particle_temperature(
+                            mcts.belief_particle_temperature, attempt, particle
+                        ),
                         perspective_players=torch.as_tensor(
                             local_actors, dtype=torch.long, device=device
                         ),
@@ -868,6 +955,29 @@ def train_self_play_pool(
 
             all_rows = np.arange(num_envs, dtype=np.int32)
             particles = np.ascontiguousarray(learned_rows(all_rows, 0))
+            engine_action_constraint_tiles = None
+            engine_action_constraint_scores = None
+            if collect_engine_action_constraints:
+                (
+                    _,
+                    _,
+                    _,
+                    initial_action_differences,
+                ) = ismcts_action_difference_rejections(pool, state_ids, particles)
+                (
+                    engine_action_constraint_tiles,
+                    engine_action_constraint_scores,
+                    constraint_step_metrics,
+                ) = _engine_action_constraint_targets(
+                    initial_action_differences, request, actors
+                )
+                engine_constraint_metrics["queries"] += 1.0
+                for key in (
+                    "particles", "missing_actions", "extra_actions", "tiles", "score"
+                ):
+                    engine_constraint_metrics[key] += float(
+                        constraint_step_metrics[key]
+                    )
             submitted = False
             rejected_rows = all_rows
             retry_pending_envs = 0
@@ -1087,6 +1197,12 @@ def train_self_play_pool(
                         leaf_tensors.action_mask,
                         mcts.teacher_prior_weight * curriculum_scale,
                         mcts.strategic_prior_weight * curriculum_scale,
+                        capture_city_bonus=mcts.capture_city_prior_bonus,
+                        capture_capital_bonus=mcts.capture_capital_prior_bonus,
+                        found_city_bonus=mcts.found_city_prior_bonus,
+                        attack_bonus=mcts.attack_prior_bonus,
+                        end_turn_penalty=mcts.end_turn_prior_penalty,
+                        map_tokens=leaf_tensors.map_tokens,
                     ).to(leaf_output.policy_logits.dtype)
                     logits, selected, pruning = prune_search_logits(
                         logits,
@@ -1094,6 +1210,7 @@ def train_self_play_pool(
                         leaf_tensors.action_mask,
                         top_actions=mcts.search_top_actions,
                         random_actions=mcts.search_random_actions,
+                        min_prior_mass=mcts.search_min_prior_mass,
                         generator=action_generator,
                     )
                     add_action_pruning(pruning)
@@ -1189,6 +1306,8 @@ def train_self_play_pool(
                 anchor_policy_weight=anchor_policy_weight,
                 anchor_value=anchor_value,
                 anchor_value_weight=anchor_value_weight,
+                engine_action_constraint_tiles=engine_action_constraint_tiles,
+                engine_action_constraint_scores=engine_action_constraint_scores,
             )
             for index, example in enumerate(examples):
                 example.bootstrap_value = float(root_values[index])
@@ -1312,6 +1431,12 @@ def train_self_play_pool(
         "replay_examples": float(len(replay)),
         "mcts_top_actions": float(mcts.search_top_actions),
         "mcts_random_actions": float(mcts.search_random_actions),
+        "belief_engine_action_constraint_queries": engine_constraint_metrics["queries"],
+        "belief_engine_action_constraint_particles": engine_constraint_metrics["particles"],
+        "belief_engine_action_constraint_missing_actions": engine_constraint_metrics["missing_actions"],
+        "belief_engine_action_constraint_extra_actions": engine_constraint_metrics["extra_actions"],
+        "belief_engine_action_constraint_tiles": engine_constraint_metrics["tiles"],
+        "belief_engine_action_constraint_score": engine_constraint_metrics["score"],
     }
     summary.update(action_pruning_metrics())
     summary.update({f"self_play_pool_belief_rejection_{kind}": float(count)

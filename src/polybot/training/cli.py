@@ -35,6 +35,11 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bridge-replay-fraction", type=float, default=0.25)
     parser.add_argument("--engine-action-constraint-replay-fraction", type=float, default=0.25)
     parser.add_argument("--max-replay-epochs", type=float, default=6.0)
+    parser.add_argument("--capture-city-prior-bonus", type=float, default=2.0)
+    parser.add_argument("--capture-capital-prior-bonus", type=float, default=4.0)
+    parser.add_argument("--found-city-prior-bonus", type=float, default=3.0)
+    parser.add_argument("--attack-prior-bonus", type=float, default=0.8)
+    parser.add_argument("--end-turn-prior-penalty", type=float, default=2.0)
 
 
 def add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -102,6 +107,11 @@ def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
         search_min_prior_mass=getattr(args, "mcts_min_prior_mass", 0.0),
         strategic_prior_weight=getattr(args, "strategic_prior_weight", 1.0),
         teacher_prior_weight=getattr(args, "teacher_prior_weight", 0.20),
+        capture_city_prior_bonus=getattr(args, "capture_city_prior_bonus", 2.0),
+        capture_capital_prior_bonus=getattr(args, "capture_capital_prior_bonus", 4.0),
+        found_city_prior_bonus=getattr(args, "found_city_prior_bonus", 3.0),
+        attack_prior_bonus=getattr(args, "attack_prior_bonus", 0.8),
+        end_turn_prior_penalty=getattr(args, "end_turn_prior_penalty", 2.0),
     )
 
 

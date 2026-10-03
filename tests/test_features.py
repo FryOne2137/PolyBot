@@ -6,6 +6,7 @@ from polybot.data.polyenv_features import (
     event_action_history,
     event_summary,
     global_features_from_obs,
+    native_capture_flags,
     vector_event_action_history,
     vector_event_summary,
 )
@@ -65,6 +66,35 @@ def test_global_feature_vector_is_stable_when_optional_obs_keys_are_absent():
     vector = global_features_from_obs({"turn": 3, "stars": 5, "map_type": "lakes"})
     assert vector.shape == (9,)
     assert np.isfinite(vector).all()
+
+
+def test_scalar_pending_city_feature_matches_native_id_scaling():
+    vector = global_features_from_obs({"pending_city_id": 513})
+
+    assert vector[6] == np.float32(513.0 / 1024.0)
+
+
+def test_native_capture_flags_exclude_found_city_and_detect_visible_capital():
+    batch = {
+        "action_features": np.zeros((2, 2, 17), dtype=np.int32),
+        "map_tokens": np.full((2, 4, 23), -1, dtype=np.int32),
+    }
+    # First row is found_city, second is capture_city targeting city 7.
+    batch["action_features"][:, :, 0] = 8
+    batch["action_features"][0, 0, 8] = 11
+    batch["action_features"][1, 1, 8] = 14
+    batch["action_features"][1, 1, 3] = 7
+    batch["map_tokens"][1, 2, 15] = 7
+    batch["map_tokens"][1, 2, 9] = 1
+
+    city, capital = native_capture_flags(
+        batch,
+        np.asarray([0, 1], dtype=np.int32),
+        np.asarray([True, True]),
+    )
+
+    assert city.tolist() == [False, True]
+    assert capital.tolist() == [False, True]
 
 
 def test_event_summary_contains_no_runtime_ids():

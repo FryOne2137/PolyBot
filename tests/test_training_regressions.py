@@ -85,6 +85,7 @@ from polybot.training.routed_self_play_pool import (
 )
 from polybot.training.self_play_pool_train import (
     _belief_rejection_kind,
+    _engine_action_constraint_targets,
     _finish_trajectory,
     _root_examples,
     _scheduled_updates,
@@ -2024,6 +2025,31 @@ def test_zero_prior_weights_remove_hand_written_leaf_bias():
     assert anchored[0, 0] > anchored[0, 1]
 
 
+def test_native_leaf_bias_uses_configured_city_and_capital_bonuses():
+    categorical = torch.full((1, 2, 12), -1, dtype=torch.long)
+    categorical[0, :, 0] = 8
+    categorical[0, :, 9] = 14
+    categorical[0, :, 4] = torch.tensor([5, 7])
+    continuous = torch.zeros((1, 2, 4))
+    mask = torch.ones((1, 2), dtype=torch.bool)
+    tokens = torch.full((1, 3, 23), -1, dtype=torch.long)
+    tokens[0, 1, 15] = 7
+    tokens[0, 1, 9] = 1
+
+    bias = _native_leaf_bias(
+        categorical,
+        continuous,
+        mask,
+        teacher_prior_weight=0.0,
+        strategic_prior_weight=1.0,
+        capture_city_bonus=1.25,
+        capture_capital_bonus=4.5,
+        map_tokens=tokens,
+    )
+
+    torch.testing.assert_close(bias, torch.tensor([[1.25, 4.5]]))
+
+
 def test_checkpoint_belief_warmup_freezes_policy_value_parameters():
     model = PolicyValueBeliefNet(
         ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
@@ -2525,6 +2551,45 @@ def test_action_pruning_expands_top_k_for_required_prior_mass():
 
     assert selected.sum().item() == 3
     assert stats.prior_mass_retained_sum >= 0.90
+
+
+def test_action_pruning_never_clears_action_zero_while_expanding_prior_mass():
+    # Before the regression fix, all ranks outside the adaptive range were
+    # redirected to index zero and scattered as False, removing this action.
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+    categorical = torch.zeros((1, 4, 12), dtype=torch.long)
+    legal = torch.ones((1, 4), dtype=torch.bool)
+
+    _, selected, _ = prune_search_logits(
+        logits, categorical, legal, top_actions=1, min_prior_mass=0.80
+    )
+
+    assert selected[0, 0]
+    assert selected.sum().item() >= 2
+
+
+def test_engine_action_constraints_focus_hidden_mismatch_endpoints():
+    request = {
+        "map_tokens": np.zeros((1, 4, 23), dtype=np.int32),
+    }
+    request["map_tokens"][0, :, 0] = np.asarray([1, 0, 0, 1])
+    masks, scores, metrics = _engine_action_constraint_targets(
+        (
+            {
+                "env_id": 0,
+                "player": 1,
+                "missing_actions": ({"source_index": 0, "target_index": 1},),
+                "extra_actions": ({"source_index": 2, "target_index": 3},),
+            },
+        ),
+        request,
+        np.asarray([1], dtype=np.int64),
+    )
+
+    assert masks.tolist() == [[False, True, True, False]]
+    assert scores.tolist() == [3.0]
+    assert metrics["missing_actions"] == 1
+    assert metrics["extra_actions"] == 1
 
 
 def test_zero_top_actions_is_an_exact_backwards_compatible_off_switch():

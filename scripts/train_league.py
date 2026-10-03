@@ -37,7 +37,15 @@ def _simulation_ladder(value: str) -> tuple[int, ...]:
     return result
 
 
-def main() -> None:
+def main(*, fixed_training_stage: str | None = None) -> None:
+    """Run the league trainer.
+
+    Dedicated entry points use ``fixed_training_stage`` so the belief and MCTS
+    phases cannot accidentally be mixed by a command-line flag.  The original
+    script keeps its ``auto`` mode for backwards-compatible experiments.
+    """
+    if fixed_training_stage not in {None, "belief", "mcts"}:
+        raise ValueError("fixed_training_stage must be None, 'belief' or 'mcts'")
     parser = argparse.ArgumentParser(
         description="Train against a historical population and save only robust promotions"
     )
@@ -54,6 +62,20 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/league"))
     parser.add_argument("--checkpoint-prefix", default="champion")
+    if fixed_training_stage is None:
+        parser.add_argument(
+            "--training-stage",
+            choices=("auto", "belief", "mcts"),
+            default="auto",
+            help=(
+                "auto keeps the guarded curriculum; belief runs only the frozen "
+                "belief-calibration stage; mcts requires an accepted belief checkpoint "
+                "and runs the MCTS policy/value stage without a fresh strict "
+                "belief-calibration generation."
+            ),
+        )
+    else:
+        parser.set_defaults(training_stage=fixed_training_stage)
     parser.add_argument(
         "--league-db", type=Path,
         help="SQLite history (default: <checkpoint-dir>/league.sqlite3)",
@@ -666,7 +688,7 @@ def main() -> None:
     print(
         f"device: {select_device(training.device)} | league rounds: "
         f"{args.rounds} | visible action history: "
-        f"{args.visible_action_history} | PPG: "
+        f"{args.visible_action_history} | stage: {args.training_stage} | PPG: "
         f"{'on' if args.direct_population_ppg else 'off'}",
         flush=True,
     )
@@ -675,6 +697,7 @@ def main() -> None:
         champion_in=args.champion_in,
         challenger_in=args.challenger_in,
         checkpoint_dir=args.checkpoint_dir,
+        training_stage=args.training_stage,
         rounds=args.rounds,
         promotion_games=args.promotion_games,
         promotion_score=args.promotion_score,

@@ -378,6 +378,27 @@ kalibracji MCTS może być targetem dla policy/value. Ścieżkę i próg reguluj
 `--belief-apprentice-path`, `--belief-action-equivalence-target` oraz
 `--belief-action-equivalence-min-particles`.
 
+### Jawne, rozdzielone etapy belief i MCTS
+
+Dedykowane entrypointy to `scripts/train_belief.py` oraz
+`scripts/train_league_mcts.py`. Pierwszy uruchamia wyłącznie zamrożoną kalibrację
+decoderów belief i zapisuje wyłącznie `*-belief-apprentice.pt`; nie wykonuje
+aktualizacji policy/value ani promocji. Drugi wymaga dla tego samego championa
+checkpointu apprentice, który przeszedł held-out próg action mismatch. Dzięki
+temu nie da się przypadkiem destylować policy z MCTS zbudowanego na
+niezaakceptowanym beliefie. `train_league.py --training-stage ...` zostaje jako
+zgodny wstecz, eksperymentalny entrypoint.
+
+W etapie MCTS zwykły loss belief pozostaje małym loss-em pomocniczym z etykietą
+pełnej mapy, aby aktualizacja wspólnego transformera nie rozregulowała decoderów.
+Nie jest to jednak strict calibration: nie zmienia admission checkpointu ani nie
+pozwala MCTS wystartować bez wcześniej zaakceptowanego beliefu.
+
+W obu jawnych trybach `--steps 0 --updates 0` jest obowiązkowe; generację
+obsługuje wyłącznie `--population-games`, a liczbę update'ów
+`--population-updates-per-game`. Etap MCTS wymaga też
+`--value-bootstrap-games 0`, bo bootstrap value/belief należy do etapu belief.
+
 Po kalibracji liga może użyć `--population-belief-search-mode root_shield`.
 Tryb zachowuje strict checker dla kalibracji i ewaluacji, lecz podczas zwykłego
 generowania policy/value nie losuje ponownie particle'a tylko dlatego, że jego
@@ -562,7 +583,8 @@ src/polybot/
     └── model_io.py               read/write model weights only
 
 scripts/
-├── train_belief.py               stage 1: belief warm-up
+├── train_belief.py               stage 1: strict belief calibration
+├── train_league_mcts.py          stage 2: gated league MCTS training
 ├── train_teacher.py              stage 2: scalar heuristic teacher
 ├── train_vector_teacher.py       stage 3: native C++ vector curriculum
 ├── train_self_play.py            stage 4: scalar MCTS self-play

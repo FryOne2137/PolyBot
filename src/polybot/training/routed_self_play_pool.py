@@ -17,7 +17,11 @@ import torch
 from tqdm.auto import tqdm
 
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
-from ..data.polyenv_features import native_batch_to_tensors, stack_examples
+from ..data.polyenv_features import (
+    native_batch_to_tensors,
+    native_capture_flags,
+    stack_examples,
+)
 from ..infrastructure.device import select_device
 from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
@@ -1378,6 +1382,12 @@ class RoutedPoolSearch:
                 tensors.action_mask,
                 self.mcts.teacher_prior_weight * prior_scale,
                 self.mcts.strategic_prior_weight * prior_scale,
+                capture_city_bonus=self.mcts.capture_city_prior_bonus,
+                capture_capital_bonus=self.mcts.capture_capital_prior_bonus,
+                found_city_bonus=self.mcts.found_city_prior_bonus,
+                attack_bonus=self.mcts.attack_prior_bonus,
+                end_turn_penalty=self.mcts.end_turn_prior_penalty,
+                map_tokens=tensors.map_tokens,
             ).to(output.policy_logits.dtype)
             routed_logits, selected, pruning = prune_search_logits(
                 routed_logits,
@@ -2163,18 +2173,16 @@ def evaluate_matches_pool(
                 totals["model_a_particles"] += float(
                     candidate_turns.sum() * max(1, int(mcts.particles))
                 )
-                chosen = np.asarray(request["action_features"], dtype=np.int32)[
-                    active_rows, action_rows[active_rows]
-                ]
-                city = (chosen[:, 0] == 8) & np.isin(chosen[:, 8], (11, 14))
-                capital = (chosen[:, 0] == 8) & (chosen[:, 8] == 14)
-                for offset, env in enumerate(active_rows):
+                city_by_env, capital_by_env = native_capture_flags(
+                    request, action_rows, active
+                )
+                for env in active_rows:
                     if candidate_turns[env]:
-                        candidate_city_captures[env] += int(city[offset])
-                        candidate_capital_captures[env] += int(capital[offset])
+                        candidate_city_captures[env] += int(city_by_env[env])
+                        candidate_capital_captures[env] += int(capital_by_env[env])
                     else:
-                        opponent_city_captures[env] += int(city[offset])
-                        opponent_capital_captures[env] += int(capital[offset])
+                        opponent_city_captures[env] += int(city_by_env[env])
+                        opponent_capital_captures[env] += int(capital_by_env[env])
                 search.pool.step_into_checked(
                     actions,
                     np.asarray(root["state_id"], dtype=np.uint64),

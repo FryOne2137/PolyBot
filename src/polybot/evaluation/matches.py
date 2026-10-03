@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from ..config import MCTSConfig, TrainingConfig
 from ..data.polyenv_features import (
     capture_flags,
+    native_capture_flags,
     native_batch_to_tensors,
     packet_to_tensors,
     visible_events_or_empty,
@@ -25,7 +26,12 @@ def _paired_seed_and_slot(base_seed: int, game_index: int) -> tuple[int, int]:
     return int(base_seed) + int(game_index) // 2, int(game_index) % 2
 
 
-def _new_env(seed: int, training: TrainingConfig) -> object:
+def _new_env(
+    seed: int,
+    training: TrainingConfig,
+    *,
+    visible_action_history: int = 0,
+) -> object:
     try:
         from PolyEnv import Bardur, GameEnv, Imperius
     except ImportError as error:
@@ -35,6 +41,7 @@ def _new_env(seed: int, training: TrainingConfig) -> object:
         map_size=training.map_size,
         players=(Bardur, Imperius),
         map_type=training.map_type,
+        visible_event_history=int(visible_action_history),
     )
 
 
@@ -46,6 +53,8 @@ def evaluate_matches(
     games: int,
     model_b: Optional[PolicyValueBeliefNet] = None,
     game_callback: Optional[Callable[[Dict[str, float | int]], None]] = None,
+    *,
+    visible_action_history: int = 0,
 ) -> Dict[str, float]:
     """Evaluate A against random play or B on fixed seeds with greedy MCTS.
 
@@ -57,8 +66,18 @@ def evaluate_matches(
     model_a.eval()
     if model_b is not None:
         model_b.eval()
-    planner_a = BeliefMCTS(model_a, device, mcts, map_size=training.map_size, map_type=training.map_type)
-    planner_b = BeliefMCTS(model_b, device, mcts, map_size=training.map_size, map_type=training.map_type) if model_b is not None else None
+    if not 0 <= int(visible_action_history) <= 1024:
+        raise ValueError("visible_action_history must be between 0 and 1024")
+    planner_a = BeliefMCTS(
+        model_a, device, mcts, map_size=training.map_size,
+        map_type=training.map_type,
+        visible_action_history=visible_action_history,
+    )
+    planner_b = BeliefMCTS(
+        model_b, device, mcts, map_size=training.map_size,
+        map_type=training.map_type,
+        visible_action_history=visible_action_history,
+    ) if model_b is not None else None
     rng = np.random.default_rng(training.seed)
     totals: Dict[str, float] = {
         "games": float(games),
@@ -82,7 +101,10 @@ def evaluate_matches(
             # This controls map-specific first-player bias instead of merely
             # alternating slots across two unrelated maps.
             map_seed, model_a_player = _paired_seed_and_slot(training.seed, game_index)
-            env = _new_env(map_seed, training)
+            env = _new_env(
+                map_seed, training,
+                visible_action_history=visible_action_history,
+            )
             before = totals.copy()
             moves = 0
             winner = -1
@@ -180,6 +202,7 @@ def evaluate_matches(
     totals["mean_model_a_particles"] = (
         totals["model_a_particles"] / max(1, totals["model_a_decisions"])
     )
+    totals["visible_action_history"] = float(visible_action_history)
     return totals
 
 
@@ -379,28 +402,8 @@ def _vector_capture_flags(
     selected_rows: np.ndarray,
     active: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Vectorized equivalent of ``capture_flags`` for native action rows."""
-    rows = np.flatnonzero(active)
-    city = np.zeros(active.shape[0], dtype=bool)
-    capital = np.zeros(active.shape[0], dtype=bool)
-    if not rows.size:
-        return city, capital
-    choices = selected_rows[rows]
-    features = np.asarray(batch["action_features"], dtype=np.int32)[
-        rows, choices
-    ]
-    city[rows] = (features[:, 0] == 8) & (features[:, 8] == 14)
-    city_positions = np.flatnonzero(city[rows])
-    for position in city_positions:
-        row = int(rows[position])
-        city_id = int(features[position, 3])
-        if city_id < 0:
-            continue
-        tokens = np.asarray(batch["map_tokens"], dtype=np.int32)[row]
-        capital[row] = bool(
-            np.any((tokens[:, 15] == city_id) & (tokens[:, 9] == 1))
-        )
-    return city, capital
+    """Compatibility wrapper for the shared native capture classifier."""
+    return native_capture_flags(batch, selected_rows, active)
 
 
 def evaluate_direct_matches(

@@ -281,7 +281,14 @@ def _scalar(value: Any, default: float = 0.0) -> float:
 def global_features_from_obs(obs: Dict[str, Any]) -> np.ndarray:
     """Small, stable global vector; unknown keys are deliberately ignored."""
     map_type = str(obs.get("map_type", "lakes")).lower()
-    pending = obs.get("pending_city_reward", obs.get("pending_city_rewards", 0))
+    # Scalar ``GameEnv`` exposes the city which still needs a reward choice as
+    # ``pending_city_id``.  The native path stores the same id in state[8].
+    # Older PolyEnv packet names remain as a compatibility fallback, but must
+    # not shadow the current field.
+    pending = obs.get(
+        "pending_city_id",
+        obs.get("pending_city_reward", obs.get("pending_city_rewards", -1)),
+    )
     values = [
         _scalar(obs.get("turn")) / 100.0,
         _scalar(obs.get("current_player", obs.get("player"))) / 16.0,
@@ -289,7 +296,9 @@ def global_features_from_obs(obs: Dict[str, Any]) -> np.ndarray:
         _scalar(obs.get("next_turn_star_income", obs.get("income"))) / 20.0,
         _scalar(obs.get("owns_units", obs.get("own_units", obs.get("units")))) / 32.0,
         _scalar(obs.get("own_cities", obs.get("cities"))) / 16.0,
-        _scalar(pending),
+        # Match ``native_batch_to_tensors``: this is an identifier/presence
+        # feature, not an unbounded reward magnitude.
+        max(_scalar(pending), 0.0) / 1024.0,
         _scalar(obs.get("map_size")) / 32.0,
         1.0 if map_type == "drylands" else 0.0,
     ]
@@ -388,6 +397,42 @@ def capture_flags(packet: Dict[str, Any], action_row: int) -> tuple[bool, bool]:
     city_id = city_ids[action_row]
     capital = bool(np.any((tokens[:, 15] == city_id) & (tokens[:, 9] == 1)))
     return True, capital
+
+
+def native_capture_flags(
+    batch: Dict[str, np.ndarray],
+    selected_rows: np.ndarray,
+    active: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return capture-city/capital flags for selected native action rows.
+
+    A native action with tile action 11 is *found city*, not capture city.  A
+    tile action 14 is a capture; its city id can then be matched against the
+    already-visible map to distinguish a capital.  Keeping this in the shared
+    feature adapter prevents league evaluation and direct evaluation from
+    drifting into different, misleading diagnostics.
+    """
+    active = np.asarray(active, dtype=bool)
+    rows = np.flatnonzero(active)
+    city = np.zeros(active.shape[0], dtype=bool)
+    capital = np.zeros(active.shape[0], dtype=bool)
+    if not rows.size:
+        return city, capital
+    selected_rows = np.asarray(selected_rows, dtype=np.int64)
+    features = np.asarray(batch["action_features"], dtype=np.int32)[
+        rows, selected_rows[rows]
+    ]
+    city[rows] = (features[:, 0] == 8) & (features[:, 8] == 14)
+    for offset in np.flatnonzero(city[rows]):
+        row = int(rows[offset])
+        city_id = int(features[offset, 3])
+        if city_id < 0:
+            continue
+        tokens = np.asarray(batch["map_tokens"], dtype=np.int32)[row]
+        capital[row] = bool(
+            np.any((tokens[:, 15] == city_id) & (tokens[:, 9] == 1))
+        )
+    return city, capital
 
 
 def strategic_action_bias(

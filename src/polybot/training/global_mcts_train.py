@@ -56,29 +56,58 @@ def _native_leaf_bias(
     mask: torch.Tensor,
     teacher_prior_weight: float,
     strategic_prior_weight: float = 1.0,
+    *,
+    capture_city_bonus: float = 2.0,
+    capture_capital_bonus: float = 4.0,
+    found_city_bonus: float = 3.0,
+    attack_bonus: float = 0.8,
+    end_turn_penalty: float = 2.0,
+    map_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Visible-only priors for every native MCTS leaf, not just the root."""
     action_type, tile_action = categorical[..., 0], categorical[..., 9]
     damage = continuous[..., 2].clamp_min(0)
+    captures_city = (action_type == 8) & (tile_action == 14)
+    captures_capital = torch.zeros_like(captures_city)
+    # The action's city id and the visible map are available in native leaf
+    # packets, so this matches the scalar strategic_action_bias distinction
+    # without consulting a hidden engine state.
+    if map_tokens is not None and map_tokens.ndim == 3:
+        city_ids = categorical[..., 4]
+        visible_capital = map_tokens[..., 9].eq(1)
+        same_city = map_tokens[..., 15].unsqueeze(1).eq(city_ids.unsqueeze(-1))
+        captures_capital = captures_city & (city_ids >= 0) & (
+            same_city & visible_capital.unsqueeze(1)
+        ).any(dim=-1)
+    captures_regular_city = captures_city & ~captures_capital
     curriculum = torch.zeros_like(action_type, dtype=torch.float32)
-    curriculum += ((action_type == 8) & (tile_action == 14)).float() * 2.0  # capture city
-    curriculum += ((action_type == 8) & (tile_action == 11)).float() * 3.0  # found city
-    curriculum += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
+    curriculum += captures_regular_city.float() * float(capture_city_bonus)
+    curriculum += captures_capital.float() * float(capture_capital_bonus)
+    curriculum += ((action_type == 8) & (tile_action == 11)).float() * float(found_city_bonus)
+    curriculum += (action_type == 1).float() * (
+        float(attack_bonus) + damage.clamp_max(10.0) * 0.12
+    )
     curriculum += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
-    curriculum -= (action_type == 3).float() * 2.0
+    curriculum -= (action_type == 3).float() * float(end_turn_penalty)
     bias = curriculum * float(np.clip(strategic_prior_weight, 0.0, 1.0))
     # The network still supplies every prior.  This decaying additive anchor
     # only stops early self-play from unlearning city capture/founding before
     # terminal games become common.  It is computed entirely from legal,
     # visible action features.
     teacher = torch.zeros_like(bias)
-    teacher += ((action_type == 8) & (tile_action == 14)).float() * 5.0
-    teacher += ((action_type == 8) & (tile_action == 11)).float() * 3.0
-    teacher += (action_type == 1).float() * (0.8 + damage.clamp_max(10.0) * 0.12)
+    # The teacher anchor uses the same configured strategic values.  Otherwise
+    # a non-zero teacher weight would silently override flags such as
+    # ``--capture-city-prior-bonus 0`` in native self-play.
+    teacher += captures_regular_city.float() * float(capture_city_bonus)
+    teacher += captures_capital.float() * float(capture_capital_bonus)
+    teacher += ((action_type == 8) & (tile_action == 11)).float() * float(found_city_bonus)
+    teacher += (action_type == 1).float() * (
+        float(attack_bonus) + damage.clamp_max(10.0) * 0.12
+    )
     teacher += ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
     teacher += ((action_type == 5) | (action_type == 6)).float() * 0.45
     teacher += ((action_type == 4) | (action_type == 7)).float() * 0.25
-    teacher -= (action_type == 3).float() * 2.0
+    teacher -= (action_type == 3).float() * float(end_turn_penalty)
     bias += teacher * float(np.clip(teacher_prior_weight, 0.0, 1.0))
     return bias.masked_fill(~mask, 0.0)
 
@@ -182,7 +211,7 @@ def _plan_many(
         belief_logits = [head[row:row + 1] for head in output.belief_logits]
         particles = model.sample_completed_maps_from_belief_logits(
             tensors.map_tokens[row:row + 1], belief_logits, config.particles,
-            max(config.temperature, 0.35),
+            config.belief_particle_temperature,
             action_categorical=tensors.action_categorical[row:row + 1],
             action_mask=tensors.action_mask[row:row + 1],
         )
@@ -223,6 +252,12 @@ def _plan_many(
         leaf_logits = leaf_output.policy_logits + _native_leaf_bias(
             leaf_tensors.action_categorical, leaf_tensors.action_continuous, leaf_tensors.action_mask,
             config.teacher_prior_weight, config.strategic_prior_weight,
+            capture_city_bonus=config.capture_city_prior_bonus,
+            capture_capital_bonus=config.capture_capital_prior_bonus,
+            found_city_bonus=config.found_city_prior_bonus,
+            attack_bonus=config.attack_prior_bonus,
+            end_turn_penalty=config.end_turn_prior_penalty,
+            map_tokens=leaf_tensors.map_tokens,
         ).to(leaf_output.policy_logits.dtype)
         leaf_logits = leaf_logits.float().cpu().numpy()
         if wave == 0:
@@ -503,7 +538,14 @@ def train_global_mcts_self_play(
                         policy = (1.0 - target_anchor) * policy + target_anchor * teacher_target
                     row, _ = _search_action(visits, priors, episode.rng, action_mcts)
                     if episode.rng.random() < training.exploration_rate * curriculum_scale:
-                        bias = strategic_action_bias(episode.env.model_request_numpy())
+                        bias = strategic_action_bias(
+                            episode.env.model_request_numpy(),
+                            capture_city_bonus=mcts.capture_city_prior_bonus,
+                            capture_capital_bonus=mcts.capture_capital_prior_bonus,
+                            found_city_bonus=mcts.found_city_prior_bonus,
+                            attack_bonus=mcts.attack_prior_bonus,
+                            end_turn_penalty=mcts.end_turn_prior_penalty,
+                        )
                         weights = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))
                         row = int(episode.rng.choice(len(weights), p=weights / weights.sum()))
                     _apply_action(episode, row, True, policy, training, bootstrap_value)

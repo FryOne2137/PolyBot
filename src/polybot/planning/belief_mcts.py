@@ -114,6 +114,7 @@ class BeliefMCTS:
         native_leaf_inference: Optional[NativeLeafInference] = None,
         map_size: int = 11,
         map_type: str = "lakes",
+        visible_action_history: int = 0,
         root_noise: bool = False,
         root_noise_rng: np.random.Generator | None = None,
     ) -> None:
@@ -124,6 +125,9 @@ class BeliefMCTS:
         self.native_leaf_inference = native_leaf_inference
         self.map_size = map_size
         self.map_type = map_type
+        if not 0 <= int(visible_action_history) <= 1024:
+            raise ValueError("visible_action_history must be between 0 and 1024")
+        self.visible_action_history = int(visible_action_history)
         # Explicit opt-in keeps evaluation and interactive MCTS deterministic.
         self.root_noise = bool(root_noise)
         self._root_noise_rng = root_noise_rng or np.random.default_rng()
@@ -225,19 +229,22 @@ class BeliefMCTS:
                 packet,
                 events,
                 self.config.particles,
-                max(self.config.temperature, 0.35),
+                self.config.belief_particle_temperature,
             )
 
         def sample() -> List[torch.Tensor]:
             if self.model is None or self.device is None:
                 raise RuntimeError("local particle sampling requires a model and device")
-            tensors = packet_to_tensors(packet, self.device, events)
+            tensors = packet_to_tensors(
+                packet, self.device, events,
+                visible_action_history=self.visible_action_history,
+            )
             perspective, city_count = _public_city_constraint(packet)
             return self.model.sample_completed_maps(
                 tensors.map_tokens,
                 tensors.global_features,
                 particles=self.config.particles,
-                temperature=max(self.config.temperature, 0.35),
+                temperature=self.config.belief_particle_temperature,
                 event_features=tensors.event_features,
                 action_categorical=tensors.action_categorical,
                 action_continuous=tensors.action_continuous,
@@ -267,7 +274,10 @@ class BeliefMCTS:
             return priors, self._particles(packet, events)
         if self.model is None or self.device is None:
             raise RuntimeError("local MCTS inference requires a model and device")
-        tensors = packet_to_tensors(packet, self.device, events)
+        tensors = packet_to_tensors(
+            packet, self.device, events,
+            visible_action_history=self.visible_action_history,
+        )
         perspective, city_count = _public_city_constraint(packet)
         output = self.model(
             tensors.map_tokens,
@@ -284,7 +294,7 @@ class BeliefMCTS:
             tensors.map_tokens,
             output.belief_logits,
             self.config.particles,
-            max(self.config.temperature, 0.35),
+            self.config.belief_particle_temperature,
             perspective_player=perspective,
             known_city_count=city_count,
             action_categorical=tensors.action_categorical,
@@ -309,6 +319,7 @@ class BeliefMCTS:
         categorical: torch.Tensor,
         continuous: torch.Tensor,
         mask: torch.Tensor,
+        map_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vectorised visible-action curriculum bias for MctsPool logits.
 
@@ -320,8 +331,21 @@ class BeliefMCTS:
         action_type = categorical[..., 0]
         tile_action = categorical[..., 9]
         damage = continuous[..., 2].clamp_min(0)
+        captures_city = (action_type == 8) & (tile_action == 14)
+        captures_capital = torch.zeros_like(captures_city)
+        if map_tokens is not None and map_tokens.ndim == 3:
+            city_ids = categorical[..., 4]
+            same_city = map_tokens[..., 15].unsqueeze(1).eq(
+                city_ids.unsqueeze(-1)
+            )
+            visible_capital = map_tokens[..., 9].eq(1).unsqueeze(1)
+            captures_capital = captures_city & (city_ids >= 0) & (
+                same_city & visible_capital
+            ).any(dim=-1)
+        captures_regular_city = captures_city & ~captures_capital
         curriculum = torch.zeros_like(action_type, dtype=torch.float32)
-        curriculum = curriculum + ((action_type == 8) & (tile_action == 14)).float() * self.config.capture_city_prior_bonus
+        curriculum = curriculum + captures_regular_city.float() * self.config.capture_city_prior_bonus
+        curriculum = curriculum + captures_capital.float() * self.config.capture_capital_prior_bonus
         curriculum = curriculum + ((action_type == 8) & (tile_action == 11)).float() * self.config.found_city_prior_bonus
         curriculum = curriculum + (action_type == 1).float() * (
             self.config.attack_prior_bonus + damage.clamp_max(10.0) * 0.12
@@ -333,15 +357,18 @@ class BeliefMCTS:
         # search.  It only sees the dense legal-action packet, never hidden
         # state, and is gradually reduced by the training pipeline.
         teacher = torch.zeros_like(bias)
-        teacher = teacher + ((action_type == 8) & (tile_action == 14)).float() * 5.0
-        teacher = teacher + ((action_type == 8) & (tile_action == 11)).float() * 3.0
+        # Keep the teacher anchor aligned with the configured curriculum too;
+        # otherwise it silently reintroduces a fixed capture/found-city bias.
+        teacher = teacher + captures_regular_city.float() * self.config.capture_city_prior_bonus
+        teacher = teacher + captures_capital.float() * self.config.capture_capital_prior_bonus
+        teacher = teacher + ((action_type == 8) & (tile_action == 11)).float() * self.config.found_city_prior_bonus
         teacher = teacher + (action_type == 1).float() * (
-            0.8 + damage.clamp_max(10.0) * 0.12
+            self.config.attack_prior_bonus + damage.clamp_max(10.0) * 0.12
         )
         teacher = teacher + ((action_type == 8) & ((tile_action == 10) | (tile_action == 12))).float() * 0.8
         teacher = teacher + ((action_type == 5) | (action_type == 6)).float() * 0.45
         teacher = teacher + ((action_type == 4) | (action_type == 7)).float() * 0.25
-        teacher = teacher - (action_type == 3).float() * 2.0
+        teacher = teacher - (action_type == 3).float() * self.config.end_turn_prior_penalty
         bias = bias + teacher * float(np.clip(self.config.teacher_prior_weight, 0.0, 1.0))
         return bias.masked_fill(~mask, 0.0)
 
@@ -360,7 +387,10 @@ class BeliefMCTS:
             include_belief=False,
         )
         logits = output.policy_logits + self._native_prior_bias(
-            tensors.action_categorical, tensors.action_continuous, tensors.action_mask
+            tensors.action_categorical,
+            tensors.action_continuous,
+            tensors.action_mask,
+            tensors.map_tokens,
         ).to(output.policy_logits.dtype)
         return logits.float().cpu().numpy(), output.value.float().cpu().numpy()
 

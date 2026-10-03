@@ -88,6 +88,7 @@ def main() -> None:
         simulations=args.simulations,
         particles=args.particles,
         temperature=0.0,
+        belief_particle_temperature=0.0,
         inference_batch_size=args.inference_batch_size,
         native_threads=args.mcts_threads,
         native_max_actions=args.mcts_max_actions,
@@ -96,12 +97,25 @@ def main() -> None:
         search_min_prior_mass=args.mcts_min_prior_mass,
         strategic_prior_weight=args.strategic_prior_weight,
         teacher_prior_weight=args.teacher_prior_weight,
+        capture_city_prior_bonus=args.capture_city_prior_bonus,
+        capture_capital_prior_bonus=args.capture_capital_prior_bonus,
+        found_city_prior_bonus=args.found_city_prior_bonus,
+        attack_prior_bonus=args.attack_prior_bonus,
+        end_turn_prior_penalty=args.end_turn_prior_penalty,
     )
     if model_b is None:
         # A random opponent is not a neural agent and retains the small scalar
         # diagnostic path. Checkpoint-vs-checkpoint evaluation uses the fast,
         # routed native pool below.
-        summary = evaluate_matches(model_a, device, training, mcts, args.games, None)
+        summary = evaluate_matches(
+            model_a,
+            device,
+            training,
+            mcts,
+            args.games,
+            None,
+            visible_action_history=args.visible_action_history,
+        )
     else:
         summary = evaluate_matches_pool(
             model_a,

@@ -145,8 +145,16 @@ def prune_search_logits(
         required = torch.minimum(required, legal_counts)
         ranks = torch.arange(width, device=logits.device).unsqueeze(0)
         adaptive = ranks < required.unsqueeze(1)
-        adaptive_indices = ordered.masked_fill(~adaptive, 0)
-        selected.scatter_(1, adaptive_indices, adaptive)
+        # Build a separate mask and merge it.  Masking rejected ranks to zero
+        # and scattering the boolean ``adaptive`` mask directly into
+        # ``selected`` used to write ``False`` repeatedly to action zero.
+        # Consequently a retained/mandatory action at index zero could be
+        # removed merely because another rank was outside the adaptive range.
+        # ``ordered`` is a permutation for each row, so the temporary mask is
+        # safe; OR keeps the top-K and mandatory guarantees intact.
+        adaptive_selected = torch.zeros_like(legal)
+        adaptive_selected.scatter_(1, ordered, adaptive)
+        selected |= adaptive_selected
         selected &= legal
 
     random_added = torch.zeros_like(legal)

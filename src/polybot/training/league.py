@@ -463,6 +463,7 @@ def train_promotion_league(
     training: TrainingConfig,
     *,
     champion_in: Path,
+    training_stage: str = "auto",
     challenger_in: Path | None = None,
     checkpoint_dir: Path,
     rounds: int,
@@ -687,6 +688,22 @@ def train_promotion_league(
         raise ValueError("checkpoint_prefix must not be empty")
     if champion_mode not in {"flat", "mcts", "auto"}:
         raise ValueError("champion_mode must be 'flat', 'mcts' or 'auto'")
+    if training_stage not in {"auto", "belief", "mcts"}:
+        raise ValueError("training_stage must be 'auto', 'belief' or 'mcts'")
+    if training_stage != "auto" and champion_mode != "mcts":
+        raise ValueError(
+            "--training-stage belief/mcts requires --champion-mode mcts"
+        )
+    if training_stage == "mcts" and value_bootstrap_games:
+        raise ValueError(
+            "MCTS-only stage must use value_bootstrap_games=0; run value/belief "
+            "calibration in the separate belief stage"
+        )
+    if training_stage != "auto" and (steps or updates):
+        raise ValueError(
+            "explicit belief/mcts stages require steps=0 and updates=0; use "
+            "population_games and population_updates_per_game for the selected stage"
+        )
     if champion_mode == "auto" and population_games < 1:
         raise ValueError(
             "champion_mode='auto' requires positive population_games for MCTS absorption"
@@ -1340,6 +1357,7 @@ def train_promotion_league(
             post_bootstrap_opponent_policy_weight
         ),
         "champion_mode": champion_mode,
+        "training_stage": training_stage,
         "flat_mcts_distill_games": flat_mcts_distill_games,
         "flat_mcts_distill_simulations": flat_mcts_distill_simulations,
         "flat_mcts_distill_max_envs": flat_mcts_distill_max_envs,
@@ -1484,9 +1502,17 @@ def train_promotion_league(
                     round_champion_mode = _round_champion_mode(
                         champion_mode, champion_capability
                     )
+                    # The normal curriculum chooses this automatically.  The
+                    # explicit modes deliberately make the two optimisation
+                    # problems independently runnable: no policy/value update
+                    # can occur in a belief job, and no fresh belief
+                    # calibration can be silently mixed into an MCTS job.
+                    if training_stage in {"belief", "mcts"}:
+                        round_champion_mode = "mcts"
                     round_training_summary["champion_mode"] = {
                         "requested": champion_mode,
                         "effective": round_champion_mode,
+                        "training_stage": training_stage,
                         "mcts_ready": float(
                             bool(
                                 champion_capability
@@ -1531,13 +1557,42 @@ def train_promotion_league(
                         and apprentice_rejection_rate
                         <= belief_action_equivalence_target
                     )
-                    belief_calibration_required = (
-                        round_champion_mode == "mcts"
-                        and not (
+                    if training_stage == "belief":
+                        belief_calibration_required = True
+                    elif training_stage == "mcts":
+                        if not (
                             apprentice_matches_champion
                             and apprentice_meets_current_belief_gate
+                        ):
+                            raise BeliefQualityError(
+                                "MCTS-only training requires an accepted belief "
+                                "apprentice for this exact champion. Run the belief "
+                                "stage until held-out action mismatch reaches the gate.",
+                                {
+                                    "belief_apprentice_path": str(
+                                        belief_apprentice_path
+                                    ),
+                                    "apprentice_matches_champion": float(
+                                        apprentice_matches_champion
+                                    ),
+                                    "checked_particles": float(
+                                        apprentice_checked_particles
+                                    ),
+                                    "rejection_rate": apprentice_rejection_rate,
+                                    "target_rejection_rate": (
+                                        belief_action_equivalence_target
+                                    ),
+                                },
+                            )
+                        belief_calibration_required = False
+                    else:
+                        belief_calibration_required = (
+                            round_champion_mode == "mcts"
+                            and not (
+                                apprentice_matches_champion
+                                and apprentice_meets_current_belief_gate
+                            )
                         )
-                    )
                     fresh_branch_round = (
                         direct_population_branch_count > 1
                         or round_champion_mode == "mcts"
@@ -5306,6 +5361,7 @@ def train_promotion_league(
                 "league_database_path": str(database_path.resolve()),
                 "league_population_size": float(population_size),
                 "league_champion_mode": champion_mode,
+                "league_training_stage": training_stage,
                 "league_mcts_probe_games": float(mcts_probe_games),
                 "league_mcts_probe_simulations": float(
                     mcts_probe_simulations

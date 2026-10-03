@@ -310,6 +310,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2137)
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument(
+        "--belief-particle-temperature", type=float, default=0.15,
+        help="MCTS only: fog-map particle sampling temperature, separate from move sampling.",
+    )
+    parser.add_argument(
         "--device",
         choices=("auto", "cuda", "mps", "cpu"),
         default="auto",
@@ -348,6 +352,8 @@ def _validate_args(args: argparse.Namespace, max_board_side: int) -> None:
         raise ValueError("--max-moves must be positive")
     if args.temperature < 0.0:
         raise ValueError("--temperature cannot be negative")
+    if args.belief_particle_temperature < 0.0:
+        raise ValueError("--belief-particle-temperature cannot be negative")
     if args.simulations < 1 or args.particles < 1:
         raise ValueError("--simulations and --particles must be positive")
     if not 0 <= args.visible_action_history <= 1024:
@@ -388,6 +394,7 @@ def main() -> None:
         simulations=args.simulations,
         particles=args.particles,
         temperature=args.temperature,
+        belief_particle_temperature=args.belief_particle_temperature,
         inference_batch_size=args.inference_batch_size,
         native_threads=args.mcts_threads,
         native_max_actions=args.mcts_max_actions,

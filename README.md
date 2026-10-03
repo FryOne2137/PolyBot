@@ -270,6 +270,13 @@ Przy wielu rundach zwykła arena ligi nadal rotuje seed ewaluacyjny, ale belief
 calibration zawsze zachowuje ten sam held-out set. Dzięki temu zapis lub
 rollback apprentice'a porównuje rzeczywiście porównywalne wyniki.
 
+Próg `--belief-action-equivalence-target` jest progiem operacyjnym, a nie
+uniwersalną miarą jakości mapy. Przy kilku particle i retry wynik około 3%
+oznacza, że prawie każda odrzucona particle zostaje zastąpiona przed MCTS;
+nie trzeba kontynuować samej kalibracji wyłącznie po to, aby zbić arbitralne
+2%. Zmiana progu ponownie ocenia zapisany held-out wynik — nie blokuje jej
+stare pole `ready` z poprzedniego, ostrzejszego runu.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

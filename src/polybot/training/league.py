@@ -1520,10 +1520,13 @@ def train_promotion_league(
                         belief_apprentice_state.get("checked_particles", 0)
                     )
                     # A marker created under a loose old threshold must not
-                    # bypass a later, stricter calibration request.
+                    # bypass a later, stricter calibration request. Conversely
+                    # a checkpoint measured at 2.7% must be eligible when the
+                    # user deliberately selects a safe 4% operational gate;
+                    # the old stored ``ready`` bit only described the old
+                    # threshold and is not an independent measurement.
                     apprentice_meets_current_belief_gate = (
-                        bool(belief_apprentice_state.get("ready", False))
-                        and apprentice_checked_particles
+                        apprentice_checked_particles
                         >= belief_action_equivalence_min_particles
                         and apprentice_rejection_rate
                         <= belief_action_equivalence_target

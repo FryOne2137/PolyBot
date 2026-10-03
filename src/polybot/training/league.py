@@ -4582,6 +4582,53 @@ def train_promotion_league(
                                     ),
                                     flush=True,
                                 )
+                                # The particle mismatch is the admission
+                                # metric, but it alone cannot identify whether
+                                # a plateau comes from terrain, rare entities,
+                                # or the hidden action endpoints.  Report the
+                                # optimisation diagnostics from this frozen
+                                # collection before asking for another costly
+                                # calibration generation.
+                                diagnostic_fields = (
+                                    ("updates", "population_pool_updates", ".0f"),
+                                    ("belief_loss", "belief_loss", ".4f"),
+                                    (
+                                        "action_loss",
+                                        "belief_engine_action_constraint_loss",
+                                        ".4f",
+                                    ),
+                                    (
+                                        "terrain_acc",
+                                        "belief_hidden_terrain_accuracy",
+                                        ".1%",
+                                    ),
+                                    (
+                                        "action_terrain_acc",
+                                        "belief_action_constraint_terrain_accuracy",
+                                        ".1%",
+                                    ),
+                                    (
+                                        "city_recall",
+                                        "belief_hidden_city_recall",
+                                        ".1%",
+                                    ),
+                                    (
+                                        "unit_recall",
+                                        "belief_hidden_unit_recall",
+                                        ".1%",
+                                    ),
+                                )
+                                diagnostics = [
+                                    f"{label}={float(rung_summary[key]):{format_spec}}"
+                                    for label, key, format_spec in diagnostic_fields
+                                    if key in rung_summary
+                                ]
+                                if diagnostics:
+                                    print(
+                                        "league belief diagnostics | "
+                                        + " | ".join(diagnostics),
+                                        flush=True,
+                                    )
                                 break
                             gate_mcts = replace(
                                 evaluation_mcts,

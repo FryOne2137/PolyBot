@@ -4534,7 +4534,12 @@ def train_promotion_league(
                                         replace(
                                             round_training,
                                             seed=_offset_seed(
-                                                round_evaluation_seed,
+                                                # The promotion arena rotates
+                                                # by round, but a calibration
+                                                # rollback must compare the
+                                                # same belief held-out maps as
+                                                # the prior apprentice.
+                                                resolved_evaluation_seed,
                                                 17_000_003,
                                             ),
                                             policy_weight=0.0,

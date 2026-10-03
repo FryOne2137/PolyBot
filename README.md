@@ -266,6 +266,10 @@ optymalizacją, więc krótki run nie zapomina poprzednich map. Ścieżkę i roz
 okna można zmienić przez `--belief-calibration-replay-path` oraz
 `--belief-calibration-replay-capacity`.
 
+Przy wielu rundach zwykła arena ligi nadal rotuje seed ewaluacyjny, ale belief
+calibration zawsze zachowuje ten sam held-out set. Dzięki temu zapis lub
+rollback apprentice'a porównuje rzeczywiście porównywalne wyniki.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

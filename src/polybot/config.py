@@ -35,6 +35,10 @@ class MCTSConfig:
     c_puct: float = 1.5
     max_depth: int = 96
     temperature: float = 1.0
+    # This controls completed fog-map sampling, not root action sampling.
+    # Keeping it separate prevents a high self-play exploration temperature
+    # from turning belief particles into implausibly random worlds.
+    belief_particle_temperature: float = 0.15
     # Number of selected MCTS leaves evaluated in one neural-network forward
     # pass.  It changes throughput, not the information exposed to search.
     inference_batch_size: int = 32

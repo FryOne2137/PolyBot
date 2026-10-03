@@ -2359,6 +2359,8 @@ def train_population_pool(
         raise ValueError(
             "engine_action_constraint_replay_fraction must be between zero and one"
         )
+    if mcts.belief_particle_temperature < 0.0:
+        raise ValueError("belief_particle_temperature must not be negative")
     if reanalysis_capacity < 1:
         raise ValueError("reanalysis_capacity must be positive")
     if reanalysis_positions < 0:
@@ -2660,7 +2662,12 @@ def train_population_pool(
                         request,
                         active,
                         root_temperature=1.0,
-                        belief_temperature=max(mcts.temperature, 0.35),
+                        # Root visit temperature controls which *legal move*
+                        # self-play executes. It must not also randomise the
+                        # hidden-map decoder: the old coupling made a default
+                        # 1.0 action temperature create noisy, action-
+                        # inconsistent belief particles.
+                        belief_temperature=mcts.belief_particle_temperature,
                         prior_scale=curriculum,
                         root_noise=True,
                         mcts_mask=mcts_mask,

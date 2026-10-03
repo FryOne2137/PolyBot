@@ -629,6 +629,10 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
     parser.add_argument("--temperature", type=float, default=1.0, help="MCTS visit-sampling temperature before the drop move.")
+    parser.add_argument(
+        "--belief-particle-temperature", type=float, default=0.15,
+        help="Completed belief-map sampling temperature; independent of MCTS action exploration.",
+    )
     parser.add_argument("--temperature-drop-move", type=int, default=20, help="Use --late-temperature from this move onward; 0 keeps one temperature.")
     parser.add_argument("--late-temperature", type=float, default=0.0, help="MCTS visit-sampling temperature after --temperature-drop-move.")
     parser.add_argument("--root-dirichlet-epsilon", type=float, default=0.25, help="Self-play-only root-prior noise share; 0 disables it.")

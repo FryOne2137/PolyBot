@@ -90,6 +90,7 @@ def mcts_config_from_args(args: argparse.Namespace) -> MCTSConfig:
         particles=args.particles,
         inference_batch_size=getattr(args, "inference_batch_size", 32),
         temperature=getattr(args, "temperature", 1.0),
+        belief_particle_temperature=getattr(args, "belief_particle_temperature", 0.15),
         root_dirichlet_epsilon=getattr(args, "root_dirichlet_epsilon", 0.25),
         root_dirichlet_concentration=getattr(args, "root_dirichlet_concentration", 10.0),
         temperature_drop_move=getattr(args, "temperature_drop_move", 20),

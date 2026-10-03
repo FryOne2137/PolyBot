@@ -253,6 +253,12 @@ nadpisze apprentice'a, jeśli niezależny mismatch pogorszy się o więcej niż
 0,5 punktu procentowego; w logu pojawi się wtedy
 `regression: restored prior apprentice`.
 
+`--temperature` dotyczy wyłącznie losowania ruchu z wizyt MCTS. Temperatura
+generowania ukrytej mapy jest niezależna: `--belief-particle-temperature`
+(domyślnie `0.15`). Nie należy zostawiać beliefu przy wartości `1.0` tylko
+dlatego, że ruchy self-play mają dużą eksplorację — mieszałoby to dwa różne
+źródła losowości i znacząco podnosiło action mismatch.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

@@ -278,6 +278,33 @@ class PolicyValueBeliefNet(nn.Module):
         # new public-action feature path.
         nn.init.zeros_(self.belief_action_evidence.weight)
         nn.init.zeros_(self.belief_action_evidence.bias)
+        # The shared map encoder is deliberately frozen during belief-only
+        # calibration: changing it would silently move policy and value too.
+        # Give the belief decoder its own spatial transformer instead.  This
+        # lets it infer map-wide relations such as a missing movement target
+        # being evidence of an unseen blocker, while policy/value retain their
+        # exact representation.  A zero gate makes this architecture extension
+        # behaviourally identical for existing checkpoints until it is trained.
+        belief_block = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=config.attention_heads,
+            dim_feedforward=4 * d_model,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.belief_spatial_refiner = nn.TransformerEncoder(
+            belief_block,
+            num_layers=max(1, int(config.belief_decoder_layers)),
+            enable_nested_tensor=False,
+        )
+        self.belief_spatial_norm = nn.LayerNorm(d_model)
+        self.belief_spatial_gate = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model),
+        )
+        nn.init.zeros_(self.belief_spatial_gate[-1].weight)
+        nn.init.zeros_(self.belief_spatial_gate[-1].bias)
         # Entity fields are decoded conditionally: settlement type determines
         # the city attributes, while unit type determines HP/owner/origin
         # attributes. Zero-initialised context tables preserve old checkpoints
@@ -449,10 +476,14 @@ class PolicyValueBeliefNet(nn.Module):
         evidence = self._belief_action_tile_evidence(
             action_categorical, action_mask, tile_states.shape[1]
         )
-        return (
+        action_conditioned = (
             tile_states
             + self.belief_action_evidence(evidence)
             + self.belief_action_gate(self.belief_action_norm(attended))
+        )
+        refined = self.belief_spatial_refiner(action_conditioned)
+        return action_conditioned + self.belief_spatial_gate(
+            self.belief_spatial_norm(refined)
         )
 
     @staticmethod

@@ -244,6 +244,15 @@ osobno wynik `collection` i stały `held-out mismatch` po aktualizacji;
 parametr `--belief-calibration-eval-games` (domyślnie 8) kontroluje koszt tej
 oceny bez gradientu.
 
+Kalibracja aktualizuje prywatny, dwuwarstwowy transformer `belief_spatial_refiner`.
+Widoczna mapa, legalne akcje i ich endpointy mogą więc wpływać na sąsiednie
+ukryte tile'e, ale policy/value nie przechodzą przez ten moduł i nie zmieniają
+się od samego treningu beliefu. Stare checkpointy są zgodne: nowa ścieżka ma
+bramkę wyzerowaną przy starcie. Po pierwszym pomiarze held-out kolejny run nie
+nadpisze apprentice'a, jeśli niezależny mismatch pogorszy się o więcej niż
+0,5 punktu procentowego; w logu pojawi się wtedy
+`regression: restored prior apprentice`.
+
 Wymuszony tryb `--champion-mode mcts` pozostaje dostępny dla eksperymentów.
 `auto` wymaga dodatniego `--population-games` i co najmniej dwóch probe games;
 nie pozwala przypadkiem wejść w generowanie danych MCTS bez bramki jakości.

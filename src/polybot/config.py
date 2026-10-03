@@ -20,6 +20,10 @@ class ModelConfig:
     # legal action to every map tile, which is both faster and less prone to
     # memorising runtime ids.  ``attention`` remains for old checkpoints.
     policy_architecture: str = "factorized"
+    # Private spatial capacity for the fog-of-war decoder.  It is deliberately
+    # separate from ``map_transformer`` so belief calibration can learn how
+    # hidden tiles relate to one another without perturbing policy/value.
+    belief_decoder_layers: int = 2
 
 
 @dataclass

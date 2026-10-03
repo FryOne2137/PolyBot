@@ -52,7 +52,7 @@ def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, 
     missing = set(incompatible.missing_keys)
     allowed_missing = {
         name for name in missing
-        if name.startswith(("belief_action_", "belief_settlement_context", "belief_unit_context", "history_"))
+        if name.startswith(("belief_", "history_"))
     }
     if unexpected or missing != allowed_missing:
         raise RuntimeError(

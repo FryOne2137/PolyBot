@@ -27,12 +27,7 @@ from .replay_buffer import TrainingExample
 from .run_artifacts import TrainingRun
 
 
-_BELIEF_ONLY_PREFIXES = (
-    "belief_action_",
-    "belief_settlement_context",
-    "belief_unit_context",
-    "belief_heads",
-)
+_BELIEF_ONLY_PREFIXES = ("belief_",)
 
 
 def _configure_belief_only_training(model: PolicyValueBeliefNet) -> Dict[str, bool]:

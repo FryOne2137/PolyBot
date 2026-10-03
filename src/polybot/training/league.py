@@ -3765,6 +3765,29 @@ def train_promotion_league(
                         "mcts_preflight": [],
                     }
                     belief_calibration_summary: Dict[str, Any] | None = None
+                    # Belief calibration is a supervised optimisation loop of
+                    # its own.  Keep an in-memory rollback point so a noisy
+                    # collection round can never overwrite a decoder which
+                    # was better on the fixed held-out maps.
+                    belief_calibration_start_state = (
+                        model_state_on_cpu(candidate)
+                        if belief_calibration_required
+                        else None
+                    )
+                    previous_held_out_rate: float | None = None
+                    if (
+                        belief_calibration_required
+                        and apprentice_matches_champion
+                        and int(belief_apprentice_state.get("held_out_games", 0)) > 0
+                        and apprentice_checked_particles
+                        >= belief_action_equivalence_min_particles
+                    ):
+                        previous_held_out_rate = float(
+                            belief_apprentice_state.get(
+                                "held_out_rejection_rate",
+                                belief_apprentice_state.get("rejection_rate", 1.0),
+                            )
+                        )
                     value_bootstrap_summary: Dict[str, Any] = {}
                     if not belief_calibration_required and value_bootstrap_games:
                         # This is not a legacy actor-critic/PPO stage. Both
@@ -4477,28 +4500,51 @@ def train_promotion_league(
                                     checked >= belief_action_equivalence_min_particles
                                     and rate <= belief_action_equivalence_target
                                 )
-                                save_model(belief_apprentice_path, candidate, model_config)
-                                _save_belief_apprentice_state(
-                                    belief_apprentice_state_path,
-                                    {
-                                        "champion_path": str(champion_path.resolve()),
-                                        "ready": ready,
-                                        "checked_particles": checked,
-                                        "rejected_particles": rejected,
-                                        "rejection_rate": rate,
-                                        "collection_checked_particles": collection_checked,
-                                        "collection_rejected_particles": collection_rejected,
-                                        "collection_rejection_rate": collection_rate,
-                                        "held_out_games": belief_calibration_eval_games,
-                                        "target_rejection_rate": (
-                                            belief_action_equivalence_target
-                                        ),
-                                        "minimum_particles": (
-                                            belief_action_equivalence_min_particles
-                                        ),
-                                        "round": round_index,
-                                    },
+                                # 8 held-out games yield thousands of sampled
+                                # particles, but still have small sampling
+                                # noise.  Permit a half percentage point
+                                # fluctuation; restore the prior apprentice on
+                                # any material generalisation regression.
+                                held_out_tolerance = 0.005
+                                rolled_back = bool(
+                                    previous_held_out_rate is not None
+                                    and rate
+                                    > previous_held_out_rate + held_out_tolerance
                                 )
+                                if rolled_back:
+                                    if belief_calibration_start_state is None:
+                                        raise RuntimeError(
+                                            "belief calibration rollback state is missing"
+                                        )
+                                    restore_model_state(
+                                        candidate, belief_calibration_start_state
+                                    )
+                                else:
+                                    save_model(
+                                        belief_apprentice_path, candidate, model_config
+                                    )
+                                    _save_belief_apprentice_state(
+                                        belief_apprentice_state_path,
+                                        {
+                                            "champion_path": str(champion_path.resolve()),
+                                            "ready": ready,
+                                            "checked_particles": checked,
+                                            "rejected_particles": rejected,
+                                            "rejection_rate": rate,
+                                            "held_out_rejection_rate": rate,
+                                            "collection_checked_particles": collection_checked,
+                                            "collection_rejected_particles": collection_rejected,
+                                            "collection_rejection_rate": collection_rate,
+                                            "held_out_games": belief_calibration_eval_games,
+                                            "target_rejection_rate": (
+                                                belief_action_equivalence_target
+                                            ),
+                                            "minimum_particles": (
+                                                belief_action_equivalence_min_particles
+                                            ),
+                                            "round": round_index,
+                                        },
+                                    )
                                 belief_calibration_summary = {
                                     "path": str(belief_apprentice_path),
                                     "ready": float(ready),
@@ -4509,6 +4555,12 @@ def train_promotion_league(
                                     "collection_rejected_particles": float(collection_rejected),
                                     "collection_rejection_rate": collection_rate,
                                     "held_out": held_out_summary,
+                                    "previous_held_out_rejection_rate": (
+                                        previous_held_out_rate
+                                        if previous_held_out_rate is not None
+                                        else -1.0
+                                    ),
+                                    "held_out_rollback": float(rolled_back),
                                     "target_rejection_rate": (
                                         belief_action_equivalence_target
                                     ),
@@ -4522,8 +4574,12 @@ def train_promotion_league(
                                     f"collection={collection_rate:.2%} | "
                                     f"held-out mismatch={rate:.2%} "
                                     f"({rejected}/{checked}) | "
-                                    f"ready={int(ready)} | saved "
-                                    f"{belief_apprentice_path}",
+                                    f"ready={int(ready)} | "
+                                    + (
+                                        "regression: restored prior apprentice"
+                                        if rolled_back
+                                        else f"saved {belief_apprentice_path}"
+                                    ),
                                     flush=True,
                                 )
                                 break

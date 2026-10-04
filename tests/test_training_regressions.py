@@ -54,6 +54,8 @@ from polybot.training.global_mcts_train import _native_leaf_bias
 from polybot.training.league import (
     _checkpoint_fingerprint,
     _belief_validation_signature,
+    _belief_calibration_can_run,
+    _value_bootstrap_required,
     _load_belief_calibration_replay,
     _save_belief_calibration_replay,
     _challenger_continuation_action,
@@ -2568,8 +2570,8 @@ def test_checkpoint_fingerprint_changes_when_checkpoint_content_changes():
     assert first != second
 
 
-def test_belief_validation_signature_rejects_changed_particle_or_map_settings():
-    training = TrainingConfig(map_size=11, map_type="lakes")
+def test_belief_validation_signature_rejects_changed_trajectory_settings():
+    training = TrainingConfig(map_size=11, map_type="lakes", max_moves=900)
     baseline = _belief_validation_signature(
         training, MCTSConfig(particles=4, belief_particle_temperature=0.15),
         visible_action_history=32, belief_retries=2,
@@ -2586,9 +2588,150 @@ def test_belief_validation_signature_rejects_changed_particle_or_map_settings():
         visible_action_history=32, belief_retries=2,
         evaluation_seed=123, evaluation_games=16,
     )
+    changed_horizon = _belief_validation_signature(
+        TrainingConfig(map_size=11, map_type="lakes", max_moves=300),
+        MCTSConfig(particles=4, belief_particle_temperature=0.15),
+        visible_action_history=32, belief_retries=2,
+        evaluation_seed=123, evaluation_games=16,
+    )
+    changed_mcts_temperature = _belief_validation_signature(
+        training,
+        MCTSConfig(particles=4, belief_particle_temperature=0.15, temperature=0.5),
+        visible_action_history=32, belief_retries=2,
+        evaluation_seed=123, evaluation_games=16,
+    )
 
     assert baseline != changed_particles
     assert baseline != changed_map
+    assert baseline != changed_horizon
+    assert baseline != changed_mcts_temperature
+    changed_exploration = _belief_validation_signature(
+        TrainingConfig(
+            map_size=11,
+            map_type="lakes",
+            max_moves=900,
+            exploration_rate=0.50,
+        ),
+        MCTSConfig(particles=4, belief_particle_temperature=0.15),
+        visible_action_history=32, belief_retries=2,
+        evaluation_seed=123, evaluation_games=16,
+    )
+    assert baseline != changed_exploration
+
+
+def test_value_bootstrap_is_done_once_for_the_same_champion():
+    completed = {"value_bootstrap_champion_fingerprint": "champion-a"}
+
+    assert not _value_bootstrap_required(
+        champion_mode="mcts",
+        belief_calibration_required=False,
+        value_bootstrap_games=64,
+        champion_fingerprint="champion-a",
+        apprentice_state=completed,
+    )
+    assert _value_bootstrap_required(
+        champion_mode="mcts",
+        belief_calibration_required=False,
+        value_bootstrap_games=64,
+        champion_fingerprint="champion-b",
+        apprentice_state=completed,
+    )
+    assert not _value_bootstrap_required(
+        champion_mode="mcts",
+        belief_calibration_required=True,
+        value_bootstrap_games=64,
+        champion_fingerprint="champion-b",
+        apprentice_state=completed,
+    )
+
+
+def test_required_calibration_runs_held_out_evaluation_without_new_replay_work():
+    # This is the bootstrap-only edge case: the decoder changed, so the
+    # held-out arena must run before a later MCTS path can inspect it.
+    assert _belief_calibration_can_run(
+        population_games=0,
+        replay_updates=0,
+        evaluation_games=16,
+    )
+    assert not _belief_calibration_can_run(
+        population_games=0,
+        replay_updates=0,
+        evaluation_games=0,
+    )
+
+
+def test_replay_history_is_right_aligned_across_legacy_window_sizes():
+    short = _example(0)
+    long = _example(1)
+    short.action_history = np.full((16, 12), 7, dtype=np.float32)
+    short.action_history_mask = np.ones(16, dtype=bool)
+    long.action_history = np.full((32, 12), 9, dtype=np.float32)
+    long.action_history_mask = np.ones(32, dtype=bool)
+
+    batch = stack_examples([short, long], torch.device("cpu"))
+
+    assert not batch["action_history_mask"][0, :16].any()
+    assert batch["action_history_mask"][0, 16:].all()
+    assert torch.equal(
+        batch["action_history"][0, 16:], torch.as_tensor(short.action_history)
+    )
+
+
+def test_empty_legacy_history_can_mix_with_a_non_empty_replay_row():
+    empty = _example(0)
+    non_empty = _example(1)
+    empty.action_history = np.empty((0, 12), dtype=np.float32)
+    empty.action_history_mask = np.empty((0,), dtype=bool)
+    non_empty.action_history = np.full((32, 12), 9, dtype=np.float32)
+    non_empty.action_history_mask = np.ones(32, dtype=bool)
+
+    batch = stack_examples([empty, non_empty], torch.device("cpu"))
+
+    assert batch["action_history"].shape == (2, 32, 12)
+    assert not batch["action_history_mask"][0].any()
+    assert batch["action_history_mask"][1].all()
+
+
+def test_history_context_is_invariant_to_the_other_batch_history_length():
+    torch.manual_seed(7)
+    model = PolicyValueBeliefNet(
+        ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    ).eval()
+    short_history = torch.arange(16 * 12, dtype=torch.float32).reshape(1, 16, 12)
+    short_mask = torch.ones((1, 16), dtype=torch.bool)
+    mixed_history = torch.zeros((2, 32, 12), dtype=torch.float32)
+    mixed_mask = torch.zeros((2, 32), dtype=torch.bool)
+    mixed_history[0, 16:] = short_history[0]
+    mixed_mask[0, 16:] = True
+    mixed_history[1] = 1.0
+    mixed_mask[1] = True
+
+    alone = model._history_context(
+        short_history, short_mask, 1, torch.device("cpu")
+    )
+    mixed = model._history_context(
+        mixed_history, mixed_mask, 2, torch.device("cpu")
+    )
+
+    torch.testing.assert_close(alone[0], mixed[0], rtol=1e-5, atol=1e-6)
+
+
+def test_empty_history_context_is_independent_of_batch_padding():
+    model = PolicyValueBeliefNet(
+        ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    ).eval()
+    with torch.no_grad():
+        model.history_gate[-1].bias.fill_(3.0)
+    empty = torch.zeros((1, 32, 12), dtype=torch.float32)
+    empty_mask = torch.zeros((1, 32), dtype=torch.bool)
+    mixed_history = torch.cat((empty, torch.ones((1, 32, 12))), dim=0)
+    mixed_mask = torch.cat((empty_mask, torch.ones((1, 32), dtype=torch.bool)), dim=0)
+
+    alone = model._history_context(empty, empty_mask, 1, torch.device("cpu"))
+    mixed = model._history_context(mixed_history, mixed_mask, 2, torch.device("cpu"))
+
+    assert torch.equal(alone, torch.zeros_like(alone))
+    assert torch.equal(mixed[0], torch.zeros_like(mixed[0]))
 
 
 def test_belief_warmup_passes_configured_presence_focal_gamma():

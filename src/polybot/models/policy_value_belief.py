@@ -361,8 +361,7 @@ class PolicyValueBeliefNet(nn.Module):
             raise ValueError("visible_action_history must have shape [batch, length, 12]")
         if history_mask is None or history_mask.shape != history.shape[:2]:
             raise ValueError("visible_action_history_mask must have shape [batch, length]")
-        length = history.shape[1]
-        positions = torch.arange(length, device=device)
+        valid_mask = history_mask.bool()
         # PolyEnv history fields are categorical ids, bit flags, tile indexes
         # and observer-local unit ids. Feeding those raw integers into one
         # linear layer makes a tile index numerically dominate event kind and
@@ -392,16 +391,34 @@ class PolicyValueBeliefNet(nn.Module):
             (history.float() + 1.0) / scales,
             torch.zeros_like(history, dtype=torch.float32),
         ).clamp_(0.0, 1.0)
-        encoded = self.history_encoder(normalised_history) + self.history_position(positions)[None]
-        valid_mask = history_mask.bool()
+        # Positional embeddings describe distance *from the latest observed
+        # action*, rather than the column chosen by the largest replay item
+        # in this batch.  Thus an old 16-event sequence has exactly the same
+        # representation alone and when right-aligned beside a 32-event row.
+        # Padded positions are masked before attention, but are clamped to a
+        # legal id so they never index the embedding out of range.
+        valid_counts = valid_mask.long().sum(dim=1, keepdim=True)
+        chronological_index = valid_mask.long().cumsum(dim=1) - 1
+        positions = (valid_counts - 1 - chronological_index).clamp_min(0)
+        positions = positions.clamp_max(self.history_position.num_embeddings - 1)
+        encoded = self.history_encoder(normalised_history) + self.history_position(positions)
         no_history = ~valid_mask.any(dim=1)
+        if bool(no_history.all()):
+            return torch.zeros(
+                (batch, self.config.d_model), dtype=torch.float32, device=device
+            )
         safe_mask = valid_mask.clone()
         if no_history.any():
             safe_mask[no_history, 0] = True
         encoded = self.history_transformer(encoded, src_key_padding_mask=~safe_mask)
         mask = valid_mask.unsqueeze(-1).to(encoded.dtype)
         pooled = (encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        return self.history_gate(pooled)
+        context = self.history_gate(pooled)
+        # A row without history must be exactly equivalent to omitting the
+        # history tensor, regardless of other rows' padded history lengths.
+        return torch.where(
+            no_history.unsqueeze(-1), torch.zeros_like(context), context
+        )
 
     def forward(
         self,

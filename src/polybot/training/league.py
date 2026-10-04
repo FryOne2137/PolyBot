@@ -71,9 +71,64 @@ def _belief_validation_signature(
         "belief_retries": int(belief_retries),
         "native_max_actions": int(mcts.native_max_actions),
         "visible_action_history": int(visible_action_history),
+        "max_moves": int(training.max_moves),
+        # Exploration changes the actual public-action trajectories sampled
+        # during held-out games.  A measurement collected with a mostly raw
+        # policy must not certify a model that will be admitted under a much
+        # more exploratory data-generation regime.
+        "exploration_rate": float(training.exploration_rate),
+        "mcts_temperature": float(mcts.temperature),
+        "root_dirichlet_epsilon": float(mcts.root_dirichlet_epsilon),
+        "root_dirichlet_concentration": float(mcts.root_dirichlet_concentration),
+        "temperature_drop_move": int(mcts.temperature_drop_move),
+        "late_temperature": float(mcts.late_temperature),
         "evaluation_seed": int(evaluation_seed),
         "evaluation_games": int(evaluation_games),
     }
+
+
+def _value_bootstrap_required(
+    *,
+    champion_mode: str,
+    belief_calibration_required: bool,
+    value_bootstrap_games: int,
+    champion_fingerprint: str | None,
+    apprentice_state: Mapping[str, Any],
+) -> bool:
+    """Run the value bootstrap once for each frozen champion checkpoint.
+
+    Bootstrap updates the shared/belief-side heads and therefore has to be
+    followed by a fresh held-out calibration.  Its completion is persisted by
+    champion content identity, rather than by round number, so ``auto`` can
+    subsequently enter MCTS instead of alternating bootstrap/calibration
+    forever.  Replacing the champion at the same path intentionally enables
+    one bootstrap again because its fingerprint changes.
+    """
+    return bool(
+        champion_mode == "mcts"
+        and not belief_calibration_required
+        and value_bootstrap_games > 0
+        and champion_fingerprint is not None
+        and apprentice_state.get("value_bootstrap_champion_fingerprint")
+        != champion_fingerprint
+    )
+
+
+def _belief_calibration_can_run(
+    *,
+    population_games: int,
+    replay_updates: int,
+    evaluation_games: int,
+) -> bool:
+    """Whether a required calibration can at least produce held-out proof.
+
+    A bootstrap invalidates the belief marker even when the caller requested
+    no fresh collection and no replay optimisation.  In that case the fixed
+    held-out arena is still mandatory: it measures the newly saved decoder
+    and keeps the round on the calibration exit path, rather than letting the
+    outer MCTS path mistake an invalid marker for permission to search.
+    """
+    return bool(population_games > 0 or replay_updates > 0 or evaluation_games > 0)
 
 
 def _load_belief_apprentice_state(path: Path) -> Dict[str, Any]:
@@ -1619,6 +1674,9 @@ def train_promotion_league(
                         ),
                         evaluation_games=belief_calibration_eval_games,
                     )
+                    # Checkpoint provenance and measurement validity are
+                    # separate: changing validation settings must remeasure
+                    # the trained apprentice rather than discard its weights.
                     apprentice_matches_champion = (
                         belief_apprentice_path.exists()
                         and belief_apprentice_state.get("champion_path")
@@ -1628,6 +1686,9 @@ def train_promotion_league(
                         == champion_fingerprint
                         and belief_apprentice_state.get("apprentice_fingerprint")
                         == apprentice_fingerprint
+                    )
+                    apprentice_validation_matches = (
+                        apprentice_matches_champion
                         and int(belief_apprentice_state.get("held_out_games", 0)) > 0
                         and belief_apprentice_state.get("validation_signature")
                         == belief_validation_signature
@@ -1645,10 +1706,20 @@ def train_promotion_league(
                     # the old stored ``ready`` bit only described the old
                     # threshold and is not an independent measurement.
                     apprentice_meets_current_belief_gate = (
-                        apprentice_checked_particles
+                        apprentice_validation_matches
+                        and apprentice_checked_particles
                         >= belief_action_equivalence_min_particles
                         and apprentice_rejection_rate
                         <= belief_action_equivalence_target
+                    )
+                    bootstrap_champion_fingerprint = (
+                        belief_apprentice_state.get(
+                            "value_bootstrap_champion_fingerprint"
+                        )
+                        if belief_apprentice_state.get(
+                            "value_bootstrap_champion_fingerprint"
+                        ) == champion_fingerprint
+                        else None
                     )
                     if training_stage == "belief":
                         belief_calibration_required = True
@@ -4001,7 +4072,7 @@ def train_promotion_league(
                     previous_held_out_rate: float | None = None
                     if (
                         belief_calibration_required
-                        and apprentice_matches_champion
+                        and apprentice_validation_matches
                         and int(belief_apprentice_state.get("held_out_games", 0)) > 0
                         and apprentice_checked_particles
                         >= belief_action_equivalence_min_particles
@@ -4013,7 +4084,29 @@ def train_promotion_league(
                             )
                         )
                     value_bootstrap_summary: Dict[str, Any] = {}
-                    if not belief_calibration_required and value_bootstrap_games:
+                    bootstrap_required = _value_bootstrap_required(
+                        champion_mode=round_champion_mode,
+                        belief_calibration_required=belief_calibration_required,
+                        value_bootstrap_games=value_bootstrap_games,
+                        champion_fingerprint=champion_fingerprint,
+                        apprentice_state=belief_apprentice_state,
+                    )
+                    if bootstrap_required and not _belief_calibration_can_run(
+                        population_games=population_games,
+                        replay_updates=belief_replay_updates,
+                        evaluation_games=belief_calibration_eval_games,
+                    ):
+                        # Do not alter a certified apprentice when this run
+                        # has no possible post-bootstrap measurement.  In
+                        # particular, falling through here would leave a
+                        # ready=False marker and allow the outer MCTS path to
+                        # use unvalidated particles.
+                        raise ValueError(
+                            "value bootstrap requires population games, belief "
+                            "replay updates, or held-out belief evaluation "
+                            "before MCTS can run"
+                        )
+                    if bootstrap_required:
                         # This is not a legacy actor-critic/PPO stage. Both
                         # players execute their frozen raw policy; every
                         # collected policy target is masked. Only terminal
@@ -4112,6 +4205,11 @@ def train_promotion_league(
                             "rejection_rate": 1.0,
                             "held_out_games": 0,
                             "validation_signature": None,
+                            # Retain this identity after the mandatory
+                            # post-bootstrap held-out calibration succeeds.
+                            # It is the guard that keeps auto from doing the
+                            # same destructive bootstrap every round.
+                            "value_bootstrap_champion_fingerprint": champion_fingerprint,
                             "value_bootstrap_round": round_index,
                             "value_bootstrap_games": value_bootstrap_games,
                             "value_bootstrap_terminals": int(
@@ -4128,6 +4226,14 @@ def train_promotion_league(
                         _save_belief_apprentice_state(
                             belief_apprentice_state_path, bootstrap_marker
                         )
+                        # The in-memory candidate now contains new decoder
+                        # weights. It must complete strict held-out belief
+                        # calibration before any later code in this round can
+                        # enter an MCTS rung.
+                        belief_calibration_required = True
+                        bootstrap_champion_fingerprint = champion_fingerprint
+                        belief_calibration_start_state = model_state_on_cpu(candidate)
+                        previous_held_out_rate = None
                         population_summary["value_belief_bootstrap"] = (
                             value_bootstrap_summary
                         )
@@ -4144,7 +4250,7 @@ def train_promotion_league(
                     )
                     if (
                         not belief_calibration_required
-                        and value_bootstrap_games
+                        and value_bootstrap_summary
                         and not population_games
                     ):
                         # A bootstrap-only invocation is a diagnostic, not a
@@ -4340,7 +4446,12 @@ def train_promotion_league(
                         raw_population_baseline["completion_rate"]
                     )
                     if population_games or (
-                        belief_calibration_required and belief_replay_updates
+                        belief_calibration_required
+                        and _belief_calibration_can_run(
+                            population_games=population_games,
+                            replay_updates=belief_replay_updates,
+                            evaluation_games=belief_calibration_eval_games,
+                        )
                     ):
                         # Calibration is a decoder dataset pass, not a search
                         # ladder. This applies both to an explicit belief run
@@ -4360,7 +4471,13 @@ def train_promotion_league(
                         ):
                             if rung_games <= 0 and not (
                                 belief_calibration_required
-                                and belief_replay_updates
+                                and _belief_calibration_can_run(
+                                    population_games=population_games,
+                                    replay_updates=belief_replay_updates,
+                                    evaluation_games=(
+                                        belief_calibration_eval_games
+                                    ),
+                                )
                             ):
                                 continue
                             rung_training = replace(
@@ -4886,6 +5003,13 @@ def train_promotion_league(
                                             ),
                                             "minimum_particles": (
                                                 belief_action_equivalence_min_particles
+                                            ),
+                                            # A successful calibration does
+                                            # not erase the fact that this
+                                            # champion has already received
+                                            # its one value bootstrap.
+                                            "value_bootstrap_champion_fingerprint": (
+                                                bootstrap_champion_fingerprint
                                             ),
                                             "round": round_index,
                                         },

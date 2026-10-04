@@ -663,11 +663,21 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
         policies[index, :length] = row.policy_target
         if row.action_history is not None:
             history_length = min(max_history, row.action_history.shape[0])
-            histories[index, :history_length] = row.action_history[:history_length]
+            # Python interprets ``-0:`` as ``0:``, i.e. the full dimension.
+            # Old replay can contain a real, shaped [0, features] history;
+            # it must remain an all-padding row when mixed with a newer
+            # non-empty history instead of attempting a full-row broadcast.
+            if history_length == 0:
+                continue
+            # Histories are chronological and right-aligned in live packets.
+            # Keep that invariant when old 16-event replay is mixed with a
+            # newer 32-event example: the newest event must use the same
+            # positional embedding in every batch.
+            histories[index, -history_length:] = row.action_history[-history_length:]
             if row.action_history_mask is None:
-                history_masks[index, :history_length] = True
+                history_masks[index, -history_length:] = True
             else:
-                history_masks[index, :history_length] = row.action_history_mask[:history_length]
+                history_masks[index, -history_length:] = row.action_history_mask[-history_length:]
 
     return {
         "map_tokens": torch.as_tensor(maps, dtype=torch.long, device=device),

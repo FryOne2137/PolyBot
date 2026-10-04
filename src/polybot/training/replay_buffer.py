@@ -83,6 +83,41 @@ class ReplayBuffer:
         self._capacity = int(capacity)
         self._preserve_constraint_fraction = float(preserve_constraint_fraction)
         self._preserve_bridge_fraction = float(preserve_bridge_fraction)
+        self._rows_cache: list[TrainingExample] | None = None
+        self._index_cache: dict[str, np.ndarray] | None = None
+
+    def _invalidate_cache(self) -> None:
+        self._rows_cache = None
+        self._index_cache = None
+
+    def _cached_rows_and_indices(
+        self,
+    ) -> tuple[list[TrainingExample], dict[str, np.ndarray]]:
+        if self._rows_cache is not None and self._index_cache is not None:
+            return self._rows_cache, self._index_cache
+        rows = list(self._examples)
+        indices = {
+            "priority": np.asarray([
+                index for index, row in enumerate(rows)
+                if row.shaped_reward >= 0.5 or abs(row.value_target) >= 0.5
+            ], dtype=np.int64),
+            "bridge": np.asarray([
+                index for index, row in enumerate(rows) if row.bridge_priority
+            ], dtype=np.int64),
+            "critical": np.asarray([
+                index for index, row in enumerate(rows) if row.critical_priority
+            ], dtype=np.int64),
+            "reanalysis": np.asarray([
+                index for index, row in enumerate(rows) if row.reanalysis_priority
+            ], dtype=np.int64),
+            "constraint": np.asarray([
+                index for index, row in enumerate(rows)
+                if row.engine_action_constraint_priority
+            ], dtype=np.int64),
+        }
+        self._rows_cache = rows
+        self._index_cache = indices
+        return rows, indices
 
     def extend(self, examples: List[TrainingExample]) -> None:
         if not examples:
@@ -90,6 +125,7 @@ class ReplayBuffer:
         combined = list(self._examples) + list(examples)
         if len(combined) <= self._capacity:
             self._examples.extend(examples)
+            self._invalidate_cache()
             return
         # FIFO silently forgets rare contradictions between a sampled world
         # and public actions. Keep recent hard examples and bridge geometry,
@@ -118,6 +154,7 @@ class ReplayBuffer:
         self._examples = deque(
             (combined[index] for index in sorted(selected)), maxlen=self._capacity
         )
+        self._invalidate_cache()
 
     def sample(
         self,
@@ -131,92 +168,48 @@ class ReplayBuffer:
     ) -> List[TrainingExample]:
         if len(self._examples) < batch_size:
             raise ValueError("not enough replay examples for this batch")
-        rows = list(self._examples)
+        rows, cached_indices = self._cached_rows_and_indices()
         priority_count = int(round(batch_size * float(np.clip(priority_fraction, 0.0, 1.0))))
         bridge_count = int(round(batch_size * float(np.clip(bridge_fraction, 0.0, 1.0))))
         critical_count = int(round(batch_size * float(np.clip(critical_fraction, 0.0, 1.0))))
         reanalysis_count = int(round(batch_size * float(np.clip(reanalysis_fraction, 0.0, 1.0))))
         constraint_count = int(round(batch_size * float(np.clip(engine_action_constraint_fraction, 0.0, 1.0))))
-        priority_indices = np.asarray(
-            [
-                index
-                for index, row in enumerate(rows)
-                if row.shaped_reward >= 0.5 or abs(row.value_target) >= 0.5
-            ],
-            dtype=np.int64,
-        )
-        bridge_indices = np.asarray(
-            [index for index, row in enumerate(rows) if row.bridge_priority],
-            dtype=np.int64,
-        )
-        critical_indices = np.asarray(
-            [
-                index
-                for index, row in enumerate(rows)
-                if row.critical_priority
-            ],
-            dtype=np.int64,
-        )
-        reanalysis_indices = np.asarray(
-            [
-                index
-                for index, row in enumerate(rows)
-                if row.reanalysis_priority
-            ],
-            dtype=np.int64,
-        )
-        constraint_indices = np.asarray(
-            [index for index, row in enumerate(rows) if row.engine_action_constraint_priority],
-            dtype=np.int64,
-        )
+        priority_indices = cached_indices["priority"]
+        bridge_indices = cached_indices["bridge"]
+        critical_indices = cached_indices["critical"]
+        reanalysis_indices = cached_indices["reanalysis"]
+        constraint_indices = cached_indices["constraint"]
+        # ``np.setdiff1d`` sorts and duplicates its inputs. On a 100k belief
+        # replay that happens several times per batch and can allocate enough
+        # temporary memory to fail before an optimiser step. A boolean mask is
+        # linear, preserves the same without-replacement semantics, and keeps
+        # the hard-example fractions independent.
+        available = np.ones(len(rows), dtype=bool)
         chosen: List[int] = []
-        if reanalysis_indices.size:
-            count = min(reanalysis_count, reanalysis_indices.size, batch_size)
-            chosen.extend(
-                int(index)
-                for index in rng.choice(reanalysis_indices, size=count, replace=False)
+
+        def reserve(indices: np.ndarray, requested: int) -> None:
+            if requested <= 0 or len(chosen) >= batch_size or not indices.size:
+                return
+            candidates = indices[available[indices]]
+            count = min(int(requested), int(candidates.size), batch_size - len(chosen))
+            if count <= 0:
+                return
+            selected = np.asarray(
+                rng.choice(candidates, size=count, replace=False), dtype=np.int64
             )
-        if critical_indices.size:
-            available_critical = np.setdiff1d(
-                critical_indices, np.asarray(chosen, dtype=np.int64)
-            )
-            count = min(critical_count, available_critical.size, batch_size - len(chosen))
-            chosen.extend(
-                int(index)
-                for index in rng.choice(available_critical, size=count, replace=False)
-            )
-        if bridge_indices.size:
-            available_bridge = np.setdiff1d(
-                bridge_indices, np.asarray(chosen, dtype=np.int64)
-            )
-            count = min(bridge_count, available_bridge.size, batch_size - len(chosen))
-            chosen.extend(
-                int(index)
-                for index in rng.choice(available_bridge, size=count, replace=False)
-            )
-        if constraint_indices.size:
-            available_constraint = np.setdiff1d(
-                constraint_indices, np.asarray(chosen, dtype=np.int64)
-            )
-            count = min(constraint_count, available_constraint.size, batch_size - len(chosen))
-            chosen.extend(
-                int(index)
-                for index in rng.choice(available_constraint, size=count, replace=False)
-            )
-        if priority_indices.size:
-            available_priority = np.setdiff1d(
-                priority_indices, np.asarray(chosen, dtype=np.int64)
-            )
-            count = min(priority_count, available_priority.size, batch_size - len(chosen))
-            chosen.extend(
-                int(index)
-                for index in rng.choice(available_priority, size=count, replace=False)
-            )
+            available[selected] = False
+            chosen.extend(int(index) for index in selected)
+
+        reserve(reanalysis_indices, reanalysis_count)
+        reserve(critical_indices, critical_count)
+        reserve(bridge_indices, bridge_count)
+        reserve(constraint_indices, constraint_count)
+        reserve(priority_indices, priority_count)
         remaining = batch_size - len(chosen)
-        available = np.setdiff1d(np.arange(len(rows), dtype=np.int64), np.asarray(chosen, dtype=np.int64))
-        chosen.extend(int(index) for index in rng.choice(available, size=remaining, replace=False))
+        if remaining:
+            reserve(np.flatnonzero(available), remaining)
         indices = np.asarray(chosen, dtype=np.int64)
-        return [self._examples[int(index)] for index in indices]
+        return [rows[int(index)] for index in indices]
 
     def __len__(self) -> int:
         return len(self._examples)

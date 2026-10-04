@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import hashlib
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
@@ -38,6 +39,41 @@ from .vector_population import (
 
 
 _MAX_SEED = 2**31 - 1
+
+
+def _checkpoint_fingerprint(path: Path) -> str | None:
+    """Return a content identity for a checkpoint, not merely its pathname."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _belief_validation_signature(
+    training: TrainingConfig,
+    mcts: MCTSConfig,
+    *,
+    visible_action_history: int,
+    belief_retries: int,
+    evaluation_seed: int,
+    evaluation_games: int,
+) -> dict[str, Any]:
+    """Describe every setting that changes a belief held-out measurement."""
+    return {
+        "map_size": int(training.map_size),
+        "map_type": str(training.map_type),
+        "particles": int(mcts.particles),
+        "belief_particle_temperature": float(mcts.belief_particle_temperature),
+        "belief_retries": int(belief_retries),
+        "native_max_actions": int(mcts.native_max_actions),
+        "visible_action_history": int(visible_action_history),
+        "evaluation_seed": int(evaluation_seed),
+        "evaluation_games": int(evaluation_games),
+    }
 
 
 def _load_belief_apprentice_state(path: Path) -> Dict[str, Any]:
@@ -1569,10 +1605,32 @@ def train_promotion_league(
                     belief_apprentice_state = _load_belief_apprentice_state(
                         belief_apprentice_state_path
                     )
+                    champion_fingerprint = _checkpoint_fingerprint(champion_path)
+                    apprentice_fingerprint = _checkpoint_fingerprint(
+                        belief_apprentice_path
+                    )
+                    belief_validation_signature = _belief_validation_signature(
+                        round_training,
+                        mcts,
+                        visible_action_history=visible_action_history,
+                        belief_retries=belief_retries,
+                        evaluation_seed=_offset_seed(
+                            resolved_evaluation_seed, 17_000_003
+                        ),
+                        evaluation_games=belief_calibration_eval_games,
+                    )
                     apprentice_matches_champion = (
                         belief_apprentice_path.exists()
                         and belief_apprentice_state.get("champion_path")
                         == str(champion_path.resolve())
+                        and champion_fingerprint is not None
+                        and belief_apprentice_state.get("champion_fingerprint")
+                        == champion_fingerprint
+                        and belief_apprentice_state.get("apprentice_fingerprint")
+                        == apprentice_fingerprint
+                        and int(belief_apprentice_state.get("held_out_games", 0)) > 0
+                        and belief_apprentice_state.get("validation_signature")
+                        == belief_validation_signature
                     )
                     apprentice_rejection_rate = float(
                         belief_apprentice_state.get("rejection_rate", 1.0)
@@ -4038,12 +4096,22 @@ def train_promotion_league(
                         save_model(
                             belief_apprentice_path, candidate, model_config
                         )
-                        bootstrap_marker = dict(belief_apprentice_state)
-                        bootstrap_marker.update({
+                        # Bootstrap changes decoder weights. Its old held-out
+                        # number therefore cannot certify this newly saved
+                        # checkpoint; force a fresh strict calibration before
+                        # MCTS can use it.
+                        bootstrap_marker = {
                             "champion_path": str(champion_path.resolve()),
-                            "ready": bool(
-                                bootstrap_marker.get("ready", False)
+                            "champion_fingerprint": _checkpoint_fingerprint(champion_path),
+                            "apprentice_fingerprint": _checkpoint_fingerprint(
+                                belief_apprentice_path
                             ),
+                            "ready": False,
+                            "checked_particles": 0,
+                            "rejected_particles": 0,
+                            "rejection_rate": 1.0,
+                            "held_out_games": 0,
+                            "validation_signature": None,
                             "value_bootstrap_round": round_index,
                             "value_bootstrap_games": value_bootstrap_games,
                             "value_bootstrap_terminals": int(
@@ -4056,7 +4124,7 @@ def train_promotion_league(
                                     "population_pool_updates", 0.0
                                 )
                             ),
-                        })
+                        }
                         _save_belief_apprentice_state(
                             belief_apprentice_state_path, bootstrap_marker
                         )
@@ -4799,6 +4867,11 @@ def train_promotion_league(
                                         belief_apprentice_state_path,
                                         {
                                             "champion_path": str(champion_path.resolve()),
+                                            "champion_fingerprint": _checkpoint_fingerprint(champion_path),
+                                            "apprentice_fingerprint": _checkpoint_fingerprint(
+                                                belief_apprentice_path
+                                            ),
+                                            "validation_signature": belief_validation_signature,
                                             "ready": ready,
                                             "checked_particles": checked,
                                             "rejected_particles": rejected,

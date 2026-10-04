@@ -27,6 +27,7 @@ from polybot.planning.action_pruning import (
 )
 from polybot.training.belief_warmup import (
     _BELIEF_ONLY_PREFIXES,
+    _belief_update,
     _configure_belief_only_training,
     _restore_trainable_parameters,
 )
@@ -51,6 +52,8 @@ from polybot.training.belief_recovery import (
 )
 from polybot.training.global_mcts_train import _native_leaf_bias
 from polybot.training.league import (
+    _checkpoint_fingerprint,
+    _belief_validation_signature,
     _load_belief_calibration_replay,
     _save_belief_calibration_replay,
     _challenger_continuation_action,
@@ -2470,6 +2473,33 @@ def test_bridge_constraint_loss_keeps_gradient_for_confident_wrong_water():
     assert logits.grad[0, (3, 5), 3].abs().max() > 0
 
 
+def test_bridge_constraint_loss_keeps_gradient_for_confident_wrong_land():
+    map_tokens = torch.full((1, 9, 23), -1, dtype=torch.long)
+    map_tokens[..., 0] = 1
+    map_tokens[..., 19] = 1
+    map_tokens[:, (1, 7), 0] = 0
+    hidden = map_tokens[..., 0] == 0
+    actions = torch.full((1, 1, 12), -1, dtype=torch.long)
+    actions[:, 0, 0] = 8
+    actions[:, 0, 2] = 4
+    actions[:, 0, 9] = 9
+    target = map_tokens.clone()
+    target[:, (1, 7), 19] = 1
+    logits = torch.full((1, 9, 6), -50.0, requires_grad=True)
+    with torch.no_grad():
+        logits[:, :, 3] = 50.0
+
+    loss = bridge_constraint_loss(
+        logits, map_tokens, target, hidden, actions,
+        torch.ones((1, 1), dtype=torch.bool), 3,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert logits.grad[0, (1, 7), 3].abs().max() > 0
+
+
 def test_entity_consistency_does_not_use_unit_runtime_origin_id():
     logits = [
         torch.zeros((1, 1, largest + 2), requires_grad=True)
@@ -2506,6 +2536,82 @@ def test_structured_particle_sampler_keeps_non_city_settlements_and_capital():
     assert int(completed[0, 15]) >= 0  # village reserves its future city ID
     assert int(completed[3, 14]) == 2
     assert int(completed[3, 9]) == 1
+
+
+def test_missing_capital_never_mutates_a_revealed_city_or_uses_water():
+    completed = torch.tensor(
+        [[1, 0, -1, -1, -1, -1, -1, 0, 0, 0, 1, 0, 0, 1,
+          2, 7, 1, 0, 0, 2, 0, -1, -1],  # revealed ordinary city, owner 1
+         [0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
+          0, -1, -1, -1, 0, 1, 0, -1, -1]],  # hidden water
+        dtype=torch.long,
+    )
+    original = completed.clone()
+    PolicyValueBeliefNet._add_missing_player_capitals(
+        completed, torch.tensor([False, True]), player_count=2,
+        perspective_player=0,
+    )
+
+    assert torch.equal(completed, original)
+
+
+def test_checkpoint_fingerprint_changes_when_checkpoint_content_changes():
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "champion.pt"
+        path.write_bytes(b"first")
+        first = _checkpoint_fingerprint(path)
+        path.write_bytes(b"second")
+        second = _checkpoint_fingerprint(path)
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+
+
+def test_belief_validation_signature_rejects_changed_particle_or_map_settings():
+    training = TrainingConfig(map_size=11, map_type="lakes")
+    baseline = _belief_validation_signature(
+        training, MCTSConfig(particles=4, belief_particle_temperature=0.15),
+        visible_action_history=32, belief_retries=2,
+        evaluation_seed=123, evaluation_games=16,
+    )
+    changed_particles = _belief_validation_signature(
+        training, MCTSConfig(particles=8, belief_particle_temperature=0.15),
+        visible_action_history=32, belief_retries=2,
+        evaluation_seed=123, evaluation_games=16,
+    )
+    changed_map = _belief_validation_signature(
+        TrainingConfig(map_size=13, map_type="lakes"),
+        MCTSConfig(particles=4, belief_particle_temperature=0.15),
+        visible_action_history=32, belief_retries=2,
+        evaluation_seed=123, evaluation_games=16,
+    )
+
+    assert baseline != changed_particles
+    assert baseline != changed_map
+
+
+def test_belief_warmup_passes_configured_presence_focal_gamma():
+    model = PolicyValueBeliefNet(
+        ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    )
+    optimiser = torch.optim.Adam(model.parameters(), lr=1e-4)
+    received: dict[str, float] = {}
+
+    def capture_loss(logits, *args, **kwargs):
+        received["gamma"] = kwargs["presence_focal_gamma"]
+        return logits[0].sum() * 0.0
+
+    with patch("polybot.training.belief_warmup.belief_loss", side_effect=capture_loss):
+        _belief_update(
+            model,
+            optimiser,
+            [_example(0)],
+            torch.device("cpu"),
+            TrainingConfig(device="cpu", belief_presence_focal_gamma=2.25),
+        )
+
+    assert received["gamma"] == 2.25
 
 
 def test_streamed_belief_replay_loads_without_materialising_a_legacy_list():

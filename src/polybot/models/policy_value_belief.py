@@ -1130,7 +1130,17 @@ class PolicyValueBeliefNet(nn.Module):
         # Do not replace a sampled village, ruin or lighthouse with a
         # synthetic centre merely to satisfy a runtime reference.
         candidates = iter(torch.nonzero(
-            hidden & (completed[:, 14] == 0), as_tuple=False
+            hidden
+            & (completed[:, 14] == 0)
+            & torch.isin(
+                completed[:, TERRAIN_FEATURE],
+                torch.as_tensor(
+                    tuple(LANDISH_TERRAINS),
+                    dtype=completed.dtype,
+                    device=completed.device,
+                ),
+            ),
+            as_tuple=False,
         ).flatten().tolist())
         for city_id in referenced.tolist():
             if int(city_id) in existing:
@@ -1187,10 +1197,21 @@ class PolicyValueBeliefNet(nn.Module):
         # Never allocate a hypothetical capital with that ID.
         existing_ids = completed[:, 15]
         next_city_id = max((int(city_id) for city_id in existing_ids.tolist() if city_id >= 0), default=-1) + 1
-        # A fallback capital may occupy only an otherwise empty hypothesis;
-        # it must not erase a sampled village, ruin or lighthouse.
+        # A fallback capital may occupy only an otherwise empty land
+        # hypothesis; it must not erase a sampled object or invent a city on
+        # water merely to keep a detached particle non-terminal.
         candidates = iter(torch.nonzero(
-            hidden & (completed[:, 14] == 0), as_tuple=False
+            hidden
+            & (completed[:, 14] == 0)
+            & torch.isin(
+                completed[:, TERRAIN_FEATURE],
+                torch.as_tensor(
+                    tuple(LANDISH_TERRAINS),
+                    dtype=completed.dtype,
+                    device=completed.device,
+                ),
+            ),
+            as_tuple=False,
         ).flatten().tolist())
         for owner in range(player_count):
             if owner in capital_owners:
@@ -1203,8 +1224,11 @@ class PolicyValueBeliefNet(nn.Module):
             # deterministic one rather than inventing a duplicate city; this
             # is only the engine-valid fallback when the decoder gave no
             # capital prediction.
+            # Revealed tokens are immutable public evidence. A missing
+            # capital may only promote a hidden city hypothesis; never turn a
+            # visible ordinary city into a different map token.
             existing = torch.nonzero(
-                city_rows & (completed[:, 16] == owner), as_tuple=False
+                hidden & city_rows & (completed[:, 16] == owner), as_tuple=False
             ).flatten()
             if existing.numel():
                 completed[int(existing[0]), 9] = 1

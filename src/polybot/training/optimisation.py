@@ -163,10 +163,26 @@ def belief_terrain_metrics(
         (target_landish[:, north] & target_landish[:, south] & north_south_available)
         | (target_landish[:, west] & target_landish[:, east] & east_west_available)
     )
-    hidden_neighbour = (
-        ((hidden_mask[:, north] | hidden_mask[:, south]) & north_south_available)
-        | ((hidden_mask[:, west] | hidden_mask[:, east]) & east_west_available)
+    # Supervise only orientations whose feasibility genuinely depends on
+    # hidden terrain. A route already disproved by known water carries no
+    # belief signal and creates an exact 0/1 probability limit.
+    north_south_uncertain = (
+        north_south_available
+        & (hidden_mask[:, north] | hidden_mask[:, south])
+        & ~(
+            (known[:, north] & ~observed_landish[:, north])
+            | (known[:, south] & ~observed_landish[:, south])
+        )
     )
+    east_west_uncertain = (
+        east_west_available
+        & (hidden_mask[:, west] | hidden_mask[:, east])
+        & ~(
+            (known[:, west] & ~observed_landish[:, west])
+            | (known[:, east] & ~observed_landish[:, east])
+        )
+    )
+    hidden_neighbour = north_south_uncertain | east_west_uncertain
     candidates = known & (map_tokens[..., 19] == 1) & hidden_neighbour
     samples = int(candidates.sum().item())
     result["belief_bridge_geometry_samples"] = float(samples)
@@ -277,68 +293,31 @@ def bridge_constraint_loss(
     south = (target_indices + map_size).clamp(0, tiles - 1)
     west = (target_indices - 1).clamp(0, tiles - 1)
     east = (target_indices + 1).clamp(0, tiles - 1)
-
-    # Do not clamp the composed probability before BCE.  A confidently-wrong
-    # water prediction can make the old expression exactly zero in float32;
-    # clamp then returned a constant and the bridge loss had no gradient.
-    # Build the same OR-of-two-pairs probability in log space and pass its
-    # log-odds to the logits form of BCE instead.
-    terrain_log_probabilities = F.log_softmax(terrain_logits, dim=-1)
-    predicted_log_landish = torch.logsumexp(
-        terrain_log_probabilities[..., 3:6], dim=-1
-    )
-    negative_infinity = torch.full_like(predicted_log_landish, -torch.inf)
-    observed_log_landish = torch.where(
-        observed_landish,
-        torch.zeros_like(predicted_log_landish),
-        negative_infinity,
-    )
-    log_landish = torch.where(known, observed_log_landish, predicted_log_landish)
-
-    def log_one_minus_exp(log_probability: torch.Tensor) -> torch.Tensor:
-        """Return log(1 - exp(log_probability)) for log_probability <= 0."""
-        return torch.where(
-            log_probability < -0.6931471805599453,
-            torch.log1p(-torch.exp(log_probability)),
-            torch.log(-torch.expm1(log_probability)),
-        )
-
-    log_ns = log_landish[:, north] + log_landish[:, south]
-    log_ew = log_landish[:, west] + log_landish[:, east]
-    log_ns = torch.where(
-        north_south_available.unsqueeze(0), log_ns, negative_infinity
-    )
-    log_ew = torch.where(
-        east_west_available.unsqueeze(0), log_ew, negative_infinity
-    )
-    # log(P(NS or EW)) must not be obtained from ``1 - P(no pair)``: when
-    # both pair probabilities are tiny, float32 rounds P(no pair) to exactly
-    # one and loses the learning signal. Inclusion-exclusion in log space
-    # keeps the leading tiny term and therefore its gradient.
-    log_pair_union = torch.logaddexp(log_ns, log_ew)
-    has_pair = torch.isfinite(log_pair_union)
-    relative_intersection = torch.where(
-        has_pair,
-        log_ns + log_ew - log_pair_union,
-        negative_infinity,
-    )
-    log_valid = torch.where(
-        has_pair,
-        log_pair_union + log_one_minus_exp(relative_intersection),
-        negative_infinity,
-    )
-    log_not_valid = log_one_minus_exp(log_valid)
-    bridge_logits = log_valid - log_not_valid
     target_valid = (
         (target_landish[:, north] & target_landish[:, south] & north_south_available)
         | (target_landish[:, west] & target_landish[:, east] & east_west_available)
     )
-    hidden_neighbour = (
-        ((hidden_mask[:, north] | hidden_mask[:, south]) & north_south_available)
-        | ((hidden_mask[:, west] | hidden_mask[:, east]) & east_west_available)
+    # Only orientations whose feasibility actually depends on hidden terrain
+    # are learnable. Known water in either side makes that orientation a
+    # deterministic non-bridge and must not enter this auxiliary objective.
+    north_south_uncertain = (
+        north_south_available
+        & (hidden_mask[:, north] | hidden_mask[:, south])
+        & ~(
+            (known[:, north] & ~observed_landish[:, north])
+            | (known[:, south] & ~observed_landish[:, south])
+        )
     )
+    east_west_uncertain = (
+        east_west_available
+        & (hidden_mask[:, west] | hidden_mask[:, east])
+        & ~(
+            (known[:, west] & ~observed_landish[:, west])
+            | (known[:, east] & ~observed_landish[:, east])
+        )
+    )
+    hidden_neighbour = north_south_uncertain | east_west_uncertain
     candidate = known & (map_tokens[..., 19] == 1) & hidden_neighbour
-
     bridge_action = (
         action_mask
         & (action_categorical[..., 0] == 8)
@@ -356,12 +335,120 @@ def bridge_constraint_loss(
     selected = weight > 0
     if not bool(selected.any()):
         return terrain_logits.sum() * 0.0
-    per_target = F.binary_cross_entropy_with_logits(
-        bridge_logits[selected],
-        target_valid[selected].to(terrain_logits.dtype),
-        reduction="none",
+
+    # Compute both P(land) and P(not land) directly from logits in float64.
+    # Deriving P(not land) as ``1 - P(land)`` loses its tiny residual when a
+    # particle is extremely certain of land; that was the source of a zero
+    # gradient for confidently wrong, non-bridge terrain predictions.
+    logits64 = terrain_logits.double()
+    normalizer = torch.logsumexp(logits64, dim=-1)
+    predicted_log_landish = torch.logsumexp(logits64[..., 3:6], dim=-1) - normalizer
+    predicted_log_not_landish = torch.logsumexp(logits64[..., :3], dim=-1) - normalizer
+    log_zero = torch.full_like(predicted_log_landish, -700.0)
+    predicted_log_landish = predicted_log_landish.clamp(min=-700.0, max=0.0)
+    predicted_log_not_landish = predicted_log_not_landish.clamp(min=-700.0, max=0.0)
+    log_landish = torch.where(
+        known,
+        torch.where(observed_landish, torch.zeros_like(log_zero), log_zero),
+        predicted_log_landish,
     )
-    return (per_target * weight[selected]).sum() / weight[selected].sum()
+    log_not_landish = torch.where(
+        known,
+        torch.where(observed_landish, log_zero, torch.zeros_like(log_zero)),
+        predicted_log_not_landish,
+    )
+
+    def log_one_minus_exp(
+        log_probability: torch.Tensor, *, safe_discarded_branch: bool = False
+    ) -> torch.Tensor:
+        """Stable log(1 - exp(x)) for finite x <= 0."""
+        if safe_discarded_branch:
+            # This call is also evaluated on a branch later discarded by
+            # ``torch.where``. Keep that discarded limit finite so its
+            # undefined derivative at x=0 cannot leak NaN into backward.
+            log_probability = log_probability.clamp(max=-1e-12)
+        threshold = -0.6931471805599453
+        # ``torch.where`` evaluates both branches. Clamp each branch to the
+        # range where *that branch* is numerically safe; otherwise the unused
+        # log1p(-exp(x)) path reaches -inf near x=0 and poisons gradients.
+        low_range = torch.minimum(
+            log_probability, torch.full_like(log_probability, threshold)
+        )
+        high_range = torch.maximum(
+            log_probability, torch.full_like(log_probability, threshold)
+        )
+        return torch.where(
+            log_probability < threshold,
+            torch.log1p(-torch.exp(low_range)),
+            torch.log(-torch.expm1(high_range)),
+        )
+
+    # Only evaluate the nonlinear geometry on tiles that contribute to this
+    # batch's loss. Besides avoiding needless accelerator work, this prevents
+    # a deterministic, non-candidate board cell from producing an undefined
+    # limiting derivative that contaminates autograd.
+    selected_rows, selected_tiles = torch.nonzero(selected, as_tuple=True)
+
+    def pair_logs(first: torch.Tensor, second: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return log P(both land) and log P(not both land)."""
+        first_log_landish = log_landish[selected_rows, first]
+        second_log_landish = log_landish[selected_rows, second]
+        first_log_not_landish = log_not_landish[selected_rows, first]
+        second_log_not_landish = log_not_landish[selected_rows, second]
+        log_pair = first_log_landish + second_log_landish
+        # 1 - p_a p_b = (1 - p_a) + p_a (1 - p_b).  This form retains
+        # gradients when p_a and p_b are each extremely close to one.
+        log_not_pair_from_residual = torch.logaddexp(
+            first_log_not_landish,
+            first_log_landish + second_log_not_landish,
+        )
+        # Near certain *water*, the residual expression above adds 1 to a
+        # tiny value and rounds to exactly 1. Here ``log_pair`` is far below
+        # zero, so log(1 - P(pair)) is the stable formulation. Near certain
+        # land we keep the residual form, which retains the tiny non-land
+        # probability that a direct 1 - P(pair) would erase.
+        log_not_pair_from_pair = log_one_minus_exp(
+            log_pair, safe_discarded_branch=True
+        )
+        log_not_pair = torch.where(
+            log_pair < -0.6931471805599453,
+            log_not_pair_from_pair,
+            log_not_pair_from_residual,
+        )
+        return log_pair, log_not_pair
+
+    selected_north = north[selected_tiles]
+    selected_south = south[selected_tiles]
+    selected_west = west[selected_tiles]
+    selected_east = east[selected_tiles]
+    log_ns, log_not_ns = pair_logs(selected_north, selected_south)
+    log_ew, log_not_ew = pair_logs(selected_west, selected_east)
+    selected_log_zero = torch.full_like(log_ns, -700.0)
+    log_ns = torch.where(
+        north_south_available[selected_tiles], log_ns, selected_log_zero
+    )
+    log_ew = torch.where(
+        east_west_available[selected_tiles], log_ew, selected_log_zero
+    )
+    log_not_ns = torch.where(
+        north_south_available[selected_tiles], log_not_ns, torch.zeros_like(log_not_ns)
+    )
+    log_not_ew = torch.where(
+        east_west_available[selected_tiles], log_not_ew, torch.zeros_like(log_not_ew)
+    )
+    # A bridge is valid when either opposite pair is land. Keep the negative
+    # probability directly: its log is well-conditioned even when validity is
+    # almost one. This avoids both NaN and the old zero-gradient saturation.
+    log_not_valid = log_not_ns + log_not_ew
+    log_valid = log_one_minus_exp(log_not_valid)
+    per_target = torch.where(
+        target_valid[selected_rows, selected_tiles],
+        -log_valid,
+        -log_not_valid,
+    )
+    return ((per_target * weight[selected]).sum() / weight[selected].sum()).to(
+        terrain_logits.dtype
+    )
 
 
 def belief_loss(

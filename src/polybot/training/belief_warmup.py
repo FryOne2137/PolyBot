@@ -101,6 +101,7 @@ def _belief_update(
         batch["action_categorical"],
         batch["action_mask"],
         training.legal_action_belief_weight,
+        presence_focal_gamma=training.belief_presence_focal_gamma,
     )
     optimiser.zero_grad(set_to_none=True)
     loss.backward()

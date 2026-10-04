@@ -720,15 +720,17 @@ class PolicyValueBeliefNet(nn.Module):
             sampled_features[feature_index] = sample_feature(feature_index)
         sampled_features[14] = sample_feature(14)
         sampled_features[4] = sample_feature(4)
-        # Cities cannot occupy water. Make this an explicit conditional in
-        # the generative order instead of relying on later structural repair
-        # to erase an independently sampled city/terrain contradiction.
+        # Only cities cannot occupy water. Villages, ruins and lighthouses
+        # are valid settlement hypotheses too; erasing every non-city value
+        # here made their prediction invisible to MCTS.
         city_present = (sampled_features[14] == 2) & torch.isin(
             sampled_features[TERRAIN_FEATURE],
             torch.as_tensor(tuple(LANDISH_TERRAINS), device=observed.device),
         )
         sampled_features[14] = torch.where(
-            city_present, sampled_features[14], torch.zeros_like(sampled_features[14])
+            (sampled_features[14] != 2) | city_present,
+            sampled_features[14],
+            torch.zeros_like(sampled_features[14]),
         )
         unit_present = sampled_features[4] >= 1
         for feature_index in CITY_PARTICLE_FEATURES:
@@ -848,15 +850,17 @@ class PolicyValueBeliefNet(nn.Module):
                 )
         sampled_features[14] = sample_feature(14)
         sampled_features[4] = sample_feature(4)
-        # See the scalar sampler above: condition city presence on terrain
-        # before sampling its attributes, so a particle never contains a
-        # decoder-created water city that must be repaired afterwards.
+        # See the scalar sampler above: condition only city presence on
+        # terrain before sampling city attributes. Other settlement types are
+        # public game objects in their own right and must reach the engine.
         city_present = (sampled_features[14] == 2) & torch.isin(
             sampled_features[TERRAIN_FEATURE],
             torch.as_tensor(tuple(LANDISH_TERRAINS), device=observed.device),
         )
         sampled_features[14] = torch.where(
-            city_present, sampled_features[14], torch.zeros_like(sampled_features[14])
+            (sampled_features[14] != 2) | city_present,
+            sampled_features[14],
+            torch.zeros_like(sampled_features[14]),
         )
         unit_present = sampled_features[4] >= 1
         for feature_index in CITY_PARTICLE_FEATURES:
@@ -940,7 +944,15 @@ class PolicyValueBeliefNet(nn.Module):
         territory/origin pointers because those are relational facts the tile
         decoder cannot identify reliably yet.
         """
-        city_candidates = torch.nonzero(hidden & (sampled[14] == 2), as_tuple=False).flatten().tolist()
+        city_candidates = torch.nonzero(
+            hidden & (sampled[14] == 2), as_tuple=False
+        ).flatten().tolist()
+        # A predicted capital must be considered before ordinary city rows;
+        # otherwise the city cap can discard the only capital hypothesis.
+        city_candidates.sort(
+            key=lambda tile: int(sampled[9][tile]) == 1,
+            reverse=True,
+        )
         city_rows = completed[:, 14] == 2
         references = torch.cat((completed[:, 6], completed[:, 22]))
         # Settlement IDs are map-wide, not city-centre-only.  A visible
@@ -952,11 +964,36 @@ class PolicyValueBeliefNet(nn.Module):
         used_ids.extend(int(value) for value in references.tolist() if int(value) >= 0)
         next_city_id = max(used_ids, default=-1) + 1
 
+        # Settlement values 1/3/4 are villages, ruins and lighthouses. They
+        # used to be silently discarded because only cities were materialised.
+        # A village reserves a future city ID; the other object types have no
+        # city runtime identity and therefore retain the valid empty defaults
+        # for city fields.
+        non_city_settlement_candidates = torch.nonzero(
+            hidden & (sampled[14] > 0) & (sampled[14] != 2),
+            as_tuple=False,
+        ).flatten().tolist()
+        for tile in non_city_settlement_candidates:
+            settlement_type = int(sampled[14][tile])
+            if settlement_type < 1 or settlement_type > MAP_FEATURE_MAX[14]:
+                continue
+            completed[tile, 14] = settlement_type
+            if settlement_type == 1:  # SettlementTypeEnum::Village
+                completed[tile, 15] = next_city_id
+                next_city_id += 1
+
         # A fresh, untrained network assigns roughly equal mass to every
         # category.  A cap prevents it from fabricating a whole board of cities
         # while retaining particle diversity once the decoder has learned them.
         city_limit = max(player_count, completed.shape[0] // 20)
         placed_cities = 0
+        capital_owners = set(
+            int(owner)
+            for owner in completed[
+                (completed[:, 14] == 2) & (completed[:, 9] == 1), 16
+            ].tolist()
+            if 0 <= int(owner) < player_count
+        )
         for tile in city_candidates:
             if placed_cities >= city_limit:
                 break
@@ -967,7 +1004,8 @@ class PolicyValueBeliefNet(nn.Module):
             # and territory actions.
             if perspective_player is not None and owner == perspective_player:
                 continue
-            completed[tile, 9] = 0
+            is_capital = int(sampled[9][tile]) == 1 and owner not in capital_owners
+            completed[tile, 9] = int(is_capital)
             completed[tile, 10] = min(1, max(0, int(sampled[10][tile])))
             completed[tile, 11] = min(1, max(0, int(sampled[11][tile])))
             completed[tile, 12] = max(0, int(sampled[12][tile]))
@@ -976,6 +1014,8 @@ class PolicyValueBeliefNet(nn.Module):
             completed[tile, 15] = next_city_id
             completed[tile, 16] = owner
             completed[tile, 17] = max(0, int(sampled[17][tile]))
+            if is_capital:
+                capital_owners.add(owner)
             next_city_id += 1
             placed_cities += 1
 
@@ -1087,7 +1127,11 @@ class PolicyValueBeliefNet(nn.Module):
             return
         existing = completed[completed[:, 14] == 2, 15]
         existing = set(int(city_id) for city_id in existing.tolist() if city_id >= 0)
-        candidates = iter(torch.nonzero(hidden & (completed[:, 14] != 2), as_tuple=False).flatten().tolist())
+        # Do not replace a sampled village, ruin or lighthouse with a
+        # synthetic centre merely to satisfy a runtime reference.
+        candidates = iter(torch.nonzero(
+            hidden & (completed[:, 14] == 0), as_tuple=False
+        ).flatten().tolist())
         for city_id in referenced.tolist():
             if int(city_id) in existing:
                 continue
@@ -1132,22 +1176,39 @@ class PolicyValueBeliefNet(nn.Module):
         if player_count < 1:
             return
         city_rows = completed[:, 14] == 2
-        existing_owners = set(
-            int(owner) for owner in completed[city_rows, 16].tolist() if 0 <= int(owner) < player_count
+        capital_owners = set(
+            int(owner)
+            for owner in completed[
+                city_rows & (completed[:, 9] == 1), 16
+            ].tolist()
+            if 0 <= int(owner) < player_count
         )
-        if len(existing_owners) >= player_count:
-            return
         # A village's settlement ID is reserved for its future city too.
         # Never allocate a hypothetical capital with that ID.
         existing_ids = completed[:, 15]
         next_city_id = max((int(city_id) for city_id in existing_ids.tolist() if city_id >= 0), default=-1) + 1
-        candidates = iter(torch.nonzero(hidden & ~city_rows, as_tuple=False).flatten().tolist())
+        # A fallback capital may occupy only an otherwise empty hypothesis;
+        # it must not erase a sampled village, ruin or lighthouse.
+        candidates = iter(torch.nonzero(
+            hidden & (completed[:, 14] == 0), as_tuple=False
+        ).flatten().tolist())
         for owner in range(player_count):
-            if owner in existing_owners:
+            if owner in capital_owners:
                 continue
             # Missing own cities are never a fog hypothesis. Their absence is
             # public information and must remain absent in the completion.
             if perspective_player is not None and owner == perspective_player:
+                continue
+            # A non-capital city can already exist for this owner. Promote a
+            # deterministic one rather than inventing a duplicate city; this
+            # is only the engine-valid fallback when the decoder gave no
+            # capital prediction.
+            existing = torch.nonzero(
+                city_rows & (completed[:, 16] == owner), as_tuple=False
+            ).flatten()
+            if existing.numel():
+                completed[int(existing[0]), 9] = 1
+                capital_owners.add(owner)
                 continue
             try:
                 tile = next(candidates)

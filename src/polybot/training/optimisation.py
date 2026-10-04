@@ -260,13 +260,10 @@ def bridge_constraint_loss(
     batch, tiles, classes = terrain_logits.shape
     if map_size * map_size != tiles or classes < 6:
         return terrain_logits.sum() * 0.0
-    probabilities = torch.softmax(terrain_logits, dim=-1)
     # Categorical labels are shifted by +1: terrain enums 2/3/4 occupy heads
     # 3/4/5, while zero is the -1/unknown class.
-    predicted_landish = probabilities[..., 3:6].sum(dim=-1)
     known = map_tokens[..., 0] == 1
     observed_landish = (map_tokens[..., 19] >= 2) & (map_tokens[..., 19] <= 4)
-    landish = torch.where(known, observed_landish.to(predicted_landish.dtype), predicted_landish)
     target_landish = (full_map_target[..., 19] >= 2) & (full_map_target[..., 19] <= 4)
 
     # Compute every target in one accelerator operation.  Avoiding a Python
@@ -281,12 +278,57 @@ def bridge_constraint_loss(
     west = (target_indices - 1).clamp(0, tiles - 1)
     east = (target_indices + 1).clamp(0, tiles - 1)
 
-    ns_probability = landish[:, north] * landish[:, south]
-    ew_probability = landish[:, west] * landish[:, east]
-    ns_probability = ns_probability * north_south_available.to(ns_probability.dtype)
-    ew_probability = ew_probability * east_west_available.to(ew_probability.dtype)
-    predicted_valid = 1.0 - (1.0 - ns_probability) * (1.0 - ew_probability)
-    predicted_valid = predicted_valid.clamp(1e-6, 1.0 - 1e-6)
+    # Do not clamp the composed probability before BCE.  A confidently-wrong
+    # water prediction can make the old expression exactly zero in float32;
+    # clamp then returned a constant and the bridge loss had no gradient.
+    # Build the same OR-of-two-pairs probability in log space and pass its
+    # log-odds to the logits form of BCE instead.
+    terrain_log_probabilities = F.log_softmax(terrain_logits, dim=-1)
+    predicted_log_landish = torch.logsumexp(
+        terrain_log_probabilities[..., 3:6], dim=-1
+    )
+    negative_infinity = torch.full_like(predicted_log_landish, -torch.inf)
+    observed_log_landish = torch.where(
+        observed_landish,
+        torch.zeros_like(predicted_log_landish),
+        negative_infinity,
+    )
+    log_landish = torch.where(known, observed_log_landish, predicted_log_landish)
+
+    def log_one_minus_exp(log_probability: torch.Tensor) -> torch.Tensor:
+        """Return log(1 - exp(log_probability)) for log_probability <= 0."""
+        return torch.where(
+            log_probability < -0.6931471805599453,
+            torch.log1p(-torch.exp(log_probability)),
+            torch.log(-torch.expm1(log_probability)),
+        )
+
+    log_ns = log_landish[:, north] + log_landish[:, south]
+    log_ew = log_landish[:, west] + log_landish[:, east]
+    log_ns = torch.where(
+        north_south_available.unsqueeze(0), log_ns, negative_infinity
+    )
+    log_ew = torch.where(
+        east_west_available.unsqueeze(0), log_ew, negative_infinity
+    )
+    # log(P(NS or EW)) must not be obtained from ``1 - P(no pair)``: when
+    # both pair probabilities are tiny, float32 rounds P(no pair) to exactly
+    # one and loses the learning signal. Inclusion-exclusion in log space
+    # keeps the leading tiny term and therefore its gradient.
+    log_pair_union = torch.logaddexp(log_ns, log_ew)
+    has_pair = torch.isfinite(log_pair_union)
+    relative_intersection = torch.where(
+        has_pair,
+        log_ns + log_ew - log_pair_union,
+        negative_infinity,
+    )
+    log_valid = torch.where(
+        has_pair,
+        log_pair_union + log_one_minus_exp(relative_intersection),
+        negative_infinity,
+    )
+    log_not_valid = log_one_minus_exp(log_valid)
+    bridge_logits = log_valid - log_not_valid
     target_valid = (
         (target_landish[:, north] & target_landish[:, south] & north_south_available)
         | (target_landish[:, west] & target_landish[:, east] & east_west_available)
@@ -308,15 +350,18 @@ def bridge_constraint_loss(
     )
     legal_counts.scatter_add_(1, bridge_targets, bridge_action.to(torch.long))
     legal_bridge = legal_counts > 0
-    weight = candidate.to(predicted_valid.dtype) * (
-        1.0 + 3.0 * legal_bridge.to(predicted_valid.dtype)
+    weight = candidate.to(terrain_logits.dtype) * (
+        1.0 + 3.0 * legal_bridge.to(terrain_logits.dtype)
     )
-    per_target = F.binary_cross_entropy(
-        predicted_valid, target_valid.to(predicted_valid.dtype), reduction="none"
+    selected = weight > 0
+    if not bool(selected.any()):
+        return terrain_logits.sum() * 0.0
+    per_target = F.binary_cross_entropy_with_logits(
+        bridge_logits[selected],
+        target_valid[selected].to(terrain_logits.dtype),
+        reduction="none",
     )
-    numerator = (per_target * weight).sum()
-    denominator = weight.sum().clamp_min(1.0)
-    return numerator / denominator
+    return (per_target * weight[selected]).sum() / weight[selected].sum()
 
 
 def belief_loss(
@@ -454,7 +499,10 @@ def belief_entity_consistency_loss(
     # every attribute populated, so valid sparse engine encodings stay valid.
     for column in (9, 10, 11, 12, 13, 16, 17):
         losses.append((1.0 - city_probability) * (1.0 - undefined_probability(column)))
-    for column in (2, 3, 5, 21, 22):
+    # Column 22 is an ephemeral origin-city runtime ID. The sampler always
+    # materialises it as -1, so using its arbitrary decoder output here would
+    # create a spurious incentive to invent units merely to satisfy an ID.
+    for column in (2, 3, 5, 21):
         losses.append((1.0 - unit_probability) * (1.0 - undefined_probability(column)))
     stacked = torch.stack(losses, dim=0).mean(dim=0)
     return stacked[hidden].mean()

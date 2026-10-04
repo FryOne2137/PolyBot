@@ -1628,6 +1628,14 @@ def train_promotion_league(
                                 and apprentice_meets_current_belief_gate
                             )
                         )
+                    if (
+                        belief_calibration_required
+                        and belief_calibration_eval_games < 1
+                    ):
+                        raise ValueError(
+                            "belief calibration requires at least one held-out "
+                            "evaluation game after optimisation"
+                        )
                     fresh_branch_round = (
                         direct_population_branch_count > 1
                         or round_champion_mode == "mcts"
@@ -1818,6 +1826,17 @@ def train_promotion_league(
                         round_training.seed, 7_500_029
                     )
                     evaluation_map_seeds: set[int] = set()
+                    # Belief calibration has its own fixed post-update arena.
+                    # Include it in the held-out reservation now, otherwise a
+                    # collection seed can generate precisely the maps later
+                    # used to decide whether the decoder generalised.
+                    belief_validation_seed = _offset_seed(
+                        resolved_evaluation_seed, 17_000_003
+                    )
+                    evaluation_map_seeds.update(
+                        belief_validation_seed + game_index
+                        for game_index in range(belief_calibration_eval_games)
+                    )
                     for opponent_index, opponent_id in enumerate(population_ids):
                         games_for_opponent = (
                             promotion_games if opponent_id == champion_id else historical_games
@@ -1879,17 +1898,23 @@ def train_promotion_league(
                             for game_index in range(mcts_gate_games)
                         )
                     known_training_map_seeds: set[int] = set()
-                    for rung_index, rung_games in enumerate(
-                        population_game_allocations
-                    ):
-                        rung_seed = _offset_seed(
-                            population_training_seed,
-                            rung_index * 2_000_003,
-                        )
+                    if belief_calibration_required and population_games:
                         known_training_map_seeds.update(
-                            rung_seed + game_index
-                            for game_index in range(rung_games)
+                            population_training_seed + game_index
+                            for game_index in range(population_games)
                         )
+                    else:
+                        for rung_index, rung_games in enumerate(
+                            population_game_allocations
+                        ):
+                            rung_seed = _offset_seed(
+                                population_training_seed,
+                                rung_index * 2_000_003,
+                            )
+                            known_training_map_seeds.update(
+                                rung_seed + game_index
+                                for game_index in range(rung_games)
+                            )
                     known_training_map_seeds.update(
                         flat_mcts_distill_training_seed + game_index
                         for game_index in range(flat_mcts_distill_games)
@@ -4249,10 +4274,18 @@ def train_promotion_league(
                     if population_games or (
                         belief_calibration_required and belief_replay_updates
                     ):
+                        # Calibration is a decoder dataset pass, not a search
+                        # ladder. This applies both to an explicit belief run
+                        # and to auto mode when it discovers that calibration
+                        # is still required.
                         calibration_rungs = (
-                            zip(population_rungs, population_game_allocations)
-                            if population_games
-                            else ((int(mcts.simulations), 0),)
+                            ((int(mcts.simulations), population_games),)
+                            if belief_calibration_required and population_games
+                            else (
+                                zip(population_rungs, population_game_allocations)
+                                if population_games
+                                else ((int(mcts.simulations), 0),)
+                            )
                         )
                         for rung_index, (simulations, rung_games) in enumerate(
                             calibration_rungs
@@ -4496,16 +4529,44 @@ def train_promotion_league(
                                 )
                                 if calibration_replay is None:
                                     legacy_path = belief_calibration_replay_path
-                                    belief_calibration_replay_path = legacy_path.with_name(
+                                    recovered_path = legacy_path.with_name(
                                         legacy_path.stem + "-recovered" + legacy_path.suffix
                                     )
-                                    calibration_replay = []
-                                    print(
-                                        "league belief replay | legacy file is too large "
-                                        f"to load; preserving {legacy_path} and starting "
-                                        f"a bounded reservoir at {belief_calibration_replay_path}",
-                                        flush=True,
+                                    recovered_replay = _load_belief_calibration_replay(
+                                        recovered_path,
+                                        belief_calibration_replay_capacity,
                                     )
+                                    if recovered_replay is not None:
+                                        belief_calibration_replay_path = recovered_path
+                                        calibration_replay = recovered_replay
+                                        print(
+                                            "league belief replay | legacy file is too large "
+                                            f"to load; preserving {legacy_path} and recovering "
+                                            f"the bounded reservoir at {recovered_path}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        # Do not overwrite either unreadable
+                                        # file. A unique successor protects
+                                        # every previously recovered sample.
+                                        suffix = 2
+                                        while True:
+                                            candidate_path = legacy_path.with_name(
+                                                legacy_path.stem
+                                                + f"-recovered-{suffix}"
+                                                + legacy_path.suffix
+                                            )
+                                            if not candidate_path.exists():
+                                                belief_calibration_replay_path = candidate_path
+                                                break
+                                            suffix += 1
+                                        calibration_replay = []
+                                        print(
+                                            "league belief replay | existing replay files are too "
+                                            f"large to load; preserving them and starting a bounded "
+                                            f"reservoir at {belief_calibration_replay_path}",
+                                            flush=True,
+                                        )
 
                                 def persist_calibration_replay(
                                     examples: Sequence[TrainingExample],
@@ -4661,15 +4722,11 @@ def train_promotion_league(
                                     held_out_summary = train_population_pool(
                                         replace(
                                             round_training,
-                                            seed=_offset_seed(
-                                                # The promotion arena rotates
-                                                # by round, but a calibration
-                                                # rollback must compare the
-                                                # same belief held-out maps as
-                                                # the prior apprentice.
-                                                resolved_evaluation_seed,
-                                                17_000_003,
-                                            ),
+                                            # The promotion arena rotates by
+                                            # round, but a calibration rollback
+                                            # must compare the same held-out
+                                            # belief maps as the prior model.
+                                            seed=belief_validation_seed,
                                             policy_weight=0.0,
                                             value_weight=0.0,
                                         ),

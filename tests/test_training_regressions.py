@@ -51,6 +51,8 @@ from polybot.training.belief_recovery import (
 )
 from polybot.training.global_mcts_train import _native_leaf_bias
 from polybot.training.league import (
+    _load_belief_calibration_replay,
+    _save_belief_calibration_replay,
     _challenger_continuation_action,
     _champion_focused_probabilities,
     _curriculum_controls,
@@ -65,6 +67,7 @@ from polybot.training.league_db import LeagueDatabase
 from polybot.training.optimisation import (
     BELIEF_LOSS_FEATURES,
     BELIEF_RUNTIME_ID_FEATURES,
+    belief_entity_consistency_loss,
     belief_terrain_metrics,
     belief_loss,
     bridge_constraint_loss,
@@ -2436,6 +2439,84 @@ def test_bridge_constraint_loss_learns_positive_and_negative_geometry():
         actions, no_actions, 3,
     )
     assert negative_good < negative_bad
+
+
+def test_bridge_constraint_loss_keeps_gradient_for_confident_wrong_water():
+    """A bridge label must still teach terrain after float32 underflow."""
+    map_tokens = torch.full((1, 9, 23), -1, dtype=torch.long)
+    map_tokens[..., 0] = 0
+    map_tokens[:, 4, 0] = 1
+    map_tokens[:, 4, 19] = 1
+    hidden = map_tokens[..., 0] == 0
+    actions = torch.full((1, 1, 12), -1, dtype=torch.long)
+    actions[:, 0, 0] = 8
+    actions[:, 0, 2] = 4
+    actions[:, 0, 9] = 9
+    target = map_tokens.clone()
+    target[:, 3, 19] = 2
+    target[:, 5, 19] = 2
+    logits = torch.full((1, 9, 6), -50.0, requires_grad=True)
+    with torch.no_grad():
+        logits[:, :, 2] = 50.0
+
+    loss = bridge_constraint_loss(
+        logits, map_tokens, target, hidden, actions,
+        torch.ones((1, 1), dtype=torch.bool), 3,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert logits.grad[0, (3, 5), 3].abs().max() > 0
+
+
+def test_entity_consistency_does_not_use_unit_runtime_origin_id():
+    logits = [
+        torch.zeros((1, 1, largest + 2), requires_grad=True)
+        for largest in MAP_FEATURE_MAX
+    ]
+    loss = belief_entity_consistency_loss(logits, torch.ones((1, 1), dtype=torch.bool))
+    loss.backward()
+
+    assert logits[22].grad is None
+
+
+def test_structured_particle_sampler_keeps_non_city_settlements_and_capital():
+    completed = torch.tensor(
+        [[0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
+          0, -1, -1, -1, 0, 2, 0, -1, -1]] * 6,
+        dtype=torch.long,
+    )
+    sampled = {field: torch.full((6,), -1, dtype=torch.long) for field in range(23)}
+    sampled[14] = torch.tensor([1, 3, 4, 2, 0, 0])
+    sampled[9][3] = 1
+    sampled[10][3] = 1
+    sampled[13][3] = 1
+    sampled[16][3] = 1
+
+    PolicyValueBeliefNet._place_structured_entities(
+        completed,
+        torch.ones(6, dtype=torch.bool),
+        sampled,
+        player_count=2,
+        perspective_player=0,
+    )
+
+    assert completed[:3, 14].tolist() == [1, 3, 4]
+    assert int(completed[0, 15]) >= 0  # village reserves its future city ID
+    assert int(completed[3, 14]) == 2
+    assert int(completed[3, 9]) == 1
+
+
+def test_streamed_belief_replay_loads_without_materialising_a_legacy_list():
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "belief-v2.pkl"
+        rows = [_example(index) for index in range(5)]
+        _save_belief_calibration_replay(path, rows, capacity=3)
+        restored = _load_belief_calibration_replay(path, capacity=3)
+
+    assert restored is not None
+    assert len(restored) == 3
 
 
 def test_bridge_positions_receive_their_configured_replay_reservation():

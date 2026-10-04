@@ -1849,16 +1849,30 @@ class RoutedPoolSearch:
             if leaves_per_root <= 0:
                 break
             self._capture_root_candidates = wave == 0
+            # PolyEnv validates that every ``*_into`` buffer has precisely
+            # ``max_leaves`` rows. Passing the full preallocated buffer while
+            # asking for a smaller final wave is rejected, even though its
+            # first rows would be sufficient. NumPy slices keep the same
+            # pinned backing storage but expose the exact native shape.
+            wave_capacity = min(
+                self.leaf_capacity,
+                int(mcts_mask.sum()) * int(leaves_per_root),
+            )
+            leaf_buffers = {
+                name: value[:wave_capacity]
+                for name, value in self.leaves.items()
+            }
             leaf_count = int(
                 self.pool.select_leaves_masked_into(
-                    self.leaves,
+                    leaf_buffers,
                     np.ascontiguousarray(mcts_mask, dtype=np.uint8),
-                    max_leaves=min(
-                        self.leaf_capacity,
-                        int(mcts_mask.sum()) * int(leaves_per_root),
-                    ),
+                    max_leaves=wave_capacity,
                 )
             )
+            if leaf_count > wave_capacity:
+                raise RuntimeError(
+                    "PolyEnv returned more leaves than the requested MCTS wave"
+                )
             self.counters.leaf_waves += 1
             self.counters.leaf_rows += leaf_count
             if leaf_count == 0:

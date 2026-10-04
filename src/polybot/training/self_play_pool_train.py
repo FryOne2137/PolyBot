@@ -226,8 +226,12 @@ def _sample_root_rows(
             row = int(weights.argmax())
         else:
             sampled = np.power(weights, 1.0 / row_temperature)
-            sampled /= max(float(sampled.sum()), 1e-8)
-            row = int(rng.choice(count, p=sampled))
+            sampled_total = float(sampled.sum())
+            row = (
+                int(weights.argmax())
+                if not np.isfinite(sampled_total) or sampled_total <= 0.0
+                else int(rng.choice(count, p=sampled / sampled_total))
+            )
         if request is not None and exploration_rate > 0.0 and rng.random() < exploration_rate:
             actions = np.asarray(request["action_features"], dtype=np.int64)[index, :count]
             bias = (

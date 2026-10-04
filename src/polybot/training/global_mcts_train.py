@@ -153,8 +153,10 @@ def _search_action(
     if mcts.temperature <= 1e-5:
         return int(policy.argmax()), policy
     sampled = np.power(policy, 1.0 / mcts.temperature)
-    sampled /= max(float(sampled.sum()), 1e-8)
-    return int(rng.choice(len(policy), p=sampled)), policy
+    sampled_total = float(sampled.sum())
+    if not np.isfinite(sampled_total) or sampled_total <= 0.0:
+        return int(policy.argmax()), policy
+    return int(rng.choice(len(policy), p=sampled / sampled_total)), policy
 
 
 @torch.inference_mode()

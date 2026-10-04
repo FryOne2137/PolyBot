@@ -515,6 +515,7 @@ def packet_to_tensors(
     events: Dict[str, Any] | None = None,
     *,
     visible_action_history: int = 0,
+    include_event_summary: bool = True,
 ) -> PacketTensors:
     """Make a batch of one, retaining the current legal-action order."""
     map_tokens = np.asarray(packet["map_tokens"], dtype=np.int64)
@@ -528,12 +529,16 @@ def packet_to_tensors(
         map_tokens=torch.as_tensor(map_tokens[None], dtype=torch.long, device=device),
         global_features=torch.as_tensor(global_features_from_obs(packet["obs"])[None], device=device),
         event_features=torch.as_tensor(
-            event_summary(
-                events,
-                max_events=(
-                    visible_action_history
-                    if visible_action_history > 0 else None
-                ),
+            (
+                event_summary(
+                    events,
+                    max_events=(
+                        visible_action_history
+                        if visible_action_history > 0 else None
+                    ),
+                )
+                if include_event_summary
+                else np.zeros(EVENT_SUMMARY_SIZE, dtype=np.float32)
             )[None],
             dtype=torch.float32,
             device=device,
@@ -554,6 +559,8 @@ def packets_to_tensors(
     packets: Iterable[Dict[str, Any]],
     device: torch.device,
     events: Iterable[Dict[str, Any] | None] | None = None,
+    *,
+    include_event_summary: bool = True,
 ) -> PacketTensors:
     """Pad several player-visible packets into one inference batch.
 
@@ -597,7 +604,13 @@ def packets_to_tensors(
             device=device,
         ),
         event_features=torch.as_tensor(
-            np.stack([event_summary(row) for row in event_rows]),
+            (
+                np.stack([event_summary(row) for row in event_rows])
+                if include_event_summary
+                else np.zeros(
+                    (len(rows), EVENT_SUMMARY_SIZE), dtype=np.float32
+                )
+            ),
             dtype=torch.float32,
             device=device,
         ),

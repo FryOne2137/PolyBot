@@ -10,6 +10,7 @@ import torch
 
 from ..config import MCTSConfig
 from ..data.polyenv_features import (
+    event_action_history,
     native_batch_to_tensors,
     packet_to_tensors,
     packets_to_tensors,
@@ -115,6 +116,7 @@ class BeliefMCTS:
         map_size: int = 11,
         map_type: str = "lakes",
         visible_action_history: int = 0,
+        event_summary_enabled: bool = True,
         root_noise: bool = False,
         root_noise_rng: np.random.Generator | None = None,
     ) -> None:
@@ -128,6 +130,11 @@ class BeliefMCTS:
         if not 0 <= int(visible_action_history) <= 1024:
             raise ValueError("visible_action_history must be between 0 and 1024")
         self.visible_action_history = int(visible_action_history)
+        # The native SelfPlayPool hot path currently supplies a neutral event
+        # summary. Reanalysis can preserve its action history while matching
+        # that same event-summary input, instead of creating targets from a
+        # richer scalar-only observation.
+        self.event_summary_enabled = bool(event_summary_enabled)
         # Explicit opt-in keeps evaluation and interactive MCTS deterministic.
         self.root_noise = bool(root_noise)
         self._root_noise_rng = root_noise_rng or np.random.default_rng()
@@ -172,7 +179,12 @@ class BeliefMCTS:
         """Evaluate variable-action MCTS leaves in one GPU forward pass."""
         if self.model is None or self.device is None:
             raise RuntimeError("direct MCTS inference requires a local model and device")
-        tensors = packets_to_tensors(packets, self.device, events)
+        tensors = packets_to_tensors(
+            packets,
+            self.device,
+            events,
+            include_event_summary=self.event_summary_enabled,
+        )
         output = self.model(
             tensors.map_tokens,
             tensors.global_features,
@@ -238,6 +250,7 @@ class BeliefMCTS:
             tensors = packet_to_tensors(
                 packet, self.device, events,
                 visible_action_history=self.visible_action_history,
+                include_event_summary=self.event_summary_enabled,
             )
             perspective, city_count = _public_city_constraint(packet)
             return self.model.sample_completed_maps(
@@ -277,6 +290,7 @@ class BeliefMCTS:
         tensors = packet_to_tensors(
             packet, self.device, events,
             visible_action_history=self.visible_action_history,
+            include_event_summary=self.event_summary_enabled,
         )
         perspective, city_count = _public_city_constraint(packet)
         output = self.model(
@@ -373,11 +387,63 @@ class BeliefMCTS:
         return bias.masked_fill(~mask, 0.0)
 
     @torch.inference_mode()
-    def _evaluate_native_leaves_direct(self, leaves: Dict[str, object]) -> Tuple[np.ndarray, np.ndarray]:
+    def _evaluate_native_leaves_direct(
+        self,
+        leaves: Dict[str, object],
+        *,
+        root_player: int,
+        root_action_history: np.ndarray | None = None,
+        root_action_history_mask: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """One dense model forward for native MctsPool leaves."""
         if self.model is None or self.device is None:
             raise RuntimeError("native MCTS requires a local model and device")
-        tensors = native_batch_to_tensors(leaves, self.device, self.map_size, self.map_type)
+        tensors = native_batch_to_tensors(
+            leaves, self.device, self.map_size, self.map_type
+        )
+        # MctsPool intentionally leaves journals out of its hot path.  The
+        # root's public journal is therefore safe to reuse *only* while the
+        # simulated side to move is still the root player.  Reusing it after
+        # turn hand-off would attach the root player's private observations to
+        # the opponent's input.  Until the native API exposes a journal per
+        # leaf/player, a neutral all-padding history is the conservative and
+        # fog-safe representation for opponent leaves.
+        if (
+            root_action_history is not None
+            and root_action_history_mask is not None
+            and root_action_history.shape[0] > 0
+        ):
+            leaf_count = int(tensors.map_tokens.shape[0])
+            states = np.asarray(leaves["state"], dtype=np.int32)
+            if states.shape[0] != leaf_count or states.ndim != 2 or states.shape[1] < 2:
+                raise RuntimeError("native MCTS leaves have no valid acting-player state")
+            same_player = torch.as_tensor(
+                states[:, 1] == int(root_player),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            history_length, feature_count = root_action_history.shape
+            tensors.action_history = torch.zeros(
+                (leaf_count, history_length, feature_count),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            tensors.action_history_mask = torch.zeros(
+                (leaf_count, history_length),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if bool(same_player.any()):
+                tensors.action_history[same_player] = torch.as_tensor(
+                    root_action_history,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                tensors.action_history_mask[same_player] = torch.as_tensor(
+                    root_action_history_mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
         output = self.model(
             tensors.map_tokens, tensors.global_features,
             tensors.action_categorical, tensors.action_continuous,
@@ -409,6 +475,9 @@ class BeliefMCTS:
         if action_ids.size == 0:
             raise RuntimeError("PolyEnv returned no legal actions")
         root_events = visible_events_or_empty(env)
+        root_action_history, root_action_history_mask = event_action_history(
+            root_events, self.visible_action_history
+        )
         root_priors, completed_particles = self._root_priors_and_particles(root_packet, root_events)
         root_priors = self._noisy_root_priors(root_priors)
         root_player = int(root_packet["obs"].get("current_player", env.current_player()))
@@ -444,7 +513,12 @@ class BeliefMCTS:
             if self.native_leaf_inference is not None:
                 logits, values = self.native_leaf_inference.evaluate(leaves)
             else:
-                logits, values = self._evaluate_native_leaves_direct(leaves)
+                logits, values = self._evaluate_native_leaves_direct(
+                    leaves,
+                    root_player=root_player,
+                    root_action_history=root_action_history,
+                    root_action_history_mask=root_action_history_mask,
+                )
             if evaluations == 0 and self.root_noise:
                 add_dirichlet_noise_to_root_logits(
                     logits,

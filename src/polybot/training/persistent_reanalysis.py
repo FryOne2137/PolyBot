@@ -28,6 +28,13 @@ class ReanalysePosition:
     map_seed: int
     action_prefix: tuple[int, ...]
     player_id: int
+    # Native action ids are only stable for the environment configuration
+    # that produced them.  Retain enough public configuration to reject a
+    # stale position rather than silently applying its visit target to a
+    # different map generator or a differently aligned history input.
+    map_size: int = 11
+    map_type: str = "lakes"
+    visible_action_history: int = 0
     refreshes: int = 0
 
 
@@ -40,7 +47,7 @@ class PersistentReanalyseBuffer:
     without losing their native order.
     """
 
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
 
     def __init__(self, path: Path, capacity: int) -> None:
         if capacity < 1:

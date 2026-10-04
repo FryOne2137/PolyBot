@@ -64,6 +64,56 @@ GameCallback = Callable[[Mapping[str, Any]], None]
 
 _EVALUATION_MIN_BELIEF_RETRIES = 64
 _EVALUATION_POSITION_RECOVERY_CYCLES = 2
+# A failed belief position must not turn an evaluation gate into an unbounded
+# stream of freshly generated maps.  A gate with this many failed pairs is
+# invalid evidence, not a reason to keep running forever.
+_MAX_EVALUATION_PAIR_REPLACEMENTS = 8
+
+
+def _mcts_leaf_wave_capacity(
+    simulations: int,
+    max_pending_leaves: int,
+    wave: int,
+) -> int:
+    """Return the per-root leaf budget for one native MCTS wave."""
+    if wave < 0 or simulations < 1 or max_pending_leaves < 1:
+        return 0
+    if wave == 0:
+        return 1
+    return max(
+        0,
+        min(
+            int(max_pending_leaves),
+            int(simulations) - 1 - (int(wave) - 1) * int(max_pending_leaves),
+        ),
+    )
+
+
+def _sample_reanalysis_positions_excluding_reserved(
+    positions: Sequence[ReanalysePosition],
+    count: int,
+    rng: np.random.Generator,
+    reserved_seeds: set[int],
+) -> tuple[tuple[ReanalysePosition, ...], int]:
+    """Sample old MCTS targets without contaminating held-out map seeds.
+
+    Persistent reanalysis survives across league invocations, while the
+    current invocation may reserve a different evaluation schedule.  Keep the
+    retained row on disk for a future non-overlapping round, but never replay
+    it into this round's optimiser.
+    """
+    eligible = tuple(
+        position
+        for position in positions
+        if int(position.map_seed) not in reserved_seeds
+    )
+    excluded = len(positions) - len(eligible)
+    if count <= 0 or not eligible:
+        return (), excluded
+    chosen = rng.choice(
+        len(eligible), size=min(int(count), len(eligible)), replace=False
+    )
+    return tuple(eligible[int(index)] for index in np.asarray(chosen)), excluded
 
 
 def _compact_belief_diagnostics(
@@ -329,6 +379,9 @@ def _reanalyse_critical_positions(
     mcts: MCTSConfig,
     device: torch.device,
     minimum_score: float,
+    visible_action_history: int,
+    anchor_model: PolicyValueBeliefNet | None = None,
+    anchor_value_weight: float = 0.0,
 ) -> tuple[list[TrainingExample], int]:
     """Refresh old MCTS targets by replaying their public game prefixes.
 
@@ -341,6 +394,18 @@ def _reanalyse_critical_positions(
     """
     if not positions:
         return [], 0
+    compatible_positions = tuple(
+        position
+        for position in positions
+        if int(position.map_size) == int(training.map_size)
+        and str(position.map_type) == str(training.map_type)
+        and int(position.visible_action_history) == int(visible_action_history)
+    )
+    # Configuration changes invalidate native ids by design. Silently
+    # skipping them is safer than calling PolyEnv with a prefix whose action
+    # semantics belonged to a different map generator.
+    if not compatible_positions:
+        return [], 0
     try:
         from PolyEnv import Bardur, GameEnv, Imperius
     except ImportError as error:  # pragma: no cover - depends on local binding
@@ -352,11 +417,13 @@ def _reanalyse_critical_positions(
         replace(mcts, temperature=0.0),
         map_size=training.map_size,
         map_type=training.map_type,
+        visible_action_history=visible_action_history,
+        event_summary_enabled=False,
     )
     refreshed: list[TrainingExample] = []
     failed = 0
     candidate.eval()
-    for position in positions:
+    for position in compatible_positions:
         try:
             env = GameEnv(
                 seed=int(position.map_seed),
@@ -375,22 +442,49 @@ def _reanalyse_critical_positions(
             visits = np.asarray(decision.visit_counts, dtype=np.float32)
             if visits.shape != previous.policy_target.shape:
                 raise RuntimeError("replayed MCTS action layout differs from retained target")
-            if float(visits.sum()) <= 0.0:
-                visits = np.asarray(decision.priors, dtype=np.float32)
+            # Priors are a raw-policy fallback, not an MCTS target. Persisting
+            # them as a refreshed critical example would claim that search
+            # succeeded even when every belief particle was rejected.
+            if (
+                int(decision.valid_particles) <= 0
+                or float(visits.sum()) <= 0.0
+            ):
+                raise RuntimeError(
+                    "reanalysis produced no valid particle-MCTS visits"
+                )
             visits /= max(float(visits.sum()), 1e-8)
             tensors = stack_examples([previous], device)
             with torch.inference_mode():
                 output = candidate(
-                    tensors.map_tokens,
-                    tensors.global_features,
-                    tensors.action_categorical,
-                    tensors.action_continuous,
-                    tensors.action_mask,
-                    tensors.event_features,
-                    action_history=tensors.action_history,
-                    action_history_mask=tensors.action_history_mask,
+                    tensors["map_tokens"],
+                    tensors["global_features"],
+                    tensors["action_categorical"],
+                    tensors["action_continuous"],
+                    tensors["action_mask"],
+                    tensors["event_features"],
+                    action_history=tensors["action_history"],
+                    action_history_mask=tensors["action_history_mask"],
                     include_belief=False,
                 )
+                # A reanalysed row must not keep the old anchor target or
+                # loss coefficient: those belonged to the checkpoint and
+                # command-line settings that created the stale row.  Anchor
+                # supervision is a current-run regulariser, so regenerate it
+                # from the current frozen anchor (or disable it explicitly).
+                anchor_value_target = 0.0
+                if anchor_model is not None and anchor_value_weight > 0.0:
+                    anchor_output = anchor_model(
+                        tensors["map_tokens"],
+                        tensors["global_features"],
+                        tensors["action_categorical"],
+                        tensors["action_continuous"],
+                        tensors["action_mask"],
+                        tensors["event_features"],
+                        action_history=tensors["action_history"],
+                        action_history_mask=tensors["action_history_mask"],
+                        include_belief=False,
+                    )
+                    anchor_value_target = float(anchor_output.value[0].item())
             raw = torch.softmax(
                 output.policy_logits[0, : visits.size].float(), dim=-1
             ).cpu().numpy()
@@ -403,6 +497,12 @@ def _reanalyse_critical_positions(
             updated.critical_priority = True
             updated.critical_score = score
             updated.reanalysis_priority = True
+            updated.anchor_value_target = anchor_value_target
+            updated.anchor_value_loss_weight = (
+                float(anchor_value_weight)
+                if anchor_model is not None and anchor_value_weight > 0.0
+                else 0.0
+            )
             position.example = copy.deepcopy(updated)
             position.refreshes += 1
             refreshed.append(updated)
@@ -617,7 +717,10 @@ def shield_root_policy_with_public_actions(
     ):
         raise ValueError("root shield requires action_id, action_mask and policy packets")
     root_ids = np.asarray(root["action_id"])
-    root_mask = np.asarray(root["action_mask"], dtype=bool)
+    # ``uint8 -> bool`` allocates a copy. Preserve the backing native field
+    # so shielding changes the mask seen by later root selection/stepping.
+    root_mask_storage = np.asarray(root["action_mask"])
+    root_mask = np.asarray(root_mask_storage, dtype=bool)
     policy = np.asarray(root["policy"])
     visit_count = (
         None
@@ -674,12 +777,14 @@ def shield_root_policy_with_public_actions(
         # leaving holes in ``action_mask``.
         root_ids[env].fill(-1)
         root_mask[env].fill(False)
+        root_mask_storage[env].fill(0)
         policy[env].fill(0.0)
         if visit_count is not None:
             visit_count[env].fill(0)
         count = int(public_action_ids.size)
         root_ids[env, :count] = public_action_ids
         root_mask[env, :count] = True
+        root_mask_storage[env, :count] = 1
         if visit_count is not None:
             visit_count[env, :count] = np.asarray(
                 [visits_by_id.get(int(action_id), 0) for action_id in public_action_ids],
@@ -1359,6 +1464,10 @@ class RoutedPoolSearch:
         max_actions = np.asarray(batch["action_mask"]).shape[1]
         logits = np.full((leaf_count, max_actions), -np.inf, dtype=np.float32)
         values = np.zeros(leaf_count, dtype=np.float32)
+        # Dirichlet noise must be applied to the same action set which was
+        # admitted by pruning.  Using the full native mask here would revive
+        # pruned actions and spend MCTS visits that are discarded later.
+        noise_mask = np.zeros((leaf_count, max_actions), dtype=bool)
         for agent in np.unique(agents):
             rows = np.flatnonzero(agents == agent)
             routed = _slice_rows(batch, rows)
@@ -1400,6 +1509,8 @@ class RoutedPoolSearch:
             )
             self.counters.add_action_pruning(pruning)
             if self._capture_root_candidates:
+                noise_mask[rows] = selected.detach().cpu().numpy()
+            if self._capture_root_candidates:
                 env_ids = np.asarray(batch["env_id"], dtype=np.int32)[rows]
                 action_ids = np.asarray(batch["action_id"], dtype=np.int32)[rows]
                 selected_cpu = selected.detach().cpu().numpy()
@@ -1413,7 +1524,7 @@ class RoutedPoolSearch:
         if self._capture_root_candidates and self._root_noise_enabled:
             add_dirichlet_noise_to_root_logits(
                 logits,
-                np.asarray(batch["action_mask"], dtype=bool),
+                noise_mask,
                 self._root_noise_rng,
                 epsilon=self.mcts.root_dirichlet_epsilon,
                 concentration=self.mcts.root_dirichlet_concentration,
@@ -1725,12 +1836,27 @@ class RoutedPoolSearch:
         )
         self._root_candidate_action_ids = {}
         for wave in range(waves):
+            # The first native selection expands one root leaf.  Every later
+            # selection may pipeline several leaves, but only up to the
+            # remaining per-root simulation budget.  Previously the last
+            # wave was always allowed a full ``max_pending_leaves`` batch:
+            # e.g. simulations=2 and pending=8 could do 1 + 8 expansions.
+            leaves_per_root = _mcts_leaf_wave_capacity(
+                self.mcts.simulations,
+                self.max_pending_leaves,
+                wave,
+            )
+            if leaves_per_root <= 0:
+                break
             self._capture_root_candidates = wave == 0
             leaf_count = int(
                 self.pool.select_leaves_masked_into(
                     self.leaves,
                     np.ascontiguousarray(mcts_mask, dtype=np.uint8),
-                    max_leaves=self.leaf_capacity,
+                    max_leaves=min(
+                        self.leaf_capacity,
+                        int(mcts_mask.sum()) * int(leaves_per_root),
+                    ),
                 )
             )
             self.counters.leaf_waves += 1
@@ -1846,8 +1972,15 @@ def _sample_active_rows(
             row = int(weights.argmax())
         else:
             sampled = np.power(weights, 1.0 / row_temperature)
-            sampled /= max(float(sampled.sum()), 1e-8)
-            row = int(rng.choice(count, p=sampled))
+            sampled_total = float(sampled.sum())
+            # Do not divide by an arbitrary epsilon: at low positive
+            # temperatures a valid distribution can have a sum below 1e-8,
+            # and NumPy correctly rejects the resulting non-distribution.
+            row = (
+                int(weights.argmax())
+                if not np.isfinite(sampled_total) or sampled_total <= 0.0
+                else int(rng.choice(count, p=sampled / sampled_total))
+            )
         if exploration_rate > 0.0 and rng.random() < exploration_rate:
             action = features[env, :count]
             bias = (
@@ -1882,18 +2015,45 @@ def _paired_uncertainty(totals: Dict[str, float], scores: Sequence[float]) -> No
     totals["model_a_score"] = float(np.mean(scores)) if scores else 0.0
     map_scores = [float(np.mean(scores[index:index + 2])) for index in range(0, len(scores), 2)]
     totals["evaluation_maps"] = float(len(map_scores))
-    totals["score_standard_error"] = (
-        float(np.std(map_scores, ddof=1) / np.sqrt(len(map_scores)))
-        if len(map_scores) > 1
-        else 0.0
-    )
-    totals["score_lower_95"] = max(
-        0.0, totals["model_a_score"] - 1.96 * totals["score_standard_error"]
-    )
+    if len(map_scores) < 2:
+        # One paired map has no empirical uncertainty estimate. Treating its
+        # standard error as zero turned two wins into a fictitious 100% lower
+        # confidence bound and could open a promotion gate by chance.
+        totals["score_standard_error"] = float("inf")
+        totals["score_lower_95"] = 0.0
+    else:
+        totals["score_standard_error"] = float(
+            np.std(map_scores, ddof=1) / np.sqrt(len(map_scores))
+        )
+        totals["score_lower_95"] = max(
+            0.0,
+            totals["model_a_score"] - 1.96 * totals["score_standard_error"],
+        )
     totals["mean_moves"] = totals["moves"] / max(1.0, totals["games"])
     totals["mean_model_a_particles"] = (
         totals["model_a_particles"] / max(1.0, totals["model_a_decisions"])
     )
+
+
+def _invalid_evaluation_result(
+    totals: Dict[str, Any],
+    scores: Sequence[float],
+    *,
+    reason: str,
+    invalid_attempts: int,
+    discarded_pairs: int,
+    replacement_events: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Return a complete, explicitly invalid gate result without hanging."""
+    _paired_uncertainty(totals, scores)
+    totals["valid"] = 0.0
+    totals["invalid_evaluations"] = 1.0
+    totals["invalid_envs"] = float(max(0, invalid_attempts))
+    totals["invalid_reason"] = reason
+    totals["discarded_evaluation_pairs"] = float(discarded_pairs)
+    totals["invalid_evaluation_attempts"] = float(invalid_attempts)
+    totals["evaluation_replacement_events"] = list(replacement_events)
+    return totals
 
 
 def _paired_pool_schedule(
@@ -1956,6 +2116,8 @@ def evaluate_matches_pool(
     belief_action_mode: str = "strict",
     model_a_uses_mcts: bool = True,
     model_b_uses_mcts: bool = True,
+    map_seeds: Sequence[int] | None = None,
+    replace_failed_pairs: bool = True,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
     model_b_search_top_actions: int | None = None,
@@ -1963,7 +2125,7 @@ def evaluate_matches_pool(
     model_a_label: str = "model A",
     model_b_label: str = "model B",
 ) -> Dict[str, Any]:
-    """Run deterministic paired evaluation with MCTS enabled per model.
+    """Run deterministic paired evaluation on a supplied or generated map set.
 
     ``model_a_uses_mcts=True, model_b_uses_mcts=False`` measures whether the
     candidate's tree search is itself stronger than the frozen opponent's raw
@@ -1977,8 +2139,13 @@ def evaluate_matches_pool(
         raise ValueError("max_envs must be at least two")
     if belief_action_mode not in {"strict", "root_shield"}:
         raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
-    if not model_a_uses_mcts and not model_b_uses_mcts:
-        raise ValueError("evaluate_matches_pool requires MCTS for at least one model")
+    fixed_map_seeds = None
+    if map_seeds is not None:
+        fixed_map_seeds = np.asarray(map_seeds, dtype=np.uint32)
+        if fixed_map_seeds.shape != (games,):
+            raise ValueError("map_seeds must contain exactly one seed per paired game")
+        if np.any(fixed_map_seeds[0::2] != fixed_map_seeds[1::2]):
+            raise ValueError("each paired evaluation map must use the same seed twice")
     model_b_top = (
         mcts.search_top_actions
         if model_b_search_top_actions is None
@@ -2025,9 +2192,11 @@ def evaluate_matches_pool(
     invalid_evaluation_attempts = 0
     replacement_pair_cursor = 0
     replacement_events: list[Dict[str, Any]] = []
-    used_evaluation_seeds = {
-        int(training.seed) + game_index // 2 for game_index in range(games)
-    }
+    used_evaluation_seeds = (
+        set(int(seed) for seed in fixed_map_seeds)
+        if fixed_map_seeds is not None
+        else {int(training.seed) + game_index // 2 for game_index in range(games)}
+    )
     chunk_limit = max(2, int(max_envs) - int(max_envs) % 2)
     with tqdm(
         total=games,
@@ -2041,6 +2210,8 @@ def evaluate_matches_pool(
                 raise RuntimeError("paired evaluation chunk split a map pair")
             indices = np.arange(start, start + count, dtype=np.int64)
             seeds, assignments = _paired_pool_schedule(training.seed, start, count)
+            if fixed_map_seeds is not None:
+                seeds = fixed_map_seeds[start:start + count].copy()
             search = RoutedPoolSearch(
                 training,
                 mcts,
@@ -2100,6 +2271,25 @@ def evaluate_matches_pool(
                     pair_starts = pair_rows[::2]
                     invalid_evaluation_attempts += int(error.env_ids.size)
                     discarded_evaluation_pairs += int(pair_starts.size)
+                    if (
+                        not replace_failed_pairs
+                        or discarded_evaluation_pairs
+                        > _MAX_EVALUATION_PAIR_REPLACEMENTS
+                    ):
+                        return _invalid_evaluation_result(
+                            totals,
+                            scores,
+                            reason=(
+                                "belief recovery failed on the fixed paired maps"
+                                if not replace_failed_pairs
+                                else "belief recovery exhausted the maximum "
+                                f"of {_MAX_EVALUATION_PAIR_REPLACEMENTS} "
+                                "paired-map replacements"
+                            ),
+                            invalid_attempts=invalid_evaluation_attempts,
+                            discarded_pairs=discarded_evaluation_pairs,
+                            replacement_events=replacement_events,
+                        )
 
                     already_counted = int(progress_counted[pair_rows].sum())
                     if already_counted:
@@ -2256,6 +2446,9 @@ def evaluate_matches_pool(
     totals["discarded_evaluation_pairs"] = float(discarded_evaluation_pairs)
     totals["invalid_evaluation_attempts"] = float(invalid_evaluation_attempts)
     totals["evaluation_replacement_events"] = replacement_events
+    totals["evaluated_map_seeds"] = [
+        int(row["map_seed"]) for row in completed_game_rows
+    ]
     totals["evaluation_position_recovery_cycles"] = float(
         evaluation_position_recovery_cycles
     )
@@ -2489,14 +2682,27 @@ def train_population_pool(
     reanalysis_loaded = reanalysis_store.load() if reanalysis_store else 0
     reanalysis_refreshed = 0
     reanalysis_failed = 0
+    reserved_seed_set = {int(value) for value in reserved_seeds}
+    reanalysis_reserved_excluded = 0
     if reanalysis_store is not None and reanalysis_positions:
+        selected_reanalysis, reanalysis_reserved_excluded = (
+            _sample_reanalysis_positions_excluding_reserved(
+                reanalysis_store.positions,
+                reanalysis_positions,
+                rng,
+                reserved_seed_set,
+            )
+        )
         reanalysed, reanalysis_failed = _reanalyse_critical_positions(
-            reanalysis_store.sample(reanalysis_positions, rng),
+            selected_reanalysis,
             candidate=candidate,
             training=training,
             mcts=mcts,
             device=device,
             minimum_score=critical_minimum_score,
+            visible_action_history=visible_action_history,
+            anchor_model=anchor_model,
+            anchor_value_weight=anchor_value_weight,
         )
         replay.extend(reanalysed)
         reanalysis_refreshed = len(reanalysed)
@@ -2524,7 +2730,6 @@ def train_population_pool(
     ]
     routing = SearchCounters()
     recovery_seed_cursor = 0
-    reserved_seed_set = {int(value) for value in reserved_seeds}
     recovery_seed_history: set[int] = set()
     new_reanalysis_positions: list[ReanalysePosition] = []
 
@@ -2664,6 +2869,11 @@ def train_population_pool(
                                         map_seed=int(seeds[env]),
                                         action_prefix=prefix,
                                         player_id=int(example.player_id),
+                                        map_size=int(training.map_size),
+                                        map_type=str(training.map_type),
+                                        visible_action_history=int(
+                                            visible_action_history
+                                        ),
                                     )
                                 )
                     replay.extend(finished)
@@ -2902,7 +3112,7 @@ def train_population_pool(
                         ),
                     )
                     if raw_candidate_policy is not None:
-                        marked, score_sum = _mark_critical_mcts_examples(
+                        marked, critical_batch_score = _mark_critical_mcts_examples(
                             candidate_examples,
                             np.asarray(
                                 candidate_root["policy"], dtype=np.float32
@@ -2915,7 +3125,7 @@ def train_population_pool(
                             minimum_score=critical_minimum_score,
                         )
                         critical_decisions += marked
-                        critical_score_sum += score_sum
+                        critical_score_sum += critical_batch_score
                     if selective_mcts:
                         # The selective scheduler has already paid for these
                         # roots.  Retain every selected candidate MCTS target
@@ -3139,6 +3349,9 @@ def train_population_pool(
         "population_pool_reanalysis_loaded": float(reanalysis_loaded),
         "population_pool_reanalysis_refreshed": float(reanalysis_refreshed),
         "population_pool_reanalysis_failed": float(reanalysis_failed),
+        "population_pool_reanalysis_reserved_excluded": float(
+            reanalysis_reserved_excluded
+        ),
         "population_pool_reanalysis_saved": float(len(new_reanalysis_positions)),
         "population_pool_reanalysis_buffer_size": float(
             len(reanalysis_store.positions) if reanalysis_store else 0

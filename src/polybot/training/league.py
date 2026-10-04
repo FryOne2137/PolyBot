@@ -147,9 +147,32 @@ def _save_belief_apprentice_state(path: Path, state: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _belief_replay_example_matches_map_size(
+    example: TrainingExample,
+    map_size: int | None,
+) -> bool:
+    """Reject replay rows whose board shape cannot match this training run."""
+    if map_size is None:
+        return True
+    expected_tiles = int(map_size) * int(map_size)
+    try:
+        return bool(
+            example.map_tokens.ndim == 2
+            and example.full_map_target.ndim == 2
+            and example.hidden_mask.ndim == 1
+            and int(example.map_tokens.shape[0]) == expected_tiles
+            and int(example.full_map_target.shape[0]) == expected_tiles
+            and int(example.hidden_mask.shape[0]) == expected_tiles
+        )
+    except (AttributeError, IndexError, TypeError):
+        return False
+
+
 def _load_belief_calibration_replay(
     path: Path,
     capacity: int,
+    *,
+    map_size: int | None = None,
 ) -> list[TrainingExample] | None:
     """Load a bounded local reservoir of supervised fog observations.
 
@@ -170,7 +193,12 @@ def _load_belief_calibration_replay(
                         example = pickle.load(handle)
                     except EOFError:
                         break
-                    if isinstance(example, TrainingExample):
+                    if (
+                        isinstance(example, TrainingExample)
+                        and _belief_replay_example_matches_map_size(
+                            example, map_size
+                        )
+                    ):
                         window.append(example)
                 return list(window)
     except MemoryError:
@@ -184,9 +212,12 @@ def _load_belief_calibration_replay(
         return []
     if not isinstance(raw, list):
         return []
-    return [example for example in raw if isinstance(example, TrainingExample)][
-        -capacity:
-    ]
+    return [
+        example
+        for example in raw
+        if isinstance(example, TrainingExample)
+        and _belief_replay_example_matches_map_size(example, map_size)
+    ][-capacity:]
 
 
 def _save_belief_calibration_replay(
@@ -1653,10 +1684,12 @@ def train_promotion_league(
                             f"mcts_ready={int(round_training_summary['champion_mode']['mcts_ready'])}",
                             flush=True,
                         )
-                    # Independent branch selection deliberately starts every
-                    # round from the frozen champion.  A merely safe
-                    # challenger (for example 0.46 against the champion) is
-                    # not allowed to drift further away for the next round.
+                    # MCTS still evaluates every update against the frozen
+                    # champion, but a challenger which cleared the retention
+                    # gate must remain the starting point for the next round.
+                    # Otherwise a multi-round MCTS run silently performs one
+                    # update per fresh apprentice and never accumulates its
+                    # accepted learning.
                     belief_apprentice_state = _load_belief_apprentice_state(
                         belief_apprentice_state_path
                     )
@@ -1712,6 +1745,115 @@ def train_promotion_league(
                         and apprentice_rejection_rate
                         <= belief_action_equivalence_target
                     )
+                    # A retained challenger has different weights from the
+                    # belief apprentice, even when both descend from the same
+                    # champion.  Its own checkpoint therefore needs its own
+                    # fingerprinted held-out marker; an apprentice result
+                    # must never authorise it to enter MCTS.
+                    continue_mcts_challenger = (
+                        round_champion_mode == "mcts"
+                        and previous_challenger_path is not None
+                        and previous_challenger_id is not None
+                    )
+                    challenger_belief_state: Dict[str, Any] = {}
+                    challenger_matches_champion = False
+                    challenger_validation_matches = False
+                    challenger_checked_particles = 0
+                    challenger_rejection_rate = 1.0
+                    challenger_meets_current_belief_gate = False
+                    if continue_mcts_challenger:
+                        assert previous_challenger_path is not None
+                        challenger_state_path = previous_challenger_path.with_suffix(
+                            previous_challenger_path.suffix + ".json"
+                        )
+                        challenger_belief_state = _load_belief_apprentice_state(
+                            challenger_state_path
+                        )
+                        challenger_fingerprint = _checkpoint_fingerprint(
+                            previous_challenger_path
+                        )
+                        challenger_matches_champion = (
+                            challenger_belief_state.get("champion_path")
+                            == str(champion_path.resolve())
+                            and champion_fingerprint is not None
+                            and challenger_belief_state.get(
+                                "champion_fingerprint"
+                            ) == champion_fingerprint
+                            and challenger_belief_state.get(
+                                "apprentice_fingerprint"
+                            ) == challenger_fingerprint
+                        )
+                        challenger_validation_matches = (
+                            challenger_matches_champion
+                            and int(
+                                challenger_belief_state.get(
+                                    "held_out_games", 0
+                                )
+                            ) > 0
+                            and challenger_belief_state.get(
+                                "validation_signature"
+                            ) == belief_validation_signature
+                        )
+                        challenger_checked_particles = int(
+                            challenger_belief_state.get(
+                                "checked_particles", 0
+                            )
+                        )
+                        challenger_rejection_rate = float(
+                            challenger_belief_state.get(
+                                "rejection_rate", 1.0
+                            )
+                        )
+                        challenger_meets_current_belief_gate = (
+                            challenger_validation_matches
+                            and challenger_checked_particles
+                            >= belief_action_equivalence_min_particles
+                            and challenger_rejection_rate
+                            <= belief_action_equivalence_target
+                        )
+                    active_belief_matches_champion = (
+                        challenger_matches_champion
+                        if continue_mcts_challenger
+                        else apprentice_matches_champion
+                    )
+                    active_belief_validation_matches = (
+                        challenger_validation_matches
+                        if continue_mcts_challenger
+                        else apprentice_validation_matches
+                    )
+                    active_belief_meets_current_gate = (
+                        challenger_meets_current_belief_gate
+                        if continue_mcts_challenger
+                        else apprentice_meets_current_belief_gate
+                    )
+                    active_belief_checked_particles = (
+                        challenger_checked_particles
+                        if continue_mcts_challenger
+                        else apprentice_checked_particles
+                    )
+                    active_belief_rejection_rate = (
+                        challenger_rejection_rate
+                        if continue_mcts_challenger
+                        else apprentice_rejection_rate
+                    )
+                    round_training_summary["belief_checkpoint"] = {
+                        "path": str(
+                            previous_challenger_path
+                            if continue_mcts_challenger
+                            else belief_apprentice_path
+                        ),
+                        "is_retained_challenger": float(
+                            continue_mcts_challenger
+                        ),
+                        "matches_champion": float(
+                            active_belief_matches_champion
+                        ),
+                        "ready": float(active_belief_meets_current_gate),
+                        "checked_particles": float(
+                            active_belief_checked_particles
+                        ),
+                        "rejection_rate": active_belief_rejection_rate,
+                    }
                     bootstrap_champion_fingerprint = (
                         belief_apprentice_state.get(
                             "value_bootstrap_champion_fingerprint"
@@ -1725,24 +1867,26 @@ def train_promotion_league(
                         belief_calibration_required = True
                     elif training_stage == "mcts":
                         if not (
-                            apprentice_matches_champion
-                            and apprentice_meets_current_belief_gate
+                            active_belief_matches_champion
+                            and active_belief_meets_current_gate
                         ):
                             raise BeliefQualityError(
                                 "MCTS-only training requires an accepted belief "
-                                "apprentice for this exact champion. Run the belief "
+                                "checkpoint for this exact champion. Run the belief "
                                 "stage until held-out action mismatch reaches the gate.",
                                 {
-                                    "belief_apprentice_path": str(
-                                        belief_apprentice_path
+                                    "belief_checkpoint_path": str(
+                                        previous_challenger_path
+                                        if continue_mcts_challenger
+                                        else belief_apprentice_path
                                     ),
-                                    "apprentice_matches_champion": float(
-                                        apprentice_matches_champion
+                                    "checkpoint_matches_champion": float(
+                                        active_belief_matches_champion
                                     ),
                                     "checked_particles": float(
-                                        apprentice_checked_particles
+                                        active_belief_checked_particles
                                     ),
-                                    "rejection_rate": apprentice_rejection_rate,
+                                    "rejection_rate": active_belief_rejection_rate,
                                     "target_rejection_rate": (
                                         belief_action_equivalence_target
                                     ),
@@ -1753,8 +1897,8 @@ def train_promotion_league(
                         belief_calibration_required = (
                             round_champion_mode == "mcts"
                             and not (
-                                apprentice_matches_champion
-                                and apprentice_meets_current_belief_gate
+                                active_belief_matches_champion
+                                and active_belief_meets_current_gate
                             )
                         )
                     if (
@@ -1770,7 +1914,9 @@ def train_promotion_league(
                         or round_champion_mode == "mcts"
                     )
                     candidate_source = (
-                        belief_apprentice_path
+                        previous_challenger_path
+                        if continue_mcts_challenger
+                        else belief_apprentice_path
                         if round_champion_mode == "mcts" and apprentice_matches_champion
                         else (
                             champion_path
@@ -1779,12 +1925,16 @@ def train_promotion_league(
                         )
                     )
                     candidate_parent_id = (
-                        champion_id
+                        previous_challenger_id
+                        if continue_mcts_challenger
+                        else champion_id
                         if fresh_branch_round
                         else previous_challenger_id or champion_id
                     )
                     candidate_source_kind = (
-                        "belief-apprentice"
+                        "challenger"
+                        if continue_mcts_challenger
+                        else "belief-apprentice"
                         if candidate_source == belief_apprentice_path
                         else (
                             "challenger"
@@ -2027,6 +2177,23 @@ def train_promotion_league(
                             for game_index in range(mcts_gate_games)
                         )
                     known_training_map_seeds: set[int] = set()
+                    # Bootstrap is collection too. Reserve its complete seed
+                    # range before checking train/evaluation disjointness.
+                    bootstrap_will_collect = _value_bootstrap_required(
+                        champion_mode=round_champion_mode,
+                        belief_calibration_required=belief_calibration_required,
+                        value_bootstrap_games=value_bootstrap_games,
+                        champion_fingerprint=champion_fingerprint,
+                        apprentice_state=belief_apprentice_state,
+                    )
+                    if bootstrap_will_collect:
+                        bootstrap_seed = _offset_seed(
+                            population_training_seed, 1_000_003
+                        )
+                        known_training_map_seeds.update(
+                            bootstrap_seed + game_index
+                            for game_index in range(value_bootstrap_games)
+                        )
                     if belief_calibration_required and population_games:
                         known_training_map_seeds.update(
                             population_training_seed + game_index
@@ -3738,28 +3905,41 @@ def train_promotion_league(
                                     game=game,
                                 )
 
-                            raw_probe = evaluate_direct_matches(
+                            # The probe measures the *candidate's* marginal
+                            # value from search. Keep the opponent raw in both
+                            # legs, keep max_moves identical, and reuse the
+                            # exact post-recovery map schedule below.
+                            probe_mcts = replace(
+                                evaluation_mcts,
+                                simulations=mcts_probe_simulations,
+                            )
+                            raw_probe = evaluate_matches_pool(
                                 candidate,
                                 champion,
-                                device,
-                                replace(
-                                    training,
-                                    seed=mcts_probe_seed,
-                                    max_moves=direct_gate_max_moves,
-                                ),
+                                replace(round_training, seed=mcts_probe_seed),
+                                probe_mcts,
                                 mcts_probe_games,
+                                num_threads=num_threads,
+                                max_pending_leaves=max_pending_leaves,
+                                visible_action_history=visible_action_history,
+                                belief_retries=belief_retries,
+                                belief_action_mode=population_belief_search_mode,
+                                model_a_uses_mcts=False,
+                                model_b_uses_mcts=False,
+                                max_envs=min(num_envs, mcts_probe_games),
                                 game_callback=record_raw_probe_game,
                                 model_a_label=candidate_evaluation_label,
                                 model_b_label=champion_path.stem,
-                                visible_action_history=(
-                                    visible_action_history
-                                ),
-                                num_threads=num_threads,
-                                max_actions=mcts.native_max_actions,
                             )
-                            database.finish_evaluation_unrated(
-                                raw_probe_id, raw_probe
-                            )
+                            raw_probe_valid = bool(raw_probe.get("valid", 1.0))
+                            if raw_probe_valid:
+                                database.finish_evaluation_unrated(
+                                    raw_probe_id, raw_probe
+                                )
+                            else:
+                                database.invalidate_evaluation(
+                                    raw_probe_id, raw_probe
+                                )
                             search_probe_id = database.start_evaluation(
                                 round_id,
                                 candidate_id,
@@ -3782,30 +3962,46 @@ def train_promotion_league(
                                     game=game,
                                 )
 
-                            probe_mcts = replace(
-                                evaluation_mcts,
-                                simulations=mcts_probe_simulations,
-                            )
                             try:
-                                search_probe = evaluate_matches_pool(
-                                    candidate,
-                                    champion,
-                                    replace(training, seed=mcts_probe_seed),
-                                    probe_mcts,
-                                    mcts_probe_games,
-                                    num_threads=num_threads,
-                                    max_pending_leaves=max_pending_leaves,
-                                    visible_action_history=(
-                                        visible_action_history
-                                    ),
-                                    belief_retries=belief_retries,
-                                    max_envs=min(
-                                        num_envs, mcts_probe_games
-                                    ),
-                                    game_callback=record_search_probe_game,
-                                    model_a_label=candidate_evaluation_label,
-                                    model_b_label=champion_path.stem,
-                                )
+                                if not raw_probe_valid:
+                                    search_probe = {
+                                        "games": 0.0,
+                                        "model_a_score": 0.0,
+                                        "score_lower_95": 0.0,
+                                        "valid": 0.0,
+                                        "invalid_evaluations": 1.0,
+                                        "invalid_reason": "raw readiness probe is invalid",
+                                    }
+                                else:
+                                    search_probe = evaluate_matches_pool(
+                                        candidate,
+                                        champion,
+                                        replace(
+                                            round_training,
+                                            seed=mcts_probe_seed,
+                                        ),
+                                        probe_mcts,
+                                        mcts_probe_games,
+                                        num_threads=num_threads,
+                                        max_pending_leaves=max_pending_leaves,
+                                        visible_action_history=visible_action_history,
+                                        belief_retries=belief_retries,
+                                        belief_action_mode=(
+                                            population_belief_search_mode
+                                        ),
+                                        model_a_uses_mcts=True,
+                                        model_b_uses_mcts=False,
+                                        map_seeds=raw_probe[
+                                            "evaluated_map_seeds"
+                                        ],
+                                        replace_failed_pairs=False,
+                                        max_envs=min(
+                                            num_envs, mcts_probe_games
+                                        ),
+                                        game_callback=record_search_probe_game,
+                                        model_a_label=candidate_evaluation_label,
+                                        model_b_label=champion_path.stem,
+                                    )
                             except (
                                 BeliefQualityError,
                                 BeliefRecoveryRequired,
@@ -3821,7 +4017,9 @@ def train_promotion_league(
                                     "invalid_evaluations": 1.0,
                                     "invalid_reason": str(error),
                                 }
-                            probe_valid = bool(search_probe.get("valid", 1.0))
+                            probe_valid = raw_probe_valid and bool(
+                                search_probe.get("valid", 1.0)
+                            )
                             if probe_valid:
                                 database.finish_evaluation_unrated(
                                     search_probe_id, search_probe
@@ -4072,15 +4270,19 @@ def train_promotion_league(
                     previous_held_out_rate: float | None = None
                     if (
                         belief_calibration_required
-                        and apprentice_validation_matches
-                        and int(belief_apprentice_state.get("held_out_games", 0)) > 0
-                        and apprentice_checked_particles
+                        and active_belief_matches_champion
+                        and active_belief_validation_matches
+                        and active_belief_checked_particles
                         >= belief_action_equivalence_min_particles
                     ):
                         previous_held_out_rate = float(
-                            belief_apprentice_state.get(
+                            (
+                                challenger_belief_state
+                                if continue_mcts_challenger
+                                else belief_apprentice_state
+                            ).get(
                                 "held_out_rejection_rate",
-                                belief_apprentice_state.get("rejection_rate", 1.0),
+                                active_belief_rejection_rate,
                             )
                         )
                     value_bootstrap_summary: Dict[str, Any] = {}
@@ -4258,46 +4460,54 @@ def train_promotion_league(
                         # test used before an MCTS rung, then stop.  Without
                         # this branch, population_games=0 would incorrectly
                         # fall through to the expensive 100-game MCTS gate.
-                        raw_probe = evaluate_direct_matches(
-                            candidate,
-                            champion,
-                            device,
-                            replace(
-                                round_training,
-                                seed=mcts_probe_seed,
-                                max_moves=direct_gate_max_moves,
-                            ),
-                            mcts_probe_games,
-                            model_a_label=candidate_evaluation_label,
-                            model_b_label=champion_path.stem,
-                            visible_action_history=visible_action_history,
-                            num_threads=num_threads,
-                            max_actions=mcts.native_max_actions,
+                        bootstrap_probe_mcts = replace(
+                            evaluation_mcts,
+                            simulations=int(population_rungs[-1])
+                            if population_rungs else int(mcts.simulations),
                         )
-                        search_probe = evaluate_matches_pool(
+                        raw_probe = evaluate_matches_pool(
                             candidate,
                             champion,
-                            replace(
-                                round_training,
-                                seed=mcts_probe_seed,
-                                max_moves=direct_gate_max_moves,
-                            ),
-                            replace(
-                                evaluation_mcts,
-                                simulations=int(population_rungs[-1])
-                                if population_rungs else int(mcts.simulations),
-                            ),
+                            replace(round_training, seed=mcts_probe_seed),
+                            bootstrap_probe_mcts,
                             mcts_probe_games,
                             num_threads=num_threads,
                             max_pending_leaves=max_pending_leaves,
                             visible_action_history=visible_action_history,
                             belief_retries=belief_retries,
                             belief_action_mode=population_belief_search_mode,
+                            model_a_uses_mcts=False,
                             model_b_uses_mcts=False,
                             max_envs=min(num_envs, population_max_envs),
                             model_a_label=candidate_evaluation_label,
                             model_b_label=champion_path.stem,
                         )
+                        if bool(raw_probe.get("valid", 1.0)):
+                            search_probe = evaluate_matches_pool(
+                                candidate,
+                                champion,
+                                replace(round_training, seed=mcts_probe_seed),
+                                bootstrap_probe_mcts,
+                                mcts_probe_games,
+                                num_threads=num_threads,
+                                max_pending_leaves=max_pending_leaves,
+                                visible_action_history=visible_action_history,
+                                belief_retries=belief_retries,
+                                belief_action_mode=population_belief_search_mode,
+                                model_a_uses_mcts=True,
+                                model_b_uses_mcts=False,
+                                map_seeds=raw_probe["evaluated_map_seeds"],
+                                replace_failed_pairs=False,
+                                max_envs=min(num_envs, population_max_envs),
+                                model_a_label=candidate_evaluation_label,
+                                model_b_label=champion_path.stem,
+                            )
+                        else:
+                            search_probe = {
+                                "model_a_score": 0.0,
+                                "valid": 0.0,
+                                "invalid_reason": "raw bootstrap probe is invalid",
+                            }
                         raw_score = float(raw_probe.get("model_a_score", 0.0))
                         search_score = float(
                             search_probe.get("model_a_score", 0.0)
@@ -4307,7 +4517,8 @@ def train_promotion_league(
                             search_score,
                             minimum_search_score=mcts_probe_score,
                             minimum_improvement=mcts_probe_minimum_improvement,
-                            valid=bool(search_probe.get("valid", 1.0)),
+                            valid=bool(raw_probe.get("valid", 1.0))
+                            and bool(search_probe.get("valid", 1.0)),
                         )
                         bootstrap_probe = {
                             "raw": raw_probe,
@@ -4582,22 +4793,6 @@ def train_promotion_league(
                             # the same frozen champion for both measurements.
                             preflight: Dict[str, Any] = {}
                             if not belief_calibration_required and mcts_probe_games:
-                                raw_preflight = evaluate_direct_matches(
-                                    candidate,
-                                    champion,
-                                    device,
-                                    replace(
-                                        rung_training,
-                                        seed=mcts_probe_seed,
-                                        max_moves=direct_gate_max_moves,
-                                    ),
-                                    mcts_probe_games,
-                                    model_a_label=candidate_evaluation_label,
-                                    model_b_label=champion_path.stem,
-                                    visible_action_history=visible_action_history,
-                                    num_threads=num_threads,
-                                    max_actions=mcts.native_max_actions,
-                                )
                                 try:
                                     search_preflight = evaluate_matches_pool(
                                         candidate,
@@ -4626,6 +4821,42 @@ def train_promotion_league(
                                         model_a_label=candidate_evaluation_label,
                                         model_b_label=champion_path.stem,
                                     )
+                                    # Recovery may replace an action-incompatible
+                                    # map pair.  Measure the raw policy on the
+                                    # exact final map schedule, not on the
+                                    # abandoned original pair.
+                                    if bool(search_preflight.get("valid", 1.0)):
+                                        raw_preflight = evaluate_matches_pool(
+                                            candidate,
+                                            champion,
+                                            replace(
+                                                rung_training,
+                                                seed=mcts_probe_seed,
+                                                max_moves=direct_gate_max_moves,
+                                            ),
+                                            evaluation_mcts,
+                                            mcts_probe_games,
+                                            num_threads=num_threads,
+                                            max_pending_leaves=max_pending_leaves,
+                                            visible_action_history=visible_action_history,
+                                            belief_retries=belief_retries,
+                                            belief_action_mode=(
+                                                population_belief_search_mode
+                                            ),
+                                            model_a_uses_mcts=False,
+                                            model_b_uses_mcts=False,
+                                            map_seeds=search_preflight[
+                                                "evaluated_map_seeds"
+                                            ],
+                                            replace_failed_pairs=False,
+                                            max_envs=min(
+                                                num_envs, population_max_envs
+                                            ),
+                                            model_a_label=candidate_evaluation_label,
+                                            model_b_label=champion_path.stem,
+                                        )
+                                    else:
+                                        raw_preflight = dict(search_preflight)
                                 except (
                                     BeliefQualityError,
                                     BeliefRecoveryRequired,
@@ -4636,6 +4867,7 @@ def train_promotion_league(
                                         "valid": 0.0,
                                         "invalid_reason": str(error),
                                     }
+                                    raw_preflight = dict(search_preflight)
                                 raw_preflight_score = float(
                                     raw_preflight.get("model_a_score", 0.0)
                                 )
@@ -4649,7 +4881,10 @@ def train_promotion_league(
                                     minimum_improvement=(
                                         mcts_probe_minimum_improvement
                                     ),
-                                    valid=bool(search_preflight.get("valid", 1.0)),
+                                    valid=(
+                                        bool(search_preflight.get("valid", 1.0))
+                                        and bool(raw_preflight.get("valid", 1.0))
+                                    ),
                                 )
                                 preflight = {
                                     "performed": 1.0,
@@ -4711,6 +4946,7 @@ def train_promotion_league(
                                 calibration_replay = _load_belief_calibration_replay(
                                     belief_calibration_replay_path,
                                     belief_calibration_replay_capacity,
+                                    map_size=round_training.map_size,
                                 )
                                 if calibration_replay is None:
                                     legacy_path = belief_calibration_replay_path
@@ -4720,6 +4956,7 @@ def train_promotion_league(
                                     recovered_replay = _load_belief_calibration_replay(
                                         recovered_path,
                                         belief_calibration_replay_capacity,
+                                        map_size=round_training.map_size,
                                     )
                                     if recovered_replay is not None:
                                         belief_calibration_replay_path = recovered_path
@@ -5326,19 +5563,52 @@ def train_promotion_league(
                         last_training = dict(round_training_summary)
                         last_candidate_score = 0.0
                         last_population_score = 0.0
-                        challenger_path = None
-                        challenger_id = None
+                        # A calibration regression restores the candidate to
+                        # the retained challenger weights. That checkpoint
+                        # remains the strongest known continuation and must
+                        # stay attached to the next round; clearing it here
+                        # would make the next MCTS round restart from an
+                        # older generic belief apprentice.
+                        preserve_restored_challenger = bool(
+                            continue_mcts_challenger
+                            and belief_calibration_summary.get(
+                                "held_out_rollback", 0.0
+                            )
+                        )
+                        if preserve_restored_challenger:
+                            challenger_path = previous_challenger_path
+                            challenger_id = previous_challenger_id
+                            print(
+                                "league belief calibration regression | "
+                                "continuing next round from restored challenger: "
+                                f"{challenger_path}",
+                                flush=True,
+                            )
+                        else:
+                            challenger_path = None
+                            challenger_id = None
                         del candidate, champion, frozen_models
                         continue
 
-                    expected_mcts_rungs = sum(
-                        int(rung_games > 0)
-                        for rung_games in population_game_allocations
-                    )
+                    # A rung whose preflight proved that search is not better
+                    # than raw policy is deliberately skipped.  It must not
+                    # later become an impossible requirement for a deeper
+                    # rung which did pass its own preflight and absorption
+                    # gate.
+                    admitted_mcts_rungs = [
+                        rung
+                        for rung in population_summary["mcts_ladder"]
+                        if rung.get("reason")
+                        != "mcts_preflight_not_better_than_raw"
+                    ]
+                    expected_mcts_rungs = len(admitted_mcts_rungs)
                     completed_mcts_curriculum = (
                         not bool(population_games)
-                        or int(population_summary["mcts_ladder_accepted"])
-                        == expected_mcts_rungs
+                        or (
+                            expected_mcts_rungs > 0
+                            and int(population_summary["mcts_ladder_accepted"])
+                            == expected_mcts_rungs
+                        )
                     )
                     population_summary["mcts_ladder_required"] = float(
                         expected_mcts_rungs
@@ -5591,12 +5861,148 @@ def train_promotion_league(
                             and minimum_historical_score
                             >= historical_score_floor
                         )
+                        challenger_belief_summary: Dict[str, Any] = {}
+                        if retain_challenger and round_champion_mode == "mcts":
+                            # MCTS updates the shared/belief parameters. A
+                            # marker inherited from the pre-rung apprentice
+                            # would certify different weights, so measure this
+                            # exact candidate before retaining it for a later
+                            # MCTS-only round.
+                            challenger_held_out = train_population_pool(
+                                replace(
+                                    round_training,
+                                    seed=belief_validation_seed,
+                                    policy_weight=0.0,
+                                    value_weight=0.0,
+                                ),
+                                model_config,
+                                mcts,
+                                games=belief_calibration_eval_games,
+                                updates_per_game=0,
+                                candidate=candidate,
+                                opponent_models=frozen_models,
+                                opponent_weights=probabilities,
+                                anchor_model=None,
+                                anchor_policy_weight=0.0,
+                                anchor_value_weight=0.0,
+                                critical_decision_fraction=0.0,
+                                critical_replay_fraction=0.0,
+                                critical_only=False,
+                                selective_mcts=False,
+                                reanalysis_path=None,
+                                reanalysis_positions=0,
+                                reanalysis_replay_fraction=0.0,
+                                offline_collection=True,
+                                belief_only=True,
+                                raw_policy_only=True,
+                                num_threads=population_workers,
+                                max_pending_leaves=max_pending_leaves,
+                                visible_action_history=visible_action_history,
+                                belief_retries=belief_retries,
+                                belief_action_mode="strict",
+                                max_envs=min(num_envs, population_max_envs),
+                                reserved_seeds=evaluation_map_seeds,
+                                run=run.child(
+                                    f"round_{round_index:03d}/challenger_belief_held_out"
+                                ),
+                            )
+                            challenger_checked = int(
+                                challenger_held_out.get(
+                                    "belief_action_equivalence_checked_particles",
+                                    0.0,
+                                )
+                            )
+                            challenger_rejected = int(
+                                challenger_held_out.get(
+                                    "belief_action_equivalence_rejected_particles",
+                                    0.0,
+                                )
+                            )
+                            challenger_rate = float(
+                                challenger_rejected / max(1, challenger_checked)
+                            )
+                            challenger_belief_ready = bool(
+                                challenger_checked
+                                >= belief_action_equivalence_min_particles
+                                and challenger_rate
+                                <= belief_action_equivalence_target
+                            )
+                            challenger_belief_summary = {
+                                "checked_particles": float(challenger_checked),
+                                "rejected_particles": float(challenger_rejected),
+                                "rejection_rate": challenger_rate,
+                                "ready": float(challenger_belief_ready),
+                                "held_out": challenger_held_out,
+                            }
+                            retain_challenger = challenger_belief_ready
+                            if not retain_challenger:
+                                print(
+                                    "league challenger belief validation failed | "
+                                    f"mismatch={challenger_rate:.2%} | "
+                                    f"required<={belief_action_equivalence_target:.2%}",
+                                    flush=True,
+                                )
                         if retain_challenger:
                             retained_path = _next_checkpoint_path(
                                 checkpoint_dir,
                                 f"{checkpoint_prefix}-challenger",
                             )
                             save_model(retained_path, candidate, model_config)
+                            retained_marker_path = retained_path.with_suffix(
+                                retained_path.suffix + ".json"
+                            )
+                            if round_champion_mode == "mcts":
+                                _save_belief_apprentice_state(
+                                    retained_marker_path,
+                                    {
+                                        "champion_path": str(
+                                            champion_path.resolve()
+                                        ),
+                                        "champion_fingerprint": (
+                                            _checkpoint_fingerprint(champion_path)
+                                        ),
+                                        "apprentice_fingerprint": (
+                                            _checkpoint_fingerprint(retained_path)
+                                        ),
+                                        "validation_signature": (
+                                            belief_validation_signature
+                                        ),
+                                        "ready": True,
+                                        "checked_particles": int(
+                                            challenger_belief_summary[
+                                                "checked_particles"
+                                            ]
+                                        ),
+                                        "rejected_particles": int(
+                                            challenger_belief_summary[
+                                                "rejected_particles"
+                                            ]
+                                        ),
+                                        "rejection_rate": float(
+                                            challenger_belief_summary[
+                                                "rejection_rate"
+                                            ]
+                                        ),
+                                        "held_out_rejection_rate": float(
+                                            challenger_belief_summary[
+                                                "rejection_rate"
+                                            ]
+                                        ),
+                                        "held_out_games": (
+                                            belief_calibration_eval_games
+                                        ),
+                                        "target_rejection_rate": (
+                                            belief_action_equivalence_target
+                                        ),
+                                        "minimum_particles": (
+                                            belief_action_equivalence_min_particles
+                                        ),
+                                        "value_bootstrap_champion_fingerprint": (
+                                            bootstrap_champion_fingerprint
+                                        ),
+                                        "round": round_index,
+                                    },
+                                )
                             database.retain_candidate(candidate_id, retained_path)
                             challenger_path = retained_path
                             challenger_id = candidate_id
@@ -5608,6 +6014,10 @@ def train_promotion_league(
                         else:
                             database.finalise_candidate(
                                 candidate_id, promoted_path=None
+                            )
+                        if challenger_belief_summary:
+                            gate_summary["retained_challenger_belief"] = (
+                                challenger_belief_summary
                             )
                         gate_summary["retained_challenger"] = float(
                             retain_challenger

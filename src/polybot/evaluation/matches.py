@@ -191,13 +191,18 @@ def evaluate_matches(
         for index in range(0, len(game_scores), 2)
     ]
     totals["evaluation_maps"] = float(len(map_scores))
-    totals["score_standard_error"] = (
-        float(np.std(map_scores, ddof=1) / np.sqrt(len(map_scores)))
-        if len(map_scores) > 1 else 0.0
-    )
-    totals["score_lower_95"] = max(
-        0.0, totals["model_a_score"] - 1.96 * totals["score_standard_error"]
-    )
+    if len(map_scores) < 2:
+        # One paired map cannot support an empirical confidence interval.
+        totals["score_standard_error"] = float("inf")
+        totals["score_lower_95"] = 0.0
+    else:
+        totals["score_standard_error"] = float(
+            np.std(map_scores, ddof=1) / np.sqrt(len(map_scores))
+        )
+        totals["score_lower_95"] = max(
+            0.0,
+            totals["model_a_score"] - 1.96 * totals["score_standard_error"],
+        )
     totals["mean_moves"] = totals["moves"] / max(1, games)
     totals["mean_model_a_particles"] = (
         totals["model_a_particles"] / max(1, totals["model_a_decisions"])
@@ -665,15 +670,18 @@ def evaluate_direct_matches(
         for index in range(0, len(scores), 2)
     ]
     totals["evaluation_maps"] = float(len(map_scores))
-    totals["score_standard_error"] = (
-        float(np.std(map_scores, ddof=1) / np.sqrt(len(map_scores)))
-        if len(map_scores) > 1
-        else 0.0
-    )
-    totals["score_lower_95"] = max(
-        0.0,
-        totals["model_a_score"] - 1.96 * totals["score_standard_error"],
-    )
+    if len(map_scores) < 2:
+        # Do not report perfect certainty from one side-swapped map.
+        totals["score_standard_error"] = float("inf")
+        totals["score_lower_95"] = 0.0
+    else:
+        totals["score_standard_error"] = float(
+            np.std(map_scores, ddof=1) / np.sqrt(len(map_scores))
+        )
+        totals["score_lower_95"] = max(
+            0.0,
+            totals["model_a_score"] - 1.96 * totals["score_standard_error"],
+        )
     totals["mean_moves"] = totals["moves"] / max(1.0, float(games))
     totals["completion_rate"] = totals["terminated_games"] / max(
         1.0, float(games)

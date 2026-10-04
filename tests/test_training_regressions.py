@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from polybot.config import MCTSConfig, ModelConfig, TrainingConfig
-from polybot.data.polyenv_features import stack_examples
+from polybot.data.polyenv_features import packet_to_tensors, stack_examples
 from polybot.data.token_schema import MAP_FEATURE_MAX
 from polybot.evaluation.matches import (
     _paired_seed_and_slot,
@@ -20,6 +21,7 @@ from polybot.models.policy_value_belief import (
     PolicyValueBeliefNet,
     apply_public_bridge_constraints,
 )
+from polybot.planning.belief_mcts import BeliefMCTS
 from polybot.planning.action_pruning import (
     mandatory_search_actions,
     prune_search_logits,
@@ -50,7 +52,7 @@ from polybot.training.belief_recovery import (
     replace_rejected_particles,
     replacement_seeds,
 )
-from polybot.training.global_mcts_train import _native_leaf_bias
+from polybot.training.global_mcts_train import _native_leaf_bias, _search_action
 from polybot.training.league import (
     _checkpoint_fingerprint,
     _belief_validation_signature,
@@ -85,10 +87,16 @@ from polybot.training.routed_self_play_pool import (
     _evaluation_pair_rows,
     _evaluation_search_with_recovery,
     _freeze_reference_model,
+    _invalid_evaluation_result,
+    _mcts_leaf_wave_capacity,
     _next_evaluation_replacement_seed,
+    _paired_uncertainty,
     _paired_pool_schedule,
     _policy_distance,
+    _reanalyse_critical_positions,
     _reference_policy,
+    _sample_reanalysis_positions_excluding_reserved,
+    _sample_active_rows,
     shield_root_policy_with_public_actions,
 )
 from polybot.training.self_play_pool_train import (
@@ -96,6 +104,7 @@ from polybot.training.self_play_pool_train import (
     _engine_action_constraint_targets,
     _finish_trajectory,
     _root_examples,
+    _sample_root_rows,
     _scheduled_updates,
     _winner_from_terminal_values,
 )
@@ -1615,6 +1624,18 @@ def test_flat_league_activates_mcts_gate_only_after_search32_is_better():
         probe_calls = []
 
         def search_probe_after_checkpoint(*args, **kwargs):
+            if not kwargs.get("model_a_uses_mcts", True):
+                probe_training = args[2]
+                return {
+                    "games": 2.0,
+                    "model_a_score": 0.50,
+                    "score_lower_95": 0.0,
+                    "valid": 1.0,
+                    "evaluated_map_seeds": [
+                        probe_training.seed,
+                        probe_training.seed,
+                    ],
+                }
             probe_calls.append(1)
             expected = f"champion-{len(probe_calls):03d}.pt"
             assert (root / "checkpoints" / expected).is_file()
@@ -2660,6 +2681,225 @@ def test_required_calibration_runs_held_out_evaluation_without_new_replay_work()
     )
 
 
+def test_low_positive_temperature_remains_a_normalized_distribution():
+    root = {
+        "policy": np.full((1, 10), 0.1, dtype=np.float64),
+        "action_mask": np.ones((1, 10), dtype=bool),
+    }
+    request = {"action_features": np.zeros((1, 10, 16), dtype=np.int64)}
+    rng = np.random.default_rng(7)
+
+    routed = _sample_active_rows(
+        root, request, np.array([0], dtype=np.int32), rng,
+        temperature=0.1, exploration_rate=0.0,
+    )
+    legacy = _sample_root_rows(root, rng, temperature=0.1)
+    global_choice, _ = _search_action(
+        np.ones(10, dtype=np.float64),
+        np.ones(10, dtype=np.float64),
+        rng,
+        MCTSConfig(temperature=0.1),
+    )
+
+    assert 0 <= int(routed[0]) < 10
+    assert 0 <= int(legacy[0]) < 10
+    assert 0 <= global_choice < 10
+
+
+def test_invalid_evaluation_is_a_result_not_an_unbounded_retry():
+    totals = {
+        "games": 2.0,
+        "model_a_wins": 0.0,
+        "model_a_decisions": 0.0,
+        "model_a_particles": 0.0,
+        "moves": 0.0,
+    }
+    result = _invalid_evaluation_result(
+        totals,
+        (),
+        reason="replacement limit reached",
+        invalid_attempts=4,
+        discarded_pairs=2,
+        replacement_events=(),
+    )
+
+    assert result["valid"] == 0.0
+    assert result["invalid_evaluations"] == 1.0
+    assert result["invalid_reason"] == "replacement limit reached"
+
+
+def test_one_paired_map_has_no_promotable_confidence_bound():
+    totals = {
+        "games": 2.0,
+        "model_a_wins": 2.0,
+        "model_a_decisions": 0.0,
+        "model_a_particles": 0.0,
+        "moves": 0.0,
+    }
+
+    _paired_uncertainty(totals, (1.0, 1.0))
+
+    assert totals["model_a_score"] == 1.0
+    assert totals["evaluation_maps"] == 1.0
+    assert totals["score_lower_95"] == 0.0
+    assert np.isinf(totals["score_standard_error"])
+
+
+def test_last_mcts_wave_is_limited_to_the_remaining_simulation_budget():
+    assert [
+        _mcts_leaf_wave_capacity(2, 8, wave)
+        for wave in range(3)
+    ] == [1, 1, 0]
+    assert [
+        _mcts_leaf_wave_capacity(17, 8, wave)
+        for wave in range(4)
+    ] == [1, 8, 8, 0]
+
+
+def test_reanalysis_discards_positions_from_a_different_map_configuration():
+    from polybot.training.persistent_reanalysis import ReanalysePosition
+
+    stale = ReanalysePosition(
+        example=_example(0),
+        map_seed=7,
+        action_prefix=(),
+        player_id=0,
+        map_size=11,
+        map_type="lakes",
+        visible_action_history=32,
+    )
+
+    refreshed, failed = _reanalyse_critical_positions(
+        [stale],
+        candidate=PolicyValueBeliefNet(ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)),
+        training=TrainingConfig(device="cpu", map_type="drylands"),
+        mcts=MCTSConfig(),
+        device=torch.device("cpu"),
+        minimum_score=0.1,
+        visible_action_history=32,
+    )
+
+    assert refreshed == []
+    assert failed == 0
+
+
+def test_reanalysis_never_samples_the_current_held_out_map_seeds():
+    from polybot.training.persistent_reanalysis import ReanalysePosition
+
+    positions = [
+        ReanalysePosition(_example(0), seed, (), 0)
+        for seed in (2137, 71, 83)
+    ]
+    selected, excluded = _sample_reanalysis_positions_excluding_reserved(
+        positions,
+        count=3,
+        rng=np.random.default_rng(5),
+        reserved_seeds={2137},
+    )
+
+    assert excluded == 1
+    assert {position.map_seed for position in selected} == {71, 83}
+
+
+def test_belief_replay_loader_rejects_a_previous_map_size():
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "belief-replay.pkl"
+        small = _example(0)
+        large = _example(1)
+        large.map_tokens = np.zeros((4, 23), dtype=np.int64)
+        large.full_map_target = np.zeros((4, 23), dtype=np.int64)
+        large.hidden_mask = np.ones(4, dtype=bool)
+        _save_belief_calibration_replay(path, [small, large], capacity=8)
+
+        loaded_small = _load_belief_calibration_replay(
+            path, capacity=8, map_size=1
+        )
+        loaded_large = _load_belief_calibration_replay(
+            path, capacity=8, map_size=2
+        )
+
+    assert loaded_small is not None and len(loaded_small) == 1
+    assert loaded_small[0].map_tokens.shape[0] == 1
+    assert loaded_large is not None and len(loaded_large) == 1
+    assert loaded_large[0].map_tokens.shape[0] == 4
+
+
+def test_reanalysis_event_mode_keeps_history_but_uses_native_zero_summary():
+    packet = {
+        "map_tokens": np.zeros((1, len(MAP_FEATURE_MAX)), dtype=np.int32),
+        "obs": {"map_size": 11, "map_type": "lakes"},
+        "actions": {"action_id": np.asarray([7], dtype=np.int64)},
+    }
+    events = {
+        "type_id": np.asarray([1], dtype=np.int32),
+        "actor_player": np.asarray([0], dtype=np.int32),
+        "actor_tribe": np.asarray([0], dtype=np.int32),
+    }
+
+    tensors = packet_to_tensors(
+        packet,
+        torch.device("cpu"),
+        events,
+        visible_action_history=4,
+        include_event_summary=False,
+    )
+
+    assert not tensors.event_features.any()
+    assert tensors.action_history_mask[0, -1]
+
+
+def test_native_leaf_history_is_not_reused_after_turn_handoff():
+    """A root player's private journal must never reach an opponent leaf."""
+    class RecordingModel:
+        def __call__(
+            self,
+            map_tokens,
+            global_features,
+            action_categorical,
+            action_continuous,
+            action_mask,
+            event_features,
+            *,
+            action_history,
+            action_history_mask,
+            include_belief,
+        ):
+            self.history = action_history.detach().cpu()
+            self.history_mask = action_history_mask.detach().cpu()
+            batch, actions = action_mask.shape
+            return SimpleNamespace(
+                policy_logits=torch.zeros((batch, actions)),
+                value=torch.zeros(batch),
+            )
+
+    model = RecordingModel()
+    search = BeliefMCTS(model, torch.device("cpu"), MCTSConfig())
+    leaves = {
+        # Native state column 1 is current/acting player.
+        "state": np.asarray(
+            [[0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        ),
+        "map_tokens": np.zeros((2, 1, len(MAP_FEATURE_MAX)), dtype=np.int32),
+        "action_features": np.zeros((2, 1, 17), dtype=np.int32),
+        "action_mask": np.ones((2, 1), dtype=bool),
+    }
+    history = np.full((2, 12), 7, dtype=np.float32)
+    history_mask = np.asarray([True, True])
+
+    search._evaluate_native_leaves_direct(
+        leaves,
+        root_player=0,
+        root_action_history=history,
+        root_action_history_mask=history_mask,
+    )
+
+    assert torch.equal(model.history[0], torch.as_tensor(history))
+    assert model.history_mask[0].all()
+    assert not model.history[1].any()
+    assert not model.history_mask[1].any()
+
+
 def test_replay_history_is_right_aligned_across_legacy_window_sizes():
     short = _example(0)
     long = _example(1)
@@ -3037,6 +3277,24 @@ def test_root_shield_restores_public_action_order_and_hides_hallucinations():
     assert stats.missing_public_actions == 1
     assert stats.hallucinated_actions == 2
     assert stats.uniform_fallbacks == 0
+
+
+def test_root_shield_updates_the_backing_uint8_action_mask():
+    root = {
+        "action_id": np.asarray([[10, 11, 12]], dtype=np.int32),
+        "action_mask": np.asarray([[1, 1, 1]], dtype=np.uint8),
+        "policy": np.asarray([[0.4, 0.3, 0.3]], dtype=np.float32),
+    }
+    request = {
+        "action_id": np.asarray([[10, 11, -1]], dtype=np.int32),
+        "action_mask": np.asarray([[1, 1, 0]], dtype=np.uint8),
+    }
+
+    shield_root_policy_with_public_actions(
+        root, request, np.asarray([True])
+    )
+
+    np.testing.assert_array_equal(root["action_mask"], [[1, 1, 0]])
 
 
 def test_root_shield_uses_public_uniform_policy_when_particle_root_has_no_overlap():

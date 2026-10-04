@@ -153,6 +153,13 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         help="Maximum number of recent belief calibration positions retained across runs.",
     )
     parser.add_argument(
+        "--belief-replay-updates", type=int, default=512,
+        help=(
+            "Additional belief-only optimiser updates over persistent replay after "
+            "each calibration generation; ignored by the MCTS-only stage."
+        ),
+    )
+    parser.add_argument(
         "--population-mcts-critical-only",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -726,6 +733,7 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         belief_calibration_replay_capacity=(
             args.belief_calibration_replay_capacity
         ),
+        belief_replay_updates=args.belief_replay_updates,
         database_path=args.league_db,
         population_model_paths=args.population_model,
         population_size=args.population_size,

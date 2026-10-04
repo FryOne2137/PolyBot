@@ -488,6 +488,7 @@ def train_promotion_league(
     belief_calibration_eval_games: int = 8,
     belief_calibration_replay_path: Path | None = None,
     belief_calibration_replay_capacity: int = 50_000,
+    belief_replay_updates: int = 512,
     database_path: Path | None = None,
     population_model_paths: Sequence[Path] = (),
     population_size: int = 6,
@@ -1056,6 +1057,8 @@ def train_promotion_league(
         raise ValueError("belief_calibration_eval_games must not be negative")
     if belief_calibration_replay_capacity < 1:
         raise ValueError("belief_calibration_replay_capacity must be positive")
+    if belief_replay_updates < 0:
+        raise ValueError("belief_replay_updates must not be negative")
     if population_belief_search_mode not in {"strict", "root_shield"}:
         raise ValueError(
             "population_belief_search_mode must be 'strict' or 'root_shield'"
@@ -1063,7 +1066,15 @@ def train_promotion_league(
     ladder = tuple(int(value) for value in mcts_simulation_ladder)
     if any(value < 1 for value in ladder) or tuple(sorted(set(ladder))) != ladder:
         raise ValueError("mcts_simulation_ladder must be strictly increasing")
-    population_rungs = ladder or ((int(mcts.simulations),) if population_games else ())
+    # Belief calibration is raw-policy data collection, not an MCTS
+    # curriculum.  Splitting its game budget across the search ladder and
+    # breaking after the first rung silently discarded half the requested
+    # examples (96 requested games became 48 with the default 32,64 ladder).
+    population_rungs = (
+        (int(mcts.simulations),)
+        if training_stage == "belief" and population_games
+        else ladder or ((int(mcts.simulations),) if population_games else ())
+    )
     population_game_allocations = tuple(
         population_games // max(1, len(population_rungs))
         + int(index < population_games % max(1, len(population_rungs)))
@@ -1168,6 +1179,7 @@ def train_promotion_league(
         "belief_calibration_eval_games": belief_calibration_eval_games,
         "belief_calibration_replay_path": str(belief_calibration_replay_path),
         "belief_calibration_replay_capacity": belief_calibration_replay_capacity,
+        "belief_replay_updates": belief_replay_updates,
         "value_bootstrap_games": value_bootstrap_games,
         "value_bootstrap_updates_per_game": value_bootstrap_updates_per_game,
         "pfsp_alpha": pfsp_alpha,
@@ -4211,11 +4223,21 @@ def train_promotion_league(
                     best_raw_completion_rate = float(
                         raw_population_baseline["completion_rate"]
                     )
-                    if population_games:
-                        for rung_index, (simulations, rung_games) in enumerate(
+                    if population_games or (
+                        belief_calibration_required and belief_replay_updates
+                    ):
+                        calibration_rungs = (
                             zip(population_rungs, population_game_allocations)
+                            if population_games
+                            else ((int(mcts.simulations), 0),)
+                        )
+                        for rung_index, (simulations, rung_games) in enumerate(
+                            calibration_rungs
                         ):
-                            if rung_games <= 0:
+                            if rung_games <= 0 and not (
+                                belief_calibration_required
+                                and belief_replay_updates
+                            ):
                                 continue
                             rung_training = replace(
                                 round_training,
@@ -4243,6 +4265,14 @@ def train_promotion_league(
                                     bridge_constraint_weight=max(
                                         0.25,
                                         rung_training.bridge_constraint_weight,
+                                    ),
+                                    engine_action_constraint_replay_fraction=max(
+                                        0.40,
+                                        rung_training.engine_action_constraint_replay_fraction,
+                                    ),
+                                    bridge_replay_fraction=max(
+                                        0.20,
+                                        rung_training.bridge_replay_fraction,
                                     ),
                                 )
                             rung_mcts = replace(
@@ -4555,6 +4585,11 @@ def train_promotion_league(
                                 reserved_seeds=evaluation_map_seeds,
                                 replay_examples=calibration_replay,
                                 replay_snapshot_callback=replay_snapshot_callback,
+                                extra_replay_updates=(
+                                    belief_replay_updates
+                                    if belief_calibration_required
+                                    else 0
+                                ),
                                 run=run.child(
                                     f"round_{round_index:03d}/mcts_rung_{rung_index + 1:02d}"
                                 ),
@@ -4649,16 +4684,12 @@ def train_promotion_league(
                                     checked >= belief_action_equivalence_min_particles
                                     and rate <= belief_action_equivalence_target
                                 )
-                                # 8 held-out games yield thousands of sampled
-                                # particles, but still have small sampling
-                                # noise.  Permit a half percentage point
-                                # fluctuation; restore the prior apprentice on
-                                # any material generalisation regression.
-                                held_out_tolerance = 0.005
+                                # This is a strict admission checkpoint. Do
+                                # not overwrite a better apprentice merely
+                                # because a worse score is close to it.
                                 rolled_back = bool(
                                     previous_held_out_rate is not None
-                                    and rate
-                                    > previous_held_out_rate + held_out_tolerance
+                                    and rate >= previous_held_out_rate
                                 )
                                 if rolled_back:
                                     if belief_calibration_start_state is None:
@@ -4750,11 +4781,26 @@ def train_promotion_league(
                                         ".0f",
                                     ),
                                     ("updates", "population_pool_updates", ".0f"),
+                                    (
+                                        "offline_updates",
+                                        "population_pool_offline_replay_updates",
+                                        ".0f",
+                                    ),
                                     ("belief_loss", "belief_loss", ".4f"),
                                     (
                                         "action_loss",
                                         "belief_engine_action_constraint_loss",
                                         ".4f",
+                                    ),
+                                    (
+                                        "missing_actions",
+                                        "belief_engine_action_constraint_missing_actions",
+                                        ".0f",
+                                    ),
+                                    (
+                                        "extra_actions",
+                                        "belief_engine_action_constraint_extra_actions",
+                                        ".0f",
                                     ),
                                     (
                                         "terrain_acc",

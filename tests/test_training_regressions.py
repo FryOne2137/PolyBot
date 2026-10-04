@@ -2471,6 +2471,37 @@ def test_engine_action_constraint_positions_receive_replay_reservation():
     assert sum(row.engine_action_constraint_priority for row in sampled) >= 4
 
 
+def test_calibration_replay_preserves_action_constraint_examples_on_overflow():
+    replay = ReplayBuffer(10, preserve_constraint_fraction=0.4)
+    hard = [_example(0) for _ in range(4)]
+    for row in hard:
+        row.engine_action_constraint_priority = True
+    replay.extend(hard + [_example(0) for _ in range(6)])
+    replay.extend([_example(0) for _ in range(10)])
+
+    assert len(replay) == 10
+    assert sum(row.engine_action_constraint_priority for row in replay.snapshot()) >= 4
+
+
+def test_focal_belief_loss_keeps_gradient_toward_an_already_correct_presence_class():
+    target = torch.zeros((1, 1, len(MAP_FEATURE_MAX)), dtype=torch.long)
+    target[..., 4] = 1
+    hidden = torch.ones((1, 1), dtype=torch.bool)
+    logits = [
+        torch.zeros((1, 1, largest + 2), requires_grad=True)
+        for largest in MAP_FEATURE_MAX
+    ]
+    # A high but imperfect target probability must still be increased, not
+    # reduced through a focal-weight normalisation denominator.
+    with torch.no_grad():
+        logits[4][..., 2] = 7.0  # token value 1 is stored at class 2
+    loss = belief_loss(logits, target, hidden, presence_focal_gamma=1.5)
+    loss.backward()
+
+    assert logits[4].grad is not None
+    assert float(logits[4].grad[..., 2]) < 0.0
+
+
 def _pruning_packet() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     logits = torch.tensor(
         [[10.0, 9.0, 3.0, 2.0, 1.0, 0.5, 0.4, 0.3, 0.2, 0.1, -1.0, -2.0]]

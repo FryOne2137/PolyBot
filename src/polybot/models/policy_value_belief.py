@@ -720,7 +720,16 @@ class PolicyValueBeliefNet(nn.Module):
             sampled_features[feature_index] = sample_feature(feature_index)
         sampled_features[14] = sample_feature(14)
         sampled_features[4] = sample_feature(4)
-        city_present = sampled_features[14] == 2
+        # Cities cannot occupy water. Make this an explicit conditional in
+        # the generative order instead of relying on later structural repair
+        # to erase an independently sampled city/terrain contradiction.
+        city_present = (sampled_features[14] == 2) & torch.isin(
+            sampled_features[TERRAIN_FEATURE],
+            torch.as_tensor(tuple(LANDISH_TERRAINS), device=observed.device),
+        )
+        sampled_features[14] = torch.where(
+            city_present, sampled_features[14], torch.zeros_like(sampled_features[14])
+        )
         unit_present = sampled_features[4] >= 1
         for feature_index in CITY_PARTICLE_FEATURES:
             samples = sample_feature(feature_index)
@@ -839,7 +848,16 @@ class PolicyValueBeliefNet(nn.Module):
                 )
         sampled_features[14] = sample_feature(14)
         sampled_features[4] = sample_feature(4)
-        city_present = sampled_features[14] == 2
+        # See the scalar sampler above: condition city presence on terrain
+        # before sampling its attributes, so a particle never contains a
+        # decoder-created water city that must be repaired afterwards.
+        city_present = (sampled_features[14] == 2) & torch.isin(
+            sampled_features[TERRAIN_FEATURE],
+            torch.as_tensor(tuple(LANDISH_TERRAINS), device=observed.device),
+        )
+        sampled_features[14] = torch.where(
+            city_present, sampled_features[14], torch.zeros_like(sampled_features[14])
+        )
         unit_present = sampled_features[4] >= 1
         for feature_index in CITY_PARTICLE_FEATURES:
             samples = sample_feature(feature_index)

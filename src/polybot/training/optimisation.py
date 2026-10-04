@@ -383,17 +383,24 @@ def belief_loss(
         elif column in (2, 3, 5, 21, 22):
             loss_mask = loss_mask & (full_map_target[..., 4] >= 1)
 
-        weights = torch.ones_like(per_tile)
+        # ``base_weights`` describes the data distribution and is deliberately
+        # independent of model logits.  It is also the only normaliser.  A
+        # previous version normalised by focal weights as well; because those
+        # weights depend on the predicted target probability, gradients flowed
+        # through the denominator and could reward lowering an already correct
+        # probability.
+        base_weights = torch.ones_like(per_tile)
         if legal_action_weight:
-            weights = weights * (
-                1.0 + float(legal_action_weight) * action_targets.to(weights.dtype)
+            base_weights = base_weights * (
+                1.0 + float(legal_action_weight) * action_targets.to(base_weights.dtype)
             )
         if example_weights is not None:
-            weights = weights * example_weights.to(weights.dtype).unsqueeze(1)
+            base_weights = base_weights * example_weights.to(base_weights.dtype).unsqueeze(1)
         if column == 14:
-            weights = torch.where(full_map_target[..., 14] != 0, weights * 4.0, weights)
+            base_weights = torch.where(full_map_target[..., 14] != 0, base_weights * 4.0, base_weights)
         elif column == 4:
-            weights = torch.where(full_map_target[..., 4] >= 1, weights * 6.0, weights)
+            base_weights = torch.where(full_map_target[..., 4] >= 1, base_weights * 6.0, base_weights)
+        focal_weights = torch.ones_like(per_tile)
         if column in (4, 14) and presence_focal_gamma:
             # City/unit presence is sparse. Standard cross entropy is easily
             # minimised by predicting an empty tile, which can look accurate
@@ -402,11 +409,13 @@ def belief_loss(
             target_probability = torch.softmax(logits, dim=-1).gather(
                 -1, labels.unsqueeze(-1)
             ).squeeze(-1)
-            weights = weights * (1.0 - target_probability).clamp_min(0.0).pow(
+            focal_weights = (1.0 - target_probability).clamp_min(0.0).pow(
                 float(presence_focal_gamma)
             )
-        denominator = (weights * loss_mask).sum().clamp_min(1.0)
-        feature_losses.append((per_tile * weights * loss_mask).sum() / denominator)
+        denominator = (base_weights * loss_mask).sum().clamp_min(1.0)
+        feature_losses.append(
+            (per_tile * base_weights * focal_weights * loss_mask).sum() / denominator
+        )
     return torch.stack(feature_losses).mean()
 
 

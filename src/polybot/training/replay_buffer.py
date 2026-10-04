@@ -64,13 +64,60 @@ class TrainingExample:
 
 
 class ReplayBuffer:
-    """Fixed-size uniformly sampled training history."""
+    """Fixed-size training history with optional hard-example preservation."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        preserve_constraint_fraction: float = 0.0,
+        preserve_bridge_fraction: float = 0.0,
+    ) -> None:
+        if capacity < 1:
+            raise ValueError("replay capacity must be positive")
+        if not 0.0 <= preserve_constraint_fraction <= 1.0:
+            raise ValueError("preserve_constraint_fraction must be in [0, 1]")
+        if not 0.0 <= preserve_bridge_fraction <= 1.0:
+            raise ValueError("preserve_bridge_fraction must be in [0, 1]")
         self._examples: Deque[TrainingExample] = deque(maxlen=capacity)
+        self._capacity = int(capacity)
+        self._preserve_constraint_fraction = float(preserve_constraint_fraction)
+        self._preserve_bridge_fraction = float(preserve_bridge_fraction)
 
     def extend(self, examples: List[TrainingExample]) -> None:
-        self._examples.extend(examples)
+        if not examples:
+            return
+        combined = list(self._examples) + list(examples)
+        if len(combined) <= self._capacity:
+            self._examples.extend(examples)
+            return
+        # FIFO silently forgets rare contradictions between a sampled world
+        # and public actions. Keep recent hard examples and bridge geometry,
+        # then fill the remaining slots with ordinary recent positions.
+        selected: set[int] = set()
+        constraint_quota = int(round(
+            self._capacity * self._preserve_constraint_fraction
+        ))
+        for index in range(len(combined) - 1, -1, -1):
+            if len(selected) >= constraint_quota:
+                break
+            if combined[index].engine_action_constraint_priority:
+                selected.add(index)
+        bridge_quota = int(round(self._capacity * self._preserve_bridge_fraction))
+        bridge_selected = 0
+        for index in range(len(combined) - 1, -1, -1):
+            if bridge_selected >= bridge_quota:
+                break
+            if index not in selected and combined[index].bridge_priority:
+                selected.add(index)
+                bridge_selected += 1
+        for index in range(len(combined) - 1, -1, -1):
+            if len(selected) >= self._capacity:
+                break
+            selected.add(index)
+        self._examples = deque(
+            (combined[index] for index in sorted(selected)), maxlen=self._capacity
+        )
 
     def sample(
         self,

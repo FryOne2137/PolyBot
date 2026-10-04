@@ -2332,6 +2332,7 @@ def train_population_pool(
     reserved_seeds: Sequence[int] = (),
     replay_examples: Sequence[TrainingExample] = (),
     replay_snapshot_callback: Callable[[Sequence[TrainingExample]], None] | None = None,
+    extra_replay_updates: int = 0,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
     """Train candidate agent 0 against PFSP with frozen-policy retention.
@@ -2345,9 +2346,9 @@ def train_population_pool(
     loss for every collected move. Combined with ``value_belief_heads_only``
     it is a safe value/belief bootstrap before MCTS is allowed to teach policy.
     """
-    if games < 0 or updates_per_game < 0:
-        raise ValueError("games and updates_per_game must not be negative")
-    if games == 0:
+    if games < 0 or updates_per_game < 0 or extra_replay_updates < 0:
+        raise ValueError("games, updates_per_game and extra_replay_updates must not be negative")
+    if games == 0 and not (extra_replay_updates and replay_examples):
         return {"population_pool_games": 0.0, "population_pool_updates": 0.0}
     if not opponent_models:
         raise ValueError("population training requires at least one opponent model")
@@ -2469,7 +2470,11 @@ def train_population_pool(
         lr=training.learning_rate,
         weight_decay=training.weight_decay,
     )
-    replay = ReplayBuffer(training.replay_capacity)
+    replay = ReplayBuffer(
+        training.replay_capacity,
+        preserve_constraint_fraction=0.40 if belief_only else 0.0,
+        preserve_bridge_fraction=0.20 if belief_only else 0.0,
+    )
     # A calibration run is deliberately short, but its supervised maps should
     # not be forgotten when the next CLI invocation starts.  The caller owns
     # persistence; this generic pool only seeds its bounded in-memory window.
@@ -2545,6 +2550,32 @@ def train_population_pool(
                 train_batch(candidate, optimiser, stack_examples(batch, device), training)
             )
             updates += 1
+
+    def optimise_replay_updates(count: int) -> int:
+        """Run a bounded offline optimisation block over the existing replay.
+
+        This deliberately bypasses the fresh-example epoch cap: calibration
+        replay is persistent, and a belief-only job must be able to train on
+        positions collected by earlier jobs without paying for another rollout.
+        """
+        nonlocal updates
+        completed = 0
+        while completed < count and len(replay) >= training.batch_size:
+            batch = replay.sample(
+                training.batch_size,
+                rng,
+                training.priority_replay_fraction,
+                training.bridge_replay_fraction,
+                critical_replay_fraction,
+                reanalysis_replay_fraction,
+                training.engine_action_constraint_replay_fraction,
+            )
+            losses.append(
+                train_batch(candidate, optimiser, stack_examples(batch, device), training)
+            )
+            updates += 1
+            completed += 1
+        return completed
 
     with tqdm(total=games, desc=f"population SelfPlayPool ({device})", unit="game", dynamic_ncols=True) as progress:
         for start in range(0, games, int(max_envs)):
@@ -3044,6 +3075,7 @@ def train_population_pool(
             routing.add(search.counters)
 
     optimise_until(games * updates_per_game)
+    offline_updates = optimise_replay_updates(extra_replay_updates)
     if reanalysis_store is not None:
         reanalysis_store.extend(new_reanalysis_positions)
         reanalysis_store.save()
@@ -3054,6 +3086,7 @@ def train_population_pool(
         "population_pool_terminals": float(terminal_count),
         "population_pool_truncated": float(truncated_count),
         "population_pool_updates": float(updates),
+        "population_pool_offline_replay_updates": float(offline_updates),
         "population_pool_examples": float(examples_count),
         "population_pool_completion_rate": float(completed_count / max(1, games)),
         "population_pool_candidate_decisions": float(decisions),

@@ -399,6 +399,15 @@ obsługuje wyłącznie `--population-games`, a liczbę update'ów
 `--population-updates-per-game`. Etap MCTS wymaga też
 `--value-bootstrap-games 0`, bo bootstrap value/belief należy do etapu belief.
 
+Kalibracja belief nie dzieli już `--population-games` pomiędzy szczeble MCTS:
+cały deklarowany budżet tworzy przykłady belief. Po kolekcji wykonuje też
+`--belief-replay-updates` dodatkowych update'ów z trwałego replay (domyślnie
+512). Dla treningu wyłącznie na już zapisanym replay ustaw
+`--population-games 0 --belief-replay-updates <liczba>`; held-out gate nadal
+decyduje o zapisie checkpointu. Replay zachowuje 40% przykładów z różnicą
+legalnych akcji oraz 20% przykładów mostów, a checkpoint apprentice jest
+nadpisywany wyłącznie przez ściśle lepszy wynik held-out.
+
 Po kalibracji liga może użyć `--population-belief-search-mode root_shield`.
 Tryb zachowuje strict checker dla kalibracji i ewaluacji, lecz podczas zwykłego
 generowania policy/value nie losuje ponownie particle'a tylko dlatego, że jego

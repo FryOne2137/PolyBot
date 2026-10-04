@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
@@ -58,7 +59,7 @@ def _save_belief_apprentice_state(path: Path, state: Mapping[str, Any]) -> None:
 def _load_belief_calibration_replay(
     path: Path,
     capacity: int,
-) -> list[TrainingExample]:
+) -> list[TrainingExample] | None:
     """Load a bounded local reservoir of supervised fog observations.
 
     This contains only PolyBot replay examples. It is never an inference
@@ -68,6 +69,26 @@ def _load_belief_calibration_replay(
     try:
         with path.open("rb") as handle:
             raw = pickle.load(handle)
+            if isinstance(raw, Mapping) and raw.get("format") == "belief-replay-v2":
+                # V2 stores examples as independent pickle records. Retain a
+                # bounded tail while reading, rather than materialising a
+                # giant list in RAM before applying ``capacity``.
+                window: deque[TrainingExample] = deque(maxlen=capacity)
+                while True:
+                    try:
+                        example = pickle.load(handle)
+                    except EOFError:
+                        break
+                    if isinstance(example, TrainingExample):
+                        window.append(example)
+                return list(window)
+    except MemoryError:
+        # Legacy replay files were stored as one pickle list. A very large
+        # list may not fit in RAM even when the requested live capacity is
+        # small, because pickle must materialise it before slicing. ``None``
+        # lets the caller choose a new path instead of overwriting the old
+        # artifact with an empty reservoir.
+        return None
     except (OSError, EOFError, pickle.UnpicklingError, AttributeError):
         return []
     if not isinstance(raw, list):
@@ -86,7 +107,9 @@ def _save_belief_calibration_replay(
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as handle:
-        pickle.dump(list(examples)[-capacity:], handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump({"format": "belief-replay-v2"}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        for example in list(examples)[-capacity:]:
+            pickle.dump(example, handle, protocol=pickle.HIGHEST_PROTOCOL)
     temporary.replace(path)
 
 
@@ -4471,6 +4494,18 @@ def train_promotion_league(
                                     belief_calibration_replay_path,
                                     belief_calibration_replay_capacity,
                                 )
+                                if calibration_replay is None:
+                                    legacy_path = belief_calibration_replay_path
+                                    belief_calibration_replay_path = legacy_path.with_name(
+                                        legacy_path.stem + "-recovered" + legacy_path.suffix
+                                    )
+                                    calibration_replay = []
+                                    print(
+                                        "league belief replay | legacy file is too large "
+                                        f"to load; preserving {legacy_path} and starting "
+                                        f"a bounded reservoir at {belief_calibration_replay_path}",
+                                        flush=True,
+                                    )
 
                                 def persist_calibration_replay(
                                     examples: Sequence[TrainingExample],

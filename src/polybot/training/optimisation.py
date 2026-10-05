@@ -732,7 +732,50 @@ def train_batch(
     )
 
     optimiser.zero_grad(set_to_none=True)
+    if not torch.isfinite(total):
+        # Do not let a malformed auxiliary target poison the persistent
+        # optimiser state.  The caller records this non-finite batch and can
+        # keep the last verified candidate unchanged.
+        return {
+            "loss": float("nan"),
+            "policy_loss": float(policy.detach().cpu()),
+            "value_loss": float(value.detach().cpu()),
+            "value_mae": float(value_mae.detach().cpu()),
+            "value_bias": float(value_bias.detach().cpu()),
+            "value_anchor_loss": float(anchor_value.detach().cpu()),
+            "belief_loss": float(belief.detach().cpu()),
+            "belief_engine_action_constraint_loss": float(
+                engine_constraint.detach().cpu()
+            ),
+            "belief_entity_consistency_loss": float(
+                entity_consistency.detach().cpu()
+            ),
+            "bridge_constraint_loss": float(bridge.detach().cpu()),
+        }
     total.backward()
+    if any(
+        parameter.grad is not None
+        and not torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ):
+        optimiser.zero_grad(set_to_none=True)
+        return {
+            "loss": float("nan"),
+            "policy_loss": float(policy.detach().cpu()),
+            "value_loss": float(value.detach().cpu()),
+            "value_mae": float(value_mae.detach().cpu()),
+            "value_bias": float(value_bias.detach().cpu()),
+            "value_anchor_loss": float(anchor_value.detach().cpu()),
+            "belief_loss": float(belief.detach().cpu()),
+            "belief_engine_action_constraint_loss": float(
+                engine_constraint.detach().cpu()
+            ),
+            "belief_entity_consistency_loss": float(
+                entity_consistency.detach().cpu()
+            ),
+            "bridge_constraint_loss": float(bridge.detach().cpu()),
+        }
     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimiser.step()
 

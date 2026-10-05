@@ -94,6 +94,10 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     )
     parser.add_argument("--population-updates-per-game", type=int, default=2)
     parser.add_argument(
+        "--population-optimisation-block-updates", type=int, default=32,
+        help="Optimiser updates per reported replay block after frozen collection.",
+    )
+    parser.add_argument(
         "--value-bootstrap-games", type=int, default=64,
         help=(
             "Raw-policy games used to calibrate only value and belief before "
@@ -202,6 +206,10 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     parser.add_argument(
         "--population-mcts-reanalyse-capacity", type=int, default=4096,
         help="Maximum durable critical MCTS positions retained between league runs",
+    )
+    parser.add_argument(
+        "--population-mcts-reanalyse-max-mb", type=int, default=64,
+        help="Maximum RAM/disk payload for durable critical MCTS positions.",
     )
     parser.add_argument(
         "--population-mcts-reanalyse-positions", type=int, default=8,
@@ -739,6 +747,9 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         population_size=args.population_size,
         population_games=args.population_games,
         population_updates_per_game=args.population_updates_per_game,
+        population_optimisation_block_updates=(
+            args.population_optimisation_block_updates
+        ),
         value_bootstrap_games=args.value_bootstrap_games,
         value_bootstrap_updates_per_game=(
             args.value_bootstrap_updates_per_game
@@ -770,6 +781,9 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         population_mcts_reanalyse_path=args.population_mcts_reanalyse_path,
         population_mcts_reanalyse_capacity=(
             args.population_mcts_reanalyse_capacity
+        ),
+        population_mcts_reanalyse_max_bytes=(
+            args.population_mcts_reanalyse_max_mb * 1024 * 1024
         ),
         population_mcts_reanalyse_positions=(
             args.population_mcts_reanalyse_positions

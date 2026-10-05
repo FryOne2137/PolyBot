@@ -80,7 +80,9 @@ class TrainingRun:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._rows: list[Dict[str, Any]] = []
         self._jsonl_path = self.directory / "metrics.jsonl"
+        self._events_path = self.directory / "events.jsonl"
         self._jsonl_path.write_text("", encoding="utf-8")
+        self._events_path.write_text("", encoding="utf-8")
         metadata = {
             "started_at": datetime.now(timezone.utc).isoformat(),
             "directory": str(self.directory.resolve()),
@@ -132,6 +134,16 @@ class TrainingRun:
             stream.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
         if self._metric_sink is not None:
             self._metric_sink(self.directory, row)
+
+    def event(self, phase: str, **details: Any) -> None:
+        """Record a textual training decision without polluting scalar charts."""
+        payload = {
+            "iteration": len(self._rows),
+            "phase": str(phase),
+            **_jsonable(details),
+        }
+        with self._events_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
 
     def finish(self, summary: Mapping[str, Any]) -> Path:
         """Write final CSV/JSON and PNG plots; return the absolute run path."""

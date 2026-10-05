@@ -2841,6 +2841,51 @@ def test_reanalysis_never_samples_the_current_held_out_map_seeds():
     assert {position.map_seed for position in selected} == {71, 83}
 
 
+def test_persistent_reanalysis_is_bounded_by_bytes_and_streams_records():
+    from polybot.training.persistent_reanalysis import (
+        PersistentReanalyseBuffer,
+        ReanalysePosition,
+        reanalyse_position_bytes,
+    )
+
+    first = ReanalysePosition(_example(0), 71, (1, 2), 0)
+    second = ReanalysePosition(_example(1), 72, (1, 2, 3), 0)
+    one_row_limit = max(
+        reanalyse_position_bytes(first), reanalyse_position_bytes(second)
+    ) + 32
+
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "reanalysis.pkl"
+        buffer = PersistentReanalyseBuffer(path, capacity=8, max_bytes=one_row_limit)
+        assert buffer.add(first)
+        assert buffer.add(second)
+        assert buffer.bytes_used <= one_row_limit
+        assert len(buffer.positions) == 1
+        buffer.save()
+
+        restored = PersistentReanalyseBuffer(path, capacity=8, max_bytes=one_row_limit)
+        assert restored.load() == 1
+        assert restored.bytes_used <= one_row_limit
+
+
+def test_persistent_reanalysis_rejects_one_oversize_position():
+    from polybot.training.persistent_reanalysis import (
+        PersistentReanalyseBuffer,
+        ReanalysePosition,
+        reanalyse_position_bytes,
+    )
+
+    position = ReanalysePosition(_example(0), 71, (), 0)
+    buffer = PersistentReanalyseBuffer(
+        Path("unused.pkl"), capacity=2,
+        max_bytes=reanalyse_position_bytes(position) - 1,
+    )
+
+    assert not buffer.add(position)
+    assert buffer.rejected_oversize == 1
+    assert not buffer.positions
+
+
 def test_calibration_replay_excludes_reserved_and_legacy_unknown_maps():
     reserved = _example(0)
     reserved.map_seed = 2137

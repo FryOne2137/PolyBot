@@ -546,6 +546,7 @@ def _validate_options(
     population_size: int,
     population_games: int,
     population_updates_per_game: int,
+    population_optimisation_block_updates: int,
     population_workers: int,
     population_max_envs: int,
     population_mcts_critical_only: bool,
@@ -556,6 +557,7 @@ def _validate_options(
     population_selective_mcts_minimum_envs: int,
     population_selective_mcts_audit_fraction: float,
     population_mcts_reanalyse_capacity: int,
+    population_mcts_reanalyse_max_bytes: int,
     population_mcts_reanalyse_positions: int,
     population_mcts_reanalyse_replay_fraction: float,
     pfsp_alpha: float,
@@ -585,6 +587,8 @@ def _validate_options(
         raise ValueError("population_size must be positive")
     if population_games < 0 or population_updates_per_game < 0:
         raise ValueError("population games and updates must not be negative")
+    if population_optimisation_block_updates < 1:
+        raise ValueError("population_optimisation_block_updates must be positive")
     if population_games and population_workers < 1:
         raise ValueError("population_workers must be positive")
     if population_max_envs < 1:
@@ -615,6 +619,8 @@ def _validate_options(
         )
     if population_mcts_reanalyse_capacity < 1:
         raise ValueError("population_mcts_reanalyse_capacity must be positive")
+    if population_mcts_reanalyse_max_bytes < 1:
+        raise ValueError("population_mcts_reanalyse_max_bytes must be positive")
     if population_mcts_reanalyse_positions < 0:
         raise ValueError("population_mcts_reanalyse_positions must not be negative")
     if not 0.0 <= population_mcts_reanalyse_replay_fraction <= 1.0:
@@ -666,6 +672,7 @@ def train_promotion_league(
     population_size: int = 6,
     population_games: int = 0,
     population_updates_per_game: int = 0,
+    population_optimisation_block_updates: int = 32,
     population_workers: int = 16,
     population_max_envs: int = 16,
     population_offline_collection: bool = True,
@@ -680,6 +687,7 @@ def train_promotion_league(
     population_selective_mcts_audit_fraction: float = 0.10,
     population_mcts_reanalyse_path: Path | None = None,
     population_mcts_reanalyse_capacity: int = 4_096,
+    population_mcts_reanalyse_max_bytes: int = 64 * 1024**2,
     population_mcts_reanalyse_positions: int = 8,
     population_mcts_reanalyse_replay_fraction: float = 0.50,
     value_bootstrap_games: int = 64,
@@ -829,6 +837,9 @@ def train_promotion_league(
         population_size=population_size,
         population_games=population_games,
         population_updates_per_game=population_updates_per_game,
+        population_optimisation_block_updates=(
+            population_optimisation_block_updates
+        ),
         population_workers=population_workers,
         population_max_envs=population_max_envs,
         population_mcts_critical_only=population_mcts_critical_only,
@@ -847,6 +858,7 @@ def train_promotion_league(
             population_selective_mcts_audit_fraction
         ),
         population_mcts_reanalyse_capacity=population_mcts_reanalyse_capacity,
+        population_mcts_reanalyse_max_bytes=population_mcts_reanalyse_max_bytes,
         population_mcts_reanalyse_positions=population_mcts_reanalyse_positions,
         population_mcts_reanalyse_replay_fraction=(
             population_mcts_reanalyse_replay_fraction
@@ -3535,6 +3547,9 @@ def train_promotion_league(
                                 reanalysis_capacity=(
                                     population_mcts_reanalyse_capacity
                                 ),
+                                reanalysis_max_bytes=(
+                                    population_mcts_reanalyse_max_bytes
+                                ),
                                 reanalysis_positions=(
                                     population_mcts_reanalyse_positions
                                 ),
@@ -4615,6 +4630,11 @@ def train_promotion_league(
                     # to an optional ungated legacy self-play snapshot.
                     best_mcts_state = direct_population_state
                     best_mcts_score = 0.50
+                    # Persisted only after a rung passes its paired search
+                    # and absorption gates.  It is deliberately distinct
+                    # from the champion: a later rung or promotion gate can
+                    # still reject it without losing this verified progress.
+                    verified_mcts_path: Path | None = None
                     if direct_population_summary:
                         raw_population_baseline = {
                             "model_a_score": float(
@@ -5053,6 +5073,9 @@ def train_promotion_league(
                                 rung_mcts,
                                 games=rung_games,
                                 updates_per_game=population_updates_per_game,
+                                optimisation_block_updates=(
+                                    population_optimisation_block_updates
+                                ),
                                 candidate=candidate,
                                 opponent_models=frozen_models,
                                 opponent_weights=probabilities,
@@ -5102,6 +5125,9 @@ def train_promotion_league(
                                 reanalysis_path=population_mcts_reanalyse_path,
                                 reanalysis_capacity=(
                                     population_mcts_reanalyse_capacity
+                                ),
+                                reanalysis_max_bytes=(
+                                    population_mcts_reanalyse_max_bytes
                                 ),
                                 reanalysis_positions=(
                                     0
@@ -5588,6 +5614,53 @@ def train_promotion_league(
                                 )
                                 best_raw_completion_rate = raw_completion_rate
                                 population_summary["mcts_ladder_accepted"] += 1.0
+                                verified_mcts_path = _next_checkpoint_path(
+                                    checkpoint_dir,
+                                    f"{checkpoint_prefix}-mcts-verified",
+                                )
+                                save_model(
+                                    verified_mcts_path, candidate, model_config
+                                )
+                                # The MCTS update changes the shared belief
+                                # decoder.  Make the next round revalidate it
+                                # instead of accidentally inheriting the
+                                # previous apprentice's calibration marker.
+                                _save_belief_apprentice_state(
+                                    verified_mcts_path.with_suffix(
+                                        verified_mcts_path.suffix + ".json"
+                                    ),
+                                    {
+                                        "champion_path": str(
+                                            champion_path.resolve()
+                                        ),
+                                        "champion_fingerprint": (
+                                            champion_fingerprint
+                                        ),
+                                        "apprentice_fingerprint": (
+                                            _checkpoint_fingerprint(
+                                                verified_mcts_path
+                                            )
+                                        ),
+                                        "validation_signature": None,
+                                        "ready": False,
+                                        "held_out_games": 0,
+                                        "stage": "mcts_verified_development",
+                                        "round": round_index,
+                                        "mcts_simulations": int(simulations),
+                                        "mcts_score": rung_score,
+                                        "raw_policy_score": raw_policy_score,
+                                    },
+                                )
+                                event = getattr(run, "event", None)
+                                if callable(event):
+                                    event(
+                                        "save",
+                                        kind="mcts_verified_development",
+                                        path=str(verified_mcts_path),
+                                        simulations=int(simulations),
+                                        search_score=rung_score,
+                                        raw_policy_score=raw_policy_score,
+                                    )
                             else:
                                 restore_model_state(candidate, best_mcts_state)
                                 population_summary["mcts_ladder_rollbacks"] += 1.0
@@ -5731,11 +5804,19 @@ def train_promotion_league(
                         # ``best_mcts_state``; discard the candidate instead
                         # of serialising that rollback as a misleading new
                         # challenger for the next generation.
-                        database.finalise_candidate(
-                            candidate_id, promoted_path=None
-                        )
-                        challenger_path = None
-                        challenger_id = None
+                        retained_verified_rung = verified_mcts_path is not None
+                        if retained_verified_rung:
+                            database.retain_candidate(
+                                candidate_id, verified_mcts_path
+                            )
+                            challenger_path = verified_mcts_path
+                            challenger_id = candidate_id
+                        else:
+                            database.finalise_candidate(
+                                candidate_id, promoted_path=None
+                            )
+                            challenger_path = None
+                            challenger_id = None
                         last_candidate_score = 0.0
                         last_population_score = 0.0
                         mcts_gate_summary = {
@@ -5751,7 +5832,11 @@ def train_promotion_league(
                             "mcts_ladder_required": float(
                                 expected_mcts_rungs
                             ),
-                            "retained_challenger": 0.0,
+                            "retained_challenger": float(retained_verified_rung),
+                            "verified_mcts_path": (
+                                str(verified_mcts_path)
+                                if verified_mcts_path is not None else ""
+                            ),
                             "reason": "mcts_curriculum_incomplete",
                         }
                         database.finish_round(
@@ -5764,7 +5849,7 @@ def train_promotion_league(
                         run.log(
                             round=round_index,
                             mcts_ready_for_promotion_gate=0.0,
-                            retained_challenger=0.0,
+                            retained_challenger=float(retained_verified_rung),
                             promoted=0.0,
                             promotions=promotions,
                         )
@@ -5773,7 +5858,11 @@ def train_promotion_league(
                             "league MCTS curriculum incomplete | final gate "
                             "skipped | accepted="
                             f"{int(population_summary['mcts_ladder_accepted'])}/"
-                            f"{expected_mcts_rungs}",
+                            f"{expected_mcts_rungs}"
+                            + (
+                                f" | retained {verified_mcts_path}"
+                                if retained_verified_rung else ""
+                            ),
                             flush=True,
                         )
                         del candidate, champion, frozen_models

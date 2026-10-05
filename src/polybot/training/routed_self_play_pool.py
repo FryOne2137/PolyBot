@@ -2605,8 +2605,10 @@ def train_population_pool(
     selective_mcts_audit_fraction: float = 0.10,
     reanalysis_path: Path | None = None,
     reanalysis_capacity: int = 4_096,
+    reanalysis_max_bytes: int = 64 * 1024**2,
     reanalysis_positions: int = 0,
     reanalysis_replay_fraction: float = 0.0,
+    optimisation_block_updates: int = 32,
     offline_collection: bool = False,
     belief_only: bool = False,
     value_belief_heads_only: bool = False,
@@ -2679,8 +2681,12 @@ def train_population_pool(
         raise ValueError("belief_particle_temperature must not be negative")
     if reanalysis_capacity < 1:
         raise ValueError("reanalysis_capacity must be positive")
+    if reanalysis_max_bytes < 1:
+        raise ValueError("reanalysis_max_bytes must be positive")
     if reanalysis_positions < 0:
         raise ValueError("reanalysis_positions must not be negative")
+    if optimisation_block_updates < 1:
+        raise ValueError("optimisation_block_updates must be positive")
     if not 0.0 <= reanalysis_replay_fraction <= 1.0:
         raise ValueError("reanalysis_replay_fraction must be between zero and one")
     if reanalysis_positions and reanalysis_path is None:
@@ -2735,8 +2741,10 @@ def train_population_pool(
             "selective_mcts_audit_fraction": selective_mcts_audit_fraction,
             "reanalysis_path": str(reanalysis_path) if reanalysis_path else "",
             "reanalysis_capacity": reanalysis_capacity,
+            "reanalysis_max_bytes": reanalysis_max_bytes,
             "reanalysis_positions": reanalysis_positions,
             "reanalysis_replay_fraction": reanalysis_replay_fraction,
+            "optimisation_block_updates": optimisation_block_updates,
             "offline_collection": offline_collection,
             "belief_only": belief_only,
             "value_belief_heads_only": value_belief_heads_only,
@@ -2787,7 +2795,11 @@ def train_population_pool(
         replay.extend(list(replay_examples)[-training.replay_capacity:])
     rng = np.random.default_rng(training.seed ^ 0x91A6E)
     reanalysis_store = (
-        PersistentReanalyseBuffer(reanalysis_path, reanalysis_capacity)
+        PersistentReanalyseBuffer(
+            reanalysis_path,
+            reanalysis_capacity,
+            reanalysis_max_bytes,
+        )
         if reanalysis_path is not None
         else None
     )
@@ -2843,7 +2855,112 @@ def train_population_pool(
     routing = SearchCounters()
     recovery_seed_cursor = 0
     recovery_seed_history: set[int] = set()
-    new_reanalysis_positions: list[ReanalysePosition] = []
+    reanalysis_saved = 0
+    reanalysis_reserved_rejected = 0
+    optimisation_blocks = 0
+    optimisation_rollbacks = 0
+    optimisation_attempted = 0
+
+    def memory_metrics() -> dict[str, float]:
+        if device.type != "cuda":
+            return {
+                "cuda_memory_allocated": 0.0,
+                "cuda_memory_reserved": 0.0,
+            }
+        return {
+            "cuda_memory_allocated": float(torch.cuda.memory_allocated(device)),
+            "cuda_memory_reserved": float(torch.cuda.memory_reserved(device)),
+        }
+
+    def record_event(phase: str, **details: Any) -> None:
+        event = getattr(run, "event", None)
+        if callable(event):
+            event(phase, **details)
+
+    def optimise_block(count: int, *, phase: str) -> int:
+        """Optimise a bounded block and surface its actual lifetime clearly."""
+        nonlocal updates, optimisation_blocks, optimisation_rollbacks
+        nonlocal optimisation_attempted
+        completed = 0
+        while completed < count and len(replay) >= training.batch_size:
+            block = min(int(optimisation_block_updates), count - completed)
+            record_event(
+                "optimise",
+                block=optimisation_blocks + 1,
+                source=phase,
+                updates_planned=block,
+                updates_retained=updates,
+                replay_examples=len(replay),
+                reanalysis_bytes=(
+                    reanalysis_store.bytes_used if reanalysis_store else 0
+                ),
+                **memory_metrics(),
+            )
+            print(
+                "population optimise | "
+                f"block={optimisation_blocks + 1} | updates={block} | "
+                f"replay={len(replay)} | "
+                f"reanalysis_bytes="
+                f"{reanalysis_store.bytes_used if reanalysis_store else 0}",
+                flush=True,
+            )
+            block_losses: list[Dict[str, float]] = []
+            for _ in range(block):
+                batch = replay.sample(
+                    training.batch_size,
+                    rng,
+                    training.priority_replay_fraction,
+                    training.bridge_replay_fraction,
+                    critical_replay_fraction,
+                    reanalysis_replay_fraction,
+                    training.engine_action_constraint_replay_fraction,
+                )
+                result = train_batch(
+                    candidate, optimiser, stack_examples(batch, device), training
+                )
+                optimisation_attempted += 1
+                if not all(np.isfinite(value) for value in result.values()):
+                    # train_batch normally catches numerical issues before the
+                    # optimiser step.  If a future loss violates that
+                    # contract, stop the block instead of treating NaN as
+                    # evidence of a useful candidate.
+                    optimisation_rollbacks += 1
+                    record_event(
+                        "rollback",
+                        source=phase,
+                        reason="non_finite_training_metric",
+                        updates_retained=updates,
+                    )
+                    return completed
+                losses.append(result)
+                block_losses.append(result)
+                updates += 1
+                completed += 1
+            optimisation_blocks += 1
+            means = {
+                f"block_{key}": float(np.mean([row[key] for row in block_losses]))
+                for key in block_losses[0]
+            }
+            run.log(
+                phase_optimise=1.0,
+                optimisation_block=optimisation_blocks,
+                optimisation_updates_attempted=optimisation_attempted,
+                optimisation_updates_retained=updates,
+                replay_examples=len(replay),
+                reanalysis_bytes=(
+                    reanalysis_store.bytes_used if reanalysis_store else 0
+                ),
+                **memory_metrics(),
+                **means,
+            )
+            record_event(
+                "optimise_complete",
+                block=optimisation_blocks,
+                source=phase,
+                updates_attempted=optimisation_attempted,
+                updates_retained=updates,
+            )
+        return completed
 
     def optimise_until(target: int) -> None:
         nonlocal updates
@@ -2853,20 +2970,7 @@ def train_population_pool(
             training.batch_size,
             training.max_replay_epochs,
         )
-        while updates < capped and len(replay) >= training.batch_size:
-            batch = replay.sample(
-                training.batch_size,
-                rng,
-                training.priority_replay_fraction,
-                training.bridge_replay_fraction,
-                critical_replay_fraction,
-                reanalysis_replay_fraction,
-                training.engine_action_constraint_replay_fraction,
-            )
-            losses.append(
-                train_batch(candidate, optimiser, stack_examples(batch, device), training)
-            )
-            updates += 1
+        optimise_block(max(0, capped - updates), phase="fresh_replay")
 
     def optimise_replay_updates(count: int) -> int:
         """Run a bounded offline optimisation block over the existing replay.
@@ -2876,24 +2980,23 @@ def train_population_pool(
         positions collected by earlier jobs without paying for another rollout.
         """
         nonlocal updates
-        completed = 0
-        while completed < count and len(replay) >= training.batch_size:
-            batch = replay.sample(
-                training.batch_size,
-                rng,
-                training.priority_replay_fraction,
-                training.bridge_replay_fraction,
-                critical_replay_fraction,
-                reanalysis_replay_fraction,
-                training.engine_action_constraint_replay_fraction,
-            )
-            losses.append(
-                train_batch(candidate, optimiser, stack_examples(batch, device), training)
-            )
-            updates += 1
-            completed += 1
-        return completed
+        return optimise_block(count, phase="persistent_replay")
 
+    record_event(
+        "collect",
+        games_planned=games,
+        offline_collection=offline_collection,
+        max_envs=max_envs,
+        reanalysis_limit_bytes=(reanalysis_store.max_bytes if reanalysis_store else 0),
+        **memory_metrics(),
+    )
+    print(
+        "population collect | "
+        f"games={games} | offline={int(offline_collection)} | "
+        f"reanalysis_limit_bytes="
+        f"{reanalysis_store.max_bytes if reanalysis_store else 0}",
+        flush=True,
+    )
     with tqdm(total=games, desc=f"population SelfPlayPool ({device})", unit="game", dynamic_ncols=True) as progress:
         for start in range(0, games, int(max_envs)):
             count = min(int(max_envs), games - start)
@@ -2975,19 +3078,27 @@ def train_population_pool(
                         for example in finished:
                             prefix = critical_prefixes[env].get(id(example))
                             if prefix is not None:
-                                new_reanalysis_positions.append(
-                                    ReanalysePosition(
-                                        example=copy.deepcopy(example),
-                                        map_seed=int(seeds[env]),
-                                        action_prefix=prefix,
-                                        player_id=int(example.player_id),
-                                        map_size=int(training.map_size),
-                                        map_type=str(training.map_type),
-                                        visible_action_history=int(
-                                            visible_action_history
-                                        ),
-                                    )
-                                )
+                                map_seed = int(seeds[env])
+                                if map_seed in reserved_seed_set:
+                                    reanalysis_reserved_rejected += 1
+                                elif reanalysis_store is not None:
+                                    # The normal replay and the durable
+                                    # reanalysis store share immutable arrays.
+                                    # Reanalysis later replaces only its
+                                    # policy target on a new example.
+                                    reanalysis_saved += int(reanalysis_store.add(
+                                        ReanalysePosition(
+                                            example=example,
+                                            map_seed=map_seed,
+                                            action_prefix=prefix,
+                                            player_id=int(example.player_id),
+                                            map_size=int(training.map_size),
+                                            map_type=str(training.map_type),
+                                            visible_action_history=int(
+                                                visible_action_history
+                                            ),
+                                        )
+                                    ))
                     replay.extend(finished)
                     examples_count += len(finished)
                     trajectories[env].clear()
@@ -3400,10 +3511,23 @@ def train_population_pool(
                 )
             routing.add(search.counters)
 
+    record_event(
+        "collect_complete",
+        games_completed=completed_count,
+        replay_examples=len(replay),
+        reanalysis_bytes=(reanalysis_store.bytes_used if reanalysis_store else 0),
+        **memory_metrics(),
+    )
+    print(
+        "population collect complete | "
+        f"games={completed_count}/{games} | replay={len(replay)} | "
+        f"reanalysis_bytes="
+        f"{reanalysis_store.bytes_used if reanalysis_store else 0}",
+        flush=True,
+    )
     optimise_until(games * updates_per_game)
     offline_updates = optimise_replay_updates(extra_replay_updates)
     if reanalysis_store is not None:
-        reanalysis_store.extend(new_reanalysis_positions)
         reanalysis_store.save()
     if replay_snapshot_callback is not None:
         replay_snapshot_callback(replay.snapshot())
@@ -3412,6 +3536,9 @@ def train_population_pool(
         "population_pool_terminals": float(terminal_count),
         "population_pool_truncated": float(truncated_count),
         "population_pool_updates": float(updates),
+        "population_pool_optimisation_blocks": float(optimisation_blocks),
+        "population_pool_optimisation_attempted": float(optimisation_attempted),
+        "population_pool_optimisation_rollbacks": float(optimisation_rollbacks),
         "population_pool_offline_replay_updates": float(offline_updates),
         "population_pool_examples": float(examples_count),
         "population_pool_replay_reserved_excluded": float(
@@ -3474,9 +3601,27 @@ def train_population_pool(
         "population_pool_reanalysis_reserved_excluded": float(
             reanalysis_reserved_excluded
         ),
-        "population_pool_reanalysis_saved": float(len(new_reanalysis_positions)),
+        "population_pool_reanalysis_saved": float(reanalysis_saved),
         "population_pool_reanalysis_buffer_size": float(
             len(reanalysis_store.positions) if reanalysis_store else 0
+        ),
+        "population_pool_reanalysis_buffer_bytes": float(
+            reanalysis_store.bytes_used if reanalysis_store else 0
+        ),
+        "population_pool_reanalysis_oversize_rejected": float(
+            reanalysis_store.rejected_oversize if reanalysis_store else 0
+        ),
+        "population_pool_reanalysis_invalid_rejected": float(
+            reanalysis_store.rejected_invalid if reanalysis_store else 0
+        ),
+        "population_pool_reanalysis_duplicates_replaced": float(
+            reanalysis_store.replaced_duplicates if reanalysis_store else 0
+        ),
+        "population_pool_reanalysis_evicted": float(
+            reanalysis_store.evicted if reanalysis_store else 0
+        ),
+        "population_pool_reanalysis_reserved_rejected": float(
+            reanalysis_reserved_rejected
         ),
         "population_pool_score": float(score_sum / max(1, games)),
         "population_pool_mean_moves": float(total_moves / max(1, games)),

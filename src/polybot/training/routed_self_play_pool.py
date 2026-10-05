@@ -116,6 +116,32 @@ def _sample_reanalysis_positions_excluding_reserved(
     return tuple(eligible[int(index)] for index in np.asarray(chosen)), excluded
 
 
+def _filter_replay_examples_excluding_reserved(
+    examples: Sequence[TrainingExample],
+    reserved_seeds: set[int],
+) -> tuple[list[TrainingExample], int, int]:
+    """Keep replay provenance disjoint from this run's held-out arenas.
+
+    Legacy rows do not have ``map_seed``.  Once a run has a held-out arena we
+    must reject them rather than assume they are safe: a previous training
+    seed can become an evaluation seed after a CLI seed change.
+    """
+    if not reserved_seeds:
+        return list(examples), 0, 0
+    eligible: list[TrainingExample] = []
+    reserved_excluded = 0
+    unknown_excluded = 0
+    for example in examples:
+        map_seed = getattr(example, "map_seed", None)
+        if map_seed is None:
+            unknown_excluded += 1
+        elif int(map_seed) in reserved_seeds:
+            reserved_excluded += 1
+        else:
+            eligible.append(example)
+    return eligible, reserved_excluded, unknown_excluded
+
+
 def _compact_belief_diagnostics(
     diagnostics: Sequence[Mapping[str, Any]],
     *,
@@ -371,6 +397,28 @@ def _mark_critical_mcts_examples(
     return int(selected.size), float(scores[selected].sum())
 
 
+def _blend_reanalysis_policy_target(
+    visits: np.ndarray,
+    anchor_policy: np.ndarray | None,
+    anchor_policy_weight: float,
+) -> np.ndarray:
+    """Apply the same frozen-policy anchor used by fresh MCTS examples."""
+    target = np.asarray(visits, dtype=np.float32).copy()
+    if anchor_policy is None or anchor_policy_weight <= 0.0:
+        return target
+    anchor = np.asarray(anchor_policy, dtype=np.float32)
+    if anchor.shape != target.shape:
+        raise ValueError("reanalysis anchor policy shape differs from MCTS visits")
+    total = float(anchor.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        return target
+    anchor /= total
+    weight = float(np.clip(anchor_policy_weight, 0.0, 1.0))
+    target = (1.0 - weight) * target + weight * anchor
+    target /= max(float(target.sum()), 1e-8)
+    return target
+
+
 def _reanalyse_critical_positions(
     positions: Sequence[ReanalysePosition],
     *,
@@ -381,6 +429,7 @@ def _reanalyse_critical_positions(
     minimum_score: float,
     visible_action_history: int,
     anchor_model: PolicyValueBeliefNet | None = None,
+    anchor_policy_weight: float = 0.0,
     anchor_value_weight: float = 0.0,
 ) -> tuple[list[TrainingExample], int]:
     """Refresh old MCTS targets by replaying their public game prefixes.
@@ -472,6 +521,7 @@ def _reanalyse_critical_positions(
                 # supervision is a current-run regulariser, so regenerate it
                 # from the current frozen anchor (or disable it explicitly).
                 anchor_value_target = 0.0
+                anchor_policy: np.ndarray | None = None
                 if anchor_model is not None and anchor_value_weight > 0.0:
                     anchor_output = anchor_model(
                         tensors["map_tokens"],
@@ -485,6 +535,24 @@ def _reanalyse_critical_positions(
                         include_belief=False,
                     )
                     anchor_value_target = float(anchor_output.value[0].item())
+                elif anchor_model is not None and anchor_policy_weight > 0.0:
+                    anchor_output = anchor_model(
+                        tensors["map_tokens"],
+                        tensors["global_features"],
+                        tensors["action_categorical"],
+                        tensors["action_continuous"],
+                        tensors["action_mask"],
+                        tensors["event_features"],
+                        action_history=tensors["action_history"],
+                        action_history_mask=tensors["action_history_mask"],
+                        include_belief=False,
+                    )
+                else:
+                    anchor_output = None
+                if anchor_output is not None and anchor_policy_weight > 0.0:
+                    anchor_policy = torch.softmax(
+                        anchor_output.policy_logits[0, : visits.size].float(), dim=-1
+                    ).cpu().numpy()
             raw = torch.softmax(
                 output.policy_logits[0, : visits.size].float(), dim=-1
             ).cpu().numpy()
@@ -492,8 +560,12 @@ def _reanalyse_critical_positions(
             score = float(visits[top] * max(0.0, visits[top] - raw[top]))
             if score < minimum_score or top == int(raw.argmax()):
                 continue
+            policy_target = _blend_reanalysis_policy_target(
+                visits, anchor_policy, anchor_policy_weight
+            )
             updated = copy.deepcopy(previous)
-            updated.policy_target = visits.astype(np.float32, copy=False)
+            updated.map_seed = int(position.map_seed)
+            updated.policy_target = policy_target.astype(np.float32, copy=False)
             updated.critical_priority = True
             updated.critical_score = score
             updated.reanalysis_priority = True
@@ -2131,6 +2203,7 @@ def evaluate_matches_pool(
     model_a_uses_mcts: bool = True,
     model_b_uses_mcts: bool = True,
     map_seeds: Sequence[int] | None = None,
+    excluded_map_seeds: Sequence[int] = (),
     replace_failed_pairs: bool = True,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
@@ -2146,6 +2219,10 @@ def evaluate_matches_pool(
     policy.  This asymmetric probe is required before search visit counts can
     be trusted as policy targets; MCTS on both sides can otherwise hide an
     equal search gain behind an unchanged win rate.
+
+    ``excluded_map_seeds`` reserves maps which must never be used as a
+    recovery replacement.  Callers use it to keep an invalid evaluation pair
+    from being silently replaced with a map used by any training collection.
     """
     if games < 2 or games % 2:
         raise ValueError("games must be positive and even for paired evaluation")
@@ -2211,6 +2288,11 @@ def evaluate_matches_pool(
         if fixed_map_seeds is not None
         else {int(training.seed) + game_index // 2 for game_index in range(games)}
     )
+    # Keep the forbidden training arena in the same set used by the
+    # deterministic replacement allocator.  It must not appear in completed
+    # evaluation rows, but it must block a collision when recovery replaces a
+    # failed paired map.
+    used_evaluation_seeds.update(int(seed) for seed in excluded_map_seeds)
     chunk_limit = max(2, int(max_envs) - int(max_envs) % 2)
     with tqdm(
         total=games,
@@ -2555,8 +2637,24 @@ def train_population_pool(
     """
     if games < 0 or updates_per_game < 0 or extra_replay_updates < 0:
         raise ValueError("games, updates_per_game and extra_replay_updates must not be negative")
+    reserved_seed_set = {int(value) for value in reserved_seeds}
+    replay_examples, replay_reserved_excluded, replay_unknown_excluded = (
+        _filter_replay_examples_excluding_reserved(
+            replay_examples,
+            reserved_seed_set,
+        )
+    )
     if games == 0 and not (extra_replay_updates and replay_examples):
-        return {"population_pool_games": 0.0, "population_pool_updates": 0.0}
+        return {
+            "population_pool_games": 0.0,
+            "population_pool_updates": 0.0,
+            "population_pool_replay_reserved_excluded": float(
+                replay_reserved_excluded
+            ),
+            "population_pool_replay_unknown_seed_excluded": float(
+                replay_unknown_excluded
+            ),
+        }
     if not opponent_models:
         raise ValueError("population training requires at least one opponent model")
     if max_envs < 1:
@@ -2696,7 +2794,6 @@ def train_population_pool(
     reanalysis_loaded = reanalysis_store.load() if reanalysis_store else 0
     reanalysis_refreshed = 0
     reanalysis_failed = 0
-    reserved_seed_set = {int(value) for value in reserved_seeds}
     reanalysis_reserved_excluded = 0
     if reanalysis_store is not None and reanalysis_positions:
         selected_reanalysis, reanalysis_reserved_excluded = (
@@ -2716,6 +2813,7 @@ def train_population_pool(
             minimum_score=critical_minimum_score,
             visible_action_history=visible_action_history,
             anchor_model=anchor_model,
+            anchor_policy_weight=anchor_policy_weight,
             anchor_value_weight=anchor_value_weight,
         )
         replay.extend(reanalysed)
@@ -3151,6 +3249,10 @@ def train_population_pool(
                                 example.critical_priority = True
                     root_values = np.asarray(root["root_value"], dtype=np.float32)
                     for env, example in zip(candidate_rows, candidate_examples):
+                        # Preserve the actual per-slot map provenance.  The
+                        # calibration reservoir may survive into a run with a
+                        # different held-out seed schedule.
+                        example.map_seed = int(seeds[int(env)])
                         if not mcts_mask[int(env)]:
                             # A raw policy target is only an action source,
                             # never an outcome-improved policy teacher. Keep
@@ -3312,6 +3414,12 @@ def train_population_pool(
         "population_pool_updates": float(updates),
         "population_pool_offline_replay_updates": float(offline_updates),
         "population_pool_examples": float(examples_count),
+        "population_pool_replay_reserved_excluded": float(
+            replay_reserved_excluded
+        ),
+        "population_pool_replay_unknown_seed_excluded": float(
+            replay_unknown_excluded
+        ),
         "population_pool_completion_rate": float(completed_count / max(1, games)),
         "population_pool_candidate_decisions": float(decisions),
         "population_pool_anchor_policy_weight": float(

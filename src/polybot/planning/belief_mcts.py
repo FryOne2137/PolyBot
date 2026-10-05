@@ -316,6 +316,46 @@ class BeliefMCTS:
         )
         return priors, [particle.cpu().numpy().astype(np.int32) for particle in particles]
 
+    def _make_action_equivalent_belief_envs(
+        self,
+        env: object,
+        completed_particles: List[np.ndarray],
+        *,
+        root_player: int,
+        public_action_ids: np.ndarray,
+    ) -> List[object]:
+        """Materialise only particles with the root's public legal actions.
+
+        A particle can be structurally valid yet hallucinate an extra route,
+        attack, or build. Searching such a world gives MCTS visits that are
+        impossible in the authoritative public position. The hot routed pool
+        asks PolyEnv the equivalent question before ``submit_beliefs``; scalar
+        reanalysis must enforce the same invariant locally.
+        """
+        belief_envs: List[object] = []
+        expected = np.asarray(public_action_ids, dtype=np.int64)
+        for completed in completed_particles:
+            try:
+                belief_env = env.make_belief_env(
+                    completed, perspective=root_player
+                )
+                legal_ids = np.asarray(
+                    belief_env.legal_action_ids_fast(), dtype=np.int64
+                )
+                if not np.array_equal(legal_ids, expected):
+                    reason = "belief particle legal actions differ from public root"
+                    if reason not in self._reported_particle_errors:
+                        print(f"belief particle rejected: {reason}", flush=True)
+                        self._reported_particle_errors.add(reason)
+                    continue
+                belief_envs.append(belief_env)
+            except Exception as error:
+                reason = str(error) or type(error).__name__
+                if reason not in self._reported_particle_errors:
+                    print(f"belief particle rejected: {reason}", flush=True)
+                    self._reported_particle_errors.add(reason)
+        return belief_envs
+
     def decide(
         self,
         env: object,
@@ -481,15 +521,12 @@ class BeliefMCTS:
         root_priors, completed_particles = self._root_priors_and_particles(root_packet, root_events)
         root_priors = self._noisy_root_priors(root_priors)
         root_player = int(root_packet["obs"].get("current_player", env.current_player()))
-        belief_envs: List[object] = []
-        for completed in completed_particles:
-            try:
-                belief_envs.append(env.make_belief_env(completed, perspective=root_player))
-            except Exception as error:
-                reason = str(error) or type(error).__name__
-                if reason not in self._reported_particle_errors:
-                    print(f"belief particle rejected: {reason}", flush=True)
-                    self._reported_particle_errors.add(reason)
+        belief_envs = self._make_action_equivalent_belief_envs(
+            env,
+            completed_particles,
+            root_player=root_player,
+            public_action_ids=action_ids,
+        )
         if not belief_envs:
             priors = np.asarray([root_priors.get(int(action), 0.0) for action in action_ids], dtype=np.float64)
             row = int(priors.argmax())
@@ -579,25 +616,17 @@ class BeliefMCTS:
         valid_particles = 0
 
         inference_batch_size = max(1, int(self.config.inference_batch_size))
-        belief_envs: List[object] = []
-        for completed in completed_particles:
-            try:
-                # The only branch creation from the authoritative env.
-                belief_env = env.make_belief_env(completed, perspective=root_player)
-            except Exception as error:
-                # Report each distinct validation failure once.  This is a
-                # terminal diagnostic only, not a saved game/log artifact.
-                reason = str(error) or type(error).__name__
-                if reason not in self._reported_particle_errors:
-                    print(f"belief particle rejected: {reason}", flush=True)
-                    self._reported_particle_errors.add(reason)
-                # Discard it; never fall back to env.clone(), which would leak.
-                completed_simulations += simulations_per_particle
-                if on_progress:
-                    on_progress(completed_simulations, total_simulations, valid_particles)
-                continue
-            valid_particles += 1
-            belief_envs.append(belief_env)
+        belief_envs = self._make_action_equivalent_belief_envs(
+            env,
+            completed_particles,
+            root_player=root_player,
+            public_action_ids=action_ids,
+        )
+        rejected_particles = len(completed_particles) - len(belief_envs)
+        completed_simulations += rejected_particles * simulations_per_particle
+        valid_particles = len(belief_envs)
+        if rejected_particles and on_progress:
+            on_progress(completed_simulations, total_simulations, valid_particles)
 
         # Select from all particle worlds before invoking the network.  These
         # worlds are independent hypotheses but share the root tree, so their

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +66,7 @@ from polybot.training.league import (
     _curriculum_controls,
     _flat_distillation_gate_decision,
     _mcts_probe_passed,
+    _updated_mcts_gate_map_schedule,
     _promotion_gate_decision,
     _round_champion_mode,
     _select_exploiter_checkpoint,
@@ -86,6 +88,8 @@ from polybot.training.routed_self_play_pool import (
     SearchCounters,
     _evaluation_pair_rows,
     _evaluation_search_with_recovery,
+    _blend_reanalysis_policy_target,
+    _filter_replay_examples_excluding_reserved,
     _freeze_reference_model,
     _invalid_evaluation_result,
     _mcts_leaf_wave_capacity,
@@ -99,6 +103,7 @@ from polybot.training.routed_self_play_pool import (
     _sample_active_rows,
     shield_root_policy_with_public_actions,
 )
+from polybot.training.league_db import _json
 from polybot.training.self_play_pool_train import (
     _belief_rejection_kind,
     _engine_action_constraint_targets,
@@ -1803,6 +1808,11 @@ def test_one_invalid_evaluation_slot_replaces_its_complete_pair_only():
 
 def test_evaluation_replacement_seeds_are_unique_and_outside_original_schedule():
     used = {1_500_000_007 + index for index in range(50)}
+    # This is the first candidate from the deterministic replacement range.
+    # Treat it as a training map: the allocator must skip it just as
+    # evaluate_matches_pool does after adding excluded_map_seeds to `used`.
+    forbidden_training_seed = 1_500_500_007
+    used.add(forbidden_training_seed)
     cursor = 0
     first, cursor = _next_evaluation_replacement_seed(
         1_500_000_007, cursor, used
@@ -1814,6 +1824,27 @@ def test_evaluation_replacement_seeds_are_unique_and_outside_original_schedule()
     assert first != second
     assert first in used and second in used
     assert first not in range(1_500_000_007, 1_500_000_057)
+    assert first != forbidden_training_seed
+
+
+def test_mcts_ladder_reuses_recovered_gate_map_schedule():
+    original = (10, 10, 11, 11)
+    recovered = _updated_mcts_gate_map_schedule(
+        original,
+        {
+            "valid": 1.0,
+            "evaluated_map_seeds": [50, 50, 11, 11],
+        },
+        games=4,
+    )
+
+    assert recovered == (50, 50, 11, 11)
+    # A subsequent failed rung cannot erase the last valid arena either.
+    assert _updated_mcts_gate_map_schedule(
+        recovered,
+        {"valid": 0.0},
+        games=4,
+    ) == recovered
 
 
 class _RecoveringEvaluationSearch:
@@ -2745,6 +2776,15 @@ def test_one_paired_map_has_no_promotable_confidence_bound():
     assert np.isinf(totals["score_standard_error"])
 
 
+def test_league_database_serialises_non_finite_diagnostics_without_aborting():
+    encoded = _json({"score_standard_error": float("inf"), "nested": [float("nan")]})
+
+    assert json.loads(encoded) == {
+        "nested": [None],
+        "score_standard_error": None,
+    }
+
+
 def test_last_mcts_wave_is_limited_to_the_remaining_simulation_budget():
     assert [
         _mcts_leaf_wave_capacity(2, 8, wave)
@@ -2799,6 +2839,25 @@ def test_reanalysis_never_samples_the_current_held_out_map_seeds():
 
     assert excluded == 1
     assert {position.map_seed for position in selected} == {71, 83}
+
+
+def test_calibration_replay_excludes_reserved_and_legacy_unknown_maps():
+    reserved = _example(0)
+    reserved.map_seed = 2137
+    safe = _example(1)
+    safe.map_seed = 71
+    legacy = _example(2)
+
+    eligible, reserved_excluded, unknown_excluded = (
+        _filter_replay_examples_excluding_reserved(
+            [reserved, safe, legacy],
+            {2137},
+        )
+    )
+
+    assert eligible == [safe]
+    assert reserved_excluded == 1
+    assert unknown_excluded == 1
 
 
 def test_belief_replay_loader_rejects_a_previous_map_size():
@@ -2898,6 +2957,43 @@ def test_native_leaf_history_is_not_reused_after_turn_handoff():
     assert model.history_mask[0].all()
     assert not model.history[1].any()
     assert not model.history_mask[1].any()
+
+
+def test_scalar_mcts_discards_particles_with_different_root_actions():
+    class BeliefEnv:
+        def __init__(self, actions):
+            self.actions = actions
+
+        def legal_action_ids_fast(self):
+            return self.actions
+
+    class RootEnv:
+        def make_belief_env(self, completed, *, perspective):
+            return BeliefEnv([10, 11] if int(completed[0]) == 1 else [10, 99])
+
+    planner = BeliefMCTS(None, None, MCTSConfig())
+    accepted = planner._make_action_equivalent_belief_envs(
+        RootEnv(),
+        [np.asarray([1]), np.asarray([2])],
+        root_player=0,
+        public_action_ids=np.asarray([10, 11]),
+    )
+
+    assert len(accepted) == 1
+    assert accepted[0].legal_action_ids_fast() == [10, 11]
+
+
+def test_reanalysis_policy_target_obeys_the_current_policy_anchor():
+    visits = np.asarray([0.8, 0.2], dtype=np.float32)
+    anchor = np.asarray([0.0, 1.0], dtype=np.float32)
+
+    np.testing.assert_allclose(
+        _blend_reanalysis_policy_target(visits, anchor, 1.0), anchor
+    )
+    np.testing.assert_allclose(
+        _blend_reanalysis_policy_target(visits, anchor, 0.25),
+        np.asarray([0.6, 0.4], dtype=np.float32),
+    )
 
 
 def test_replay_history_is_right_aligned_across_legacy_window_sizes():

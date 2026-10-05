@@ -22,6 +22,10 @@ class TrainingExample:
     full_map_target: np.ndarray
     hidden_mask: np.ndarray
     player_id: int
+    # Training-only provenance.  Persisted belief replay uses it to exclude
+    # examples whose map becomes a held-out arena in a later league run.
+    # ``None`` denotes legacy examples created before provenance existed.
+    map_seed: int | None = None
     action_history: np.ndarray | None = None  # [history, 12], public action memory
     action_history_mask: np.ndarray | None = None
     shaped_reward: float = 0.0

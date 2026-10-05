@@ -41,6 +41,33 @@ from .vector_population import (
 _MAX_SEED = 2**31 - 1
 
 
+def _updated_mcts_gate_map_schedule(
+    current_schedule: Sequence[int],
+    evaluation: Mapping[str, Any],
+    games: int,
+) -> tuple[int, ...]:
+    """Keep every MCTS ladder rung on the last valid paired arena.
+
+    Evaluation may replace a pair whose belief reconstruction failed.  The
+    replacement is part of the arena, so subsequent search depths must reuse
+    it rather than going back to the original seed schedule.
+    """
+    current = tuple(int(seed) for seed in current_schedule)
+    if not bool(evaluation.get("valid", 1.0)):
+        return current
+    observed = tuple(
+        int(seed) for seed in evaluation.get("evaluated_map_seeds", ())
+    )
+    if len(observed) != int(games):
+        raise RuntimeError("MCTS gate evaluation returned an incomplete map schedule")
+    if any(
+        observed[index] != observed[index + 1]
+        for index in range(0, len(observed), 2)
+    ):
+        raise RuntimeError("MCTS gate evaluation returned an unpaired map schedule")
+    return observed
+
+
 def _checkpoint_fingerprint(path: Path) -> str | None:
     """Return a content identity for a checkpoint, not merely its pathname."""
     digest = hashlib.sha256()
@@ -2167,15 +2194,17 @@ def train_promotion_league(
                     )
                     # Reuse one development arena across search depths so a
                     # later rung cannot silently erase a score earned by an
-                    # earlier rung. The final promotion arena remains separate.
-                    mcts_gate_seeds = [
-                        _offset_seed(round_evaluation_seed, 400_000_007)
-                    ] * len(population_rungs)
-                    for seed in mcts_gate_seeds:
-                        evaluation_map_seeds.update(
-                            seed + game_index // 2
-                            for game_index in range(mcts_gate_games)
-                        )
+                    # earlier rung.  If recovery replaces an incompatible
+                    # pair, the schedule below is updated with that exact
+                    # replacement and carried into every later rung.
+                    mcts_gate_seed = _offset_seed(
+                        round_evaluation_seed, 400_000_007
+                    )
+                    mcts_gate_map_seeds = tuple(
+                        mcts_gate_seed + game_index // 2
+                        for game_index in range(mcts_gate_games)
+                    )
+                    evaluation_map_seeds.update(mcts_gate_map_seeds)
                     known_training_map_seeds: set[int] = set()
                     # Bootstrap is collection too. Reserve its complete seed
                     # range before checking train/evaluation disjointness.
@@ -3315,6 +3344,7 @@ def train_promotion_league(
                                 max_pending_leaves=max_pending_leaves,
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
+                                excluded_map_seeds=known_training_map_seeds,
                                 max_envs=min(num_envs, mcts_probe_games),
                                 model_a_label=candidate_evaluation_label,
                                 model_b_label=champion_path.stem,
@@ -3926,6 +3956,7 @@ def train_promotion_league(
                                 belief_action_mode=population_belief_search_mode,
                                 model_a_uses_mcts=False,
                                 model_b_uses_mcts=False,
+                                excluded_map_seeds=known_training_map_seeds,
                                 max_envs=min(num_envs, mcts_probe_games),
                                 game_callback=record_raw_probe_game,
                                 model_a_label=candidate_evaluation_label,
@@ -3994,6 +4025,7 @@ def train_promotion_league(
                                         map_seeds=raw_probe[
                                             "evaluated_map_seeds"
                                         ],
+                                        excluded_map_seeds=known_training_map_seeds,
                                         replace_failed_pairs=False,
                                         max_envs=min(
                                             num_envs, mcts_probe_games
@@ -4478,6 +4510,7 @@ def train_promotion_league(
                             belief_action_mode=population_belief_search_mode,
                             model_a_uses_mcts=False,
                             model_b_uses_mcts=False,
+                            excluded_map_seeds=known_training_map_seeds,
                             max_envs=min(num_envs, population_max_envs),
                             model_a_label=candidate_evaluation_label,
                             model_b_label=champion_path.stem,
@@ -4497,6 +4530,7 @@ def train_promotion_league(
                                 model_a_uses_mcts=True,
                                 model_b_uses_mcts=False,
                                 map_seeds=raw_probe["evaluated_map_seeds"],
+                                excluded_map_seeds=known_training_map_seeds,
                                 replace_failed_pairs=False,
                                 max_envs=min(num_envs, population_max_envs),
                                 model_a_label=candidate_evaluation_label,
@@ -4815,6 +4849,7 @@ def train_promotion_league(
                                             population_belief_search_mode
                                         ),
                                         model_b_uses_mcts=False,
+                                        excluded_map_seeds=known_training_map_seeds,
                                         max_envs=min(
                                             num_envs, population_max_envs
                                         ),
@@ -4848,6 +4883,7 @@ def train_promotion_league(
                                             map_seeds=search_preflight[
                                                 "evaluated_map_seeds"
                                             ],
+                                            excluded_map_seeds=known_training_map_seeds,
                                             replace_failed_pairs=False,
                                             max_envs=min(
                                                 num_envs, population_max_envs
@@ -5387,12 +5423,13 @@ def train_promotion_league(
                                     game=row,
                                 )
 
+                            prior_mcts_gate_map_seeds = mcts_gate_map_seeds
                             rung_gate = evaluate_matches_pool(
                                 candidate,
                                 champion,
                                 replace(
                                     training,
-                                    seed=mcts_gate_seeds[rung_index],
+                                    seed=mcts_gate_seed,
                                 ),
                                 gate_mcts,
                                 mcts_gate_games,
@@ -5401,12 +5438,78 @@ def train_promotion_league(
                                 visible_action_history=visible_action_history,
                                 belief_retries=belief_retries,
                                 belief_action_mode=population_belief_search_mode,
+                                map_seeds=mcts_gate_map_seeds,
+                                excluded_map_seeds=known_training_map_seeds,
                                 max_envs=min(num_envs, population_max_envs),
                                 game_callback=record_rung_gate_game,
                                 model_a_label=candidate_evaluation_label,
                                 model_b_label=champion_path.stem,
                             )
+                            mcts_gate_map_seeds = _updated_mcts_gate_map_schedule(
+                                mcts_gate_map_seeds,
+                                rung_gate,
+                                mcts_gate_games,
+                            )
+                            # Future collection has not happened yet.  Reserve
+                            # newly substituted arena maps before the next
+                            # rung so they cannot become MCTS training data.
+                            evaluation_map_seeds.update(mcts_gate_map_seeds)
                             rung_score = float(rung_gate.get("model_a_score", 0.0))
+                            arena_rebased = (
+                                mcts_gate_map_seeds
+                                != prior_mcts_gate_map_seeds
+                            )
+                            baseline_gate: Dict[str, Any] | None = None
+                            baseline_valid = True
+                            # A replacement pair changes the arena itself.
+                            # The accepted model from the prior rung must be
+                            # measured again on that same recovered schedule;
+                            # comparing against its score on the abandoned
+                            # maps can reject a genuinely equal or better
+                            # candidate merely because the new map is harder.
+                            if arena_rebased:
+                                candidate_after_rung = model_state_on_cpu(candidate)
+                                try:
+                                    restore_model_state(candidate, best_mcts_state)
+                                    baseline_gate = evaluate_matches_pool(
+                                        candidate,
+                                        champion,
+                                        replace(training, seed=mcts_gate_seed),
+                                        gate_mcts,
+                                        mcts_gate_games,
+                                        num_threads=num_threads,
+                                        max_pending_leaves=max_pending_leaves,
+                                        visible_action_history=(
+                                            visible_action_history
+                                        ),
+                                        belief_retries=belief_retries,
+                                        belief_action_mode=(
+                                            population_belief_search_mode
+                                        ),
+                                        map_seeds=mcts_gate_map_seeds,
+                                        excluded_map_seeds=(
+                                            known_training_map_seeds
+                                        ),
+                                        replace_failed_pairs=False,
+                                        max_envs=min(
+                                            num_envs, population_max_envs
+                                        ),
+                                        model_a_label=(
+                                            f"{candidate_evaluation_label} baseline"
+                                        ),
+                                        model_b_label=champion_path.stem,
+                                    )
+                                finally:
+                                    restore_model_state(
+                                        candidate, candidate_after_rung
+                                    )
+                                baseline_valid = bool(
+                                    baseline_gate.get("valid", 1.0)
+                                )
+                                if baseline_valid:
+                                    best_mcts_score = float(
+                                        baseline_gate.get("model_a_score", 0.0)
+                                    )
 
                             def record_absorption_gate_game(
                                 opponent_index: int,
@@ -5462,7 +5565,7 @@ def train_promotion_league(
                             )
                             search_ready = bool(
                                 rung_gate.get("valid", 1.0)
-                            ) and (
+                            ) and baseline_valid and (
                                 rung_score
                                 >= max(float(mcts_gate_score), best_mcts_score)
                             )
@@ -5494,6 +5597,8 @@ def train_promotion_league(
                                 "accepted": float(accepted),
                                 "gate_score": rung_score,
                                 "best_gate_score": best_mcts_score,
+                                "arena_rebased": float(arena_rebased),
+                                "arena_baseline": baseline_gate,
                                 "gate_lower_95": float(
                                     rung_gate.get("score_lower_95", 0.0)
                                 ),
@@ -5727,6 +5832,7 @@ def train_promotion_league(
                             visible_action_history=visible_action_history,
                             belief_retries=belief_retries,
                             belief_action_mode=population_belief_search_mode,
+                            excluded_map_seeds=known_training_map_seeds,
                             max_envs=min(num_envs, population_max_envs),
                             game_callback=record_evaluation_game,
                             model_a_label=candidate_evaluation_label,

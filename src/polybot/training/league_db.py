@@ -34,8 +34,34 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert diagnostic payloads into strict JSON-safe values.
+
+    Evaluation intentionally uses ``inf`` as an *in-memory* marker when one
+    paired map cannot provide a standard-error estimate. SQLite summaries must
+    still be durable after that valid diagnostic outcome, so represent every
+    non-finite scalar as JSON ``null`` rather than aborting an entire league
+    round.
+    """
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "__dict__"):
+        return _json_safe(vars(value))
+    return value
+
+
 def _json(value: Any) -> str:
-    return json.dumps(value, default=_json_default, sort_keys=True, allow_nan=False)
+    return json.dumps(
+        _json_safe(value), default=_json_default, sort_keys=True, allow_nan=False
+    )
 
 
 def checkpoint_digest(path: Path) -> tuple[str, int]:

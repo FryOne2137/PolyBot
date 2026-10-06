@@ -734,57 +734,6 @@ def test_selective_mcts_mask_uses_public_raw_uncertainty_and_audit():
     assert search.counters.direct_policy_decisions == 1
 
 
-def test_all_raw_routed_search_does_not_submit_belief_particles():
-    class Pool:
-        def __init__(self) -> None:
-            self.root_calls = 0
-
-        def root_policy_into(self, root, *, temperature):
-            self.root_calls += 1
-
-        def submit_beliefs(self, *args, **kwargs):
-            raise AssertionError("raw baseline must not submit belief particles")
-
-    search = object.__new__(RoutedPoolSearch)
-    search.num_envs = 1
-    search.public_raw_only = True
-    search.models = (SimpleNamespace(eval=lambda: None),)
-    search.pool = Pool()
-    search.root = {
-        "action_id": np.asarray([[0, 1]], dtype=np.int32),
-        "action_mask": np.asarray([[1, 1]], dtype=np.uint8),
-        "policy": np.zeros((1, 2), dtype=np.float32),
-        "root_value": np.zeros(1, dtype=np.float32),
-        "state_id": np.zeros(1, dtype=np.uint64),
-        "agent_id": np.zeros(1, dtype=np.int32),
-    }
-    search.direct_policy_value = lambda request, rows: (
-        np.asarray([[0.25, 0.75]], dtype=np.float32),
-        np.asarray([0.4], dtype=np.float32),
-    )
-    request = {
-        "action_id": np.asarray([[10, 11]], dtype=np.int32),
-        "action_mask": np.asarray([[1, 1]], dtype=np.uint8),
-        "agent_id": np.asarray([0], dtype=np.int32),
-        "to_play": np.asarray([0], dtype=np.int32),
-        "state_id": np.asarray([123], dtype=np.uint64),
-    }
-
-    root = search.search(
-        request,
-        np.asarray([True]),
-        root_temperature=0.0,
-        belief_temperature=0.0,
-        prior_scale=0.0,
-        mcts_mask=np.asarray([False]),
-    )
-
-    assert search.pool.root_calls == 0
-    np.testing.assert_array_equal(root["action_id"], [[10, 11]])
-    np.testing.assert_allclose(root["policy"], [[0.25, 0.75]])
-    np.testing.assert_array_equal(root["state_id"], [123])
-
-
 def test_selective_mcts_covers_confident_public_strategic_roots():
     search = object.__new__(RoutedPoolSearch)
     search.num_envs = 4
@@ -1476,6 +1425,59 @@ def test_direct_evaluation_progress_names_both_models():
     assert result["model_a_score"] == 0.5
     assert [game["model_a_player"] for game in games] == [0, 1]
     assert [game["map_seed"] for game in games] == [2137, 2137]
+
+
+def test_direct_evaluation_explicit_map_schedule_uses_public_game_env():
+    class _OneStepGame:
+        def __init__(self, seed: int) -> None:
+            self.seed = seed
+            self.done = False
+
+        def is_done(self):
+            return self.done
+
+        @staticmethod
+        def current_player():
+            return 0
+
+        @staticmethod
+        def model_request_numpy():
+            return {
+                "obs": {"current_player": 0},
+                "actions": {"action_id": np.asarray([7], dtype=np.int32)},
+            }
+
+        def step_fast(self, action_id: int):
+            self.done = True
+            return True, 0.0, False, 0, {}
+
+    config = ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    model_a = PolicyValueBeliefNet(config)
+    model_b = PolicyValueBeliefNet(config)
+    created: list[int] = []
+
+    def new_env(seed, training, *, visible_action_history=0):
+        created.append(int(seed))
+        return _OneStepGame(int(seed))
+
+    with (
+        patch("polybot.evaluation.matches._new_env", side_effect=new_env),
+        patch("polybot.evaluation.matches._direct_policy_action", return_value=0),
+        patch("polybot.evaluation.matches.visible_events_or_empty", return_value={}),
+    ):
+        result = evaluate_direct_matches(
+            model_a,
+            model_b,
+            torch.device("cpu"),
+            TrainingConfig(device="cpu"),
+            2,
+            map_seeds=np.asarray([401, 401], dtype=np.uint32),
+        )
+
+    assert created == [401, 401]
+    assert result["evaluated_map_seeds"] == [401, 401]
+    assert result["completed_games"] == 2.0
+    assert result["valid"] == 1.0
 
 
 def test_unsafe_candidate_falls_back_to_previous_challenger():

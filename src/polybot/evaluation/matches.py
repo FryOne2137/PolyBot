@@ -424,6 +424,7 @@ def evaluate_direct_matches(
     visible_action_history: int = 0,
     num_threads: int | None = None,
     max_actions: int = 1024,
+    map_seeds: Sequence[int] | None = None,
 ) -> Dict[str, float]:
     """Evaluate paired greedy policies in two native vector batches.
 
@@ -440,6 +441,27 @@ def evaluate_direct_matches(
         raise ValueError("max_actions must be positive")
     if training.max_moves < 1:
         raise ValueError("direct evaluation max_moves must be positive")
+    if map_seeds is not None:
+        fixed_map_seeds = np.asarray(map_seeds, dtype=np.uint32)
+        if fixed_map_seeds.shape != (games,):
+            raise ValueError("map_seeds must contain exactly one seed per paired game")
+        if np.any(fixed_map_seeds[0::2] != fixed_map_seeds[1::2]):
+            raise ValueError("each paired evaluation map must use the same seed twice")
+        # VectorGameEnv can only reset a contiguous seed arena.  A recovered
+        # MCTS preflight may instead provide arbitrary replacement maps.  Use
+        # the scalar public GameEnv here so the raw baseline is measured on
+        # exactly the same maps, without SelfPlayPool beliefs or ISMCTS.
+        return _evaluate_direct_matches_on_map_seeds(
+            model_a,
+            model_b,
+            device,
+            training,
+            fixed_map_seeds,
+            game_callback=game_callback,
+            model_a_label=model_a_label,
+            model_b_label=model_b_label,
+            visible_action_history=visible_action_history,
+        )
     seed_everything(training.seed)
     model_a.eval()
     model_b.eval()
@@ -690,4 +712,158 @@ def evaluate_direct_matches(
         "model_a_city_captures"
     ] / max(1.0, float(games))
     totals["visible_action_history"] = float(visible_action_history)
+    return totals
+
+
+@torch.inference_mode()
+def _evaluate_direct_matches_on_map_seeds(
+    model_a: PolicyValueBeliefNet,
+    model_b: PolicyValueBeliefNet,
+    device: torch.device,
+    training: TrainingConfig,
+    map_seeds: np.ndarray,
+    *,
+    game_callback: Optional[Callable[[Dict[str, float | int]], None]],
+    model_a_label: str,
+    model_b_label: str,
+    visible_action_history: int,
+) -> Dict[str, float]:
+    """Public-information raw evaluation for an explicit paired map schedule.
+
+    This deliberately does not use ``SelfPlayPool``.  Its stepping protocol is
+    an ISMCTS protocol and requires submitted belief worlds even when no tree
+    search is requested; doing that would turn a raw-policy measurement into
+    a belief-quality measurement.
+    """
+    seed_everything(training.seed)
+    model_a.eval()
+    model_b.eval()
+    games = int(map_seeds.size)
+    totals: Dict[str, float] = {
+        "games": float(games),
+        "model_a_wins": 0.0,
+        "model_a_losses": 0.0,
+        "draws": 0.0,
+        "model_a_city_captures": 0.0,
+        "model_a_capital_captures": 0.0,
+        "opponent_city_captures": 0.0,
+        "opponent_capital_captures": 0.0,
+        "model_a_particles": 0.0,
+        "model_a_decisions": 0.0,
+        "moves": 0.0,
+        "terminated_games": 0.0,
+        "truncated_games": 0.0,
+        "evaluation_seed": float(training.seed),
+    }
+    scores: list[float] = []
+    with tqdm(
+        total=games,
+        desc=f"evaluate direct {model_a_label} vs {model_b_label}",
+        unit="game",
+        dynamic_ncols=True,
+    ) as progress:
+        for game_index, raw_seed in enumerate(map_seeds):
+            map_seed = int(raw_seed)
+            model_a_player = int(game_index % 2)
+            env = _new_env(
+                map_seed,
+                training,
+                visible_action_history=visible_action_history,
+            )
+            before = totals.copy()
+            moves = 0
+            winner = -1
+            while not env.is_done() and moves < training.max_moves:
+                packet = env.model_request_numpy()
+                player = int(packet["obs"].get("current_player", env.current_player()))
+                is_a_turn = player == model_a_player
+                model = model_a if is_a_turn else model_b
+                action_row = _direct_policy_action(
+                    model,
+                    packet,
+                    device,
+                    visible_events_or_empty(env),
+                    visible_action_history=visible_action_history,
+                )
+                action_ids = np.asarray(packet["actions"]["action_id"], dtype=np.int64)
+                if not 0 <= action_row < action_ids.size:
+                    raise RuntimeError("raw policy chose an action outside PolyEnv's public list")
+                city, capital = capture_flags(packet, action_row)
+                ok, _, _, winner, _ = env.step_fast(int(action_ids[action_row]))
+                if not ok:
+                    raise RuntimeError("direct evaluation selected an action rejected by PolyEnv")
+                prefix = "model_a" if is_a_turn else "opponent"
+                if city:
+                    totals[prefix + "_city_captures"] += 1.0
+                if capital:
+                    totals[prefix + "_capital_captures"] += 1.0
+                if is_a_turn:
+                    totals["model_a_decisions"] += 1.0
+                moves += 1
+            terminal = bool(env.is_done())
+            totals["moves"] += float(moves)
+            totals["terminated_games"] += float(terminal)
+            totals["truncated_games"] += float(not terminal)
+            score = 0.5 if winner < 0 else float(winner == model_a_player)
+            scores.append(score)
+            if score == 1.0:
+                totals["model_a_wins"] += 1.0
+            elif score == 0.0:
+                totals["model_a_losses"] += 1.0
+            else:
+                totals["draws"] += 1.0
+            if game_callback is not None:
+                game_callback({
+                    "game_index": game_index,
+                    "map_seed": map_seed,
+                    "model_a_player": model_a_player,
+                    "winner_player": int(winner),
+                    "score_a": score,
+                    "moves": moves,
+                    "model_a_city_captures": int(
+                        totals["model_a_city_captures"] - before["model_a_city_captures"]
+                    ),
+                    "model_a_capital_captures": int(
+                        totals["model_a_capital_captures"] - before["model_a_capital_captures"]
+                    ),
+                    "opponent_city_captures": int(
+                        totals["opponent_city_captures"] - before["opponent_city_captures"]
+                    ),
+                    "opponent_capital_captures": int(
+                        totals["opponent_capital_captures"] - before["opponent_capital_captures"]
+                    ),
+                    "truncated": int(not terminal),
+                })
+            progress.update(1)
+            progress.set_postfix(
+                wins=int(totals["model_a_wins"]),
+                draws=int(totals["draws"]),
+                losses=int(totals["model_a_losses"]),
+                moves=moves,
+            )
+    totals["model_a_win_rate"] = totals["model_a_wins"] / max(1.0, float(games))
+    totals["model_a_score"] = float(np.mean(scores)) if scores else 0.0
+    map_scores = [
+        float(np.mean(scores[index:index + 2]))
+        for index in range(0, len(scores), 2)
+    ]
+    totals["evaluation_maps"] = float(len(map_scores))
+    if len(map_scores) < 2:
+        totals["score_standard_error"] = float("inf")
+        totals["score_lower_95"] = 0.0
+    else:
+        totals["score_standard_error"] = float(
+            np.std(map_scores, ddof=1) / np.sqrt(len(map_scores))
+        )
+        totals["score_lower_95"] = max(
+            0.0,
+            totals["model_a_score"] - 1.96 * totals["score_standard_error"],
+        )
+    totals["mean_moves"] = totals["moves"] / max(1.0, float(games))
+    totals["mean_model_a_particles"] = 0.0
+    totals["visible_action_history"] = float(visible_action_history)
+    totals["valid"] = 1.0
+    totals["completed_games"] = float(games)
+    totals["planned_games"] = float(games)
+    totals["evaluated_map_seeds"] = [int(seed) for seed in map_seeds]
     return totals

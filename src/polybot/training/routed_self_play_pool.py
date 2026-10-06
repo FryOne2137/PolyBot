@@ -17,6 +17,7 @@ import torch
 from tqdm.auto import tqdm
 
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
+from ..evaluation.matches import evaluate_direct_matches
 from ..data.polyenv_features import (
     native_batch_to_tensors,
     native_capture_flags,
@@ -943,10 +944,13 @@ class RoutedPoolSearch:
         self.belief_retries = int(belief_retries)
         self.belief_action_mode = str(belief_action_mode)
         self.collect_engine_action_constraints = bool(collect_engine_action_constraints)
-        # True only for a whole evaluation in which neither participant uses
-        # MCTS.  A raw opponent turn inside an asymmetric MCTS game still
-        # shares a native search pool and therefore must submit beliefs.
-        self.public_raw_only = bool(public_raw_only)
+        # A SelfPlayPool is an ISMCTS state machine: every native step requires
+        # submitted beliefs. Fully raw evaluations are routed through
+        # VectorGameEnv/GameEnv by the league instead of this pool.
+        if public_raw_only:
+            raise ValueError(
+                "raw-only evaluation must use evaluate_direct_matches, not SelfPlayPool"
+            )
         self.counters = SearchCounters()
         self._action_generator: torch.Generator | None = None
         if self.device.type in ("cpu", "cuda"):
@@ -1693,24 +1697,6 @@ class RoutedPoolSearch:
             if direct_value.shape != (self.num_envs,):
                 raise ValueError("direct_value must have shape [num_envs]")
 
-        # This is deliberately before ``all_player_belief_requests_into`` and
-        # every call to ``submit_beliefs``.  A direct-policy turn needs neither
-        # a reconstructed world nor ``root_policy_into``: that native API also
-        # requires a preceding belief submission.  Copy the authoritative
-        # public root packet instead, so raw evaluation remains independent of
-        # belief quality.  This applies both to a wholly raw evaluation and to
-        # an opponent's direct turn in an asymmetric MCTS evaluation.
-        if not mcts_mask.any():
-            if direct_policy is None or direct_value is None:
-                raise RuntimeError("raw policy path requires direct policy and value")
-            self._install_direct_root_rows(
-                request,
-                direct_rows,
-                direct_policy,
-                direct_value,
-                preserve_native_metadata=False,
-            )
-            return self.root
         # Search objects are also used by promotion gates. Noise is opt-in so
         # those fixed-seed evaluations remain deterministic.
         self._root_noise_enabled = bool(root_noise)
@@ -1940,6 +1926,24 @@ class RoutedPoolSearch:
                     f"beliefs ({kind}): {error}{original}{detail}",
                     diagnostics,
                 ) from error
+
+        if not mcts_mask.any():
+            # This is a raw-player turn inside an asymmetric MCTS game.  The
+            # native pool still needs beliefs to advance its live ISMCTS state,
+            # but this row owns no tree leaves.  Recover the native state id
+            # after submission, then replace the executable policy with the
+            # public direct policy before stepping.
+            if direct_policy is None or direct_value is None:
+                raise RuntimeError("raw policy path requires direct policy and value")
+            self.pool.root_policy_into(self.root, temperature=root_temperature)
+            self._install_direct_root_rows(
+                request,
+                direct_rows,
+                direct_policy,
+                direct_value,
+                preserve_native_metadata=True,
+            )
+            return self.root
 
         waves = 1 + int(
             np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)
@@ -2357,9 +2361,6 @@ def evaluate_matches_pool(
                 belief_retries=evaluation_belief_retries,
                 seed=int(seeds[0]),
                 belief_action_mode=belief_action_mode,
-                public_raw_only=(
-                    not bool(model_a_uses_mcts) and not bool(model_b_uses_mcts)
-                ),
                 search_top_actions_by_agent=(mcts.search_top_actions, model_b_top),
                 search_random_actions_by_agent=(mcts.search_random_actions, model_b_random),
             )
@@ -2972,26 +2973,18 @@ def train_population_pool(
             ),
             2,
         )
-        forbidden = tuple(reserved_seed_set | {int(value) for value in screen_seeds})
-        return evaluate_matches_pool(
+        return evaluate_direct_matches(
             candidate,
             anchor_model,
+            device,
             replace(training, seed=screen_seed),
-            mcts,
             int(optimisation_screen_games),
-            num_threads=num_threads,
-            max_pending_leaves=max_pending_leaves,
-            visible_action_history=visible_action_history,
-            belief_retries=belief_retries,
-            belief_action_mode=belief_action_mode,
-            model_a_uses_mcts=False,
-            model_b_uses_mcts=False,
             map_seeds=screen_seeds,
-            excluded_map_seeds=forbidden,
-            replace_failed_pairs=False,
-            max_envs=max(2, min(max_envs, int(optimisation_screen_games))),
             model_a_label="candidate block screen",
             model_b_label="frozen anchor",
+            visible_action_history=visible_action_history,
+            num_threads=num_threads,
+            max_actions=mcts.native_max_actions,
         )
 
     def memory_metrics() -> dict[str, float]:

@@ -4063,24 +4063,18 @@ def train_promotion_league(
                                 evaluation_mcts,
                                 simulations=mcts_probe_simulations,
                             )
-                            raw_probe = evaluate_matches_pool(
+                            raw_probe = evaluate_direct_matches(
                                 candidate,
                                 champion,
+                                device,
                                 replace(round_training, seed=mcts_probe_seed),
-                                probe_mcts,
                                 mcts_probe_games,
-                                num_threads=num_threads,
-                                max_pending_leaves=max_pending_leaves,
-                                visible_action_history=visible_action_history,
-                                belief_retries=belief_retries,
-                                belief_action_mode=population_belief_search_mode,
-                                model_a_uses_mcts=False,
-                                model_b_uses_mcts=False,
-                                excluded_map_seeds=known_training_map_seeds,
-                                max_envs=min(num_envs, mcts_probe_games),
                                 game_callback=record_raw_probe_game,
                                 model_a_label=candidate_evaluation_label,
                                 model_b_label=champion_path.stem,
+                                visible_action_history=visible_action_history,
+                                num_threads=num_threads,
+                                max_actions=mcts.native_max_actions,
                             )
                             raw_probe_valid = bool(raw_probe.get("valid", 1.0))
                             if raw_probe_valid:
@@ -4617,23 +4611,17 @@ def train_promotion_league(
                             simulations=int(population_rungs[-1])
                             if population_rungs else int(mcts.simulations),
                         )
-                        raw_probe = evaluate_matches_pool(
+                        raw_probe = evaluate_direct_matches(
                             candidate,
                             champion,
+                            device,
                             replace(round_training, seed=mcts_probe_seed),
-                            bootstrap_probe_mcts,
                             mcts_probe_games,
-                            num_threads=num_threads,
-                            max_pending_leaves=max_pending_leaves,
-                            visible_action_history=visible_action_history,
-                            belief_retries=belief_retries,
-                            belief_action_mode=population_belief_search_mode,
-                            model_a_uses_mcts=False,
-                            model_b_uses_mcts=False,
-                            excluded_map_seeds=known_training_map_seeds,
-                            max_envs=min(num_envs, population_max_envs),
                             model_a_label=candidate_evaluation_label,
                             model_b_label=champion_path.stem,
+                            visible_action_history=visible_action_history,
+                            num_threads=num_threads,
+                            max_actions=mcts.native_max_actions,
                         )
                         if bool(raw_probe.get("valid", 1.0)):
                             search_probe = evaluate_matches_pool(
@@ -4986,35 +4974,24 @@ def train_promotion_league(
                                     # exact final map schedule, not on the
                                     # abandoned original pair.
                                     if bool(search_preflight.get("valid", 1.0)):
-                                        raw_preflight = evaluate_matches_pool(
+                                        raw_preflight = evaluate_direct_matches(
                                             candidate,
                                             champion,
+                                            device,
                                             replace(
                                                 rung_training,
                                                 seed=mcts_probe_seed,
                                                 max_moves=direct_gate_max_moves,
                                             ),
-                                            evaluation_mcts,
                                             mcts_probe_games,
-                                            num_threads=num_threads,
-                                            max_pending_leaves=max_pending_leaves,
-                                            visible_action_history=visible_action_history,
-                                            belief_retries=belief_retries,
-                                            belief_action_mode=(
-                                                population_belief_search_mode
-                                            ),
-                                            model_a_uses_mcts=False,
-                                            model_b_uses_mcts=False,
                                             map_seeds=search_preflight[
                                                 "evaluated_map_seeds"
                                             ],
-                                            excluded_map_seeds=known_training_map_seeds,
-                                            replace_failed_pairs=False,
-                                            max_envs=min(
-                                                num_envs, population_max_envs
-                                            ),
                                             model_a_label=candidate_evaluation_label,
                                             model_b_label=champion_path.stem,
+                                            visible_action_history=visible_action_history,
+                                            num_threads=num_threads,
+                                            max_actions=mcts.native_max_actions,
                                         )
                                     else:
                                         raw_preflight = dict(search_preflight)

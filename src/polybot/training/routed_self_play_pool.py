@@ -1941,6 +1941,24 @@ class RoutedPoolSearch:
                     diagnostics,
                 ) from error
 
+        if not mcts_mask.any():
+            # This is a raw-player turn *inside* an asymmetric MCTS match.
+            # The active native pool still required the belief submission
+            # above, but this particular turn owns no tree leaves.  Install
+            # its public direct policy and return before computing a zero
+            # leaf-buffer capacity.
+            if direct_policy is None or direct_value is None:
+                raise RuntimeError("raw policy path requires direct policy and value")
+            self.pool.root_policy_into(self.root, temperature=root_temperature)
+            self._install_direct_root_rows(
+                request,
+                direct_rows,
+                direct_policy,
+                direct_value,
+                preserve_native_metadata=True,
+            )
+            return self.root
+
         waves = 1 + int(
             np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)
         )

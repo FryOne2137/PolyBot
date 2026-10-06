@@ -747,6 +747,7 @@ def test_all_raw_routed_search_does_not_submit_belief_particles():
 
     search = object.__new__(RoutedPoolSearch)
     search.num_envs = 1
+    search.public_raw_only = True
     search.models = (SimpleNamespace(eval=lambda: None),)
     search.pool = Pool()
     search.root = {

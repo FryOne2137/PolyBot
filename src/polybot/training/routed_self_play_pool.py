@@ -894,6 +894,7 @@ class RoutedPoolSearch:
         seed: int,
         belief_action_mode: str = "strict",
         collect_engine_action_constraints: bool = False,
+        public_raw_only: bool = False,
         search_top_actions_by_agent: Sequence[int] | None = None,
         search_random_actions_by_agent: Sequence[int] | None = None,
     ) -> None:
@@ -942,6 +943,10 @@ class RoutedPoolSearch:
         self.belief_retries = int(belief_retries)
         self.belief_action_mode = str(belief_action_mode)
         self.collect_engine_action_constraints = bool(collect_engine_action_constraints)
+        # True only for a whole evaluation in which neither participant uses
+        # MCTS.  A raw opponent turn inside an asymmetric MCTS game still
+        # shares a native search pool and therefore must submit beliefs.
+        self.public_raw_only = bool(public_raw_only)
         self.counters = SearchCounters()
         self._action_generator: torch.Generator | None = None
         if self.device.type in ("cpu", "cuda"):
@@ -1663,7 +1668,7 @@ class RoutedPoolSearch:
         # state id, so ``step_into_checked`` can execute a legal direct action
         # without inventing an ISMCTS world.  Mixed selective search still
         # needs beliefs for its MCTS rows and follows the path below.
-        if not mcts_mask.any():
+        if self.public_raw_only and not mcts_mask.any():
             if direct_policy is None or direct_value is None:
                 raise RuntimeError("raw policy path requires direct policy and value")
             self.pool.root_policy_into(self.root, temperature=root_temperature)
@@ -2326,6 +2331,9 @@ def evaluate_matches_pool(
                 belief_retries=evaluation_belief_retries,
                 seed=int(seeds[0]),
                 belief_action_mode=belief_action_mode,
+                public_raw_only=(
+                    not bool(model_a_uses_mcts) and not bool(model_b_uses_mcts)
+                ),
                 search_top_actions_by_agent=(mcts.search_top_actions, model_b_top),
                 search_random_actions_by_agent=(mcts.search_random_actions, model_b_random),
             )

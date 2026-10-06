@@ -999,6 +999,17 @@ class RoutedPoolSearch:
             self.pool, "completed_batch_spec", self.device
         )
         self.leaf_capacity = leaf_capacity
+        # ``leaf_batch_spec(max_leaves=...)`` is part of PolyEnv's ABI.  It
+        # may contain capacity-dependent metadata in addition to the leading
+        # leaf dimension, so a view into one maximum-size packet is not a
+        # portable substitute for asking the native binding for the precise
+        # packet required by a smaller masked wave.
+        self._leaf_buffer_cache: dict[int, Dict[str, np.ndarray]] = {
+            leaf_capacity: self.leaves
+        }
+        self._leaf_buffer_owner_cache: dict[int, Dict[str, torch.Tensor]] = {
+            leaf_capacity: leaf_owners
+        }
         # Pinned tensors own the memory exported through their NumPy views.
         self._buffer_owners = (
             request_owners,
@@ -1013,6 +1024,21 @@ class RoutedPoolSearch:
         self.last_engine_action_constraint_scores = np.zeros(
             self.num_envs, dtype=np.float32
         )
+
+    def _leaf_buffers_for_capacity(self, capacity: int) -> Dict[str, np.ndarray]:
+        """Return buffers matching PolyEnv's exact native leaf-packet ABI."""
+        capacity = int(capacity)
+        if not 1 <= capacity <= self.leaf_capacity:
+            raise ValueError("leaf buffer capacity is outside the configured pool limit")
+        cached = self._leaf_buffer_cache.get(capacity)
+        if cached is not None:
+            return cached
+        buffers, owners = _allocate_native_buffers(
+            self.pool, "leaf_batch_spec", self.device, capacity
+        )
+        self._leaf_buffer_cache[capacity] = buffers
+        self._leaf_buffer_owner_cache[capacity] = owners
+        return buffers
 
     def reset(self, seeds: np.ndarray, assignments: np.ndarray) -> Dict[str, np.ndarray]:
         seeds = np.ascontiguousarray(seeds, dtype=np.uint32)
@@ -1534,8 +1560,13 @@ class RoutedPoolSearch:
         return result
 
     @torch.inference_mode()
-    def _expand_leaves(self, leaf_count: int, prior_scale: float) -> None:
-        batch = {name: value[:leaf_count] for name, value in self.leaves.items()}
+    def _expand_leaves(
+        self,
+        leaf_buffers: Mapping[str, np.ndarray],
+        leaf_count: int,
+        prior_scale: float,
+    ) -> None:
+        batch = {name: value[:leaf_count] for name, value in leaf_buffers.items()}
         agents = np.asarray(batch["agent_id"], dtype=np.int32)
         _validate_agents(agents, len(self.models), "leaf packet")
         max_actions = np.asarray(batch["action_mask"]).shape[1]
@@ -1928,19 +1959,14 @@ class RoutedPoolSearch:
             if leaves_per_root <= 0:
                 break
             self._capture_root_candidates = wave == 0
-            # PolyEnv validates that every ``*_into`` buffer has precisely
-            # ``max_leaves`` rows. Passing the full preallocated buffer while
-            # asking for a smaller final wave is rejected, even though its
-            # first rows would be sufficient. NumPy slices keep the same
-            # pinned backing storage but expose the exact native shape.
+            # Get the exact packet layout for this masked wave from the
+            # installed PolyEnv binding.  In particular, do not assume that
+            # slicing a maximum packet preserves every ABI shape contract.
             wave_capacity = min(
                 self.leaf_capacity,
                 int(mcts_mask.sum()) * int(leaves_per_root),
             )
-            leaf_buffers = {
-                name: value[:wave_capacity]
-                for name, value in self.leaves.items()
-            }
+            leaf_buffers = self._leaf_buffers_for_capacity(wave_capacity)
             leaf_count = int(
                 self.pool.select_leaves_masked_into(
                     leaf_buffers,
@@ -1956,7 +1982,7 @@ class RoutedPoolSearch:
             self.counters.leaf_rows += leaf_count
             if leaf_count == 0:
                 break
-            self._expand_leaves(leaf_count, prior_scale)
+            self._expand_leaves(leaf_buffers, leaf_count, prior_scale)
         self._capture_root_candidates = False
         self.pool.root_policy_into(self.root, temperature=root_temperature)
         if direct_rows.any():

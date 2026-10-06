@@ -1694,21 +1694,21 @@ class RoutedPoolSearch:
                 raise ValueError("direct_value must have shape [num_envs]")
 
         # This is deliberately before ``all_player_belief_requests_into`` and
-        # every call to ``submit_beliefs``.  The native root packet already
-        # contains the authoritative public legal action list and a matching
-        # state id, so ``step_into_checked`` can execute a legal direct action
-        # without inventing an ISMCTS world.  Mixed selective search still
-        # needs beliefs for its MCTS rows and follows the path below.
-        if self.public_raw_only and not mcts_mask.any():
+        # every call to ``submit_beliefs``.  A direct-policy turn needs neither
+        # a reconstructed world nor ``root_policy_into``: that native API also
+        # requires a preceding belief submission.  Copy the authoritative
+        # public root packet instead, so raw evaluation remains independent of
+        # belief quality.  This applies both to a wholly raw evaluation and to
+        # an opponent's direct turn in an asymmetric MCTS evaluation.
+        if not mcts_mask.any():
             if direct_policy is None or direct_value is None:
                 raise RuntimeError("raw policy path requires direct policy and value")
-            self.pool.root_policy_into(self.root, temperature=root_temperature)
             self._install_direct_root_rows(
                 request,
                 direct_rows,
                 direct_policy,
                 direct_value,
-                preserve_native_metadata=True,
+                preserve_native_metadata=False,
             )
             return self.root
         # Search objects are also used by promotion gates. Noise is opt-in so
@@ -1940,24 +1940,6 @@ class RoutedPoolSearch:
                     f"beliefs ({kind}): {error}{original}{detail}",
                     diagnostics,
                 ) from error
-
-        if not mcts_mask.any():
-            # This is a raw-player turn *inside* an asymmetric MCTS match.
-            # The active native pool still required the belief submission
-            # above, but this particular turn owns no tree leaves.  Install
-            # its public direct policy and return before computing a zero
-            # leaf-buffer capacity.
-            if direct_policy is None or direct_value is None:
-                raise RuntimeError("raw policy path requires direct policy and value")
-            self.pool.root_policy_into(self.root, temperature=root_temperature)
-            self._install_direct_root_rows(
-                request,
-                direct_rows,
-                direct_policy,
-                direct_value,
-                preserve_native_metadata=True,
-            )
-            return self.root
 
         waves = 1 + int(
             np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)

@@ -755,6 +755,8 @@ def test_all_raw_routed_search_does_not_submit_belief_particles():
         "action_mask": np.asarray([[1, 1]], dtype=np.uint8),
         "policy": np.zeros((1, 2), dtype=np.float32),
         "root_value": np.zeros(1, dtype=np.float32),
+        "state_id": np.zeros(1, dtype=np.uint64),
+        "agent_id": np.zeros(1, dtype=np.int32),
     }
     search.direct_policy_value = lambda request, rows: (
         np.asarray([[0.25, 0.75]], dtype=np.float32),
@@ -765,6 +767,7 @@ def test_all_raw_routed_search_does_not_submit_belief_particles():
         "action_mask": np.asarray([[1, 1]], dtype=np.uint8),
         "agent_id": np.asarray([0], dtype=np.int32),
         "to_play": np.asarray([0], dtype=np.int32),
+        "state_id": np.asarray([123], dtype=np.uint64),
     }
 
     root = search.search(
@@ -776,9 +779,10 @@ def test_all_raw_routed_search_does_not_submit_belief_particles():
         mcts_mask=np.asarray([False]),
     )
 
-    assert search.pool.root_calls == 1
+    assert search.pool.root_calls == 0
     np.testing.assert_array_equal(root["action_id"], [[10, 11]])
     np.testing.assert_allclose(root["policy"], [[0.25, 0.75]])
+    np.testing.assert_array_equal(root["state_id"], [123])
 
 
 def test_selective_mcts_covers_confident_public_strategic_roots():

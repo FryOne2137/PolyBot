@@ -98,6 +98,14 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         help="Optimiser updates per reported replay block after frozen collection.",
     )
     parser.add_argument(
+        "--population-optimisation-screen-games", type=int, default=4,
+        help="Paired raw-policy guard games after each MCTS optimisation block; 0 disables it.",
+    )
+    parser.add_argument(
+        "--population-optimisation-screen-max-regression", type=float, default=0.10,
+        help="Maximum raw-screen score drop before model and AdamW are restored.",
+    )
+    parser.add_argument(
         "--value-bootstrap-games", type=int, default=64,
         help=(
             "Raw-policy games used to calibrate only value and belief before "
@@ -749,6 +757,12 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         population_updates_per_game=args.population_updates_per_game,
         population_optimisation_block_updates=(
             args.population_optimisation_block_updates
+        ),
+        population_optimisation_screen_games=(
+            args.population_optimisation_screen_games
+        ),
+        population_optimisation_screen_max_regression=(
+            args.population_optimisation_screen_max_regression
         ),
         value_bootstrap_games=args.value_bootstrap_games,
         value_bootstrap_updates_per_game=(

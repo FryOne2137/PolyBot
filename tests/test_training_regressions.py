@@ -66,6 +66,7 @@ from polybot.training.league import (
     _curriculum_controls,
     _flat_distillation_gate_decision,
     _mcts_probe_passed,
+    _mcts_preflight_diagnostics,
     _updated_mcts_gate_map_schedule,
     _promotion_gate_decision,
     _round_champion_mode,
@@ -731,6 +732,52 @@ def test_selective_mcts_mask_uses_public_raw_uncertainty_and_audit():
     np.testing.assert_array_equal(returned_values, values)
     assert search.counters.selective_mcts_decisions == 2
     assert search.counters.direct_policy_decisions == 1
+
+
+def test_all_raw_routed_search_does_not_submit_belief_particles():
+    class Pool:
+        def __init__(self) -> None:
+            self.root_calls = 0
+
+        def root_policy_into(self, root, *, temperature):
+            self.root_calls += 1
+
+        def submit_beliefs(self, *args, **kwargs):
+            raise AssertionError("raw baseline must not submit belief particles")
+
+    search = object.__new__(RoutedPoolSearch)
+    search.num_envs = 1
+    search.models = (SimpleNamespace(eval=lambda: None),)
+    search.pool = Pool()
+    search.root = {
+        "action_id": np.asarray([[0, 1]], dtype=np.int32),
+        "action_mask": np.asarray([[1, 1]], dtype=np.uint8),
+        "policy": np.zeros((1, 2), dtype=np.float32),
+        "root_value": np.zeros(1, dtype=np.float32),
+    }
+    search.direct_policy_value = lambda request, rows: (
+        np.asarray([[0.25, 0.75]], dtype=np.float32),
+        np.asarray([0.4], dtype=np.float32),
+    )
+    request = {
+        "action_id": np.asarray([[10, 11]], dtype=np.int32),
+        "action_mask": np.asarray([[1, 1]], dtype=np.uint8),
+        "agent_id": np.asarray([0], dtype=np.int32),
+        "to_play": np.asarray([0], dtype=np.int32),
+    }
+
+    root = search.search(
+        request,
+        np.asarray([True]),
+        root_temperature=0.0,
+        belief_temperature=0.0,
+        prior_scale=0.0,
+        mcts_mask=np.asarray([False]),
+    )
+
+    assert search.pool.root_calls == 1
+    np.testing.assert_array_equal(root["action_id"], [[10, 11]])
+    np.testing.assert_allclose(root["policy"], [[0.25, 0.75]])
 
 
 def test_selective_mcts_covers_confident_public_strategic_roots():
@@ -1554,6 +1601,28 @@ def test_mcts_probe_requires_search32_to_strictly_beat_raw_policy():
         minimum_improvement=0.0,
         valid=False,
     )
+
+
+def test_mcts_preflight_diagnostics_distinguish_partial_raw_measurement():
+    diagnostic = _mcts_preflight_diagnostics(
+        {
+            "valid": 0.0,
+            "games": 20.0,
+            "completed_games": 12.0,
+            "planned_games": 20.0,
+            "invalid_reason": "fixed paired maps exhausted",
+        },
+        {
+            "valid": 1.0,
+            "games": 20.0,
+            "completed_games": 20.0,
+            "planned_games": 20.0,
+        },
+    )
+    assert diagnostic["status"] == "raw_evaluation_invalid"
+    assert diagnostic["raw_completed_games"] == 12.0
+    assert diagnostic["search_completed_games"] == 20.0
+    assert diagnostic["reason"] == "fixed paired maps exhausted"
 
 
 def test_flat_league_activates_mcts_gate_only_after_search32_is_better():
@@ -2757,6 +2826,8 @@ def test_invalid_evaluation_is_a_result_not_an_unbounded_retry():
     assert result["valid"] == 0.0
     assert result["invalid_evaluations"] == 1.0
     assert result["invalid_reason"] == "replacement limit reached"
+    assert result["completed_games"] == 0.0
+    assert result["planned_games"] == 2.0
 
 
 def test_one_paired_map_has_no_promotable_confidence_bound():

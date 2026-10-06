@@ -1622,8 +1622,10 @@ class RoutedPoolSearch:
 
         An all-false ``mcts_mask`` is intentionally a raw-policy path. Value/
         belief bootstrap never uses particles for action selection or policy
-        targets. It still runs PolyEnv's normal belief acceptance protocol,
-        because checked stepping requires an action-equivalent belief world.
+        targets. It must also not submit particles: a direct-policy baseline
+        is a public-information measurement, and rejecting it because an
+        unrelated hidden-world reconstruction failed makes an MCTS-vs-raw
+        comparison invalid by construction.
         """
         for model in self.models:
             model.eval()
@@ -1654,6 +1656,25 @@ class RoutedPoolSearch:
             direct_value = np.asarray(direct_value, dtype=np.float32)
             if direct_value.shape != (self.num_envs,):
                 raise ValueError("direct_value must have shape [num_envs]")
+
+        # This is deliberately before ``all_player_belief_requests_into`` and
+        # every call to ``submit_beliefs``.  The native root packet already
+        # contains the authoritative public legal action list and a matching
+        # state id, so ``step_into_checked`` can execute a legal direct action
+        # without inventing an ISMCTS world.  Mixed selective search still
+        # needs beliefs for its MCTS rows and follows the path below.
+        if not mcts_mask.any():
+            if direct_policy is None or direct_value is None:
+                raise RuntimeError("raw policy path requires direct policy and value")
+            self.pool.root_policy_into(self.root, temperature=root_temperature)
+            self._install_direct_root_rows(
+                request,
+                direct_rows,
+                direct_policy,
+                direct_value,
+                preserve_native_metadata=True,
+            )
+            return self.root
         # Search objects are also used by promotion gates. Noise is opt-in so
         # those fixed-seed evaluations remain deterministic.
         self._root_noise_enabled = bool(root_noise)
@@ -1883,25 +1904,6 @@ class RoutedPoolSearch:
                     f"beliefs ({kind}): {error}{original}{detail}",
                     diagnostics,
                 ) from error
-
-        if not mcts_mask.any():
-            # Beliefs have been accepted by the same retry/fallback protocol
-            # as ordinary root-shield MCTS. Do not select a leaf: actions and
-            # value are copied from the raw policy pass above.
-            if direct_policy is None or direct_value is None:
-                raise RuntimeError("raw policy path requires direct policy and value")
-            # ``submit_beliefs`` can refresh native root identity. Read it
-            # back before replacing only its action distribution with raw
-            # policy, otherwise the following checked step sees a stale id.
-            self.pool.root_policy_into(self.root, temperature=root_temperature)
-            self._install_direct_root_rows(
-                request,
-                direct_rows,
-                direct_policy,
-                direct_value,
-                preserve_native_metadata=True,
-            )
-            return self.root
 
         waves = 1 + int(
             np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)
@@ -2133,6 +2135,11 @@ def _invalid_evaluation_result(
     """Return a complete, explicitly invalid gate result without hanging."""
     _paired_uncertainty(totals, scores)
     totals["valid"] = 0.0
+    # ``games`` is the requested arena size.  Keep completed games separate:
+    # a score calculated from a partial paired arena is diagnostic evidence,
+    # never a zero-score match result.
+    totals["completed_games"] = float(len(scores))
+    totals["planned_games"] = float(totals.get("games", 0.0))
     totals["invalid_evaluations"] = 1.0
     totals["invalid_envs"] = float(max(0, invalid_attempts))
     totals["invalid_reason"] = reason
@@ -2538,6 +2545,8 @@ def evaluate_matches_pool(
             )
     _paired_uncertainty(totals, scores)
     totals["valid"] = 1.0
+    totals["completed_games"] = float(len(scores))
+    totals["planned_games"] = float(games)
     totals["invalid_evaluations"] = 0.0
     totals["discarded_evaluation_pairs"] = float(discarded_evaluation_pairs)
     totals["invalid_evaluation_attempts"] = float(invalid_evaluation_attempts)
@@ -2609,6 +2618,8 @@ def train_population_pool(
     reanalysis_positions: int = 0,
     reanalysis_replay_fraction: float = 0.0,
     optimisation_block_updates: int = 32,
+    optimisation_screen_games: int = 0,
+    optimisation_screen_max_regression: float = 0.10,
     offline_collection: bool = False,
     belief_only: bool = False,
     value_belief_heads_only: bool = False,
@@ -2687,6 +2698,10 @@ def train_population_pool(
         raise ValueError("reanalysis_positions must not be negative")
     if optimisation_block_updates < 1:
         raise ValueError("optimisation_block_updates must be positive")
+    if optimisation_screen_games < 0 or optimisation_screen_games % 2:
+        raise ValueError("optimisation_screen_games must be a non-negative even number")
+    if optimisation_screen_max_regression < 0.0:
+        raise ValueError("optimisation_screen_max_regression must be non-negative")
     if not 0.0 <= reanalysis_replay_fraction <= 1.0:
         raise ValueError("reanalysis_replay_fraction must be between zero and one")
     if reanalysis_positions and reanalysis_path is None:
@@ -2745,6 +2760,10 @@ def train_population_pool(
             "reanalysis_positions": reanalysis_positions,
             "reanalysis_replay_fraction": reanalysis_replay_fraction,
             "optimisation_block_updates": optimisation_block_updates,
+            "optimisation_screen_games": optimisation_screen_games,
+            "optimisation_screen_max_regression": (
+                optimisation_screen_max_regression
+            ),
             "offline_collection": offline_collection,
             "belief_only": belief_only,
             "value_belief_heads_only": value_belief_heads_only,
@@ -2860,6 +2879,86 @@ def train_population_pool(
     optimisation_blocks = 0
     optimisation_rollbacks = 0
     optimisation_attempted = 0
+    optimisation_screen_attempts = 0
+    optimisation_screen_rollbacks = 0
+    optimisation_screen_invalid = 0
+    optimisation_screen_score: float | None = None
+    optimisation_screen_best_score: float | None = None
+    optimisation_screen_model_state: dict[str, torch.Tensor] | None = None
+    optimisation_screen_optimiser_state: dict[str, Any] | None = None
+
+    def cpu_model_state() -> dict[str, torch.Tensor]:
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in candidate.state_dict().items()
+        }
+
+    def cpu_optimizer_state() -> dict[str, Any]:
+        def clone(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, Mapping):
+                return {key: clone(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone(item) for item in value)
+            return copy.deepcopy(value)
+
+        return clone(optimiser.state_dict())
+
+    def restore_verified_screen_state() -> None:
+        if (
+            optimisation_screen_model_state is None
+            or optimisation_screen_optimiser_state is None
+        ):
+            raise RuntimeError("optimisation screen rollback state is missing")
+        candidate.load_state_dict(optimisation_screen_model_state, strict=True)
+        # PyTorch casts optimiser tensors to their parameter devices while
+        # loading.  Keeping the snapshot on CPU therefore avoids a second
+        # GPU-sized AdamW copy between blocks.
+        optimiser.load_state_dict(optimisation_screen_optimiser_state)
+
+    def evaluate_optimisation_screen() -> dict[str, Any] | None:
+        """Cheap fixed-arena raw gate used between optimisation blocks.
+
+        This is not an MCTS promotion decision.  It catches a catastrophic
+        policy regression early, before a full generation can overwrite the
+        last verified state.  It intentionally uses raw policy on both sides,
+        so it needs neither belief particles nor a second costly tree search.
+        """
+        if optimisation_screen_games <= 0 or anchor_model is None:
+            return None
+        screen_seed = (int(training.seed) + 700_000_019) % (2**31 - 1)
+        screen_seeds = np.repeat(
+            np.arange(
+                screen_seed,
+                screen_seed + int(optimisation_screen_games) // 2,
+                dtype=np.uint32,
+            ),
+            2,
+        )
+        forbidden = tuple(reserved_seed_set | {int(value) for value in screen_seeds})
+        return evaluate_matches_pool(
+            candidate,
+            anchor_model,
+            replace(training, seed=screen_seed),
+            mcts,
+            int(optimisation_screen_games),
+            num_threads=num_threads,
+            max_pending_leaves=max_pending_leaves,
+            visible_action_history=visible_action_history,
+            belief_retries=belief_retries,
+            belief_action_mode=belief_action_mode,
+            model_a_uses_mcts=False,
+            model_b_uses_mcts=False,
+            map_seeds=screen_seeds,
+            excluded_map_seeds=forbidden,
+            replace_failed_pairs=False,
+            max_envs=max(2, min(max_envs, int(optimisation_screen_games))),
+            model_a_label="candidate block screen",
+            model_b_label="frozen anchor",
+        )
 
     def memory_metrics() -> dict[str, float]:
         if device.type != "cuda":
@@ -2881,7 +2980,28 @@ def train_population_pool(
         """Optimise a bounded block and surface its actual lifetime clearly."""
         nonlocal updates, optimisation_blocks, optimisation_rollbacks
         nonlocal optimisation_attempted
+        nonlocal optimisation_screen_attempts, optimisation_screen_rollbacks
+        nonlocal optimisation_screen_invalid, optimisation_screen_score
+        nonlocal optimisation_screen_best_score
+        nonlocal optimisation_screen_model_state, optimisation_screen_optimiser_state
         completed = 0
+        if (
+            optimisation_screen_games > 0
+            and anchor_model is not None
+            and optimisation_screen_model_state is None
+        ):
+            initial_screen = evaluate_optimisation_screen()
+            optimisation_screen_attempts += 1
+            if initial_screen is not None and bool(initial_screen.get("valid", 0.0)):
+                optimisation_screen_score = float(initial_screen["model_a_score"])
+                optimisation_screen_best_score = optimisation_screen_score
+            else:
+                optimisation_screen_invalid += 1
+            # Even when the baseline arena itself is temporarily invalid,
+            # retain a coherent rollback point for a later finite/numerical
+            # failure in this same generation.
+            optimisation_screen_model_state = cpu_model_state()
+            optimisation_screen_optimiser_state = cpu_optimizer_state()
         while completed < count and len(replay) >= training.batch_size:
             block = min(int(optimisation_block_updates), count - completed)
             record_event(
@@ -2960,6 +3080,58 @@ def train_population_pool(
                 updates_attempted=optimisation_attempted,
                 updates_retained=updates,
             )
+            if optimisation_screen_games > 0 and anchor_model is not None:
+                screen = evaluate_optimisation_screen()
+                optimisation_screen_attempts += 1
+                if screen is None or not bool(screen.get("valid", 0.0)):
+                    optimisation_screen_invalid += 1
+                    record_event(
+                        "optimisation_screen_invalid",
+                        block=optimisation_blocks,
+                        reason=(
+                            "screen unavailable"
+                            if screen is None
+                            else str(screen.get("invalid_reason", "invalid"))
+                        ),
+                    )
+                else:
+                    optimisation_screen_score = float(screen["model_a_score"])
+                    if (
+                        optimisation_screen_best_score is not None
+                        and optimisation_screen_score
+                        < optimisation_screen_best_score
+                        - float(optimisation_screen_max_regression)
+                    ):
+                        restore_verified_screen_state()
+                        optimisation_screen_rollbacks += 1
+                        optimisation_rollbacks += 1
+                        record_event(
+                            "rollback",
+                            source=phase,
+                            reason="raw_policy_screen_regression",
+                            block=optimisation_blocks,
+                            score=optimisation_screen_score,
+                            best_score=optimisation_screen_best_score,
+                            updates_retained=updates - block,
+                        )
+                        print(
+                            "population optimise rollback | "
+                            f"block={optimisation_blocks} | "
+                            f"screen={optimisation_screen_score:.4f} | "
+                            f"best={optimisation_screen_best_score:.4f}",
+                            flush=True,
+                        )
+                        updates -= block
+                        completed -= block
+                        del losses[-block:]
+                        return completed
+                    if (
+                        optimisation_screen_best_score is None
+                        or optimisation_screen_score > optimisation_screen_best_score
+                    ):
+                        optimisation_screen_best_score = optimisation_screen_score
+                    optimisation_screen_model_state = cpu_model_state()
+                    optimisation_screen_optimiser_state = cpu_optimizer_state()
         return completed
 
     def optimise_until(target: int) -> None:
@@ -3539,6 +3711,28 @@ def train_population_pool(
         "population_pool_optimisation_blocks": float(optimisation_blocks),
         "population_pool_optimisation_attempted": float(optimisation_attempted),
         "population_pool_optimisation_rollbacks": float(optimisation_rollbacks),
+        "population_pool_optimisation_screen_games": float(
+            optimisation_screen_games
+        ),
+        "population_pool_optimisation_screen_attempts": float(
+            optimisation_screen_attempts
+        ),
+        "population_pool_optimisation_screen_invalid": float(
+            optimisation_screen_invalid
+        ),
+        "population_pool_optimisation_screen_rollbacks": float(
+            optimisation_screen_rollbacks
+        ),
+        "population_pool_optimisation_screen_score": float(
+            optimisation_screen_score
+            if optimisation_screen_score is not None
+            else -1.0
+        ),
+        "population_pool_optimisation_screen_best_score": float(
+            optimisation_screen_best_score
+            if optimisation_screen_best_score is not None
+            else -1.0
+        ),
         "population_pool_offline_replay_updates": float(offline_updates),
         "population_pool_examples": float(examples_count),
         "population_pool_replay_reserved_excluded": float(

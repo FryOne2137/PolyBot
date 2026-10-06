@@ -532,8 +532,9 @@ def _curriculum_controls(
     direct_objective_steps: int = 0,
     post_bootstrap_objective_steps: int = 0,
     refresh_promoted_curriculum: bool = False,
+    flat_enabled: bool = False,
 ) -> Dict[str, float | int | str | bool]:
-    """Keep league learning on the authoritative MCTS self-play path.
+    """Choose either the authoritative MCTS or explicit flat curriculum.
 
     The direct teacher, objective, flat actor-critic and raw-population PPO
     curricula remain available as standalone tools for a new model.  They are
@@ -543,8 +544,45 @@ def _curriculum_controls(
     reward.  Keeping the parameters accepts old command lines without letting
     a legacy bootstrap silently block MCTS collection.
     """
+    if flat_enabled:
+        # ``train_flat.py`` is an intentionally separate Stage-0 workflow.
+        # It needs the old direct VectorGameEnv curriculum, but must never
+        # leak that curriculum into a normal MCTS league run.
+        post_bootstrap = champion_status == "promoted"
+        if post_bootstrap:
+            population_steps = post_bootstrap_population_steps
+            population_max_steps = post_bootstrap_population_max_steps
+            policy_anchor_weight = post_bootstrap_policy_anchor_weight
+            population_teacher_weight = post_bootstrap_teacher_weight
+            population_opponent_policy_weight = (
+                post_bootstrap_opponent_policy_weight
+            )
+            objective_steps = post_bootstrap_objective_steps
+        else:
+            population_steps = direct_population_steps
+            population_max_steps = direct_population_max_steps
+            policy_anchor_weight = direct_policy_anchor_weight
+            population_teacher_weight = direct_population_teacher_weight
+            population_opponent_policy_weight = (
+                direct_population_opponent_policy_weight
+            )
+            objective_steps = direct_objective_steps
+        return {
+            "phase": "flat_population",
+            "post_bootstrap": post_bootstrap,
+            "teacher_steps": direct_teacher_steps,
+            "objective_steps": objective_steps,
+            "actor_steps": direct_actor_steps,
+            "actor_max_steps": direct_actor_max_steps,
+            "population_steps": population_steps,
+            "population_max_steps": population_max_steps,
+            "policy_anchor_weight": policy_anchor_weight,
+            "population_teacher_weight": population_teacher_weight,
+            "population_opponent_policy_weight": population_opponent_policy_weight,
+        }
+
     # Parameters remain for backwards-compatible callers and run metadata,
-    # but the league loop never executes their raw-policy stages.
+    # but a normal league loop never executes their raw-policy stages.
     _ = (
         direct_teacher_steps, direct_objective_steps, direct_actor_steps,
         direct_actor_max_steps, direct_population_steps,
@@ -2177,6 +2215,7 @@ def train_promotion_league(
                                 and round_champion_mode == "mcts"
                             )
                         ),
+                        flat_enabled=training_stage == "flat",
                     )
                     if champion_mode == "auto" and round_champion_mode == "mcts":
                         # The preceding flat rounds already established the
@@ -2399,6 +2438,16 @@ def train_promotion_league(
                         print(
                             "league curriculum | MCTS self-play | "
                             "legacy direct stages skipped",
+                            flush=True,
+                        )
+                    elif curriculum_phase == "flat_population":
+                        print(
+                            "league curriculum | flat VectorGameEnv PPO/PPG | "
+                            f"teacher={effective_teacher_steps} | "
+                            f"objectives={effective_objective_steps} | "
+                            f"actor={effective_actor_steps} | "
+                            f"population={effective_population_steps}-"
+                            f"{effective_population_max_steps} steps",
                             flush=True,
                         )
                     elif curriculum_phase == "champion_population":

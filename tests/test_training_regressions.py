@@ -235,6 +235,35 @@ def test_league_always_skips_legacy_direct_curricula():
     assert controls["population_teacher_weight"] == 0.0
 
 
+def test_explicit_flat_stage_restores_direct_vector_curriculum():
+    controls = _curriculum_controls(
+        champion_status="active",
+        direct_teacher_steps=200,
+        direct_actor_steps=300,
+        direct_actor_max_steps=500,
+        direct_population_steps=400,
+        direct_population_max_steps=800,
+        direct_policy_anchor_weight=0.75,
+        direct_population_teacher_weight=0.25,
+        direct_population_opponent_policy_weight=0.50,
+        post_bootstrap_population_steps=600,
+        post_bootstrap_population_max_steps=1_000,
+        post_bootstrap_policy_anchor_weight=0.50,
+        post_bootstrap_teacher_weight=0.05,
+        post_bootstrap_opponent_policy_weight=0.75,
+        direct_objective_steps=250,
+        flat_enabled=True,
+    )
+
+    assert controls["phase"] == "flat_population"
+    assert controls["teacher_steps"] == 200
+    assert controls["objective_steps"] == 250
+    assert controls["actor_steps"] == 300
+    assert controls["population_steps"] == 400
+    assert controls["population_max_steps"] == 800
+    assert controls["policy_anchor_weight"] == 0.75
+
+
 def test_legacy_recovery_flag_cannot_restore_direct_curriculum_in_league():
     controls = _curriculum_controls(
         champion_status="promoted",

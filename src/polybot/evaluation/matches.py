@@ -36,13 +36,26 @@ def _new_env(
         from PolyEnv import Bardur, GameEnv, Imperius
     except ImportError as error:
         raise RuntimeError("PolyEnv is required for evaluation") from error
-    return GameEnv(
-        seed=seed,
-        map_size=training.map_size,
-        players=(Bardur, Imperius),
-        map_type=training.map_type,
-        visible_event_history=int(visible_action_history),
-    )
+    arguments = {
+        "seed": seed,
+        "map_size": training.map_size,
+        "players": (Bardur, Imperius),
+        "map_type": training.map_type,
+    }
+    # ``visible_event_history`` was added after the original scalar GameEnv
+    # binding.  Keep raw MCTS-preflight evaluation compatible with that older
+    # binding: PolyBot still reads visible events through
+    # ``visible_events_or_empty`` and builds the bounded 32-event model input
+    # itself.  Only the engine-side retention hint is absent.
+    try:
+        return GameEnv(
+            **arguments,
+            visible_event_history=int(visible_action_history),
+        )
+    except TypeError as error:
+        if "visible_event_history" not in str(error):
+            raise
+        return GameEnv(**arguments)
 
 
 def evaluate_matches(

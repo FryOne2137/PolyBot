@@ -109,6 +109,13 @@ python scripts/train_self_play.py \
   --max-moves 300
 ```
 
+Liga ma też trzy rozdzielone entrypointy: `train_flat.py` wykonuje wyłącznie
+raw-policy PPO/population training i płaskie bramki, `train_belief.py` uczy
+wyłącznie dekoder belief, a `train_league_mcts.py` destyluje policy/value z
+zaakceptowanego MCTS. `train_flat.py` wymusza `--champion-mode flat` i odrzuca
+MCTS collection, bootstrap value oraz MCTS distillation, więc nie może
+przypadkiem uruchomić searcha.
+
 ## Population league and SQLite history
 
 `scripts/train_league.py` uruchamia od razu self-play MCTS. Kandydat uczy się

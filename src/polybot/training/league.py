@@ -932,12 +932,24 @@ def train_promotion_league(
         raise ValueError("checkpoint_prefix must not be empty")
     if champion_mode not in {"flat", "mcts", "auto"}:
         raise ValueError("champion_mode must be 'flat', 'mcts' or 'auto'")
-    if training_stage not in {"auto", "belief", "mcts"}:
-        raise ValueError("training_stage must be 'auto', 'belief' or 'mcts'")
-    if training_stage != "auto" and champion_mode != "mcts":
+    if training_stage not in {"auto", "flat", "belief", "mcts"}:
+        raise ValueError("training_stage must be 'auto', 'flat', 'belief' or 'mcts'")
+    if training_stage in {"belief", "mcts"} and champion_mode != "mcts":
         raise ValueError(
             "--training-stage belief/mcts requires --champion-mode mcts"
         )
+    if training_stage == "flat" and champion_mode != "flat":
+        raise ValueError("--training-stage flat requires --champion-mode flat")
+    if training_stage == "flat" and population_games:
+        raise ValueError(
+            "flat-only training must use population_games=0; use direct-population PPO instead"
+        )
+    if training_stage == "flat" and value_bootstrap_games:
+        raise ValueError("flat-only training must use value_bootstrap_games=0")
+    if training_stage == "flat" and flat_mcts_distill_games:
+        raise ValueError("flat-only training must use flat_mcts_distill_games=0")
+    if training_stage == "flat" and mcts_probe_games:
+        raise ValueError("flat-only training must use mcts_probe_games=0")
     if training_stage == "mcts" and value_bootstrap_games:
         raise ValueError(
             "MCTS-only stage must use value_bootstrap_games=0; run value/belief "
@@ -945,8 +957,8 @@ def train_promotion_league(
         )
     if training_stage != "auto" and (steps or updates):
         raise ValueError(
-            "explicit belief/mcts stages require steps=0 and updates=0; use "
-            "population_games and population_updates_per_game for the selected stage"
+            "explicit flat/belief/mcts stages require steps=0 and updates=0; use "
+            "the stage-specific population/direct options instead"
         )
     if champion_mode == "auto" and population_games < 1:
         raise ValueError(
@@ -1764,6 +1776,8 @@ def train_promotion_league(
                     # calibration can be silently mixed into an MCTS job.
                     if training_stage in {"belief", "mcts"}:
                         round_champion_mode = "mcts"
+                    elif training_stage == "flat":
+                        round_champion_mode = "flat"
                     round_training_summary["champion_mode"] = {
                         "requested": champion_mode,
                         "effective": round_champion_mode,

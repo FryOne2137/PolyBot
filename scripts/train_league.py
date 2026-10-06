@@ -40,12 +40,15 @@ def _simulation_ladder(value: str) -> tuple[int, ...]:
 def main(*, fixed_training_stage: str | None = None) -> None:
     """Run the league trainer.
 
-    Dedicated entry points use ``fixed_training_stage`` so the belief and MCTS
-    phases cannot accidentally be mixed by a command-line flag.  The original
-    script keeps its ``auto`` mode for backwards-compatible experiments.
+    Dedicated entry points use ``fixed_training_stage`` so flat, belief and
+    MCTS phases cannot accidentally be mixed by a command-line flag. The
+    original script keeps its ``auto`` mode for backwards-compatible
+    experiments.
     """
-    if fixed_training_stage not in {None, "belief", "mcts"}:
-        raise ValueError("fixed_training_stage must be None, 'belief' or 'mcts'")
+    if fixed_training_stage not in {None, "flat", "belief", "mcts"}:
+        raise ValueError(
+            "fixed_training_stage must be None, 'flat', 'belief' or 'mcts'"
+        )
     parser = argparse.ArgumentParser(
         description="Train against a historical population and save only robust promotions"
     )
@@ -65,13 +68,13 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     if fixed_training_stage is None:
         parser.add_argument(
             "--training-stage",
-            choices=("auto", "belief", "mcts"),
+            choices=("auto", "flat", "belief", "mcts"),
             default="auto",
             help=(
-                "auto keeps the guarded curriculum; belief runs only the frozen "
-                "belief-calibration stage; mcts requires an accepted belief checkpoint "
-                "and runs the MCTS policy/value stage without a fresh strict "
-                "belief-calibration generation."
+                "auto keeps the guarded curriculum; flat runs only raw-policy "
+                "PPO/population training; belief runs only the frozen belief "
+                "calibration stage; mcts requires an accepted belief checkpoint "
+                "and runs the MCTS policy/value stage."
             ),
         )
     else:
@@ -705,6 +708,17 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     )
     parser.add_argument("--strategic-prior-weight", type=float, default=1.0)
     parser.add_argument("--teacher-prior-weight", type=float, default=0.20)
+    # A dedicated flat job must never inherit the league's MCTS-oriented CLI
+    # defaults. Arguments explicitly supplied by the user are still validated
+    # by ``train_promotion_league`` below.
+    if fixed_training_stage == "flat":
+        parser.set_defaults(
+            champion_mode="flat",
+            population_games=0,
+            value_bootstrap_games=0,
+            mcts_probe_games=0,
+            flat_mcts_distill_games=0,
+        )
     args = parser.parse_args()
 
     training = training_config_from_args(args)

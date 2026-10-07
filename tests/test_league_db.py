@@ -116,6 +116,30 @@ def test_unknown_historical_opponent_receives_pfsp_probability(tmp_path):
     assert probabilities == pytest.approx([0.4, 0.6])
 
 
+def test_main_exploiter_pfsp_reserves_probability_for_its_target(tmp_path):
+    champion = tmp_path / "champion.pt"
+    counter = tmp_path / "counter.pt"
+    champion.write_bytes(b"champion")
+    counter.write_bytes(b"counter")
+    with LeagueDatabase(tmp_path / "league.sqlite3") as database:
+        run_id = database.start_run(tmp_path, {})
+        champion_id = database.register_checkpoint(champion, {}, run_id=run_id)
+        counter_id = database.register_checkpoint(counter, {}, run_id=run_id)
+        probabilities, _ = database.opponent_probabilities(
+            champion_id,
+            [champion_id, counter_id],
+            pfsp_alpha=2.0,
+            champion_probability=0.4,
+            probability_floor=0.05,
+            role="main_exploiter",
+            primary_opponent_id=counter_id,
+            primary_opponent_probability=0.70,
+        )
+
+    assert sum(probabilities) == pytest.approx(1.0)
+    assert probabilities[1] >= 0.70
+
+
 def test_invalid_evaluation_does_not_update_elo_or_rating_history(tmp_path):
     champion_path = tmp_path / "champion.pt"
     candidate_path = tmp_path / "candidate.pt"

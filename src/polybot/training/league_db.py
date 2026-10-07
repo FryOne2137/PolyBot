@@ -128,8 +128,10 @@ class LeagueDatabase:
                 checkpoint_bytes INTEGER,
                 model_config_json TEXT NOT NULL,
                 status TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'main',
                 protected INTEGER NOT NULL DEFAULT 0,
                 in_population INTEGER NOT NULL DEFAULT 0,
+                trainable_opponent INTEGER NOT NULL DEFAULT 0,
                 elo REAL NOT NULL DEFAULT 1000.0,
                 rated_games INTEGER NOT NULL DEFAULT 0,
                 rated_wins INTEGER NOT NULL DEFAULT 0,
@@ -257,6 +259,27 @@ class LeagueDatabase:
                 "ALTER TABLE model_capabilities ADD COLUMN "
                 "mcts_evaluation_active INTEGER NOT NULL DEFAULT 0"
             )
+        model_columns = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA table_info(models)"
+            ).fetchall()
+        }
+        if "role" not in model_columns:
+            self.connection.execute(
+                "ALTER TABLE models ADD COLUMN role TEXT NOT NULL DEFAULT 'main'"
+            )
+        if "trainable_opponent" not in model_columns:
+            self.connection.execute(
+                "ALTER TABLE models ADD COLUMN trainable_opponent "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            # Existing promoted checkpoints are the historical population and
+            # remain eligible after migration; transient candidates do not.
+            self.connection.execute(
+                "UPDATE models SET trainable_opponent = 1 "
+                "WHERE status IN ('initial', 'promoted')"
+            )
         current = self.connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
@@ -298,7 +321,13 @@ class LeagueDatabase:
         protected: bool = False,
         protect_existing: bool = False,
         in_population: bool = True,
+        role: str = "main",
+        trainable_opponent: bool | None = None,
     ) -> int:
+        if not role:
+            raise ValueError("model role must not be empty")
+        if trainable_opponent is None:
+            trainable_opponent = status in {"initial", "promoted", "archive"}
         resolved = path.resolve()
         digest, size = checkpoint_digest(resolved)
         existing = self.connection.execute(
@@ -313,10 +342,13 @@ class LeagueDatabase:
                        WHEN status IN ('initial', 'promoted') THEN in_population
                        ELSE ?
                    END,
+                   role = CASE WHEN ? THEN ? ELSE role END,
+                   trainable_opponent = MAX(trainable_opponent, ?),
                    updated_at = ? WHERE id = ?""",
                 (
                     str(resolved), int(protect_existing), int(protected),
-                    int(in_population), _utc_now(), model_id,
+                    int(in_population), int(bool(role)), role,
+                    int(trainable_opponent), _utc_now(), model_id,
                 ),
             )
             self.connection.commit()
@@ -325,13 +357,13 @@ class LeagueDatabase:
         cursor = self.connection.execute(
             """INSERT INTO models(
                    run_id, parent_model_id, name, checkpoint_path, checkpoint_sha256,
-                   checkpoint_bytes, model_config_json, status, protected,
-                   in_population, created_at, updated_at
-               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   checkpoint_bytes, model_config_json, status, role, protected,
+                   in_population, trainable_opponent, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run_id, parent_model_id, resolved.stem, str(resolved), digest, size,
-                _json(model_config), status, int(protected), int(in_population),
-                now, now,
+                _json(model_config), status, role, int(protected),
+                int(in_population), int(trainable_opponent), now, now,
             ),
         )
         self.connection.commit()
@@ -343,6 +375,7 @@ class LeagueDatabase:
         parent_model_id: int,
         name: str,
         model_config: Any,
+        role: str = "main",
     ) -> int:
         parent = self.connection.execute(
             "SELECT elo FROM models WHERE id = ?", (parent_model_id,)
@@ -352,10 +385,13 @@ class LeagueDatabase:
         now = _utc_now()
         cursor = self.connection.execute(
             """INSERT INTO models(
-                   run_id, parent_model_id, name, model_config_json, status, elo,
-                   created_at, updated_at
-               ) VALUES(?, ?, ?, ?, 'training', ?, ?, ?)""",
-            (run_id, parent_model_id, name, _json(model_config), float(parent["elo"]), now, now),
+                   run_id, parent_model_id, name, model_config_json, status, role,
+                   trainable_opponent, elo, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, 'training', ?, 0, ?, ?, ?)""",
+            (
+                run_id, parent_model_id, name, _json(model_config), role,
+                float(parent["elo"]), now, now,
+            ),
         )
         self.connection.commit()
         return int(cursor.lastrowid)
@@ -364,7 +400,8 @@ class LeagueDatabase:
         now = _utc_now()
         if promoted_path is None:
             self.connection.execute(
-                """UPDATE models SET status = 'rejected', in_population = 0, updated_at = ?
+                """UPDATE models SET status = 'rejected', in_population = 0,
+                   trainable_opponent = 0, updated_at = ?
                    WHERE id = ? AND status = 'training'""",
                 (now, model_id),
             )
@@ -372,7 +409,8 @@ class LeagueDatabase:
             resolved = promoted_path.resolve()
             digest, size = checkpoint_digest(resolved)
             self.connection.execute(
-                """UPDATE models SET status = 'promoted', in_population = 1,
+                """UPDATE models SET status = 'promoted', role = 'main',
+                   in_population = 1, trainable_opponent = 1,
                    checkpoint_path = ?, checkpoint_sha256 = ?, checkpoint_bytes = ?,
                    updated_at = ? WHERE id = ?""",
                 (str(resolved), digest, size, now, model_id),
@@ -385,10 +423,30 @@ class LeagueDatabase:
         digest, size = checkpoint_digest(resolved)
         self.connection.execute(
             """UPDATE models SET status = 'challenger', in_population = 0,
+               trainable_opponent = 0,
                checkpoint_path = ?, checkpoint_sha256 = ?, checkpoint_bytes = ?,
                updated_at = ? WHERE id = ? AND status = 'training'""",
             (str(resolved), digest, size, _utc_now(), model_id),
         )
+        self.connection.commit()
+
+    def archive_candidate(
+        self, model_id: int, checkpoint_path: Path, *, role: str
+    ) -> None:
+        """Keep a verified counterstrategy as a trainable league opponent."""
+        if not role:
+            raise ValueError("archive role must not be empty")
+        resolved = checkpoint_path.resolve()
+        digest, size = checkpoint_digest(resolved)
+        cursor = self.connection.execute(
+            """UPDATE models SET status = 'archive', role = ?, in_population = 0,
+               trainable_opponent = 1, checkpoint_path = ?,
+               checkpoint_sha256 = ?, checkpoint_bytes = ?, updated_at = ?
+               WHERE id = ? AND status IN ('training', 'challenger', 'archive')""",
+            (role, str(resolved), digest, size, _utc_now(), model_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError(f"cannot archive model {model_id}")
         self.connection.commit()
 
     def model_capability(self, model_id: int) -> Mapping[str, Any] | None:
@@ -400,7 +458,8 @@ class LeagueDatabase:
     def model_record(self, model_id: int) -> Mapping[str, Any]:
         """Return immutable lineage metadata needed to choose a curriculum."""
         row = self.connection.execute(
-            """SELECT id, parent_model_id, status, protected, in_population
+            """SELECT id, parent_model_id, status, role, protected, in_population,
+                      trainable_opponent
                FROM models WHERE id = ?""",
             (model_id,),
         ).fetchone()
@@ -508,13 +567,35 @@ class LeagueDatabase:
         by_id = {int(row["id"]): row for row in rows}
         return [by_id[model_id] for model_id in model_ids if model_id in by_id]
 
-    def select_population(self, champion_id: int, maximum: int) -> list[sqlite3.Row]:
+    def select_population(
+        self,
+        champion_id: int,
+        maximum: int,
+        *,
+        include_archived_counters: bool = False,
+    ) -> list[sqlite3.Row]:
+        """Choose the current population.
+
+        Archived counterstrategies belong to the flat-PPO curriculum only.
+        Keeping them opt-in prevents a flat experiment from silently changing
+        the opponent distribution of the separate belief or MCTS jobs.
+        """
         if maximum < 1:
             raise ValueError("population maximum must be positive")
         rows = list(self.connection.execute(
             """SELECT * FROM models
-               WHERE checkpoint_path IS NOT NULL AND status IN ('initial', 'promoted')
-               ORDER BY id DESC"""
+               WHERE checkpoint_path IS NOT NULL
+                 AND (
+                     status IN ('initial', 'promoted')
+                     OR (
+                         ? = 1
+                         AND status = 'archive'
+                         AND role IN ('flat_counter', 'flat_main_exploiter')
+                         AND trainable_opponent = 1
+                     )
+                 )
+               ORDER BY id DESC""",
+            (int(include_archived_counters),),
         ).fetchall())
         by_id = {int(row["id"]): row for row in rows}
         if champion_id not in by_id:
@@ -595,12 +676,27 @@ class LeagueDatabase:
         pfsp_alpha: float,
         champion_probability: float,
         probability_floor: float,
+        role: str = "main",
+        primary_opponent_id: int | None = None,
+        primary_opponent_probability: float = 0.70,
     ) -> tuple[list[float], list[float | None]]:
-        """PFSP distribution with an explicit latest-champion component."""
+        """PFSP distribution, optionally focused on one exploiter target.
+
+        The regular main sees a champion/history mixture.  A role-specific
+        exploiter can reserve most samples for one target while retaining the
+        normal PFSP tail; callers with an in-memory current-main snapshot use
+        the analogous flat helper because that snapshot has no database ID.
+        """
         if not opponent_ids:
             raise ValueError("opponent population must not be empty")
         if champion_id not in opponent_ids:
             raise ValueError("current champion must be present in opponent population")
+        if role not in {"main", "main_exploiter"}:
+            raise ValueError("opponent role must be 'main' or 'main_exploiter'")
+        if not 0.0 <= primary_opponent_probability <= 1.0:
+            raise ValueError("primary opponent probability must be in [0, 1]")
+        if role == "main_exploiter" and primary_opponent_id not in opponent_ids:
+            raise ValueError("main exploiter requires a population primary opponent")
         reference_scores = [
             0.5 if model_id == champion_id else self.latest_pair_score(champion_id, model_id)
             for model_id in opponent_ids
@@ -623,7 +719,17 @@ class LeagueDatabase:
         ]
         probabilities = [max(probability_floor, value) for value in probabilities]
         normaliser = sum(probabilities)
-        return [value / normaliser for value in probabilities], reference_scores
+        probabilities = [value / normaliser for value in probabilities]
+        if role == "main_exploiter":
+            primary_index = opponent_ids.index(primary_opponent_id)
+            probabilities = [
+                value * (1.0 - primary_opponent_probability)
+                for value in probabilities
+            ]
+            probabilities[primary_index] += primary_opponent_probability
+            normaliser = sum(probabilities)
+            probabilities = [value / normaliser for value in probabilities]
+        return probabilities, reference_scores
 
     def record_opponent_selection(
         self,

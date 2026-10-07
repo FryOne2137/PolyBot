@@ -33,6 +33,7 @@ from .run_artifacts import TrainingRun
 from .replay_buffer import TrainingExample
 from .self_play_pool_train import train_self_play_pool
 from .vector_population import (
+    _flat_pfsp_weights,
     evaluate_direct_population_matches,
     train_direct_population_curriculum,
 )
@@ -869,6 +870,19 @@ def train_promotion_league(
     direct_population_ppg_value_weight: float = 1.0,
     direct_population_ema_enabled: bool = True,
     direct_population_ema_decay: float = 0.999,
+    flat_population_persistent_optimizer: bool = False,
+    flat_population_terminal_replay_capacity: int = 0,
+    flat_population_terminal_replay_batch_size: int = 0,
+    flat_population_terminal_replay_interval: int = 1,
+    flat_population_terminal_replay_value_weight: float = 0.0,
+    flat_population_ppo_max_policy_age: int | None = None,
+    flat_population_policy_anchor_final_weight: float | None = None,
+    flat_population_snapshot_archive_size: int = 0,
+    flat_population_pfsp_alpha: float = 2.0,
+    flat_population_pfsp_probability_floor: float = 0.05,
+    flat_population_pfsp_score_ema_decay: float = 0.80,
+    flat_main_exploiter_probability: float = 0.70,
+    flat_main_exploiter_archive_score: float = 0.55,
     breakthrough_exploiter: bool = False,
     exploiter_champion_probability: float = 0.75,
     exploiter_policy_anchor_weight: float = 0.0,
@@ -1256,6 +1270,12 @@ def train_promotion_league(
         direct_population_ema_decay
     ) < 1.0:
         raise ValueError("direct population EMA decay must be in [0, 1)")
+    if not 0.0 <= flat_population_pfsp_score_ema_decay < 1.0:
+        raise ValueError("flat PFSP score EMA decay must be in [0, 1)")
+    if not 0.0 <= flat_main_exploiter_probability <= 1.0:
+        raise ValueError("flat main-exploiter probability must be in [0, 1]")
+    if not 0.0 <= flat_main_exploiter_archive_score <= 1.0:
+        raise ValueError("flat main-exploiter archive score must be in [0, 1]")
     for name, value in {
         "exploiter_champion_probability": exploiter_champion_probability,
         "exploiter_policy_anchor_weight": exploiter_policy_anchor_weight,
@@ -1637,6 +1657,19 @@ def train_promotion_league(
         ),
         "direct_population_ema_enabled": direct_population_ema_enabled,
         "direct_population_ema_decay": direct_population_ema_decay,
+        "flat_population_persistent_optimizer": flat_population_persistent_optimizer,
+        "flat_population_terminal_replay_capacity": flat_population_terminal_replay_capacity,
+        "flat_population_terminal_replay_batch_size": flat_population_terminal_replay_batch_size,
+        "flat_population_terminal_replay_interval": flat_population_terminal_replay_interval,
+        "flat_population_terminal_replay_value_weight": flat_population_terminal_replay_value_weight,
+        "flat_population_ppo_max_policy_age": flat_population_ppo_max_policy_age,
+        "flat_population_policy_anchor_final_weight": flat_population_policy_anchor_final_weight,
+        "flat_population_snapshot_archive_size": flat_population_snapshot_archive_size,
+        "flat_population_pfsp_alpha": flat_population_pfsp_alpha,
+        "flat_population_pfsp_probability_floor": flat_population_pfsp_probability_floor,
+        "flat_population_pfsp_score_ema_decay": flat_population_pfsp_score_ema_decay,
+        "flat_main_exploiter_probability": flat_main_exploiter_probability,
+        "flat_main_exploiter_archive_score": flat_main_exploiter_archive_score,
         "breakthrough_exploiter": breakthrough_exploiter,
         "exploiter_champion_probability": exploiter_champion_probability,
         "exploiter_policy_anchor_weight": exploiter_policy_anchor_weight,
@@ -2161,7 +2194,11 @@ def train_promotion_league(
                     )
                     database.attach_candidate(round_id, candidate_id)
 
-                    population_rows = database.select_population(champion_id, population_size)
+                    population_rows = database.select_population(
+                        champion_id,
+                        population_size,
+                        include_archived_counters=(training_stage == "flat"),
+                    )
                     population_ids = [int(row["id"]) for row in population_rows]
                     population_paths = [Path(str(row["checkpoint_path"])) for row in population_rows]
                     population_evaluation_labels = [
@@ -2675,18 +2712,48 @@ def train_promotion_league(
                             )
                         frozen_models.append(frozen_model.eval())
 
+                    population_id_set = set(population_ids)
+
+                    def recorded_population_opponent_id(
+                        game: Mapping[str, Any], fallback_index: int = 0
+                    ) -> int | None:
+                        """Map a callback's stable opponent identity to DB ID.
+
+                        Flat curriculum may temporarily add in-memory
+                        snapshots. They retain their string identity in the
+                        match JSON, but are not database models until they are
+                        archived.  Never reinterpret one as whichever model
+                        now occupies the same list offset.
+                        """
+                        stable_id = game.get("opponent_id")
+                        if isinstance(stable_id, int) and stable_id in population_id_set:
+                            return stable_id
+                        if stable_id is None and 0 <= fallback_index < len(population_ids):
+                            return population_ids[fallback_index]
+                        return None
+
                     # The free exploiter starts from exactly the same point as
                     # the main line, before the latter's champion-anchored PPO
                     # updates.  It is evaluated on the same development arena
                     # and can only earn the later independent promotion gate.
                     exploiter_source_state = (
                         model_state_on_cpu(candidate)
-                        if breakthrough_exploiter and effective_population_steps
+                        if (
+                            training_stage == "flat"
+                            and breakthrough_exploiter
+                            and effective_population_steps
+                        )
                         else None
                     )
                     direct_population_summary: Dict[str, Any] = {}
                     direct_population_main_summary: Dict[str, Any] = {}
                     direct_population_exploiter_summary: Dict[str, Any] = {}
+                    main_exploiter_archive_summary: Dict[str, Any] = {
+                        "enabled": float(exploiter_source_state is not None),
+                        "main_score": 0.0,
+                        "eligible": 0.0,
+                        "archived": 0.0,
+                    }
                     selected_population_branch = "main"
                     if effective_population_steps:
                         def record_direct_population_gate_game(
@@ -2706,7 +2773,9 @@ def train_promotion_league(
                                     f"{stage}_{block}"
                                 ),
                                 model_a_id=candidate_id,
-                                model_b_id=population_ids[opponent_index],
+                                model_b_id=recorded_population_opponent_id(
+                                    row, opponent_index
+                                ),
                                 game=row,
                             )
 
@@ -2724,7 +2793,9 @@ def train_promotion_league(
                                 round_id=round_id,
                                 phase=f"direct_population_training_{block}",
                                 model_a_id=candidate_id,
-                                model_b_id=population_ids[opponent_index],
+                                model_b_id=recorded_population_opponent_id(
+                                    row, opponent_index
+                                ),
                                 game=row,
                             )
 
@@ -2759,7 +2830,9 @@ def train_promotion_league(
                                     round_id=round_id,
                                     phase=f"{phase_prefix}_{stage}_{block}",
                                     model_a_id=candidate_id,
-                                    model_b_id=population_ids[opponent_index],
+                                    model_b_id=recorded_population_opponent_id(
+                                        decorated, opponent_index
+                                    ),
                                     game=decorated,
                                 )
 
@@ -2783,7 +2856,9 @@ def train_promotion_league(
                                     round_id=round_id,
                                     phase=f"{phase_prefix}_{block}",
                                     model_a_id=candidate_id,
-                                    model_b_id=population_ids[opponent_index],
+                                    model_b_id=recorded_population_opponent_id(
+                                        decorated, opponent_index
+                                    ),
                                     game=decorated,
                                 )
 
@@ -2932,10 +3007,50 @@ def train_promotion_league(
                                 ),
                                 ema_enabled=direct_population_ema_enabled,
                                 ema_decay=direct_population_ema_decay,
+                                flat_persistent_optimizer=(
+                                    training_stage == "flat"
+                                    and flat_population_persistent_optimizer
+                                ),
+                                flat_terminal_replay_capacity=(
+                                    flat_population_terminal_replay_capacity
+                                    if training_stage == "flat" else 0
+                                ),
+                                flat_terminal_replay_batch_size=(
+                                    flat_population_terminal_replay_batch_size
+                                    if training_stage == "flat" else 0
+                                ),
+                                flat_terminal_replay_interval=(
+                                    flat_population_terminal_replay_interval
+                                ),
+                                flat_terminal_replay_value_weight=(
+                                    flat_population_terminal_replay_value_weight
+                                    if training_stage == "flat" else 0.0
+                                ),
+                                flat_ppo_max_policy_age=(
+                                    flat_population_ppo_max_policy_age
+                                    if training_stage == "flat" else None
+                                ),
+                                flat_policy_anchor_final_weight=(
+                                    flat_population_policy_anchor_final_weight
+                                    if training_stage == "flat" else None
+                                ),
+                                flat_snapshot_archive_size=(
+                                    flat_population_snapshot_archive_size
+                                    if training_stage == "flat" else 0
+                                ),
+                                flat_pfsp_alpha=flat_population_pfsp_alpha,
+                                flat_pfsp_probability_floor=(
+                                    flat_population_pfsp_probability_floor
+                                ),
+                                flat_pfsp_score_ema_decay=(
+                                    flat_population_pfsp_score_ema_decay
+                                ),
+                                flat_role="main",
                                 gate_game_callback=record_stage_gate_game,
                                 training_game_callback=record_stage_training_game,
                                 candidate_label=label,
                                 opponent_labels=population_evaluation_labels,
+                                opponent_ids=population_ids,
                                 run=run.child(
                                     f"round_{round_index:03d}/"
                                     f"direct_population_{stage_name}"
@@ -3119,23 +3234,40 @@ def train_promotion_league(
                                 device
                             ).eval()
                             restore_model_state(exploiter, exploiter_source_state)
-                            exploiter_probabilities = (
-                                _champion_focused_probabilities(
-                                    population_ids,
-                                    probabilities,
-                                    champion_id,
-                                    champion_probability=(
-                                        min(
-                                            exploiter_champion_probability,
-                                            1.0
-                                            - (len(population_ids) - 1)
-                                            * minimum_sampling_probability,
-                                        )
-                                    ),
-                                    probability_floor=(
-                                        minimum_sampling_probability
-                                    ),
-                                )
+                            # Freeze the main after its PPO block.  The
+                            # exploiter collects chiefly against this exact
+                            # policy, so it can discover a concrete counter
+                            # rather than optimizing against an old champion.
+                            current_main = PolicyValueBeliefNet(model_config)
+                            restore_model_state(
+                                current_main, model_state_on_cpu(candidate)
+                            )
+                            current_main.to(device).eval()
+                            for parameter in current_main.parameters():
+                                parameter.requires_grad_(False)
+                            current_main_id = "flat-current-main"
+                            exploiter_models = [current_main, *frozen_models]
+                            exploiter_labels = [
+                                f"current main {candidate_source.stem}",
+                                *population_evaluation_labels,
+                            ]
+                            exploiter_ids: list[int | str] = [
+                                current_main_id, *population_ids
+                            ]
+                            exploiter_probabilities = _flat_pfsp_weights(
+                                np.full(
+                                    len(exploiter_models), 0.5,
+                                    dtype=np.float64,
+                                ),
+                                alpha=flat_population_pfsp_alpha,
+                                probability_floor=(
+                                    flat_population_pfsp_probability_floor
+                                ),
+                                role="main_exploiter",
+                                primary_index=0,
+                                primary_probability=(
+                                    flat_main_exploiter_probability
+                                ),
                             )
 
                             def record_exploiter_gate_game(
@@ -3169,7 +3301,9 @@ def train_promotion_league(
                                         f"{block}"
                                     ),
                                     model_a_id=candidate_id,
-                                    model_b_id=population_ids[opponent_index],
+                                    model_b_id=recorded_population_opponent_id(
+                                        row, opponent_index
+                                    ),
                                     game=row,
                                 )
 
@@ -3186,7 +3320,7 @@ def train_promotion_league(
                                     model_config,
                                     exploiter,
                                     champion,
-                                    frozen_models,
+                                    exploiter_models,
                                     exploiter_probabilities,
                                     num_envs=direct_population_envs,
                                     minimum_steps=effective_population_steps,
@@ -3310,6 +3444,49 @@ def train_promotion_league(
                                     ),
                                     ema_enabled=direct_population_ema_enabled,
                                     ema_decay=direct_population_ema_decay,
+                                    flat_persistent_optimizer=(
+                                        training_stage == "flat"
+                                        and flat_population_persistent_optimizer
+                                    ),
+                                    flat_terminal_replay_capacity=(
+                                        flat_population_terminal_replay_capacity
+                                        if training_stage == "flat" else 0
+                                    ),
+                                    flat_terminal_replay_batch_size=(
+                                        flat_population_terminal_replay_batch_size
+                                        if training_stage == "flat" else 0
+                                    ),
+                                    flat_terminal_replay_interval=(
+                                        flat_population_terminal_replay_interval
+                                    ),
+                                    flat_terminal_replay_value_weight=(
+                                        flat_population_terminal_replay_value_weight
+                                        if training_stage == "flat" else 0.0
+                                    ),
+                                    flat_ppo_max_policy_age=(
+                                        flat_population_ppo_max_policy_age
+                                        if training_stage == "flat" else None
+                                    ),
+                                    flat_policy_anchor_final_weight=(
+                                        flat_population_policy_anchor_final_weight
+                                        if training_stage == "flat" else None
+                                    ),
+                                    flat_snapshot_archive_size=(
+                                        flat_population_snapshot_archive_size
+                                        if training_stage == "flat" else 0
+                                    ),
+                                    flat_pfsp_alpha=flat_population_pfsp_alpha,
+                                    flat_pfsp_probability_floor=(
+                                        flat_population_pfsp_probability_floor
+                                    ),
+                                    flat_pfsp_score_ema_decay=(
+                                        flat_population_pfsp_score_ema_decay
+                                    ),
+                                    flat_role="main_exploiter",
+                                    flat_primary_opponent_id=current_main_id,
+                                    flat_primary_opponent_probability=(
+                                        flat_main_exploiter_probability
+                                    ),
                                     gate_game_callback=(
                                         record_exploiter_gate_game
                                     ),
@@ -3320,14 +3497,109 @@ def train_promotion_league(
                                         f"exploiter {candidate_source.stem}"
                                     ),
                                     opponent_labels=(
+                                        exploiter_labels
+                                    ),
+                                    opponent_ids=exploiter_ids,
+                                    # Main and exploiter may collect against
+                                    # different PFSP mixtures, but promotion
+                                    # and rollback must use one fixed arena.
+                                    benchmark_opponent_models=frozen_models,
+                                    benchmark_opponent_weights=probabilities,
+                                    benchmark_opponent_labels=(
                                         population_evaluation_labels
                                     ),
+                                    benchmark_opponent_ids=population_ids,
                                     run=run.child(
                                         f"round_{round_index:03d}/"
                                         "direct_population_exploiter"
                                     ),
                                 )
                             )
+                            # Its PFSP benchmark intentionally excludes the
+                            # live main.  Verify the actual exploit on a
+                            # separate paired arena before spending a durable
+                            # archive slot on it.
+                            exploiter_main_match = (
+                                evaluate_direct_population_matches(
+                                    replace(
+                                        round_training,
+                                        seed=_offset_seed(
+                                            direct_population_training_seed,
+                                            2_750_003,
+                                        ),
+                                        max_moves=direct_gate_max_moves,
+                                    ),
+                                    exploiter,
+                                    [current_main],
+                                    [1.0],
+                                    games=direct_population_gate_games,
+                                    gate_seed=_offset_seed(
+                                        direct_population_gate_seed,
+                                        2_750_003,
+                                    ),
+                                    visible_action_history=(
+                                        visible_action_history
+                                    ),
+                                    candidate_label=(
+                                        f"main exploiter {candidate_source.stem}"
+                                    ),
+                                    opponent_labels=[
+                                        f"current main {candidate_source.stem}"
+                                    ],
+                                    num_threads=num_threads,
+                                    max_actions=mcts.native_max_actions,
+                                )
+                            )
+                            exploiter_main_score = float(
+                                exploiter_main_match["model_a_score"]
+                            )
+                            exploiter_archive_eligible = bool(
+                                exploiter_main_match.get("valid", 1.0)
+                            ) and (
+                                exploiter_main_score
+                                >= flat_main_exploiter_archive_score
+                            )
+                            main_exploiter_archive_summary = {
+                                "enabled": 1.0,
+                                "main_score": exploiter_main_score,
+                                "eligible": float(exploiter_archive_eligible),
+                                "archived": 0.0,
+                                "threshold": flat_main_exploiter_archive_score,
+                                "games": float(
+                                    exploiter_main_match.get("games", 0.0)
+                                ),
+                            }
+                            if exploiter_archive_eligible:
+                                exploiter_model_id = database.create_candidate(
+                                    database_run_id,
+                                    candidate_id,
+                                    f"main-exploiter-round-{round_index:03d}",
+                                    model_config,
+                                    role="flat_main_exploiter",
+                                )
+                                archive_path = _next_checkpoint_path(
+                                    checkpoint_dir,
+                                    f"{checkpoint_prefix}-main-exploiter",
+                                )
+                                save_model(
+                                    archive_path, exploiter, model_config
+                                )
+                                database.archive_candidate(
+                                    exploiter_model_id,
+                                    archive_path,
+                                    role="flat_main_exploiter",
+                                )
+                                main_exploiter_archive_summary.update(
+                                    archived=1.0,
+                                    model_id=exploiter_model_id,
+                                    checkpoint_path=str(archive_path),
+                                )
+                                print(
+                                    "league main exploiter archived | "
+                                    f"vs-main={exploiter_main_score:.4f} | "
+                                    f"saved {archive_path}",
+                                    flush=True,
+                                )
                             if _select_exploiter_checkpoint(
                                 direct_population_main_summary,
                                 direct_population_exploiter_summary,
@@ -3357,6 +3629,9 @@ def train_promotion_league(
                             "selected_branch": selected_population_branch,
                             "main": direct_population_main_summary,
                             "exploiter": direct_population_exploiter_summary,
+                            "main_exploiter_archive": (
+                                main_exploiter_archive_summary
+                            ),
                         }
                     )
                     direct_population_ready = (
@@ -3986,6 +4261,28 @@ def train_promotion_league(
                         continue_previous_challenger = (
                             continuation_action == "previous"
                         )
+                        champion_counter_score = next(
+                            (
+                                float(result.get("model_a_score", 0.0))
+                                for result in flat_evaluations
+                                if int(result.get("opponent_id", -1))
+                                == champion_before_id
+                            ),
+                            0.0,
+                        )
+                        # A model which has found a non-losing response to
+                        # the current champion is strategically useful even
+                        # when it misses the global, all-opponent promotion
+                        # gate.  Keep it as a durable training counter, not
+                        # merely as an in-memory PFSP snapshot.
+                        archive_counterstrategy = bool(
+                            training_stage == "flat"
+                            and not flat_invalid
+                            and champion_counter_score >= 0.50
+                            and minimum_historical_score
+                            >= historical_score_floor
+                        )
+                        archived_counterstrategy = False
                         parent_capability = database.model_capability(
                             candidate_parent_id
                         )
@@ -4042,12 +4339,24 @@ def train_promotion_league(
                         elif retain_challenger:
                             retained_path = _next_checkpoint_path(
                                 checkpoint_dir,
-                                f"{checkpoint_prefix}-challenger",
+                                (
+                                    f"{checkpoint_prefix}-counter"
+                                    if archive_counterstrategy
+                                    else f"{checkpoint_prefix}-challenger"
+                                ),
                             )
                             save_model(retained_path, candidate, model_config)
-                            database.retain_candidate(
-                                candidate_id, retained_path
-                            )
+                            if archive_counterstrategy:
+                                database.archive_candidate(
+                                    candidate_id,
+                                    retained_path,
+                                    role="flat_counter",
+                                )
+                                archived_counterstrategy = True
+                            else:
+                                database.retain_candidate(
+                                    candidate_id, retained_path
+                                )
                             challenger_path = retained_path
                             challenger_id = candidate_id
                             print(
@@ -4057,9 +4366,24 @@ def train_promotion_league(
                                 flush=True,
                             )
                         else:
-                            database.finalise_candidate(
-                                candidate_id, promoted_path=None
-                            )
+                            if archive_counterstrategy:
+                                archived_path = _next_checkpoint_path(
+                                    checkpoint_dir,
+                                    f"{checkpoint_prefix}-counter",
+                                )
+                                save_model(
+                                    archived_path, candidate, model_config
+                                )
+                                database.archive_candidate(
+                                    candidate_id,
+                                    archived_path,
+                                    role="flat_counter",
+                                )
+                                archived_counterstrategy = True
+                            else:
+                                database.finalise_candidate(
+                                    candidate_id, promoted_path=None
+                                )
                             if continue_previous_challenger:
                                 challenger_path = previous_challenger_path
                                 challenger_id = previous_challenger_id
@@ -4088,6 +4412,11 @@ def train_promotion_league(
                                 mcts_gate_active
                             ),
                             "evaluation_active": float(mcts_gate_active),
+                        }
+                        round_training_summary["flat_counterstrategy"] = {
+                            "champion_score": champion_counter_score,
+                            "eligible": float(archive_counterstrategy),
+                            "archived": float(archived_counterstrategy),
                         }
                         probe_passed = False
                         # Search quality is a property of a model that has

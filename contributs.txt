@@ -5,3 +5,4 @@ https://arxiv.org/abs/1909.12823
 https://arxiv.org/abs/1707.06347
 https://arxiv.org/abs/2009.04416
 https://proceedings.mlr.press/v202/wang23aw/wang23aw.pdf
+https://deepmind.google/blog/alphastar-grandmaster-level-in-starcraft-ii-using-multi-agent-reinforcement-learning/

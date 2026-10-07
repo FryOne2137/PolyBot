@@ -489,6 +489,53 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         "--direct-population-ema-decay", type=float, default=0.999,
     )
     parser.add_argument(
+        "--flat-population-persistent-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Flat-only: retain AdamW, PPG and auxiliary replay across population blocks.",
+    )
+    parser.add_argument(
+        "--flat-population-terminal-replay-capacity", type=int, default=0,
+        help="Flat-only capacity of terminal-outcome value replay; 0 disables it.",
+    )
+    parser.add_argument(
+        "--flat-population-terminal-replay-batch-size", type=int, default=0,
+    )
+    parser.add_argument(
+        "--flat-population-terminal-replay-interval", type=int, default=1,
+    )
+    parser.add_argument(
+        "--flat-population-terminal-replay-value-weight", type=float, default=0.0,
+    )
+    parser.add_argument(
+        "--flat-population-ppo-max-policy-age", type=int, default=None,
+        help="Flat-only: actor ignores trajectories older than this many PPO updates; value keeps them.",
+    )
+    parser.add_argument(
+        "--flat-population-policy-anchor-final-weight", type=float, default=None,
+        help="Flat-only final champion-policy anchor after linear decay.",
+    )
+    parser.add_argument(
+        "--flat-population-snapshot-archive-size", type=int, default=0,
+        help="Flat-only number of accepted candidate snapshots used as PFSP opponents.",
+    )
+    parser.add_argument("--flat-population-pfsp-alpha", type=float, default=2.0)
+    parser.add_argument(
+        "--flat-population-pfsp-probability-floor", type=float, default=0.05,
+    )
+    parser.add_argument(
+        "--flat-population-pfsp-score-ema-decay", type=float, default=0.80,
+        help="Flat-only smoothing for opponent difficulty before PFSP reweights.",
+    )
+    parser.add_argument(
+        "--flat-main-exploiter-probability", type=float, default=0.70,
+        help="Flat-only main-exploiter share reserved for the current main snapshot.",
+    )
+    parser.add_argument(
+        "--flat-main-exploiter-archive-score", type=float, default=0.55,
+        help="Flat-only minimum held-out score versus current main to archive a counterstrategy.",
+    )
+    parser.add_argument(
         "--breakthrough-exploiter",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -718,6 +765,27 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             value_bootstrap_games=0,
             mcts_probe_games=0,
             flat_mcts_distill_games=0,
+            # Flat PPO can safely use every on-policy advantage.  The
+            # terminal value replay is critic-only, so it cannot make the
+            # actor off-policy.  These defaults are intentionally scoped to
+            # train_flat.py and leave train_league.py unchanged.
+            direct_population_ppo_top_advantage_fraction=1.0,
+            direct_policy_anchor_weight=0.20,
+            direct_value_anchor_weight=0.10,
+            flat_population_persistent_optimizer=True,
+            flat_population_terminal_replay_capacity=16_384,
+            flat_population_terminal_replay_batch_size=256,
+            flat_population_terminal_replay_interval=1,
+            flat_population_terminal_replay_value_weight=0.25,
+            flat_population_ppo_max_policy_age=1,
+            flat_population_policy_anchor_final_weight=0.05,
+            flat_population_snapshot_archive_size=6,
+            flat_population_pfsp_alpha=2.0,
+            flat_population_pfsp_probability_floor=0.05,
+            flat_population_pfsp_score_ema_decay=0.80,
+            flat_main_exploiter_probability=0.70,
+            flat_main_exploiter_archive_score=0.55,
+            breakthrough_exploiter=True,
         )
     args = parser.parse_args()
 
@@ -987,6 +1055,43 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         ),
         direct_population_ema_enabled=args.direct_population_ema,
         direct_population_ema_decay=args.direct_population_ema_decay,
+        flat_population_persistent_optimizer=(
+            args.flat_population_persistent_optimizer
+        ),
+        flat_population_terminal_replay_capacity=(
+            args.flat_population_terminal_replay_capacity
+        ),
+        flat_population_terminal_replay_batch_size=(
+            args.flat_population_terminal_replay_batch_size
+        ),
+        flat_population_terminal_replay_interval=(
+            args.flat_population_terminal_replay_interval
+        ),
+        flat_population_terminal_replay_value_weight=(
+            args.flat_population_terminal_replay_value_weight
+        ),
+        flat_population_ppo_max_policy_age=(
+            args.flat_population_ppo_max_policy_age
+        ),
+        flat_population_policy_anchor_final_weight=(
+            args.flat_population_policy_anchor_final_weight
+        ),
+        flat_population_snapshot_archive_size=(
+            args.flat_population_snapshot_archive_size
+        ),
+        flat_population_pfsp_alpha=args.flat_population_pfsp_alpha,
+        flat_population_pfsp_probability_floor=(
+            args.flat_population_pfsp_probability_floor
+        ),
+        flat_population_pfsp_score_ema_decay=(
+            args.flat_population_pfsp_score_ema_decay
+        ),
+        flat_main_exploiter_probability=(
+            args.flat_main_exploiter_probability
+        ),
+        flat_main_exploiter_archive_score=(
+            args.flat_main_exploiter_archive_score
+        ),
         breakthrough_exploiter=args.breakthrough_exploiter,
         exploiter_champion_probability=args.exploiter_champion_probability,
         exploiter_policy_anchor_weight=args.exploiter_policy_anchor_weight,

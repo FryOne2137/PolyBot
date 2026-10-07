@@ -74,6 +74,10 @@ class _PPOExample:
     # a 700-move game must still teach its opening positions who eventually
     # won.  A forced partial-trajectory flush falls back to ``return_target``.
     value_target: float | None = None
+    # PPO may wait for a long native game to end while other slots already
+    # update the policy.  Value can still learn from this observation, but the
+    # actor must not silently optimize a very old behaviour policy.
+    policy_version: int = 0
     # Policy updates can use only the upper advantage quantile while the value
     # and PPG objectives continue to see every completed position.
     policy_selected: bool = True
@@ -1271,6 +1275,7 @@ def train_vector_population(
     num_threads: int | None,
     max_actions: int,
     anchor_model: PolicyValueBeliefNet,
+    opponent_ids: Sequence[int | str] | None = None,
     visible_action_history: int = 32,
     policy_anchor_weight: float = 0.10,
     value_anchor_weight: float = 0.10,
@@ -1303,6 +1308,11 @@ def train_vector_population(
     objective_replay_weight: float = 0.35,
     objective_replay_recency: float = 0.92,
     objective_replay_max_epochs: int = 4,
+    terminal_replay_capacity: int = 0,
+    terminal_replay_batch_size: int = 0,
+    terminal_replay_interval: int = 1,
+    terminal_replay_value_weight: float = 0.0,
+    ppo_max_policy_age: int | None = None,
     ppg_enabled: bool = True,
     ppg_interval: int = 8,
     ppg_buffer_capacity: int = 8_192,
@@ -1314,6 +1324,7 @@ def train_vector_population(
     ppg_value_weight: float = 1.0,
     ema_model: PolicyValueBeliefNet | None = None,
     ema_decay: float = 0.999,
+    continuation_state: dict[str, Any] | None = None,
     game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, float | str]:
@@ -1352,6 +1363,13 @@ def train_vector_population(
     ):
         raise ValueError("opponent_weights must be finite and positive")
     weights /= weights.sum()
+    resolved_opponent_ids: list[int | str] = (
+        list(range(len(opponent_models)))
+        if opponent_ids is None
+        else list(opponent_ids)
+    )
+    if len(resolved_opponent_ids) != len(opponent_models):
+        raise ValueError("opponent_ids must match opponent_models")
     for name, value in {
         "policy_anchor_weight": policy_anchor_weight,
         "value_anchor_weight": value_anchor_weight,
@@ -1426,6 +1444,22 @@ def train_vector_population(
         raise ValueError(
             "objective_replay_capacity must be at least its batch size"
         )
+    if terminal_replay_capacity < 0 or terminal_replay_batch_size < 0:
+        raise ValueError("terminal replay sizes must not be negative")
+    if terminal_replay_value_weight < 0.0:
+        raise ValueError("terminal_replay_value_weight must not be negative")
+    terminal_replay_enabled = terminal_replay_value_weight > 0.0
+    if terminal_replay_enabled and (
+        terminal_replay_capacity < 1
+        or terminal_replay_batch_size < 1
+        or terminal_replay_interval < 1
+        or terminal_replay_capacity < terminal_replay_batch_size
+    ):
+        raise ValueError(
+            "enabled terminal replay requires capacity >= batch size >= 1"
+        )
+    if ppo_max_policy_age is not None and ppo_max_policy_age < 0:
+        raise ValueError("ppo_max_policy_age must not be negative")
     for name, value in {
         "ppg_interval": ppg_interval,
         "ppg_buffer_capacity": ppg_buffer_capacity,
@@ -1450,7 +1484,11 @@ def train_vector_population(
     except ImportError as error:
         raise RuntimeError("PolyEnv VectorGameEnv is required") from error
 
-    seed_everything(training.seed)
+    # A flat continuation deliberately owns the RNG stream across blocks.
+    # Resetting it here would make long games and replay sampling repeat after
+    # every block despite retaining their optimiser and environments.
+    if continuation_state is None or "optimiser" not in continuation_state:
+        seed_everything(training.seed)
     device = select_device(training.device)
     run = run or TrainingRun.create("runs", "direct_population_ppo")
     run.write_config(
@@ -1493,6 +1531,12 @@ def train_vector_population(
             "objective_replay_weight": objective_replay_weight,
             "objective_replay_recency": objective_replay_recency,
             "objective_replay_max_epochs": objective_replay_max_epochs,
+            "terminal_replay_capacity": terminal_replay_capacity,
+            "terminal_replay_batch_size": terminal_replay_batch_size,
+            "terminal_replay_interval": terminal_replay_interval,
+            "terminal_replay_value_weight": terminal_replay_value_weight,
+            "ppo_max_policy_age": ppo_max_policy_age,
+            "continuation_enabled": continuation_state is not None,
             "ppg_enabled": ppg_enabled,
             "ppg_interval": ppg_interval,
             "ppg_buffer_capacity": ppg_buffer_capacity,
@@ -1521,45 +1565,168 @@ def train_vector_population(
     anchor_model.to(device).eval()
     for parameter in anchor_model.parameters():
         parameter.requires_grad_(False)
+    # A PFSP archive can expire a snapshot between curriculum blocks.  An
+    # in-flight VectorGameEnv episode must nevertheless finish against the
+    # exact opponent it started with; append those retained per-slot models
+    # only for this block, without sampling new episodes from them.
+    active_opponent_count = len(opponent_models)
+    carried_opponents = (
+        continuation_state.get("environment_opponents", [])
+        if continuation_state is not None
+        else []
+    )
+    carried_opponent_ids = (
+        continuation_state.get("environment_opponent_ids", [])
+        if continuation_state is not None
+        else []
+    )
+    if len(carried_opponent_ids) != len(carried_opponents):
+        carried_opponent_ids = [
+            f"carried-opponent-{index}"
+            for index in range(len(carried_opponents))
+        ]
     frozen: list[PolicyValueBeliefNet] = []
-    for model in opponent_models:
+    frozen_opponent_ids: list[int | str] = []
+    for model, model_id in zip(
+        [*opponent_models, *carried_opponents],
+        [*resolved_opponent_ids, *carried_opponent_ids],
+    ):
+        if any(existing is model for existing in frozen):
+            continue
         model.to(device).eval()
         for parameter in model.parameters():
             parameter.requires_grad_(False)
         frozen.append(model)
-    optimiser = torch.optim.AdamW(
-        candidate.parameters(),
-        lr=training.learning_rate,
-        weight_decay=training.weight_decay,
+        frozen_opponent_ids.append(model_id)
+    optimiser = (
+        continuation_state.get("optimiser")
+        if continuation_state is not None
+        else None
     )
+    if optimiser is None:
+        optimiser = torch.optim.AdamW(
+            candidate.parameters(),
+            lr=training.learning_rate,
+            weight_decay=training.weight_decay,
+        )
+    else:
+        # The candidate is the same live module across flat curriculum blocks.
+        # Do not silently attach an AdamW state to a different parameter set.
+        optimiser_parameters = {
+            id(parameter)
+            for group in optimiser.param_groups
+            for parameter in group["params"]
+        }
+        if optimiser_parameters != {id(parameter) for parameter in candidate.parameters()}:
+            raise ValueError("continuation optimiser belongs to another model")
+        for parameter_group in optimiser.param_groups:
+            parameter_group["lr"] = training.learning_rate
     cuda_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
-    env = VectorGameEnv(
-        num_envs=num_envs,
-        seed=training.seed,
-        map_size=training.map_size,
-        players=(Bardur, Imperius),
-        num_threads=num_threads,
-        max_actions=max_actions,
-        auto_reset=True,
-        visible_event_history=visible_action_history,
+    scaler = (
+        continuation_state.get("scaler")
+        if continuation_state is not None
+        else None
     )
-    batch = env.reset(seed=training.seed)
-    rng = np.random.default_rng(training.seed ^ 0x50504F)
-    opponent_indices = rng.choice(
-        len(frozen), size=num_envs, p=weights
-    ).astype(np.int32)
-    candidate_players = (np.arange(num_envs, dtype=np.int32) & 1).copy()
-    traces: list[list[_PPOTransition]] = [[] for _ in range(num_envs)]
-    objective_histories: list[Deque[_ObjectiveReplayExample]] = [
-        deque(maxlen=objective_replay_horizon) for _ in range(num_envs)
-    ]
-    objective_replay: Deque[_ObjectiveReplayExample] = deque(
-        maxlen=objective_replay_capacity
+    if scaler is None:
+        scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
+    continuation_signature = (
+        num_envs,
+        training.map_size,
+        num_threads,
+        max_actions,
+        visible_action_history,
     )
-    ppg_replay: Deque[_PPGExample] = deque(maxlen=ppg_buffer_capacity)
-    episode_moves = np.zeros(num_envs, dtype=np.int32)
-    episode_numbers = np.zeros(num_envs, dtype=np.int64)
+    if (
+        continuation_state is not None
+        and continuation_state.get("environment_signature")
+        == continuation_signature
+        and "env" in continuation_state
+        and "batch" in continuation_state
+    ):
+        env = continuation_state["env"]
+        batch = continuation_state["batch"]
+        reused_environment = True
+    else:
+        env = VectorGameEnv(
+            num_envs=num_envs,
+            seed=training.seed,
+            map_size=training.map_size,
+            players=(Bardur, Imperius),
+            num_threads=num_threads,
+            max_actions=max_actions,
+            auto_reset=True,
+            visible_event_history=visible_action_history,
+        )
+        batch = env.reset(seed=training.seed)
+        reused_environment = False
+    rng = (
+        continuation_state.get("rng")
+        if continuation_state is not None
+        else None
+    )
+    if rng is None:
+        rng = np.random.default_rng(training.seed ^ 0x50504F)
+    if reused_environment and len(carried_opponents) == num_envs:
+        opponent_indices = np.asarray(
+            [
+                next(
+                    index
+                    for index, opponent in enumerate(frozen)
+                    if opponent is model
+                )
+                for model in carried_opponents
+            ],
+            dtype=np.int32,
+        )
+    else:
+        opponent_indices = rng.choice(
+            active_opponent_count, size=num_envs, p=weights
+        ).astype(np.int32)
+    candidate_players = (
+        np.asarray(continuation_state["candidate_players"], dtype=np.int32)
+        if reused_environment
+        else (np.arange(num_envs, dtype=np.int32) & 1).copy()
+    )
+    traces: list[list[_PPOTransition]] = (
+        continuation_state.get("traces")
+        if reused_environment
+        else [[] for _ in range(num_envs)]
+    )
+    objective_histories: list[Deque[_ObjectiveReplayExample]] = (
+        continuation_state.get("objective_histories")
+        if reused_environment
+        else [
+            deque(maxlen=objective_replay_horizon) for _ in range(num_envs)
+        ]
+    )
+    objective_replay: Deque[_ObjectiveReplayExample] = (
+        continuation_state.get("objective_replay")
+        if continuation_state is not None
+        and continuation_state.get("objective_replay") is not None
+        else deque(maxlen=objective_replay_capacity)
+    )
+    ppg_replay: Deque[_PPGExample] = (
+        continuation_state.get("ppg_replay")
+        if continuation_state is not None
+        and continuation_state.get("ppg_replay") is not None
+        else deque(maxlen=ppg_buffer_capacity)
+    )
+    terminal_replay: Deque[_PPGExample] = (
+        continuation_state.get("terminal_replay")
+        if continuation_state is not None
+        and continuation_state.get("terminal_replay") is not None
+        else deque(maxlen=max(1, terminal_replay_capacity))
+    )
+    episode_moves = (
+        np.asarray(continuation_state["episode_moves"], dtype=np.int32)
+        if reused_environment
+        else np.zeros(num_envs, dtype=np.int32)
+    )
+    episode_numbers = (
+        np.asarray(continuation_state["episode_numbers"], dtype=np.int64)
+        if reused_environment
+        else np.zeros(num_envs, dtype=np.int64)
+    )
     completed_games = wins = losses = draws = 0
     value_calibration = _TerminalValueCalibration()
     candidate_turns = opponent_turns = 0
@@ -1567,12 +1734,21 @@ def train_vector_population(
     ppo_policy_samples = 0
     ppo_behaviour_kl_limits = 0
     completed_examples: list[_PPOExample] = []
-    pending_candidate_examples = 0
+    pending_candidate_examples = int(
+        continuation_state.get("pending_candidate_examples", 0)
+        if reused_environment
+        else 0
+    )
     ppo_forced_truncations = 0
     objective_replay_events = 0
     objective_replay_positions = 0
     objective_replay_updates = 0
-    objective_replay_update_credits = 0
+    objective_replay_update_credits = int(
+        continuation_state.get("objective_replay_update_credits", 0)
+        if continuation_state is not None
+        else 0
+    )
+    terminal_replay_updates = 0
     ppg_samples_added = 0
     ppg_phases = 0
     ppg_updates = 0
@@ -1590,7 +1766,11 @@ def train_vector_population(
         "clip_fraction": 0.0,
         "entropy": 0.0,
         "objective_replay_loss": 0.0,
+        "terminal_replay_value_loss": 0.0,
         "policy_selected_fraction": 0.0,
+        "policy_age_mean": 0.0,
+        "policy_age_max": 0.0,
+        "policy_stale_samples": 0.0,
     }
     # A PPO update happens only after enough completed trajectories have been
     # collected.  Keep its most recent value separately from the metrics for
@@ -1612,6 +1792,7 @@ def train_vector_population(
         nonlocal ppo_updates, ppo_policy_samples, ppo_behaviour_kl_limits
         nonlocal ema_updates
         nonlocal objective_replay_updates, objective_replay_update_credits
+        nonlocal terminal_replay_updates
         if not examples:
             return {
                 "loss": 0.0,
@@ -1623,6 +1804,7 @@ def train_vector_population(
                 "clip_fraction": 0.0,
                 "entropy": 0.0,
                 "objective_replay_loss": 0.0,
+                "terminal_replay_value_loss": 0.0,
             }
         advantages = np.asarray(
             [example.advantage for example in examples], dtype=np.float32
@@ -1632,9 +1814,15 @@ def train_vector_population(
         )
         for example, advantage in zip(examples, advantages):
             example.advantage = float(advantage)
-        _mark_top_advantage_examples(
-            examples, ppo_top_advantage_fraction
+        _mark_top_advantage_examples(examples, ppo_top_advantage_fraction)
+        policy_ages = np.asarray(
+            [ppo_updates - example.policy_version for example in examples],
+            dtype=np.int32,
         )
+        if ppo_max_policy_age is not None:
+            for example, age in zip(examples, policy_ages):
+                if age > ppo_max_policy_age:
+                    example.policy_selected = False
         totals_local = {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -1645,6 +1833,7 @@ def train_vector_population(
             "clip_fraction": 0.0,
             "entropy": 0.0,
             "objective_replay_loss": 0.0,
+            "terminal_replay_value_loss": 0.0,
             "policy_selected_fraction": 0.0,
         }
         local_updates = 0
@@ -1894,12 +2083,56 @@ def train_vector_population(
                     objective_replay_update_credits -= (
                         objective_replay_batch_size
                     )
+                terminal_replay_value_loss = output.value.sum() * 0.0
+                if (
+                    terminal_replay_enabled
+                    and len(terminal_replay) >= terminal_replay_batch_size
+                    and (ppo_updates + 1) % terminal_replay_interval == 0
+                ):
+                    terminal_indices = rng.choice(
+                        len(terminal_replay),
+                        size=terminal_replay_batch_size,
+                        replace=False,
+                    )
+                    terminal_examples = [
+                        list(terminal_replay)[int(index)]
+                        for index in terminal_indices
+                    ]
+                    terminal_batch = _collate_public_observations(
+                        terminal_examples
+                    )
+                    terminal_tensors = _vector_tensors(
+                        terminal_batch, device, training
+                    )
+                    terminal_targets = torch.as_tensor(
+                        [example.return_target for example in terminal_examples],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    terminal_output = candidate(
+                        terminal_tensors["map_tokens"],
+                        terminal_tensors["global_features"],
+                        terminal_tensors["action_categorical"],
+                        terminal_tensors["action_continuous"],
+                        terminal_tensors["action_mask"],
+                        terminal_tensors["event_features"],
+                        action_history=terminal_tensors["action_history"],
+                        action_history_mask=terminal_tensors[
+                            "action_history_mask"
+                        ],
+                        include_belief=False,
+                    )
+                    terminal_replay_value_loss = F.smooth_l1_loss(
+                        terminal_output.value.float(), terminal_targets
+                    )
+                    terminal_replay_updates += 1
                 loss = (
                     policy_loss
                     + 0.50 * value_loss
                     + kl_multiplier * champion_kl
                     + 0.25 * value_anchor_weight * value_anchor_loss
                     + objective_replay_weight * objective_replay_loss
+                    + terminal_replay_value_weight * terminal_replay_value_loss
                     - entropy_weight * entropy
                 )
                 optimiser.zero_grad(set_to_none=True)
@@ -1924,6 +2157,9 @@ def train_vector_population(
                     "entropy": float(entropy.detach().cpu()),
                     "objective_replay_loss": float(
                         objective_replay_loss.detach().cpu()
+                    ),
+                    "terminal_replay_value_loss": float(
+                        terminal_replay_value_loss.detach().cpu()
                     ),
                     "policy_selected_fraction": float(
                         policy_selected_tensor.float().mean().detach().cpu()
@@ -1985,6 +2221,13 @@ def train_vector_population(
             np.mean(accepted_epoch_behaviour_kls)
             if accepted_epoch_behaviour_kls
             else 0.0
+        )
+        result["policy_age_mean"] = float(policy_ages.mean())
+        result["policy_age_max"] = float(policy_ages.max())
+        result["policy_stale_samples"] = float(
+            (policy_ages > ppo_max_policy_age).sum()
+            if ppo_max_policy_age is not None
+            else 0
         )
         return result
 
@@ -2333,6 +2576,7 @@ def train_vector_population(
                         old_policy_log_probabilities=old_policy_logs[
                             env_id, np.flatnonzero(legal[env_id])
                         ].copy(),
+                        policy_version=ppo_updates,
                     )
                     pending_candidate_examples += 1
                 traces[env_id].append(
@@ -2373,6 +2617,17 @@ def train_vector_population(
                     ),
                 )
                 value_calibration.add(finished_examples, candidate_outcome)
+                if terminal_replay_enabled:
+                    # These are immutable public observations paired only
+                    # with a genuine final outcome.  They train the critic,
+                    # never an off-policy actor target.
+                    for finished_example in finished_examples:
+                        terminal_replay.append(
+                            _PPGExample(
+                                observation=finished_example.observation,
+                                return_target=candidate_outcome,
+                            )
+                        )
                 completed_examples.extend(finished_examples)
                 pending_candidate_examples -= len(finished_examples)
                 traces[int(env_id)].clear()
@@ -2399,10 +2654,11 @@ def train_vector_population(
                         "score_a": score,
                         "moves": int(episode_moves[env_id]),
                         "opponent_model_index": selected_opponent,
+                        "opponent_id": frozen_opponent_ids[selected_opponent],
                     })
                 candidate_players[env_id] = 1 - candidate_players[env_id]
                 opponent_indices[env_id] = int(
-                    rng.choice(len(frozen), p=weights)
+                    rng.choice(active_opponent_count, p=weights)
                 )
                 episode_moves[env_id] = 0
                 episode_numbers[env_id] += 1
@@ -2420,8 +2676,11 @@ def train_vector_population(
                     pending_candidate_examples -= len(truncated_examples)
                     trace.clear()
                     ppo_forced_truncations += 1
-            if step + 1 == steps:
+            if step + 1 == steps and continuation_state is None:
                 # The final block boundary is a bootstrap, never a fake draw.
+                # Flat continuation instead preserves the live trajectory
+                # until its real outcome, allowing terminal replay to cover
+                # a complete long game.
                 for trace in traces:
                     if not trace:
                         continue
@@ -2465,6 +2724,7 @@ def train_vector_population(
                 ppo_updates=ppo_updates,
                 ppo_rollouts=ppo_rollouts,
                 ppo_pending_examples=pending_candidate_examples,
+                ppo_environment_reused=float(reused_environment),
                 ppo_forced_truncations=ppo_forced_truncations,
                 ppg_enabled=float(ppg_enabled),
                 ppg_buffer_size=len(ppg_replay),
@@ -2476,6 +2736,8 @@ def train_vector_population(
                 objective_replay_positions=objective_replay_positions,
                 objective_replay_size=len(objective_replay),
                 objective_replay_updates=objective_replay_updates,
+                terminal_replay_size=len(terminal_replay),
+                terminal_replay_updates=terminal_replay_updates,
                 objective_replay_update_credits=(
                     objective_replay_update_credits
                 ),
@@ -2588,6 +2850,16 @@ def train_vector_population(
             objective_replay_updates * objective_replay_batch_size
             / max(1, objective_replay_positions)
         ),
+        "direct_population_terminal_replay_enabled": float(
+            terminal_replay_enabled
+        ),
+        "direct_population_terminal_replay_size": float(len(terminal_replay)),
+        "direct_population_terminal_replay_updates": float(
+            terminal_replay_updates
+        ),
+        "direct_population_terminal_replay_value_weight": float(
+            terminal_replay_value_weight
+        ),
         "direct_population_objective_replay_weight": float(
             objective_replay_weight
         ),
@@ -2613,6 +2885,9 @@ def train_vector_population(
         "direct_population_ppo_rollout_temperature": float(
             ppo_rollout_temperature
         ),
+        "direct_population_ppo_environment_reused": float(
+            reused_environment
+        ),
         "direct_population_ppo_reward": reward_total / max(1, step + 1),
         "direct_population_shaping_weight_start": float(shaping_weight),
         "direct_population_shaping_weight_final": float(
@@ -2635,6 +2910,35 @@ def train_vector_population(
             for name, value in totals.items()
         },
     }
+    if continuation_state is not None:
+        # Flat curriculum blocks deliberately share optimizer moments and
+        # replay.  Their policy samples remain on-policy because PPO examples
+        # themselves are never carried over; only value/auxiliary replay is.
+        continuation_state.update(
+            optimiser=optimiser,
+            scaler=scaler,
+            rng=rng,
+            objective_replay=objective_replay,
+            objective_replay_update_credits=objective_replay_update_credits,
+            ppg_replay=ppg_replay,
+            terminal_replay=terminal_replay,
+            env=env,
+            batch=batch,
+            environment_signature=continuation_signature,
+            opponent_indices=opponent_indices,
+            environment_opponents=[
+                frozen[int(index)] for index in opponent_indices
+            ],
+            environment_opponent_ids=[
+                frozen_opponent_ids[int(index)] for index in opponent_indices
+            ],
+            candidate_players=candidate_players,
+            episode_moves=episode_moves,
+            episode_numbers=episode_numbers,
+            traces=traces,
+            objective_histories=objective_histories,
+            pending_candidate_examples=pending_candidate_examples,
+        )
     summary["run_dir"] = str(run.finish(summary))
     return summary
 
@@ -2794,6 +3098,52 @@ def _population_block_selects_checkpoint(
     return False, "safe_but_not_best"
 
 
+def _flat_pfsp_weights(
+    scores: Sequence[float],
+    *,
+    alpha: float,
+    probability_floor: float,
+    role: str = "main",
+    primary_index: int | None = None,
+    primary_probability: float = 0.70,
+) -> np.ndarray:
+    """Prefer opponents near a 50% score for the current flat candidate.
+
+    Unlike the league's champion-centric PFSP, this uses the candidate's own
+    held-out results.  Both solved and impossible opponents retain a floor so
+    the policy cannot forget openings or collapse against a hard counter.
+    """
+    values = np.clip(np.asarray(scores, dtype=np.float64), 0.0, 1.0)
+    if values.ndim != 1 or not values.size:
+        raise ValueError("PFSP requires at least one opponent score")
+    if alpha <= 0.0 or not 0.0 <= probability_floor < 1.0:
+        raise ValueError("invalid flat PFSP settings")
+    if role not in {"main", "main_exploiter"}:
+        raise ValueError("flat PFSP role must be 'main' or 'main_exploiter'")
+    if not 0.0 <= primary_probability <= 1.0:
+        raise ValueError("primary PFSP probability must be in [0, 1]")
+    if role == "main_exploiter" and (
+        primary_index is None
+        or not 0 <= primary_index < len(values)
+    ):
+        raise ValueError("main exploiter PFSP requires a primary opponent")
+    hardness = np.maximum(values * (1.0 - values), 1.0e-6) ** alpha
+    free_mass = max(0.0, 1.0 - probability_floor * len(values))
+    if free_mass <= 0.0:
+        weights = np.full(values.shape, 1.0 / len(values), dtype=np.float64)
+    else:
+        weights = probability_floor + free_mass * hardness / hardness.sum()
+    if role == "main_exploiter":
+        # The exploiter's purpose is to expose the current main's blind
+        # spots, not merely to become another generic PFSP branch.  Keep a
+        # stable majority of its collection budget on that exact snapshot;
+        # the remainder still protects it from overfitting to one policy.
+        weights *= 1.0 - primary_probability
+        weights[int(primary_index)] += primary_probability
+        weights /= weights.sum()
+    return weights
+
+
 def train_direct_population_curriculum(
     training: TrainingConfig,
     model_config: ModelConfig,
@@ -2862,12 +3212,33 @@ def train_direct_population_curriculum(
     ppg_value_weight: float = 1.0,
     ema_enabled: bool = True,
     ema_decay: float = 0.999,
+    # These controls are enabled only by train_flat.py. Defaults preserve the
+    # legacy direct curriculum for every other caller.
+    flat_persistent_optimizer: bool = False,
+    flat_terminal_replay_capacity: int = 0,
+    flat_terminal_replay_batch_size: int = 0,
+    flat_terminal_replay_interval: int = 1,
+    flat_terminal_replay_value_weight: float = 0.0,
+    flat_ppo_max_policy_age: int | None = None,
+    flat_policy_anchor_final_weight: float | None = None,
+    flat_snapshot_archive_size: int = 0,
+    flat_pfsp_alpha: float = 2.0,
+    flat_pfsp_probability_floor: float = 0.05,
+    flat_pfsp_score_ema_decay: float = 0.80,
+    flat_role: str = "main",
+    flat_primary_opponent_id: int | str | None = None,
+    flat_primary_opponent_probability: float = 0.70,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
     | None = None,
     candidate_label: str = "pretendent",
     opponent_labels: Sequence[str] | None = None,
+    opponent_ids: Sequence[int | str] | None = None,
+    benchmark_opponent_models: Sequence[PolicyValueBeliefNet] | None = None,
+    benchmark_opponent_weights: Sequence[float] | None = None,
+    benchmark_opponent_labels: Sequence[str] | None = None,
+    benchmark_opponent_ids: Sequence[int | str] | None = None,
     run: TrainingRun | None = None,
 ) -> Dict[str, Any]:
     """Advance raw population play only while held-out population skill grows."""
@@ -2879,8 +3250,13 @@ def train_direct_population_curriculum(
         raise ValueError("block_steps must be positive")
     if gate_games < 2 or gate_games % 2:
         raise ValueError("direct population gate games must be positive and even")
+    # A diagnostic screen must never be larger than the final promotion gate.
+    # Keep the public default useful for long runs, while making small test and
+    # smoke configurations work without requiring an extra override.
     resolved_diagnostic_gate_games = (
-        gate_games if diagnostic_gate_games is None else int(diagnostic_gate_games)
+        gate_games
+        if diagnostic_gate_games is None
+        else min(gate_games, int(diagnostic_gate_games))
     )
     if (
         resolved_diagnostic_gate_games < 2
@@ -2971,6 +3347,24 @@ def train_direct_population_curriculum(
         raise ValueError("PPG loss weights must not be negative")
     if not 0.0 <= shaping_final_weight <= 1.0:
         raise ValueError("shaping_final_weight must be between zero and one")
+    if flat_policy_anchor_final_weight is not None and not 0.0 <= flat_policy_anchor_final_weight <= 1.0:
+        raise ValueError("flat_policy_anchor_final_weight must be between zero and one")
+    if flat_snapshot_archive_size < 0:
+        raise ValueError("flat_snapshot_archive_size must not be negative")
+    if flat_snapshot_archive_size and not 0.0 <= flat_pfsp_probability_floor < 1.0:
+        raise ValueError("flat_pfsp_probability_floor must be in [0, 1)")
+    if flat_snapshot_archive_size and flat_pfsp_alpha <= 0.0:
+        raise ValueError("flat_pfsp_alpha must be positive")
+    if not 0.0 <= flat_pfsp_score_ema_decay < 1.0:
+        raise ValueError("flat_pfsp_score_ema_decay must be in [0, 1)")
+    if flat_role not in {"main", "main_exploiter"}:
+        raise ValueError("flat_role must be 'main' or 'main_exploiter'")
+    if not 0.0 <= flat_primary_opponent_probability <= 1.0:
+        raise ValueError(
+            "flat_primary_opponent_probability must be in [0, 1]"
+        )
+    if flat_ppo_max_policy_age is not None and flat_ppo_max_policy_age < 0:
+        raise ValueError("flat_ppo_max_policy_age must not be negative")
     if ema_enabled and not 0.0 <= ema_decay < 1.0:
         raise ValueError("ema_decay must be in [0, 1)")
     weights = np.asarray(opponent_weights, dtype=np.float64)
@@ -2982,6 +3376,78 @@ def train_direct_population_curriculum(
     ):
         raise ValueError("opponent_weights must be finite and positive")
     weights /= weights.sum()
+    active_opponents = list(opponent_models)
+    active_weights = weights.copy()
+    active_labels = (
+        [f"model B {index + 1}" for index in range(len(active_opponents))]
+        if opponent_labels is None
+        else [str(label) for label in opponent_labels]
+    )
+    if len(active_labels) != len(active_opponents):
+        raise ValueError("opponent_labels must match opponent_models")
+    active_ids: list[int | str] = (
+        list(range(len(active_opponents)))
+        if opponent_ids is None
+        else list(opponent_ids)
+    )
+    if len(active_ids) != len(active_opponents):
+        raise ValueError("opponent_ids must match opponent_models")
+    benchmark_opponents = tuple(
+        active_opponents
+        if benchmark_opponent_models is None
+        else benchmark_opponent_models
+    )
+    if not benchmark_opponents:
+        raise ValueError("fixed benchmark requires at least one opponent")
+    benchmark_weights = (
+        (
+            weights.copy()
+            if benchmark_opponent_models is None
+            else np.full(
+                len(benchmark_opponents),
+                1.0 / len(benchmark_opponents),
+                dtype=np.float64,
+            )
+        )
+        if benchmark_opponent_weights is None
+        else np.asarray(benchmark_opponent_weights, dtype=np.float64)
+    )
+    if (
+        benchmark_weights.shape != (len(benchmark_opponents),)
+        or np.any(benchmark_weights < 0.0)
+        or not np.isfinite(benchmark_weights).all()
+        or float(benchmark_weights.sum()) <= 0.0
+    ):
+        raise ValueError("benchmark_opponent_weights must be finite and positive")
+    benchmark_weights = benchmark_weights / benchmark_weights.sum()
+    benchmark_labels = tuple(
+        active_labels
+        if benchmark_opponent_labels is None
+        else [str(label) for label in benchmark_opponent_labels]
+    )
+    benchmark_ids = tuple(
+        active_ids
+        if benchmark_opponent_ids is None
+        else list(benchmark_opponent_ids)
+    )
+    if len(benchmark_labels) != len(benchmark_opponents):
+        raise ValueError("benchmark_opponent_labels must match benchmark models")
+    if len(benchmark_ids) != len(benchmark_opponents):
+        raise ValueError("benchmark_opponent_ids must match benchmark models")
+    primary_index = (
+        active_ids.index(flat_primary_opponent_id)
+        if flat_primary_opponent_id in active_ids
+        else None
+    )
+    if flat_role == "main_exploiter" and primary_index is None:
+        raise ValueError(
+            "flat main exploiter requires its current-main opponent ID"
+        )
+    flat_snapshots: list[PolicyValueBeliefNet] = []
+    flat_pfsp_scores = np.full(len(active_opponents), 0.5, dtype=np.float64)
+    flat_continuation: dict[str, Any] | None = (
+        {} if flat_persistent_optimizer else None
+    )
     run = run or TrainingRun.create("runs", "direct_population_curriculum")
     run.write_config(
         training=training,
@@ -3053,12 +3519,24 @@ def train_direct_population_curriculum(
             "ppg_value_weight": ppg_value_weight,
             "ema_enabled": ema_enabled,
             "ema_decay": ema_decay if ema_enabled else None,
+            "flat_ppo_max_policy_age": flat_ppo_max_policy_age,
+            "flat_persistent_optimizer": flat_persistent_optimizer,
+            "flat_terminal_replay_capacity": flat_terminal_replay_capacity,
+            "flat_terminal_replay_batch_size": flat_terminal_replay_batch_size,
+            "flat_terminal_replay_interval": flat_terminal_replay_interval,
+            "flat_terminal_replay_value_weight": flat_terminal_replay_value_weight,
+            "flat_policy_anchor_final_weight": flat_policy_anchor_final_weight,
+            "flat_snapshot_archive_size": flat_snapshot_archive_size,
+            "flat_pfsp_alpha": flat_pfsp_alpha,
+            "flat_pfsp_probability_floor": flat_pfsp_probability_floor,
         },
     )
     parent_state = model_state_on_cpu(candidate)
     best_state = model_state_on_cpu(candidate)
     ema_model: PolicyValueBeliefNet | None = None
     best_ema_state: Dict[str, torch.Tensor] | None = None
+    best_flat_optimiser_state: Dict[str, Any] | None = None
+    best_flat_scaler_state: Dict[str, Any] | None = None
     if ema_enabled:
         ema_model = PolicyValueBeliefNet(model_config)
         restore_model_state(ema_model, parent_state)
@@ -3094,11 +3572,13 @@ def train_direct_population_curriculum(
         nonlocal rollback_blocks
         nonlocal best_meets_readiness
         nonlocal consecutive_regressions, maximum_consecutive_regressions
-        evaluation = evaluate_direct_population_matches(
+        nonlocal active_weights, flat_pfsp_scores
+        nonlocal best_flat_optimiser_state, best_flat_scaler_state
+        training_evaluation = evaluate_direct_population_matches(
             training,
             candidate,
-            opponent_models,
-            weights,
+            active_opponents,
+            active_weights,
             games=games,
             gate_seed=gate_seed,
             visible_action_history=visible_action_history,
@@ -3106,15 +3586,59 @@ def train_direct_population_curriculum(
                 None
                 if gate_game_callback is None
                 else lambda opponent_index, game: gate_game_callback(
-                    label, block, opponent_index, game
+                    label,
+                    block,
+                    opponent_index,
+                    {
+                        **game,
+                        "opponent_id": active_ids[opponent_index],
+                    },
                 )
             ),
             candidate_label=candidate_label,
-            opponent_labels=opponent_labels,
+            opponent_labels=active_labels,
             num_threads=num_threads,
             max_actions=max_actions,
         )
+        benchmark_matches_active = (
+            len(active_opponents) == len(benchmark_opponents)
+            and all(
+                active is benchmark
+                for active, benchmark in zip(active_opponents, benchmark_opponents)
+            )
+            and np.array_equal(active_weights, benchmark_weights)
+        )
+        if benchmark_matches_active:
+            evaluation = training_evaluation
+        else:
+            evaluation = evaluate_direct_population_matches(
+                training,
+                candidate,
+                benchmark_opponents,
+                benchmark_weights,
+                games=games,
+                gate_seed=gate_seed,
+                visible_action_history=visible_action_history,
+                game_callback=(
+                    None
+                    if gate_game_callback is None
+                    else lambda opponent_index, game: gate_game_callback(
+                        f"{label}_benchmark",
+                        block,
+                        opponent_index,
+                        {
+                            **game,
+                            "opponent_id": benchmark_ids[opponent_index],
+                        },
+                    )
+                ),
+                candidate_label=candidate_label,
+                opponent_labels=benchmark_labels,
+                num_threads=num_threads,
+                max_actions=max_actions,
+            )
         results = evaluation["opponents"]
+        training_results = training_evaluation["opponents"]
         weighted_score = float(evaluation["model_a_score"])
         worst_score = float(evaluation["worst_score"])
         capture_rate = float(
@@ -3159,6 +3683,13 @@ def train_direct_population_curriculum(
                 best_objective_progress = objective_progress
                 if not baseline:
                     selected_blocks += 1
+                    if flat_continuation is not None:
+                        best_flat_optimiser_state = deepcopy(
+                            flat_continuation["optimiser"].state_dict()
+                        )
+                        best_flat_scaler_state = deepcopy(
+                            flat_continuation["scaler"].state_dict()
+                        )
             elif not baseline:
                 # A 20-game diagnostic only resolves score in coarse steps.
                 # Keep a safe near-tie as the *working* policy so several
@@ -3188,12 +3719,94 @@ def train_direct_population_curriculum(
             restore_model_state(candidate, best_state)
             if ema_model is not None and best_ema_state is not None:
                 restore_model_state(ema_model, best_ema_state)
+            if (
+                flat_continuation is not None
+                and best_flat_optimiser_state is not None
+            ):
+                flat_continuation["optimiser"].load_state_dict(
+                    best_flat_optimiser_state
+                )
+                if best_flat_scaler_state is not None:
+                    flat_continuation["scaler"].load_state_dict(
+                        best_flat_scaler_state
+                    )
+            elif flat_continuation is not None:
+                # No post-baseline checkpoint exists yet: the restored
+                # parent must start the next attempt with fresh moments.
+                flat_continuation.clear()
             rollback_blocks += 1
             consecutive_regressions += 1
             maximum_consecutive_regressions = max(
                 maximum_consecutive_regressions,
                 consecutive_regressions,
             )
+        # The baseline gate has no candidate-specific outcome to learn from.
+        # Also keep evaluation stubs / interrupted evaluations harmless: there
+        # is nothing meaningful to reweight until at least one opponent result
+        # was completed.
+        if (
+            flat_snapshot_archive_size
+            and accepted
+            and not baseline
+            and training_results
+        ):
+            # Scores are always measured for the candidate that just reached
+            # this gate; use them to choose its next training opponents.
+            observed_scores = np.asarray(
+                [float(result["model_a_score"]) for result in training_results],
+                dtype=np.float64,
+            )
+            # Gate samples are deliberately small.  An exponential moving
+            # average prevents one lucky two-game result from completely
+            # changing which counterstrategy the next PPO block sees.
+            if observed_scores.shape == flat_pfsp_scores.shape:
+                flat_pfsp_scores = (
+                    flat_pfsp_score_ema_decay * flat_pfsp_scores
+                    + (1.0 - flat_pfsp_score_ema_decay) * observed_scores
+                )
+            else:
+                flat_pfsp_scores = observed_scores
+            active_weights = _flat_pfsp_weights(
+                flat_pfsp_scores,
+                alpha=flat_pfsp_alpha,
+                probability_floor=flat_pfsp_probability_floor,
+                role=flat_role,
+                primary_index=primary_index,
+                primary_probability=flat_primary_opponent_probability,
+            )
+            if selected and not baseline:
+                snapshot = PolicyValueBeliefNet(model_config)
+                restore_model_state(snapshot, model_state_on_cpu(candidate))
+                snapshot.eval()
+                for parameter in snapshot.parameters():
+                    parameter.requires_grad_(False)
+                active_opponents.append(snapshot)
+                active_labels.append(f"flat snapshot {block:03d}")
+                active_ids.append(f"flat-snapshot-{block:03d}")
+                flat_snapshots.append(snapshot)
+                flat_pfsp_scores = np.append(flat_pfsp_scores, 0.5)
+                if len(flat_snapshots) > flat_snapshot_archive_size:
+                    expired = flat_snapshots.pop(0)
+                    expired_index = next(
+                        index
+                        for index, model in enumerate(active_opponents)
+                        if model is expired
+                    )
+                    active_opponents.pop(expired_index)
+                    active_labels.pop(expired_index)
+                    active_ids.pop(expired_index)
+                    flat_pfsp_scores = np.delete(
+                        flat_pfsp_scores, expired_index
+                    )
+                active_weights = _flat_pfsp_weights(
+                    flat_pfsp_scores,
+                    alpha=flat_pfsp_alpha,
+                    probability_floor=flat_pfsp_probability_floor,
+                    role=flat_role,
+                    primary_index=primary_index,
+                    primary_probability=flat_primary_opponent_probability,
+                )
+        benchmark_score = weighted_score
         row = {
             "stage": label,
             "block": float(block),
@@ -3212,6 +3825,13 @@ def train_direct_population_curriculum(
             "consecutive_regressions": float(consecutive_regressions),
             "games": float(games),
             "opponents": results,
+            "training_mix_score": float(training_evaluation["model_a_score"]),
+            "training_mix_worst_score": float(training_evaluation["worst_score"]),
+            "flat_static_benchmark_score": benchmark_score,
+            "flat_role": flat_role,
+            "flat_pfsp_score_ema": flat_pfsp_scores.tolist(),
+            "flat_pfsp_weights": active_weights.tolist(),
+            "flat_snapshot_count": len(flat_snapshots),
         }
         gate_rows.append(row)
         run.log(
@@ -3232,13 +3852,23 @@ def train_direct_population_curriculum(
                 consecutive_regressions
             ),
             direct_population_gate_games=float(games),
+            flat_static_benchmark_score=(
+                0.0 if benchmark_score is None else benchmark_score
+            ),
+            flat_role=flat_role,
+            flat_snapshot_count=float(len(flat_snapshots)),
         )
         if not baseline:
             print(
                 "direct population diagnostic | "
                 f"block={block} score={weighted_score:.4f} "
                 f"worst={worst_score:.4f} accepted={int(accepted)} "
-                f"selection={selection_reason}",
+                f"selection={selection_reason}"
+                + (
+                    ""
+                    if benchmark_score is None
+                    else f" benchmark={benchmark_score:.4f}"
+                ),
                 flush=True,
             )
         return accepted
@@ -3266,15 +3896,23 @@ def train_direct_population_curriculum(
             block_training,
             model_config,
             candidate,
-            opponent_models,
-            opponent_weights,
+            active_opponents,
+            active_weights,
             num_envs=num_envs,
             steps=current_steps,
             num_threads=num_threads,
             max_actions=max_actions,
             anchor_model=champion,
             visible_action_history=visible_action_history,
-            policy_anchor_weight=policy_anchor_weight,
+            policy_anchor_weight=(
+                policy_anchor_weight
+                if flat_policy_anchor_final_weight is None
+                else (
+                    policy_anchor_weight
+                    + (flat_policy_anchor_final_weight - policy_anchor_weight)
+                    * ((completed + current_steps * 0.5) / max(1, maximum_steps))
+                )
+            ),
             value_anchor_weight=value_anchor_weight,
             opponent_policy_weight=opponent_policy_weight,
             teacher_weight=teacher_weight,
@@ -3305,6 +3943,12 @@ def train_direct_population_curriculum(
             objective_replay_weight=objective_replay_weight,
             objective_replay_recency=objective_replay_recency,
             objective_replay_max_epochs=objective_replay_max_epochs,
+            terminal_replay_capacity=flat_terminal_replay_capacity,
+            terminal_replay_batch_size=flat_terminal_replay_batch_size,
+            terminal_replay_interval=flat_terminal_replay_interval,
+            terminal_replay_value_weight=flat_terminal_replay_value_weight,
+            ppo_max_policy_age=flat_ppo_max_policy_age,
+            opponent_ids=active_ids,
             ppg_enabled=ppg_enabled,
             ppg_interval=ppg_interval,
             ppg_buffer_capacity=ppg_buffer_capacity,
@@ -3316,6 +3960,7 @@ def train_direct_population_curriculum(
             ppg_value_weight=ppg_value_weight,
             ema_model=ema_model,
             ema_decay=ema_decay,
+            continuation_state=flat_continuation,
             game_callback=(
                 None
                 if training_game_callback is None
@@ -3419,8 +4064,8 @@ def train_direct_population_curriculum(
         evaluation = evaluate_direct_population_matches(
             training,
             candidate,
-            opponent_models,
-            weights,
+            benchmark_opponents,
+            benchmark_weights,
             games=gate_games,
             gate_seed=gate_seed,
             visible_action_history=visible_action_history,
@@ -3428,11 +4073,17 @@ def train_direct_population_curriculum(
                 None
                 if gate_game_callback is None
                 else lambda opponent_index, game, stage=label: gate_game_callback(
-                    f"final_{stage}", block, opponent_index, game
+                    f"final_{stage}",
+                    block,
+                    opponent_index,
+                    {
+                        **game,
+                        "opponent_id": benchmark_ids[opponent_index],
+                    },
                 )
             ),
             candidate_label=label_for_log,
-            opponent_labels=opponent_labels,
+            opponent_labels=benchmark_labels,
             num_threads=num_threads,
             max_actions=max_actions,
         )
@@ -3609,6 +4260,21 @@ def train_direct_population_curriculum(
         ),
         "direct_population_algorithm": (
             "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
+        ),
+        "flat_population_persistent_optimizer": float(
+            flat_persistent_optimizer
+        ),
+        "flat_population_snapshot_count": float(len(flat_snapshots)),
+        "flat_population_active_opponents": float(len(active_opponents)),
+        "flat_population_role": flat_role,
+        "flat_population_primary_opponent_id": flat_primary_opponent_id,
+        "flat_population_pfsp_score_ema": flat_pfsp_scores.tolist(),
+        "flat_population_pfsp_weights": active_weights.tolist(),
+        "flat_population_static_benchmark_score": (
+            float(gate_rows[-1].get("flat_static_benchmark_score"))
+            if gate_rows
+            and gate_rows[-1].get("flat_static_benchmark_score") is not None
+            else None
         ),
         "direct_population_diagnostic_gate_games": float(
             resolved_diagnostic_gate_games

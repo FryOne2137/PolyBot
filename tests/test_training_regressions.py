@@ -128,6 +128,7 @@ from polybot.training.vector_population import (
     _ppo_batch,
     _ppo_snapshot,
     _finish_ppo_trace,
+    _flat_pfsp_weights,
     _mark_top_advantage_examples,
     _population_block_acceptance,
     _population_block_selects_checkpoint,
@@ -346,34 +347,27 @@ def test_population_safe_near_tie_resumes_from_strongest_checkpoint():
     candidate = PolicyValueBeliefNet(config)
     champion = PolicyValueBeliefNet(config)
     gate_rows = [
-        {
-            "model_a_score": 0.50,
-            "worst_score": 0.50,
-            "model_a_city_captures_per_game": 0.10,
-            "completion_rate": 0.50,
-            "opponents": [],
-        },
-        {
-            "model_a_score": 0.60,
-            "worst_score": 0.60,
-            "model_a_city_captures_per_game": 0.20,
-            "completion_rate": 0.60,
-            "opponents": [],
-        },
-        {
-            "model_a_score": 0.59,
-            "worst_score": 0.59,
-            "model_a_city_captures_per_game": 0.40,
-            "completion_rate": 0.80,
-            "opponents": [],
-        },
-        {
-            "model_a_score": 0.60,
-            "worst_score": 0.60,
-            "model_a_city_captures_per_game": 0.20,
-            "completion_rate": 0.60,
-            "opponents": [],
-        },
+        # baseline, block 1, block 2
+        {"model_a_score": 0.50, "worst_score": 0.50,
+         "model_a_city_captures_per_game": 0.10, "completion_rate": 0.50,
+         "opponents": []},
+        {"model_a_score": 0.60, "worst_score": 0.60,
+         "model_a_city_captures_per_game": 0.20, "completion_rate": 0.60,
+         "opponents": []},
+        {"model_a_score": 0.59, "worst_score": 0.59,
+         "model_a_city_captures_per_game": 0.40, "completion_rate": 0.80,
+         "opponents": []},
+        # Full gate: working raw, best raw, EMA.  The best raw state from
+        # block 1 must be retained over the safe near-tie from block 2.
+        {"model_a_score": 0.59, "worst_score": 0.59,
+         "model_a_city_captures_per_game": 0.40, "completion_rate": 0.80,
+         "opponents": []},
+        {"model_a_score": 0.60, "worst_score": 0.60,
+         "model_a_city_captures_per_game": 0.20, "completion_rate": 0.60,
+         "opponents": []},
+        {"model_a_score": 0.50, "worst_score": 0.50,
+         "model_a_city_captures_per_game": 0.10, "completion_rate": 0.50,
+         "opponents": []},
     ]
     states = []
     population_kwargs = []
@@ -1262,6 +1256,29 @@ def test_direct_population_advances_after_persistent_regression():
             "completion_rate": 0.10,
             "opponents": [],
         },
+        # Final held-out selection evaluates the restored live/best state and
+        # the EMA state.  The restored best state must win this comparison.
+        {
+            "model_a_score": 0.70,
+            "worst_score": 0.65,
+            "model_a_city_captures_per_game": 0.25,
+            "completion_rate": 0.70,
+            "opponents": [],
+        },
+        {
+            "model_a_score": 0.20,
+            "worst_score": 0.10,
+            "model_a_city_captures_per_game": 0.00,
+            "completion_rate": 0.10,
+            "opponents": [],
+        },
+        {
+            "model_a_score": 0.60,
+            "worst_score": 0.55,
+            "model_a_city_captures_per_game": 0.20,
+            "completion_rate": 0.60,
+            "opponents": [],
+        },
     ]
 
     population_parameters = []
@@ -1325,6 +1342,121 @@ def test_direct_population_advances_after_persistent_regression():
     torch.testing.assert_close(
         next(candidate.parameters()), population_parameters[1]
     )
+
+
+def test_flat_population_uses_fixed_benchmark_for_rollback():
+    config = ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    candidate = PolicyValueBeliefNet(config)
+    champion = PolicyValueBeliefNet(config)
+    # Baseline and block one share the initial arena.  Once the accepted
+    # snapshot joins PFSP, the training mixture says 0.90 while the fixed
+    # benchmark says 0.40: the block must be rejected and rolled back.
+    gate_rows = [
+        {"model_a_score": 0.50, "worst_score": 0.50,
+         "model_a_city_captures_per_game": 0.10, "completion_rate": 0.50,
+         "opponents": [{"model_a_score": 0.50}]},
+        {"model_a_score": 0.60, "worst_score": 0.60,
+         "model_a_city_captures_per_game": 0.20, "completion_rate": 0.60,
+         "opponents": [{"model_a_score": 0.60}]},
+        {"model_a_score": 0.90, "worst_score": 0.90,
+         "model_a_city_captures_per_game": 0.40, "completion_rate": 0.90,
+         "opponents": [{"model_a_score": 0.90}]},
+        {"model_a_score": 0.40, "worst_score": 0.40,
+         "model_a_city_captures_per_game": 0.05, "completion_rate": 0.40,
+         "opponents": [{"model_a_score": 0.40}]},
+        {"model_a_score": 0.60, "worst_score": 0.60,
+         "model_a_city_captures_per_game": 0.20, "completion_rate": 0.60,
+         "opponents": [{"model_a_score": 0.60}]},
+        {"model_a_score": 0.50, "worst_score": 0.50,
+         "model_a_city_captures_per_game": 0.10, "completion_rate": 0.50,
+         "opponents": [{"model_a_score": 0.50}]},
+    ]
+
+    def population_update(*args, **kwargs):
+        with torch.no_grad():
+            next(candidate.parameters()).add_(0.01)
+        return {"steps": 1.0}
+
+    with (
+        patch(
+            "polybot.training.vector_population.evaluate_direct_population_matches",
+            side_effect=gate_rows,
+        ),
+        patch(
+            "polybot.training.vector_population.train_vector_population",
+            side_effect=population_update,
+        ),
+    ):
+        result = train_direct_population_curriculum(
+            TrainingConfig(device="cpu"), config, candidate, champion,
+            [champion], [1.0], num_envs=2, minimum_steps=2_000,
+            maximum_steps=2_000, block_steps=1_000, num_threads=1,
+            max_actions=16, gate_games=2, diagnostic_gate_games=2,
+            gate_seed=100, gate_score=0.50, historical_score_floor=0.45,
+            readiness_city_captures_per_game=0.05,
+            readiness_completion_rate=0.05, readiness_patience=2,
+            policy_anchor_weight=0.20, value_anchor_weight=0.10,
+            opponent_policy_weight=0.0, teacher_weight=0.0,
+            shaping_weight=0.20, flat_snapshot_archive_size=1,
+            run=_MemoryRun(),
+        )
+
+    second_block = result["direct_population_gate_rows"][2]
+    assert second_block["training_mix_score"] == 0.90
+    assert second_block["weighted_score"] == 0.40
+    assert result["direct_population_best_score"] == 0.60
+
+
+def test_main_exploiter_pfsp_keeps_current_main_as_primary_opponent():
+    weights = _flat_pfsp_weights(
+        [0.50, 0.50, 0.50],
+        alpha=2.0,
+        probability_floor=0.05,
+        role="main_exploiter",
+        primary_index=0,
+        primary_probability=0.70,
+    )
+
+    np.testing.assert_allclose(weights.sum(), 1.0)
+    assert weights[0] >= 0.70
+    assert weights[1] >= 0.05
+    assert weights[2] >= 0.05
+
+
+def test_league_database_archives_counterstrategy_as_population_opponent():
+    config = ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    champion = PolicyValueBeliefNet(config)
+    counter = PolicyValueBeliefNet(config)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        champion_path = root / "champion.pt"
+        counter_path = root / "counter.pt"
+        save_model(champion_path, champion, config)
+        save_model(counter_path, counter, config)
+        with LeagueDatabase(root / "league.sqlite") as database:
+            run_id = database.start_run(root, {})
+            champion_id = database.register_checkpoint(
+                champion_path, config, run_id=run_id
+            )
+            counter_id = database.create_candidate(
+                run_id, champion_id, "counter", config, role="flat_counter"
+            )
+            database.archive_candidate(
+                counter_id, counter_path, role="flat_counter"
+            )
+            default_population = database.select_population(
+                champion_id, maximum=2
+            )
+            selected = database.select_population(
+                champion_id, maximum=2, include_archived_counters=True
+            )
+            archived = database.model_record(counter_id)
+
+    assert {int(row["id"]) for row in selected} == {champion_id, counter_id}
+    assert {int(row["id"]) for row in default_population} == {champion_id}
+    assert archived["status"] == "archive"
+    assert archived["role"] == "flat_counter"
+    assert archived["trainable_opponent"] == 1
 
 
 def test_flat_promotion_uses_raw_population_results_only():
@@ -1684,10 +1816,10 @@ def test_flat_league_activates_mcts_gate_only_after_search32_is_better():
         {
             "games": 2.0,
             "model_a_wins": 1.0,
-            "model_a_losses": 0.0,
-            "draws": 1.0,
-            "model_a_score": 0.75,
-            "score_lower_95": 0.50,
+            "model_a_losses": 1.0,
+            "draws": 0.0,
+            "model_a_score": 0.50,
+            "score_lower_95": 0.10,
         },
         {
             "games": 2.0,
@@ -1706,6 +1838,10 @@ def test_flat_league_activates_mcts_gate_only_after_search32_is_better():
             "score_lower_95": 0.10,
         },
     ]
+    for result in direct_results:
+        # The real direct evaluator always records its paired map schedule.
+        # Keep this lightweight fixture faithful to that contract.
+        result["evaluated_map_seeds"] = [1, 1]
     passing_search_result = {
         "games": 2.0,
         "model_a_wins": 1.0,
@@ -1835,17 +1971,19 @@ def test_flat_league_activates_mcts_gate_only_after_search32_is_better():
                 """SELECT status, checkpoint_path FROM models
                    WHERE parent_model_id IS NOT NULL ORDER BY id"""
             ).fetchall()
-        assert len(rows) == 2
-        assert [int(row["mcts_ready"]) for row in rows] == [1, 0]
+        # Only a flat-promoted model gets an expensive MCTS-readiness probe.
+        # A merely retained challenger has not been evaluated by search yet.
+        assert len(rows) == 1
+        assert [int(row["mcts_ready"]) for row in rows] == [1]
         assert [
             int(row["mcts_evaluation_active"]) for row in rows
-        ] == [1, 1]
+        ] == [1]
         assert [row["status"] for row in models] == [
             "promoted",
             "challenger",
         ]
         assert Path(str(models[1]["checkpoint_path"])).name == (
-            "champion-002.pt"
+            "champion-challenger-001.pt"
         )
 
 

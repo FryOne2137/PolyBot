@@ -765,6 +765,12 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             value_bootstrap_games=0,
             mcts_probe_games=0,
             flat_mcts_distill_games=0,
+            # A resumed flat model already has a policy/value starting point.
+            # Do not silently spend hours in the legacy teacher/objective
+            # stages before the population PPO, PFSP and exploiter begin.
+            direct_teacher_steps=0,
+            direct_objective_steps=0,
+            direct_actor_steps=0,
             # Flat PPO can safely use every on-policy advantage.  The
             # terminal value replay is critic-only, so it cannot make the
             # actor off-policy.  These defaults are intentionally scoped to

@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
+import numpy as np
 import torch
 
 from ..config import MCTSConfig, TrainingConfig

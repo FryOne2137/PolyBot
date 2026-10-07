@@ -1730,7 +1730,17 @@ def train_vector_population(
     completed_games = wins = losses = draws = 0
     value_calibration = _TerminalValueCalibration()
     candidate_turns = opponent_turns = 0
-    ppo_samples = ppo_updates = ppo_rollouts = 0
+    # PPO/PPG blocks are intentionally shorter than many native games.  The
+    # PPG cadence therefore belongs to the persistent flat continuation, not
+    # to one arbitrary outer curriculum block; otherwise interval=8 can
+    # silently mean "never" even though PPG is reported as enabled.
+    ppo_rollouts = int(
+        continuation_state.get("ppo_rollouts", 0)
+        if continuation_state is not None
+        else 0
+    )
+    ppo_rollouts_this_call = 0
+    ppo_samples = ppo_updates = 0
     ppo_policy_samples = 0
     ppo_behaviour_kl_limits = 0
     completed_examples: list[_PPOExample] = []
@@ -1751,6 +1761,11 @@ def train_vector_population(
     terminal_replay_updates = 0
     ppg_samples_added = 0
     ppg_phases = 0
+    ppg_phases_total = int(
+        continuation_state.get("ppg_phases_total", 0)
+        if continuation_state is not None
+        else 0
+    )
     ppg_updates = 0
     ema_updates = 0
     ppo_update_target = max(
@@ -2258,7 +2273,7 @@ def train_vector_population(
 
     def optimise_ppg_phase() -> Dict[str, float]:
         """Distil the current policy while value trains the shared encoder."""
-        nonlocal ppg_phases, ppg_updates, ema_updates
+        nonlocal ppg_phases, ppg_phases_total, ppg_updates, ema_updates
         if not ppg_enabled or len(ppg_replay) < ppg_minibatch_size:
             return {}
         phase_size = min(ppg_phase_samples, len(ppg_replay))
@@ -2318,7 +2333,7 @@ def train_vector_population(
                 (len(targets) + ppg_minibatch_size - 1)
                 // ppg_minibatch_size
             ),
-            desc=f"PPG auxiliary phase {ppg_phases + 1}",
+            desc=f"PPG auxiliary phase {ppg_phases_total + 1}",
             unit="update",
             dynamic_ncols=True,
             leave=False,
@@ -2396,6 +2411,7 @@ def train_vector_population(
         auxiliary_progress.close()
         candidate.eval()
         ppg_phases += 1
+        ppg_phases_total += 1
         return {
             name: total / max(1, local_updates)
             for name, total in local_totals.items()
@@ -2699,6 +2715,7 @@ def train_vector_population(
                 completed_examples = []
                 ppo_samples += len(examples)
                 ppo_rollouts += 1
+                ppo_rollouts_this_call += 1
                 rollout_metrics = optimise_rollout(examples)
                 retain_ppg_examples(examples)
                 if ppo_rollouts % ppg_interval == 0:
@@ -2772,7 +2789,7 @@ def train_vector_population(
                     kl_limits=ppo_behaviour_kl_limits,
                 )
 
-    divisor = max(1, ppo_rollouts)
+    divisor = max(1, ppo_rollouts_this_call)
     summary: Dict[str, float | str] = {
         "direct_population_algorithm": (
             "single_network_ppg" if ppg_enabled else "signed_ppo_gae"
@@ -2801,7 +2818,8 @@ def train_vector_population(
         "direct_population_ppo_samples": float(ppo_samples),
         "direct_population_ppo_policy_samples": float(ppo_policy_samples),
         "direct_population_ppo_updates": float(ppo_updates),
-        "direct_population_ppo_rollouts": float(ppo_rollouts),
+        "direct_population_ppo_rollouts": float(ppo_rollouts_this_call),
+        "direct_population_ppo_rollouts_total": float(ppo_rollouts),
         "direct_population_ppo_pending_examples": float(
             pending_candidate_examples
         ),
@@ -2938,6 +2956,8 @@ def train_vector_population(
             traces=traces,
             objective_histories=objective_histories,
             pending_candidate_examples=pending_candidate_examples,
+            ppo_rollouts=ppo_rollouts,
+            ppg_phases_total=ppg_phases_total,
         )
     summary["run_dir"] = str(run.finish(summary))
     return summary
@@ -3142,6 +3162,34 @@ def _flat_pfsp_weights(
         weights[int(primary_index)] += primary_probability
         weights /= weights.sum()
     return weights
+
+
+def _clear_policy_replay_after_flat_rollback(
+    continuation_state: dict[str, Any],
+    *,
+    num_envs: int,
+    objective_replay_horizon: int,
+    objective_replay_capacity: int,
+    ppg_buffer_capacity: int,
+) -> None:
+    """Discard data whose policy labels belong to a rejected flat block.
+
+    Terminal replay is deliberately not touched: it contains public states
+    and actual game outcomes, so it remains valid critic supervision after a
+    policy rollback.
+    """
+    continuation_state["traces"] = [[] for _ in range(num_envs)]
+    continuation_state["objective_histories"] = [
+        deque(maxlen=objective_replay_horizon) for _ in range(num_envs)
+    ]
+    continuation_state["objective_replay"] = deque(
+        maxlen=objective_replay_capacity
+    )
+    continuation_state["objective_replay_update_credits"] = 0
+    continuation_state["ppg_replay"] = deque(maxlen=ppg_buffer_capacity)
+    continuation_state["pending_candidate_examples"] = 0
+    continuation_state["ppo_rollouts"] = 0
+    continuation_state["ppg_phases_total"] = 0
 
 
 def train_direct_population_curriculum(
@@ -3734,6 +3782,20 @@ def train_direct_population_curriculum(
                 # No post-baseline checkpoint exists yet: the restored
                 # parent must start the next attempt with fresh moments.
                 flat_continuation.clear()
+            if flat_continuation is not None:
+                # Optimiser moments above belong to the restored accepted
+                # checkpoint, but policy-labelled replay and unfinished PPO
+                # traces belong to the rejected policy.  Keeping them would
+                # silently make the next block off-policy after a rollback.
+                # Terminal outcome examples remain valid critic data and are
+                # deliberately retained.
+                _clear_policy_replay_after_flat_rollback(
+                    flat_continuation,
+                    num_envs=num_envs,
+                    objective_replay_horizon=objective_replay_horizon,
+                    objective_replay_capacity=objective_replay_capacity,
+                    ppg_buffer_capacity=ppg_buffer_capacity,
+                )
             rollback_blocks += 1
             consecutive_regressions += 1
             maximum_consecutive_regressions = max(

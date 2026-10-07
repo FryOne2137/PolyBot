@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -129,6 +130,7 @@ from polybot.training.vector_population import (
     _ppo_snapshot,
     _finish_ppo_trace,
     _flat_pfsp_weights,
+    _clear_policy_replay_after_flat_rollback,
     _mark_top_advantage_examples,
     _population_block_acceptance,
     _population_block_selects_checkpoint,
@@ -1421,6 +1423,37 @@ def test_main_exploiter_pfsp_keeps_current_main_as_primary_opponent():
     assert weights[0] >= 0.70
     assert weights[1] >= 0.05
     assert weights[2] >= 0.05
+
+
+def test_flat_rollback_drops_rejected_policy_replay_but_keeps_terminal_value_data():
+    terminal_replay = deque(["genuine-terminal"], maxlen=8)
+    continuation = {
+        "traces": [["old-policy"]],
+        "objective_histories": [deque(["old-objective"], maxlen=4)],
+        "objective_replay": deque(["old-objective"], maxlen=8),
+        "objective_replay_update_credits": 10,
+        "ppg_replay": deque(["old-ppg"], maxlen=8),
+        "pending_candidate_examples": 3,
+        "ppo_rollouts": 7,
+        "ppg_phases_total": 2,
+        "terminal_replay": terminal_replay,
+    }
+
+    _clear_policy_replay_after_flat_rollback(
+        continuation,
+        num_envs=1,
+        objective_replay_horizon=4,
+        objective_replay_capacity=8,
+        ppg_buffer_capacity=8,
+    )
+
+    assert continuation["traces"] == [[]]
+    assert not continuation["objective_histories"][0]
+    assert not continuation["objective_replay"]
+    assert not continuation["ppg_replay"]
+    assert continuation["pending_candidate_examples"] == 0
+    assert continuation["ppo_rollouts"] == 0
+    assert continuation["terminal_replay"] is terminal_replay
 
 
 def test_league_database_archives_counterstrategy_as_population_opponent():

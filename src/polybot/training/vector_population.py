@@ -3276,6 +3276,7 @@ def train_direct_population_curriculum(
     flat_role: str = "main",
     flat_primary_opponent_id: int | str | None = None,
     flat_primary_opponent_probability: float = 0.70,
+    flat_terminal_replay: Deque[_PPGExample] | None = None,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -3493,9 +3494,19 @@ def train_direct_population_curriculum(
         )
     flat_snapshots: list[PolicyValueBeliefNet] = []
     flat_pfsp_scores = np.full(len(active_opponents), 0.5, dtype=np.float64)
+    # A terminal outcome is a critic label, not an actor target.  A flat main
+    # may therefore safely retain these examples when it advances to the next
+    # league round, unlike PPO traces, policy replay, or optimiser moments.
+    # The caller owns the deque so the same bounded archive can be supplied
+    # to several successive main curricula without sharing any actor data.
+    shared_terminal_replay = flat_terminal_replay
     flat_continuation: dict[str, Any] | None = (
-        {} if flat_persistent_optimizer else None
+        {}
+        if flat_persistent_optimizer or shared_terminal_replay is not None
+        else None
     )
+    if flat_continuation is not None and shared_terminal_replay is not None:
+        flat_continuation["terminal_replay"] = shared_terminal_replay
     run = run or TrainingRun.create("runs", "direct_population_curriculum")
     run.write_config(
         training=training,
@@ -3782,6 +3793,12 @@ def train_direct_population_curriculum(
                 # No post-baseline checkpoint exists yet: the restored
                 # parent must start the next attempt with fresh moments.
                 flat_continuation.clear()
+                if shared_terminal_replay is not None:
+                    # ``clear`` must not sever the caller-owned critic-only
+                    # archive.  It remains valid after a policy rollback.
+                    flat_continuation["terminal_replay"] = (
+                        shared_terminal_replay
+                    )
             if flat_continuation is not None:
                 # Optimiser moments above belong to the restored accepted
                 # checkpoint, but policy-labelled replay and unfinished PPO
@@ -4325,6 +4342,14 @@ def train_direct_population_curriculum(
         ),
         "flat_population_persistent_optimizer": float(
             flat_persistent_optimizer
+        ),
+        "flat_population_terminal_replay_shared": float(
+            shared_terminal_replay is not None
+        ),
+        "flat_population_terminal_replay_size": float(
+            len(shared_terminal_replay)
+            if shared_terminal_replay is not None
+            else 0
         ),
         "flat_population_snapshot_count": float(len(flat_snapshots)),
         "flat_population_active_opponents": float(len(active_opponents)),

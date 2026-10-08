@@ -1456,6 +1456,76 @@ def test_flat_rollback_drops_rejected_policy_replay_but_keeps_terminal_value_dat
     assert continuation["terminal_replay"] is terminal_replay
 
 
+def test_flat_terminal_value_replay_is_reused_by_successive_curricula():
+    """A new flat round may reuse terminal critic labels, never PPO traces."""
+    config = ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    candidate = PolicyValueBeliefNet(config)
+    champion = PolicyValueBeliefNet(config)
+    shared_terminal_replay = deque(maxlen=8)
+    seen_replays = []
+    evaluation = {
+        "model_a_score": 0.50,
+        "worst_score": 0.50,
+        "model_a_city_captures_per_game": 0.10,
+        "completion_rate": 0.50,
+        "opponents": [],
+    }
+
+    def population_update(*args, **kwargs):
+        continuation = kwargs["continuation_state"]
+        seen_replays.append(continuation["terminal_replay"])
+        continuation["terminal_replay"].append("genuine-terminal")
+        return {"steps": 1.0}
+
+    with (
+        patch(
+            "polybot.training.vector_population.evaluate_direct_population_matches",
+            return_value=evaluation,
+        ),
+        patch(
+            "polybot.training.vector_population.train_vector_population",
+            side_effect=population_update,
+        ),
+    ):
+        for _ in range(2):
+            train_direct_population_curriculum(
+                TrainingConfig(device="cpu"),
+                config,
+                candidate,
+                champion,
+                [champion],
+                [1.0],
+                num_envs=2,
+                minimum_steps=1,
+                maximum_steps=1,
+                block_steps=1,
+                num_threads=1,
+                max_actions=16,
+                gate_games=2,
+                diagnostic_gate_games=2,
+                gate_seed=100,
+                gate_score=0.50,
+                historical_score_floor=0.45,
+                readiness_city_captures_per_game=0.05,
+                readiness_completion_rate=0.05,
+                readiness_patience=2,
+                policy_anchor_weight=0.20,
+                value_anchor_weight=0.10,
+                opponent_policy_weight=0.0,
+                teacher_weight=0.0,
+                shaping_weight=0.20,
+                flat_terminal_replay=shared_terminal_replay,
+                flat_terminal_replay_capacity=8,
+                flat_terminal_replay_batch_size=1,
+                flat_terminal_replay_value_weight=0.25,
+                ema_enabled=False,
+                run=_MemoryRun(),
+            )
+
+    assert seen_replays == [shared_terminal_replay, shared_terminal_replay]
+    assert len(shared_terminal_replay) == 2
+
+
 def test_league_database_archives_counterstrategy_as_population_opponent():
     config = ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
     champion = PolicyValueBeliefNet(config)

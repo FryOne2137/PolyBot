@@ -1742,6 +1742,19 @@ def train_promotion_league(
     last_population_score = 0.0
     last_training: Dict[str, Any] = {}
     current_round_id: list[int | None] = [None]
+    # This archive deliberately contains only complete-game value labels from
+    # the main flat lineage.  It survives population blocks and league rounds
+    # but is never used as PPO policy data and is never shared with an
+    # exploiter, whose opponent distribution serves a different purpose.
+    flat_main_terminal_replay: deque[Any] | None = (
+        deque(maxlen=flat_population_terminal_replay_capacity)
+        if (
+            training_stage == "flat"
+            and flat_population_terminal_replay_value_weight > 0.0
+            and flat_population_terminal_replay_capacity > 0
+        )
+        else None
+    )
 
     with LeagueDatabase(database_path) as database:
         database_run_id = database.start_run(run.directory, league_config)
@@ -3047,6 +3060,11 @@ def train_promotion_league(
                                     flat_population_pfsp_score_ema_decay
                                 ),
                                 flat_role="main",
+                                flat_terminal_replay=(
+                                    flat_main_terminal_replay
+                                    if stage_name == "main"
+                                    else None
+                                ),
                                 gate_game_callback=record_stage_gate_game,
                                 training_game_callback=record_stage_training_game,
                                 candidate_label=label,
@@ -3605,17 +3623,20 @@ def train_promotion_league(
                                 direct_population_main_summary,
                                 direct_population_exploiter_summary,
                             ):
-                                candidate = exploiter
-                                candidate_evaluation_label = (
-                                    f"exploiter {candidate_source.stem}"
-                                )
-                                direct_population_summary = dict(
-                                    direct_population_exploiter_summary
-                                )
-                                selected_population_branch = "exploiter"
+                                # An exploiter is evidence of a weakness, not
+                                # an alternative main policy.  Replacing the
+                                # main candidate here made the expensive
+                                # promotion gate judge a specialised counter
+                                # instead of the model meant to become the
+                                # champion.  It may be archived above and
+                                # sampled by PFSP in later rounds, but only
+                                # the main lineage is eligible for promotion
+                                # or apprentice continuation.
                                 print(
-                                    "league breakthrough exploiter selected | "
-                                    f"score={float(direct_population_summary.get('direct_population_full_gate_score', 0.0)):.4f}",
+                                    "league breakthrough exploiter kept off "
+                                    "the champion path | "
+                                    f"score={float(direct_population_exploiter_summary.get('direct_population_full_gate_score', 0.0)):.4f} "
+                                    "| main remains promotion candidate",
                                     flush=True,
                                 )
                             else:
@@ -4278,6 +4299,13 @@ def train_promotion_league(
                         # merely as an in-memory PFSP snapshot.
                         archive_counterstrategy = bool(
                             training_stage == "flat"
+                            # The main candidate is either promoted or
+                            # retained as the next round's apprentice.  A
+                            # specialised counter is archived by the
+                            # dedicated main-exploiter path above, under its
+                            # own model ID; never relabel the main lineage as
+                            # a counter merely because it is non-losing.
+                            and selected_population_branch != "main"
                             and not flat_invalid
                             and champion_counter_score >= 0.50
                             and minimum_historical_score
@@ -4343,7 +4371,11 @@ def train_promotion_league(
                                 (
                                     f"{checkpoint_prefix}-counter"
                                     if archive_counterstrategy
-                                    else f"{checkpoint_prefix}-challenger"
+                                    else (
+                                        f"{checkpoint_prefix}-apprentice"
+                                        if training_stage == "flat"
+                                        else f"{checkpoint_prefix}-challenger"
+                                    )
                                 ),
                             )
                             save_model(retained_path, candidate, model_config)
@@ -4361,8 +4393,12 @@ def train_promotion_league(
                             challenger_path = retained_path
                             challenger_id = candidate_id
                             print(
-                                "league challenger advanced | saved "
-                                f"{challenger_path} | continuation floor="
+                                (
+                                    "league flat apprentice advanced | saved "
+                                    if training_stage == "flat"
+                                    else "league challenger advanced | saved "
+                                )
+                                + f"{challenger_path} | continuation floor="
                                 f"{historical_score_floor:.4f}",
                                 flush=True,
                             )

@@ -273,8 +273,12 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     )
     parser.add_argument("--direct-gate-games", type=int, default=30)
     parser.add_argument(
-        "--direct-gate-max-moves", type=int, default=700,
-        help="Longer raw-policy games used by direct and population gates",
+        "--direct-gate-max-moves", type=int, default=None,
+        help=(
+            "Raw-policy horizon used by direct and population gates. "
+            "train_flat.py inherits --max-moves when this is omitted; "
+            "other entry points retain their 700-move default."
+        ),
     )
     parser.add_argument("--direct-gate-score", type=float, default=0.50)
     parser.add_argument("--direct-policy-anchor-weight", type=float, default=0.75)
@@ -771,6 +775,14 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             direct_teacher_steps=0,
             direct_objective_steps=0,
             direct_actor_steps=0,
+            # A sparse terminal game cannot improve a mature policy from a
+            # few hundred completed episodes.  These are vector steps (not
+            # individual actions): with the usual 16 environments this gives
+            # the main line roughly 0.4--0.8M fresh transitions per round,
+            # while still checking and rolling back every 4k steps.
+            direct_population_steps=24_000,
+            direct_population_max_steps=48_000,
+            direct_population_block_steps=4_000,
             # Flat PPO can safely use every on-policy advantage.  The
             # terminal value replay is critic-only, so it cannot make the
             # actor off-policy.  These defaults are intentionally scoped to
@@ -794,6 +806,23 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             breakthrough_exploiter=True,
         )
     args = parser.parse_args()
+
+    # ``train_direct_population_curriculum`` deliberately uses one horizon
+    # for both collection and its raw-policy gates.  Historically train_flat
+    # silently replaced ``--max-moves`` with the generic 700-move direct
+    # default here, so a flat run requested at 1200 moves still collected and
+    # evaluated truncated 700-move games.  Keep the legacy league default,
+    # but make a dedicated flat invocation follow its public --max-moves
+    # unless the user explicitly supplies the direct override.
+    resolved_direct_gate_max_moves = (
+        int(args.direct_gate_max_moves)
+        if args.direct_gate_max_moves is not None
+        else (
+            int(args.max_moves)
+            if fixed_training_stage == "flat"
+            else 700
+        )
+    )
 
     training = training_config_from_args(args)
     print(
@@ -915,7 +944,7 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         direct_actor_block_steps=args.direct_actor_block_steps,
         direct_actor_max_steps=args.direct_actor_max_steps,
         direct_gate_games=args.direct_gate_games,
-        direct_gate_max_moves=args.direct_gate_max_moves,
+        direct_gate_max_moves=resolved_direct_gate_max_moves,
         direct_gate_score=args.direct_gate_score,
         direct_policy_anchor_weight=args.direct_policy_anchor_weight,
         direct_value_anchor_weight=args.direct_value_anchor_weight,

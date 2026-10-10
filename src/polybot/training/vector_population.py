@@ -3163,9 +3163,18 @@ def _flat_pfsp_weights(
     held-out results.  Both solved and impossible opponents retain a floor so
     the policy cannot forget openings or collapse against a hard counter.
     """
-    values = np.clip(np.asarray(scores, dtype=np.float64), 0.0, 1.0)
-    if values.ndim != 1 or not values.size:
+    raw_values = np.asarray(scores, dtype=np.float64)
+    if raw_values.ndim != 1 or not raw_values.size:
         raise ValueError("PFSP requires at least one opponent score")
+    # A failed or partial diagnostic must never poison the collection
+    # distribution for the next PPO block.  Scores are diagnostics, not
+    # targets, so an unavailable score is deliberately treated as neutral
+    # (0.5) rather than allowing one NaN to terminate the whole run.
+    values = np.clip(
+        np.nan_to_num(raw_values, nan=0.5, posinf=1.0, neginf=0.0),
+        0.0,
+        1.0,
+    )
     if alpha <= 0.0 or not 0.0 <= probability_floor < 1.0:
         raise ValueError("invalid flat PFSP settings")
     if role not in {"main", "main_exploiter"}:
@@ -3182,11 +3191,18 @@ def _flat_pfsp_weights(
     ):
         raise ValueError("main exploiter PFSP requires a primary opponent")
     hardness = np.maximum(values * (1.0 - values), 1.0e-6) ** alpha
+    hardness_sum = float(hardness.sum())
     free_mass = max(0.0, 1.0 - probability_floor * len(values))
     if free_mass <= 0.0:
         weights = np.full(values.shape, 1.0 / len(values), dtype=np.float64)
     else:
-        weights = probability_floor + free_mass * hardness / hardness.sum()
+        # This fallback also handles a future change which might produce an
+        # underflowing or otherwise invalid hardness vector.
+        if not np.isfinite(hardness_sum) or hardness_sum <= 0.0:
+            hardness = np.full(values.shape, 1.0 / len(values), dtype=np.float64)
+        else:
+            hardness = hardness / hardness_sum
+        weights = probability_floor + free_mass * hardness
     if role == "main_exploiter":
         # The exploiter's purpose is to expose the current main's blind
         # spots, not merely to become another generic PFSP branch.  Keep a
@@ -3211,7 +3227,17 @@ def _flat_pfsp_weights(
             hard_weights = severity / severity.sum()
             weights *= 1.0 - hard_counter_probability
             weights[hard] += hard_counter_probability * hard_weights
-            weights /= weights.sum()
+        weights /= weights.sum()
+    # Keep the contract of this helper strong: callers may safely pass the
+    # result straight to the vector collector, even when a diagnostic score
+    # was missing or corrupt.
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    weights = np.maximum(weights, 0.0)
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        weights = np.full(values.shape, 1.0 / len(values), dtype=np.float64)
+    else:
+        weights /= total
     return weights
 
 
@@ -3693,6 +3719,39 @@ def train_direct_population_curriculum(
     plateau_adjustments = 0
     gate_rows: list[Dict[str, Any]] = []
 
+    def refresh_flat_pfsp_weights() -> None:
+        """Rebuild a collector-safe PFSP vector for the current archive.
+
+        Snapshots can be appended or evicted between PPO blocks.  Never let
+        an interrupted diagnostic leave a stale score/weight vector whose
+        length no longer matches ``active_opponents``: that would otherwise
+        fail only after starting the next expensive PPO block.
+        """
+        nonlocal active_weights, flat_pfsp_scores
+        size = len(active_opponents)
+        repaired_scores = np.full(size, 0.5, dtype=np.float64)
+        previous_scores = np.asarray(flat_pfsp_scores, dtype=np.float64)
+        if previous_scores.ndim == 1:
+            shared = min(size, len(previous_scores))
+            if shared:
+                repaired_scores[:shared] = np.nan_to_num(
+                    previous_scores[:shared],
+                    nan=0.5,
+                    posinf=1.0,
+                    neginf=0.0,
+                )
+        flat_pfsp_scores = np.clip(repaired_scores, 0.0, 1.0)
+        active_weights = _flat_pfsp_weights(
+            flat_pfsp_scores,
+            alpha=flat_pfsp_alpha,
+            probability_floor=flat_pfsp_probability_floor,
+            role=flat_role,
+            primary_index=primary_index,
+            primary_probability=flat_primary_opponent_probability,
+            hard_counter_threshold=flat_hard_counter_threshold,
+            hard_counter_probability=flat_hard_counter_probability,
+        )
+
     def gate(
         label: str,
         block: int,
@@ -4009,16 +4068,7 @@ def train_direct_population_curriculum(
                 )
             else:
                 flat_pfsp_scores = observed_scores
-            active_weights = _flat_pfsp_weights(
-                flat_pfsp_scores,
-                alpha=flat_pfsp_alpha,
-                probability_floor=flat_pfsp_probability_floor,
-                role=flat_role,
-                primary_index=primary_index,
-                primary_probability=flat_primary_opponent_probability,
-                hard_counter_threshold=flat_hard_counter_threshold,
-                hard_counter_probability=flat_hard_counter_probability,
-            )
+            refresh_flat_pfsp_weights()
             if selected and not baseline:
                 snapshot = PolicyValueBeliefNet(model_config)
                 restore_model_state(snapshot, model_state_on_cpu(candidate))
@@ -4043,16 +4093,7 @@ def train_direct_population_curriculum(
                     flat_pfsp_scores = np.delete(
                         flat_pfsp_scores, expired_index
                     )
-                active_weights = _flat_pfsp_weights(
-                    flat_pfsp_scores,
-                    alpha=flat_pfsp_alpha,
-                    probability_floor=flat_pfsp_probability_floor,
-                    role=flat_role,
-                    primary_index=primary_index,
-                    primary_probability=flat_primary_opponent_probability,
-                    hard_counter_threshold=flat_hard_counter_threshold,
-                    hard_counter_probability=flat_hard_counter_probability,
-                )
+                refresh_flat_pfsp_weights()
         benchmark_score = weighted_score
         row = {
             "stage": label,
@@ -4170,6 +4211,11 @@ def train_direct_population_curriculum(
         or 0 < consecutive_regressions < regression_patience
     ):
         block += 1
+        if flat_snapshot_archive_size:
+            # Validate at the point of use as well as after every archive
+            # mutation.  This makes continuation resilient to old runs whose
+            # serialized PFSP state predates the archive changes.
+            refresh_flat_pfsp_weights()
         current_steps = min(block_steps, maximum_steps - completed)
         block_training = replace(
             training,

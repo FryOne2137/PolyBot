@@ -1440,6 +1440,21 @@ def test_flat_pfsp_reserves_collection_for_known_hard_counter():
     assert weights[2] > weights[0]
 
 
+def test_flat_pfsp_sanitises_missing_or_nonfinite_diagnostic_scores():
+    weights = _flat_pfsp_weights(
+        [0.40, np.nan, np.inf, -np.inf],
+        alpha=2.0,
+        probability_floor=0.05,
+        hard_counter_threshold=0.45,
+        hard_counter_probability=0.30,
+    )
+
+    assert weights.shape == (4,)
+    assert np.isfinite(weights).all()
+    assert (weights >= 0.0).all()
+    np.testing.assert_allclose(weights.sum(), 1.0)
+
+
 def test_flat_rollback_drops_rejected_policy_replay_but_keeps_terminal_value_data():
     terminal_replay = deque(["genuine-terminal"], maxlen=8)
     continuation = {

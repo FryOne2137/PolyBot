@@ -1741,6 +1741,15 @@ def train_vector_population(
     )
     ppo_rollouts_this_call = 0
     ppo_samples = ppo_updates = 0
+    # Unlike the local minibatch counter above, this version survives every
+    # flat continuation block.  A live long game can cross many blocks, so a
+    # policy sample must be aged against the policy phase that created it,
+    # never against a counter that silently restarts at zero.
+    policy_version = int(
+        continuation_state.get("policy_version", 0)
+        if continuation_state is not None
+        else 0
+    )
     ppo_policy_samples = 0
     ppo_behaviour_kl_limits = 0
     completed_examples: list[_PPOExample] = []
@@ -1807,7 +1816,7 @@ def train_vector_population(
         nonlocal ppo_updates, ppo_policy_samples, ppo_behaviour_kl_limits
         nonlocal ema_updates
         nonlocal objective_replay_updates, objective_replay_update_credits
-        nonlocal terminal_replay_updates
+        nonlocal terminal_replay_updates, policy_version
         if not examples:
             return {
                 "loss": 0.0,
@@ -1830,9 +1839,15 @@ def train_vector_population(
         for example, advantage in zip(examples, advantages):
             example.advantage = float(advantage)
         _mark_top_advantage_examples(examples, ppo_top_advantage_fraction)
-        policy_ages = np.asarray(
-            [ppo_updates - example.policy_version for example in examples],
-            dtype=np.int32,
+        policy_ages = np.maximum(
+            0,
+            np.asarray(
+                [
+                    policy_version - example.policy_version
+                    for example in examples
+                ],
+                dtype=np.int32,
+            ),
         )
         if ppo_max_policy_age is not None:
             for example, age in zip(examples, policy_ages):
@@ -2228,6 +2243,11 @@ def train_vector_population(
                     break
                 continue
             accepted_epoch_behaviour_kls.append(behaviour_kl)
+            # One accepted PPO epoch is one behaviour-policy version.  Do
+            # not increment for individual minibatches: a one-rollout update
+            # may contain dozens of them, which made --max-policy-age=1 mean
+            # something completely different from one policy phase.
+            policy_version += 1
         result = {
             name: total / max(1, local_updates)
             for name, total in totals_local.items()
@@ -2274,6 +2294,7 @@ def train_vector_population(
     def optimise_ppg_phase() -> Dict[str, float]:
         """Distil the current policy while value trains the shared encoder."""
         nonlocal ppg_phases, ppg_phases_total, ppg_updates, ema_updates
+        nonlocal policy_version
         if not ppg_enabled or len(ppg_replay) < ppg_minibatch_size:
             return {}
         phase_size = min(ppg_phase_samples, len(ppg_replay))
@@ -2412,6 +2433,10 @@ def train_vector_population(
         candidate.eval()
         ppg_phases += 1
         ppg_phases_total += 1
+        # PPG changes the shared representation and can therefore move the
+        # policy even while its KL term constrains that movement.  Examples
+        # collected before the phase are one policy version older.
+        policy_version += 1
         return {
             name: total / max(1, local_updates)
             for name, total in local_totals.items()
@@ -2592,7 +2617,7 @@ def train_vector_population(
                         old_policy_log_probabilities=old_policy_logs[
                             env_id, np.flatnonzero(legal[env_id])
                         ].copy(),
-                        policy_version=ppo_updates,
+                        policy_version=policy_version,
                     )
                     pending_candidate_examples += 1
                 traces[env_id].append(
@@ -2739,6 +2764,7 @@ def train_vector_population(
                 ppo_samples=ppo_samples,
                 ppo_policy_samples=ppo_policy_samples,
                 ppo_updates=ppo_updates,
+                policy_version=policy_version,
                 ppo_rollouts=ppo_rollouts,
                 ppo_pending_examples=pending_candidate_examples,
                 ppo_environment_reused=float(reused_environment),
@@ -2820,6 +2846,7 @@ def train_vector_population(
         "direct_population_ppo_updates": float(ppo_updates),
         "direct_population_ppo_rollouts": float(ppo_rollouts_this_call),
         "direct_population_ppo_rollouts_total": float(ppo_rollouts),
+        "direct_population_policy_version": float(policy_version),
         "direct_population_ppo_pending_examples": float(
             pending_candidate_examples
         ),
@@ -2957,6 +2984,7 @@ def train_vector_population(
             objective_histories=objective_histories,
             pending_candidate_examples=pending_candidate_examples,
             ppo_rollouts=ppo_rollouts,
+            policy_version=policy_version,
             ppg_phases_total=ppg_phases_total,
         )
     summary["run_dir"] = str(run.finish(summary))
@@ -3126,6 +3154,8 @@ def _flat_pfsp_weights(
     role: str = "main",
     primary_index: int | None = None,
     primary_probability: float = 0.70,
+    hard_counter_threshold: float = 0.0,
+    hard_counter_probability: float = 0.0,
 ) -> np.ndarray:
     """Prefer opponents near a 50% score for the current flat candidate.
 
@@ -3142,6 +3172,10 @@ def _flat_pfsp_weights(
         raise ValueError("flat PFSP role must be 'main' or 'main_exploiter'")
     if not 0.0 <= primary_probability <= 1.0:
         raise ValueError("primary PFSP probability must be in [0, 1]")
+    if not 0.0 <= hard_counter_threshold <= 1.0:
+        raise ValueError("hard-counter threshold must be in [0, 1]")
+    if not 0.0 <= hard_counter_probability < 1.0:
+        raise ValueError("hard-counter probability must be in [0, 1)")
     if role == "main_exploiter" and (
         primary_index is None
         or not 0 <= primary_index < len(values)
@@ -3161,6 +3195,23 @@ def _flat_pfsp_weights(
         weights *= 1.0 - primary_probability
         weights[int(primary_index)] += primary_probability
         weights /= weights.sum()
+    elif hard_counter_probability > 0.0 and hard_counter_threshold > 0.0:
+        # Vanilla PFSP prefers opponents close to 50%, which is excellent for
+        # discovery but can leave a known 30--45% counter with only its small
+        # probability floor.  Reserve an explicit fraction for such counters
+        # so the main policy repeatedly practises the weakness which blocks
+        # promotion.  Within that reserve, the weakest score receives the
+        # largest share.  Non-main exploiters keep their primary-opponent
+        # curriculum above instead.
+        hard = np.flatnonzero(values < hard_counter_threshold)
+        if hard.size:
+            severity = np.maximum(
+                hard_counter_threshold - values[hard], 1.0e-6
+            )
+            hard_weights = severity / severity.sum()
+            weights *= 1.0 - hard_counter_probability
+            weights[hard] += hard_counter_probability * hard_weights
+            weights /= weights.sum()
     return weights
 
 
@@ -3273,6 +3324,9 @@ def train_direct_population_curriculum(
     flat_pfsp_alpha: float = 2.0,
     flat_pfsp_probability_floor: float = 0.05,
     flat_pfsp_score_ema_decay: float = 0.80,
+    flat_hard_counter_threshold: float = 0.0,
+    flat_hard_counter_probability: float = 0.0,
+    flat_regression_confirmation_games: int = 0,
     flat_role: str = "main",
     flat_primary_opponent_id: int | str | None = None,
     flat_primary_opponent_probability: float = 0.70,
@@ -3406,6 +3460,17 @@ def train_direct_population_curriculum(
         raise ValueError("flat_pfsp_alpha must be positive")
     if not 0.0 <= flat_pfsp_score_ema_decay < 1.0:
         raise ValueError("flat_pfsp_score_ema_decay must be in [0, 1)")
+    if not 0.0 <= flat_hard_counter_threshold <= 1.0:
+        raise ValueError("flat_hard_counter_threshold must be in [0, 1]")
+    if not 0.0 <= flat_hard_counter_probability < 1.0:
+        raise ValueError("flat_hard_counter_probability must be in [0, 1)")
+    if flat_regression_confirmation_games < 0 or (
+        flat_regression_confirmation_games
+        and flat_regression_confirmation_games % 2
+    ):
+        raise ValueError(
+            "flat_regression_confirmation_games must be zero or a positive even number"
+        )
     if flat_role not in {"main", "main_exploiter"}:
         raise ValueError("flat_role must be 'main' or 'main_exploiter'")
     if not 0.0 <= flat_primary_opponent_probability <= 1.0:
@@ -3588,6 +3653,12 @@ def train_direct_population_curriculum(
             "flat_snapshot_archive_size": flat_snapshot_archive_size,
             "flat_pfsp_alpha": flat_pfsp_alpha,
             "flat_pfsp_probability_floor": flat_pfsp_probability_floor,
+            "flat_pfsp_score_ema_decay": flat_pfsp_score_ema_decay,
+            "flat_hard_counter_threshold": flat_hard_counter_threshold,
+            "flat_hard_counter_probability": flat_hard_counter_probability,
+            "flat_regression_confirmation_games": (
+                flat_regression_confirmation_games
+            ),
         },
     )
     parent_state = model_state_on_cpu(candidate)
@@ -3605,6 +3676,12 @@ def train_direct_population_curriculum(
     best_capture_rate = 0.0
     best_completion_rate = 0.0
     best_objective_progress = 0.0
+    # Last measured opponent results for the checkpoint stored in best_state.
+    # On a rollback these, rather than the rejected policy's scores, are the
+    # only valid evidence for adapting the next PFSP mixture.
+    best_training_scores = np.full(
+        len(active_opponents), 0.5, dtype=np.float64
+    )
     readiness_streak = 0
     ready = False
     best_meets_readiness = False
@@ -3633,6 +3710,7 @@ def train_direct_population_curriculum(
         nonlocal consecutive_regressions, maximum_consecutive_regressions
         nonlocal active_weights, flat_pfsp_scores
         nonlocal best_flat_optimiser_state, best_flat_scaler_state
+        nonlocal best_training_scores
         training_evaluation = evaluate_direct_population_matches(
             training,
             candidate,
@@ -3718,6 +3796,63 @@ def train_direct_population_curriculum(
             score_tolerance=score_tolerance,
             objective_tolerance=objective_tolerance,
         )
+        confirmation_candidate_score: float | None = None
+        confirmation_best_score: float | None = None
+        confirmation_opponent_index: int | None = None
+        if (
+            not baseline
+            and not accepted
+            and flat_regression_confirmation_games
+            and results
+        ):
+            # A twenty-game screen is intentionally cheap, not authoritative.
+            # Before throwing away a whole PPO block, replay its weakest
+            # matchup on more paired maps and compare it to the high-water
+            # checkpoint on those exact maps.
+            confirmation_opponent_index = min(
+                range(len(results)),
+                key=lambda index: float(results[index]["model_a_score"]),
+            )
+            candidate_confirmation = evaluate_direct_population_matches(
+                training,
+                candidate,
+                [benchmark_opponents[confirmation_opponent_index]],
+                [1.0],
+                games=flat_regression_confirmation_games,
+                gate_seed=gate_seed,
+                visible_action_history=visible_action_history,
+                candidate_label=candidate_label,
+                opponent_labels=[
+                    benchmark_labels[confirmation_opponent_index]
+                ],
+                num_threads=num_threads,
+                max_actions=max_actions,
+            )
+            confirmation_candidate_score = float(
+                candidate_confirmation["model_a_score"]
+            )
+            candidate_state = model_state_on_cpu(candidate)
+            restore_model_state(candidate, best_state)
+            best_confirmation = evaluate_direct_population_matches(
+                training,
+                candidate,
+                [benchmark_opponents[confirmation_opponent_index]],
+                [1.0],
+                games=flat_regression_confirmation_games,
+                gate_seed=gate_seed,
+                visible_action_history=visible_action_history,
+                candidate_label=f"{candidate_label} previous-best",
+                opponent_labels=[
+                    benchmark_labels[confirmation_opponent_index]
+                ],
+                num_threads=num_threads,
+                max_actions=max_actions,
+            )
+            confirmation_best_score = float(best_confirmation["model_a_score"])
+            restore_model_state(candidate, candidate_state)
+            if confirmation_candidate_score + score_tolerance >= confirmation_best_score:
+                accepted = True
+                acceptance_reason = "regression_not_confirmed"
         selected, selection_reason = _population_block_selects_checkpoint(
             baseline=baseline,
             weighted_score=weighted_score,
@@ -3728,6 +3863,11 @@ def train_direct_population_curriculum(
         if not accepted:
             selected = False
             selection_reason = "not_accepted"
+        elif acceptance_reason == "regression_not_confirmed":
+            # Confirmation only says that the apparent loss was not real; it
+            # is not evidence of a new high-water checkpoint.
+            selected = False
+            selection_reason = "unconfirmed_regression_continue"
         if accepted:
             if not baseline:
                 accepted_blocks += 1
@@ -3740,6 +3880,13 @@ def train_direct_population_curriculum(
                 best_capture_rate = capture_rate
                 best_completion_rate = completion_rate
                 best_objective_progress = objective_progress
+                best_training_scores = np.asarray(
+                    [
+                        float(result["model_a_score"])
+                        for result in training_results
+                    ],
+                    dtype=np.float64,
+                )
                 if not baseline:
                     selected_blocks += 1
                     if flat_continuation is not None:
@@ -3760,6 +3907,13 @@ def train_direct_population_curriculum(
             if baseline:
                 # Baseline protects the input checkpoint but does not count as
                 # a successful population-training block.
+                best_training_scores = np.asarray(
+                    [
+                        float(result["model_a_score"])
+                        for result in training_results
+                    ],
+                    dtype=np.float64,
+                )
                 best_meets_readiness = False
                 readiness_streak = 0
                 ready = False
@@ -3792,7 +3946,16 @@ def train_direct_population_curriculum(
             elif flat_continuation is not None:
                 # No post-baseline checkpoint exists yet: the restored
                 # parent must start the next attempt with fresh moments.
+                preserved_policy_version = int(
+                    flat_continuation.get("policy_version", 0)
+                )
                 flat_continuation.clear()
+                # Versioning is monotonic even when model/AdamW state rolls
+                # back.  Otherwise a live trajectory would appear younger
+                # merely because the curriculum cleared its local state.
+                flat_continuation["policy_version"] = (
+                    preserved_policy_version
+                )
                 if shared_terminal_replay is not None:
                     # ``clear`` must not sever the caller-owned critic-only
                     # archive.  It remains valid after a policy rollback.
@@ -3819,21 +3982,22 @@ def train_direct_population_curriculum(
                 maximum_consecutive_regressions,
                 consecutive_regressions,
             )
-        # The baseline gate has no candidate-specific outcome to learn from.
-        # Also keep evaluation stubs / interrupted evaluations harmless: there
-        # is nothing meaningful to reweight until at least one opponent result
-        # was completed.
-        if (
-            flat_snapshot_archive_size
-            and accepted
-            and not baseline
-            and training_results
-        ):
-            # Scores are always measured for the candidate that just reached
-            # this gate; use them to choose its next training opponents.
-            observed_scores = np.asarray(
-                [float(result["model_a_score"]) for result in training_results],
-                dtype=np.float64,
+        # Seed PFSP with the baseline and refresh it even after a rollback.
+        # A rejected policy must not dictate the next opponent mix; in that
+        # case use the last measurements of the checkpoint just restored.
+        # This lets a known hard counter become common immediately rather than
+        # waiting for another globally accepted PPO block.
+        if flat_snapshot_archive_size and training_results:
+            observed_scores = (
+                np.asarray(
+                    [
+                        float(result["model_a_score"])
+                        for result in training_results
+                    ],
+                    dtype=np.float64,
+                )
+                if accepted
+                else best_training_scores
             )
             # Gate samples are deliberately small.  An exponential moving
             # average prevents one lucky two-game result from completely
@@ -3852,6 +4016,8 @@ def train_direct_population_curriculum(
                 role=flat_role,
                 primary_index=primary_index,
                 primary_probability=flat_primary_opponent_probability,
+                hard_counter_threshold=flat_hard_counter_threshold,
+                hard_counter_probability=flat_hard_counter_probability,
             )
             if selected and not baseline:
                 snapshot = PolicyValueBeliefNet(model_config)
@@ -3884,6 +4050,8 @@ def train_direct_population_curriculum(
                     role=flat_role,
                     primary_index=primary_index,
                     primary_probability=flat_primary_opponent_probability,
+                    hard_counter_threshold=flat_hard_counter_threshold,
+                    hard_counter_probability=flat_hard_counter_probability,
                 )
         benchmark_score = weighted_score
         row = {
@@ -3903,6 +4071,19 @@ def train_direct_population_curriculum(
             "readiness_streak": float(readiness_streak),
             "consecutive_regressions": float(consecutive_regressions),
             "games": float(games),
+            "regression_confirmation_games": float(
+                flat_regression_confirmation_games
+                if confirmation_candidate_score is not None else 0
+            ),
+            "regression_confirmation_opponent_index": float(
+                -1
+                if confirmation_opponent_index is None
+                else confirmation_opponent_index
+            ),
+            "regression_confirmation_candidate_score": (
+                confirmation_candidate_score
+            ),
+            "regression_confirmation_best_score": confirmation_best_score,
             "opponents": results,
             "training_mix_score": float(training_evaluation["model_a_score"]),
             "training_mix_worst_score": float(training_evaluation["worst_score"]),
@@ -3931,6 +4112,20 @@ def train_direct_population_curriculum(
                 consecutive_regressions
             ),
             direct_population_gate_games=float(games),
+            direct_population_regression_confirmation_games=float(
+                flat_regression_confirmation_games
+                if confirmation_candidate_score is not None else 0
+            ),
+            direct_population_regression_confirmation_candidate_score=(
+                0.0
+                if confirmation_candidate_score is None
+                else confirmation_candidate_score
+            ),
+            direct_population_regression_confirmation_best_score=(
+                0.0
+                if confirmation_best_score is None
+                else confirmation_best_score
+            ),
             flat_static_benchmark_score=(
                 0.0 if benchmark_score is None else benchmark_score
             ),
@@ -3938,6 +4133,15 @@ def train_direct_population_curriculum(
             flat_snapshot_count=float(len(flat_snapshots)),
         )
         if not baseline:
+            confirmation_suffix = (
+                ""
+                if confirmation_candidate_score is None
+                else (
+                    " | confirmation="
+                    f"{confirmation_candidate_score:.4f}"
+                    f" vs best={confirmation_best_score:.4f}"
+                )
+            )
             print(
                 "direct population diagnostic | "
                 f"block={block} score={weighted_score:.4f} "
@@ -3947,7 +4151,8 @@ def train_direct_population_curriculum(
                     ""
                     if benchmark_score is None
                     else f" benchmark={benchmark_score:.4f}"
-                ),
+                )
+                + confirmation_suffix,
                 flush=True,
             )
         return accepted

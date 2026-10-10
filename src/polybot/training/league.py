@@ -882,6 +882,9 @@ def train_promotion_league(
     flat_population_pfsp_alpha: float = 2.0,
     flat_population_pfsp_probability_floor: float = 0.05,
     flat_population_pfsp_score_ema_decay: float = 0.80,
+    flat_population_hard_counter_threshold: float = 0.0,
+    flat_population_hard_counter_probability: float = 0.0,
+    flat_population_regression_confirm_games: int = 0,
     flat_main_exploiter_probability: float = 0.70,
     flat_main_exploiter_archive_score: float = 0.55,
     breakthrough_exploiter: bool = False,
@@ -3059,6 +3062,18 @@ def train_promotion_league(
                                 flat_pfsp_score_ema_decay=(
                                     flat_population_pfsp_score_ema_decay
                                 ),
+                                flat_hard_counter_threshold=(
+                                    flat_population_hard_counter_threshold
+                                    if training_stage == "flat" else 0.0
+                                ),
+                                flat_hard_counter_probability=(
+                                    flat_population_hard_counter_probability
+                                    if training_stage == "flat" else 0.0
+                                ),
+                                flat_regression_confirmation_games=(
+                                    flat_population_regression_confirm_games
+                                    if training_stage == "flat" else 0
+                                ),
                                 flat_role="main",
                                 flat_terminal_replay=(
                                     flat_main_terminal_replay
@@ -3500,6 +3515,18 @@ def train_promotion_league(
                                     ),
                                     flat_pfsp_score_ema_decay=(
                                         flat_population_pfsp_score_ema_decay
+                                    ),
+                                    flat_hard_counter_threshold=(
+                                        flat_population_hard_counter_threshold
+                                        if training_stage == "flat" else 0.0
+                                    ),
+                                    flat_hard_counter_probability=(
+                                        flat_population_hard_counter_probability
+                                        if training_stage == "flat" else 0.0
+                                    ),
+                                    flat_regression_confirmation_games=(
+                                        flat_population_regression_confirm_games
+                                        if training_stage == "flat" else 0
                                     ),
                                     flat_role="main_exploiter",
                                     flat_primary_opponent_id=current_main_id,

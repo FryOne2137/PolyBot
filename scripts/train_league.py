@@ -532,6 +532,27 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         help="Flat-only smoothing for opponent difficulty before PFSP reweights.",
     )
     parser.add_argument(
+        "--flat-population-hard-counter-threshold", type=float, default=0.0,
+        help=(
+            "Flat-only: scores below this value are hard counters; 0 disables "
+            "their dedicated collection quota."
+        ),
+    )
+    parser.add_argument(
+        "--flat-population-hard-counter-probability", type=float, default=0.0,
+        help=(
+            "Flat-only total collection share reserved for currently weak "
+            "hard-counter opponents."
+        ),
+    )
+    parser.add_argument(
+        "--flat-population-regression-confirm-games", type=int, default=0,
+        help=(
+            "Flat-only paired games used to confirm a diagnostic regression "
+            "against its weakest opponent; 0 preserves immediate rollback."
+        ),
+    )
+    parser.add_argument(
         "--flat-main-exploiter-probability", type=float, default=0.70,
         help="Flat-only main-exploiter share reserved for the current main snapshot.",
     )
@@ -801,6 +822,13 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             flat_population_pfsp_alpha=2.0,
             flat_population_pfsp_probability_floor=0.05,
             flat_population_pfsp_score_ema_decay=0.80,
+            # A narrow policy that merely beats the champion must spend a
+            # substantial fraction of its own data fixing the counter that
+            # defeats it.  The generic defaults stay unchanged for all other
+            # entry points.
+            flat_population_hard_counter_threshold=0.45,
+            flat_population_hard_counter_probability=0.30,
+            flat_population_regression_confirm_games=60,
             flat_main_exploiter_probability=0.70,
             flat_main_exploiter_archive_score=0.55,
             breakthrough_exploiter=True,
@@ -1120,6 +1148,15 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         ),
         flat_population_pfsp_score_ema_decay=(
             args.flat_population_pfsp_score_ema_decay
+        ),
+        flat_population_hard_counter_threshold=(
+            args.flat_population_hard_counter_threshold
+        ),
+        flat_population_hard_counter_probability=(
+            args.flat_population_hard_counter_probability
+        ),
+        flat_population_regression_confirm_games=(
+            args.flat_population_regression_confirm_games
         ),
         flat_main_exploiter_probability=(
             args.flat_main_exploiter_probability

@@ -1425,6 +1425,21 @@ def test_main_exploiter_pfsp_keeps_current_main_as_primary_opponent():
     assert weights[2] >= 0.05
 
 
+def test_flat_pfsp_reserves_collection_for_known_hard_counter():
+    weights = _flat_pfsp_weights(
+        [0.55, 0.48, 0.30],
+        alpha=2.0,
+        probability_floor=0.05,
+        hard_counter_threshold=0.45,
+        hard_counter_probability=0.30,
+    )
+
+    np.testing.assert_allclose(weights.sum(), 1.0)
+    # The hard-counter reserve is additive to its ordinary PFSP probability.
+    assert weights[2] >= 0.30
+    assert weights[2] > weights[0]
+
+
 def test_flat_rollback_drops_rejected_policy_replay_but_keeps_terminal_value_data():
     terminal_replay = deque(["genuine-terminal"], maxlen=8)
     continuation = {

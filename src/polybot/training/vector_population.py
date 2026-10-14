@@ -3353,6 +3353,8 @@ def train_direct_population_curriculum(
     flat_hard_counter_threshold: float = 0.0,
     flat_hard_counter_probability: float = 0.0,
     flat_regression_confirmation_games: int = 0,
+    flat_champion_screen: bool = False,
+    flat_champion_screen_score: float = 0.50,
     flat_role: str = "main",
     flat_primary_opponent_id: int | str | None = None,
     flat_primary_opponent_probability: float = 0.70,
@@ -3497,6 +3499,8 @@ def train_direct_population_curriculum(
         raise ValueError(
             "flat_regression_confirmation_games must be zero or a positive even number"
         )
+    if not 0.0 <= flat_champion_screen_score <= 1.0:
+        raise ValueError("flat_champion_screen_score must be between zero and one")
     if flat_role not in {"main", "main_exploiter"}:
         raise ValueError("flat_role must be 'main' or 'main_exploiter'")
     if not 0.0 <= flat_primary_opponent_probability <= 1.0:
@@ -3685,6 +3689,8 @@ def train_direct_population_curriculum(
             "flat_regression_confirmation_games": (
                 flat_regression_confirmation_games
             ),
+            "flat_champion_screen": bool(flat_champion_screen),
+            "flat_champion_screen_score": float(flat_champion_screen_score),
         },
     )
     parent_state = model_state_on_cpu(candidate)
@@ -3718,6 +3724,18 @@ def train_direct_population_curriculum(
     plateau_blocks = 0
     plateau_adjustments = 0
     gate_rows: list[Dict[str, Any]] = []
+    flat_champion_index = next(
+        (
+            index
+            for index, opponent in enumerate(active_opponents)
+            if opponent is champion
+        ),
+        None,
+    )
+    if flat_champion_screen and flat_champion_index is None:
+        raise ValueError(
+            "flat champion screen requires the current champion in opponent_models"
+        )
 
     def refresh_flat_pfsp_weights() -> None:
         """Rebuild a collector-safe PFSP vector for the current archive.
@@ -3770,48 +3788,81 @@ def train_direct_population_curriculum(
         nonlocal active_weights, flat_pfsp_scores
         nonlocal best_flat_optimiser_state, best_flat_scaler_state
         nonlocal best_training_scores
-        training_evaluation = evaluate_direct_population_matches(
-            training,
-            candidate,
-            active_opponents,
-            active_weights,
-            games=games,
-            gate_seed=gate_seed,
-            visible_action_history=visible_action_history,
-            game_callback=(
-                None
-                if gate_game_callback is None
-                else lambda opponent_index, game: gate_game_callback(
-                    label,
-                    block,
-                    opponent_index,
-                    {
-                        **game,
-                        "opponent_id": active_ids[opponent_index],
-                    },
-                )
-            ),
-            candidate_label=candidate_label,
-            opponent_labels=active_labels,
-            num_threads=num_threads,
-            max_actions=max_actions,
-        )
-        benchmark_matches_active = (
-            len(active_opponents) == len(benchmark_opponents)
-            and all(
-                active is benchmark
-                for active, benchmark in zip(active_opponents, benchmark_opponents)
-            )
-            and np.array_equal(active_weights, benchmark_weights)
-        )
-        if benchmark_matches_active:
-            evaluation = training_evaluation
-        else:
-            evaluation = evaluate_direct_population_matches(
+        champion_screen: Mapping[str, Any] | None = None
+        champion_screen_score: float | None = None
+        champion_screen_lower_95: float | None = None
+        champion_screen_upper_95: float | None = None
+        champion_screen_passed = True
+        population_evaluation_skipped = False
+        if flat_champion_screen and not baseline:
+            assert flat_champion_index is not None
+            screen_evaluation = evaluate_direct_population_matches(
                 training,
                 candidate,
-                benchmark_opponents,
-                benchmark_weights,
+                [champion],
+                [1.0],
+                games=games,
+                gate_seed=gate_seed,
+                visible_action_history=visible_action_history,
+                game_callback=(
+                    None
+                    if gate_game_callback is None
+                    else lambda _screen_index, game: gate_game_callback(
+                        f"{label}_champion_screen",
+                        block,
+                        flat_champion_index,
+                        {
+                            **game,
+                            "opponent_id": active_ids[flat_champion_index],
+                        },
+                    )
+                ),
+                candidate_label=candidate_label,
+                opponent_labels=[active_labels[flat_champion_index]],
+                num_threads=num_threads,
+                max_actions=max_actions,
+            )
+            champion_screen = screen_evaluation["opponents"][0]
+            champion_screen_score = float(champion_screen["model_a_score"])
+            champion_screen_lower_95 = float(
+                champion_screen.get("score_lower_95", 0.0)
+            )
+            screen_standard_error = float(
+                champion_screen.get("score_standard_error", float("inf"))
+            )
+            champion_screen_upper_95 = (
+                min(1.0, champion_screen_score + 1.96 * screen_standard_error)
+                if np.isfinite(screen_standard_error)
+                else 1.0
+            )
+            # A block whose *upper* confidence bound is below a non-losing
+            # score against the champion cannot become a useful population
+            # checkpoint.  Do not spend another N-1 population evaluations
+            # merely to rediscover that fact.  The test is deliberately
+            # conservative: ambiguous screens still receive the full arena.
+            champion_screen_passed = bool(
+                champion_screen_upper_95 >= flat_champion_screen_score
+            )
+            population_evaluation_skipped = not champion_screen_passed
+
+        if population_evaluation_skipped:
+            assert champion_screen is not None
+            training_evaluation = {
+                "model_a_score": float(champion_screen["model_a_score"]),
+                "worst_score": float(champion_screen["model_a_score"]),
+                "model_a_city_captures_per_game": float(
+                    champion_screen["model_a_city_captures_per_game"]
+                ),
+                "completion_rate": float(champion_screen["completion_rate"]),
+                "opponents": [dict(champion_screen)],
+            }
+            evaluation = training_evaluation
+        else:
+            training_evaluation = evaluate_direct_population_matches(
+                training,
+                candidate,
+                active_opponents,
+                active_weights,
                 games=games,
                 gate_seed=gate_seed,
                 visible_action_history=visible_action_history,
@@ -3819,20 +3870,57 @@ def train_direct_population_curriculum(
                     None
                     if gate_game_callback is None
                     else lambda opponent_index, game: gate_game_callback(
-                        f"{label}_benchmark",
+                        label,
                         block,
                         opponent_index,
                         {
                             **game,
-                            "opponent_id": benchmark_ids[opponent_index],
+                            "opponent_id": active_ids[opponent_index],
                         },
                     )
                 ),
                 candidate_label=candidate_label,
-                opponent_labels=benchmark_labels,
+                opponent_labels=active_labels,
                 num_threads=num_threads,
                 max_actions=max_actions,
             )
+            benchmark_matches_active = (
+                len(active_opponents) == len(benchmark_opponents)
+                and all(
+                    active is benchmark
+                    for active, benchmark in zip(active_opponents, benchmark_opponents)
+                )
+                and np.array_equal(active_weights, benchmark_weights)
+            )
+            if benchmark_matches_active:
+                evaluation = training_evaluation
+            else:
+                evaluation = evaluate_direct_population_matches(
+                    training,
+                    candidate,
+                    benchmark_opponents,
+                    benchmark_weights,
+                    games=games,
+                    gate_seed=gate_seed,
+                    visible_action_history=visible_action_history,
+                    game_callback=(
+                        None
+                        if gate_game_callback is None
+                        else lambda opponent_index, game: gate_game_callback(
+                            f"{label}_benchmark",
+                            block,
+                            opponent_index,
+                            {
+                                **game,
+                                "opponent_id": benchmark_ids[opponent_index],
+                            },
+                        )
+                    ),
+                    candidate_label=candidate_label,
+                    opponent_labels=benchmark_labels,
+                    num_threads=num_threads,
+                    max_actions=max_actions,
+                )
         results = evaluation["opponents"]
         training_results = training_evaluation["opponents"]
         weighted_score = float(evaluation["model_a_score"])
@@ -3855,12 +3943,16 @@ def train_direct_population_curriculum(
             score_tolerance=score_tolerance,
             objective_tolerance=objective_tolerance,
         )
+        if population_evaluation_skipped:
+            accepted = False
+            acceptance_reason = "champion_screen_failed"
         confirmation_candidate_score: float | None = None
         confirmation_best_score: float | None = None
         confirmation_opponent_index: int | None = None
         if (
             not baseline
             and not accepted
+            and not population_evaluation_skipped
             and flat_regression_confirmation_games
             and results
         ):
@@ -4112,6 +4204,13 @@ def train_direct_population_curriculum(
             "readiness_streak": float(readiness_streak),
             "consecutive_regressions": float(consecutive_regressions),
             "games": float(games),
+            "flat_champion_screen_score": champion_screen_score,
+            "flat_champion_screen_lower_95": champion_screen_lower_95,
+            "flat_champion_screen_upper_95": champion_screen_upper_95,
+            "flat_champion_screen_passed": float(champion_screen_passed),
+            "flat_population_evaluation_skipped": float(
+                population_evaluation_skipped
+            ),
             "regression_confirmation_games": float(
                 flat_regression_confirmation_games
                 if confirmation_candidate_score is not None else 0
@@ -4153,6 +4252,18 @@ def train_direct_population_curriculum(
                 consecutive_regressions
             ),
             direct_population_gate_games=float(games),
+            flat_champion_screen_score=(
+                0.0 if champion_screen_score is None else champion_screen_score
+            ),
+            flat_champion_screen_upper_95=(
+                0.0
+                if champion_screen_upper_95 is None
+                else champion_screen_upper_95
+            ),
+            flat_champion_screen_passed=float(champion_screen_passed),
+            flat_population_evaluation_skipped=float(
+                population_evaluation_skipped
+            ),
             direct_population_regression_confirmation_games=float(
                 flat_regression_confirmation_games
                 if confirmation_candidate_score is not None else 0
@@ -4196,6 +4307,15 @@ def train_direct_population_curriculum(
                 + confirmation_suffix,
                 flush=True,
             )
+            if population_evaluation_skipped:
+                print(
+                    "direct population champion screen | "
+                    f"score={champion_screen_score:.4f} "
+                    f"upper95={champion_screen_upper_95:.4f} "
+                    f"threshold={flat_champion_screen_score:.4f} | "
+                    "population benchmark skipped",
+                    flush=True,
+                )
         return accepted
 
     gate("baseline", -1, baseline=True)

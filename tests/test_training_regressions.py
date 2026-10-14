@@ -1409,6 +1409,88 @@ def test_flat_population_uses_fixed_benchmark_for_rollback():
     assert result["direct_population_best_score"] == 0.60
 
 
+def test_flat_champion_screen_skips_population_for_a_clear_loss():
+    config = ModelConfig(d_model=32, transformer_layers=1, attention_heads=4)
+    candidate = PolicyValueBeliefNet(config)
+    champion = PolicyValueBeliefNet(config)
+    counter = PolicyValueBeliefNet(config)
+    evaluation_sizes: list[int] = []
+
+    def evaluation(*args, **kwargs):
+        opponents = args[2]
+        evaluation_sizes.append(len(opponents))
+        if len(evaluation_sizes) == 1:
+            # Baseline: full fixed arena.
+            rows = [
+                {"model_a_score": 0.50, "model_a_city_captures_per_game": 0.1,
+                 "completion_rate": 0.5},
+                {"model_a_score": 0.50, "model_a_city_captures_per_game": 0.1,
+                 "completion_rate": 0.5},
+            ]
+        elif len(evaluation_sizes) == 2:
+            # A precise losing champion screen: its upper 95% bound is 0.22.
+            rows = [
+                {"model_a_score": 0.20, "score_lower_95": 0.18,
+                 "score_standard_error": 0.01,
+                 "model_a_city_captures_per_game": 0.0,
+                 "completion_rate": 0.5}
+            ]
+        else:
+            # Final held-out arena after the rollback.
+            rows = [
+                {"model_a_score": 0.50, "model_a_city_captures_per_game": 0.1,
+                 "completion_rate": 0.5},
+                {"model_a_score": 0.50, "model_a_city_captures_per_game": 0.1,
+                 "completion_rate": 0.5},
+            ]
+        return {
+            "model_a_score": float(np.mean([row["model_a_score"] for row in rows])),
+            "worst_score": min(float(row["model_a_score"]) for row in rows),
+            "model_a_city_captures_per_game": float(np.mean(
+                [row["model_a_city_captures_per_game"] for row in rows]
+            )),
+            "completion_rate": float(np.mean(
+                [row["completion_rate"] for row in rows]
+            )),
+            "opponents": rows,
+        }
+
+    with (
+        patch(
+            "polybot.training.vector_population.evaluate_direct_population_matches",
+            side_effect=evaluation,
+        ),
+        patch(
+            "polybot.training.vector_population.train_vector_population",
+            return_value={"steps": 1.0},
+        ),
+    ):
+        result = train_direct_population_curriculum(
+            TrainingConfig(device="cpu"), config, candidate, champion,
+            [champion, counter], [0.5, 0.5], num_envs=2,
+            minimum_steps=1_000, maximum_steps=1_000, block_steps=1_000,
+            num_threads=1, max_actions=16, gate_games=2,
+            diagnostic_gate_games=2, gate_seed=100, gate_score=0.50,
+            historical_score_floor=0.45,
+            readiness_city_captures_per_game=0.05,
+            readiness_completion_rate=0.05, readiness_patience=2,
+            policy_anchor_weight=0.20, value_anchor_weight=0.10,
+            opponent_policy_weight=0.0, teacher_weight=0.0,
+            shaping_weight=0.20, regression_patience=1,
+            flat_champion_screen=True, run=_MemoryRun(),
+        )
+
+    # Baseline and final evaluation use two opponents.  The rejected PPO
+    # block spent exactly one matchup on the champion, not another full arena.
+    # The final selector also compares its EMA, hence the two trailing full
+    # arenas.  Crucially there is no full-population evaluation between the
+    # one-opponent screen and final selection.
+    assert evaluation_sizes == [2, 1, 2, 2]
+    block = result["direct_population_gate_rows"][1]
+    assert block["acceptance_reason"] == "champion_screen_failed"
+    assert block["flat_population_evaluation_skipped"] == 1.0
+
+
 def test_main_exploiter_pfsp_keeps_current_main_as_primary_opponent():
     weights = _flat_pfsp_weights(
         [0.50, 0.50, 0.50],

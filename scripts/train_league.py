@@ -553,6 +553,16 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--flat-population-champion-screen",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Flat-only: screen each PPO block against the champion before "
+            "running the full population benchmark; clearly losing blocks "
+            "skip the expensive historical evaluations."
+        ),
+    )
+    parser.add_argument(
         "--flat-main-exploiter-probability", type=float, default=0.70,
         help="Flat-only main-exploiter share reserved for the current main snapshot.",
     )
@@ -829,6 +839,7 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             flat_population_hard_counter_threshold=0.45,
             flat_population_hard_counter_probability=0.30,
             flat_population_regression_confirm_games=60,
+            flat_population_champion_screen=True,
             flat_main_exploiter_probability=0.70,
             flat_main_exploiter_archive_score=0.55,
             breakthrough_exploiter=True,
@@ -1157,6 +1168,9 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         ),
         flat_population_regression_confirm_games=(
             args.flat_population_regression_confirm_games
+        ),
+        flat_population_champion_screen=(
+            args.flat_population_champion_screen
         ),
         flat_main_exploiter_probability=(
             args.flat_main_exploiter_probability

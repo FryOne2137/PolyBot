@@ -320,6 +320,21 @@ def _promotion_gate_decision(
     }
 
 
+def _score_upper_95(summary: Mapping[str, Any]) -> float:
+    """Return the paired-arena upper confidence bound, conservatively.
+
+    Evaluation reports the lower bound because promotion needs proof of an
+    improvement.  Early rejection has the opposite question: can this model
+    plausibly still reach the required score?  An unavailable uncertainty
+    estimate must therefore *not* reject the candidate.
+    """
+    score = float(summary.get("model_a_score", 0.0))
+    standard_error = float(summary.get("score_standard_error", float("inf")))
+    if not np.isfinite(standard_error):
+        return 1.0
+    return min(1.0, score + 1.96 * max(0.0, standard_error))
+
+
 def _challenger_continuation_action(
     *,
     valid: bool,
@@ -885,6 +900,7 @@ def train_promotion_league(
     flat_population_hard_counter_threshold: float = 0.0,
     flat_population_hard_counter_probability: float = 0.0,
     flat_population_regression_confirm_games: int = 0,
+    flat_population_champion_screen: bool = False,
     flat_main_exploiter_probability: float = 0.70,
     flat_main_exploiter_archive_score: float = 0.55,
     breakthrough_exploiter: bool = False,
@@ -3074,6 +3090,13 @@ def train_promotion_league(
                                     flat_population_regression_confirm_games
                                     if training_stage == "flat" else 0
                                 ),
+                                flat_champion_screen=(
+                                    training_stage == "flat"
+                                    and flat_population_champion_screen
+                                ),
+                                flat_champion_screen_score=(
+                                    direct_population_gate_score
+                                ),
                                 flat_role="main",
                                 flat_terminal_replay=(
                                     flat_main_terminal_replay
@@ -4165,18 +4188,30 @@ def train_promotion_league(
                         # neither block nor overwrite a champion.
                         flat_evaluations: list[Dict[str, Any]] = []
                         flat_invalid = False
+                        flat_champion_gate_short_circuited = False
                         champion_before_id = champion_id
+                        # Promotion and continuation are both anchored on the
+                        # current champion.  Run that matchup first, while
+                        # retaining its original map schedule if the database
+                        # population happens to be ordered differently.
+                        ordered_flat_gate_opponents = sorted(
+                            enumerate(zip(
+                                population_ids,
+                                population_paths,
+                                frozen_models,
+                                probabilities,
+                            )),
+                            key=lambda item: (
+                                0 if item[1][0] == champion_before_id else 1,
+                                item[0],
+                            ),
+                        )
                         for opponent_index, (
                             opponent_id,
                             opponent_path,
                             opponent_model,
                             probability,
-                        ) in enumerate(zip(
-                            population_ids,
-                            population_paths,
-                            frozen_models,
-                            probabilities,
-                        )):
+                        ) in ordered_flat_gate_opponents:
                             is_champion = opponent_id == champion_before_id
                             games = (
                                 promotion_games if is_champion else historical_games
@@ -4257,11 +4292,43 @@ def train_promotion_league(
                                 f"lower95={float(match['score_lower_95']):.4f}",
                                 flush=True,
                             )
+                            if (
+                                is_champion
+                                and _score_upper_95(match) < 0.50
+                            ):
+                                # There is no evidence that this candidate is
+                                # even non-losing against the model it must
+                                # replace.  Historical gates cannot turn it
+                                # into a promotion, so avoid paying for them.
+                                flat_champion_gate_short_circuited = True
+                                print(
+                                    "league flat champion screen failed | "
+                                    f"upper95={_score_upper_95(match):.4f} "
+                                    "< 0.5000 | historical gates skipped",
+                                    flush=True,
+                                )
+                                break
 
                         if flat_invalid:
                             decision: Dict[str, float | bool] = {
                                 "candidate_score": 0.0,
                                 "champion_lower_95": 0.0,
+                                "population_score": 0.0,
+                                "minimum_historical_score": 0.0,
+                                "promoted": False,
+                            }
+                        elif flat_champion_gate_short_circuited:
+                            champion_result = flat_evaluations[0]
+                            decision = {
+                                "candidate_score": float(
+                                    champion_result["model_a_score"]
+                                ),
+                                "champion_lower_95": float(
+                                    champion_result["score_lower_95"]
+                                ),
+                                # No population result was measured.  These
+                                # sentinels deliberately make continuation
+                                # fall back to the last verified apprentice.
                                 "population_score": 0.0,
                                 "minimum_historical_score": 0.0,
                                 "promoted": False,
@@ -4752,6 +4819,9 @@ def train_promotion_league(
                             "minimum_historical_score": (
                                 minimum_historical_score
                             ),
+                            "champion_gate_short_circuited": float(
+                                flat_champion_gate_short_circuited
+                            ),
                             "retained_challenger": float(
                                 retain_challenger and not promoted
                             ),
@@ -4780,6 +4850,9 @@ def train_promotion_league(
                             champion_mode_auto_flat=float(champion_mode == "auto"),
                             candidate_score=last_candidate_score,
                             population_score=last_population_score,
+                            flat_champion_gate_short_circuited=float(
+                                flat_champion_gate_short_circuited
+                            ),
                             promoted=float(promoted),
                             retained_challenger=float(
                                 retain_challenger and not promoted

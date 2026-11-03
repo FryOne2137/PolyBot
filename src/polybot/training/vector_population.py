@@ -74,6 +74,7 @@ class _PPOExample:
     # a 700-move game must still teach its opening positions who eventually
     # won.  A forced partial-trajectory flush falls back to ``return_target``.
     value_target: float | None = None
+    has_terminal_value: bool = False
     # PPO may wait for a long native game to end while other slots already
     # update the policy.  Value can still learn from this observation, but the
     # actor must not silently optimize a very old behaviour policy.
@@ -93,6 +94,98 @@ class _PPOTransition:
     sign: float
     terminal: bool
     candidate_example: _PPOExample | None
+
+
+@dataclass(frozen=True)
+class _TerminalValuePosition:
+    observation: Mapping[str, np.ndarray]
+    old_value: float
+
+
+@dataclass
+class _TerminalValueTrace:
+    """Bounded reservoir of public positions across one complete game.
+
+    Policy fragments can be consumed immediately. These positions carry no
+    actor targets and survive until the game's actual outcome is known.
+    """
+
+    seen: int = 0
+    positions: list[_TerminalValuePosition] = field(default_factory=list)
+
+    def add(
+        self, example: _PPOExample, rng: np.random.Generator, capacity: int
+    ) -> None:
+        self.seen += 1
+        index = (
+            len(self.positions)
+            if len(self.positions) < capacity
+            else int(rng.integers(self.seen))
+        )
+        if index >= capacity:
+            return
+        position = _TerminalValuePosition(example.observation, example.old_value)
+        if index == len(self.positions):
+            self.positions.append(position)
+        else:
+            self.positions[index] = position
+
+
+@dataclass
+class _PolicySampleUsage:
+    """Sample-weighted actor coverage; unlike minibatch means, this adds up."""
+
+    samples: int = 0
+    eligible: int = 0
+    stale: int = 0
+    terminal: int = 0
+    age_histogram: dict[int, int] = field(default_factory=dict)
+
+    def add(
+        self, examples: Sequence[_PPOExample], ages: np.ndarray,
+        max_age: int | None,
+    ) -> None:
+        self.samples += len(examples)
+        self.eligible += sum(example.policy_selected for example in examples)
+        self.stale += int((ages > max_age).sum()) if max_age is not None else 0
+        self.terminal += sum(example.has_terminal_value for example in examples)
+        values, counts = np.unique(ages, return_counts=True)
+        for age, count in zip(values, counts):
+            key = int(age)
+            self.age_histogram[key] = self.age_histogram.get(key, 0) + int(count)
+
+    def metrics(self) -> dict[str, float]:
+        def percentile(fraction: float) -> float:
+            threshold = max(1, int(np.ceil(fraction * self.samples)))
+            count = 0
+            for age in sorted(self.age_histogram):
+                count += self.age_histogram[age]
+                if count >= threshold:
+                    return float(age)
+            return 0.0
+
+        return {
+            "samples_observed": float(self.samples),
+            "policy_eligible_samples": float(self.eligible),
+            "policy_selected_fraction": self.eligible / max(1, self.samples),
+            "policy_stale_samples": float(self.stale),
+            "policy_stale_fraction": self.stale / max(1, self.samples),
+            "policy_advantage_filtered_samples": float(
+                self.samples - self.eligible - self.stale
+            ),
+            "policy_age_mean": sum(
+                age * count for age, count in self.age_histogram.items()
+            ) / max(1, self.samples),
+            "policy_age_p50": percentile(0.50),
+            "policy_age_p95": percentile(0.95),
+            "policy_age_max": float(max(self.age_histogram, default=0)),
+            "policy_age_0_fraction": self.age_histogram.get(0, 0) / max(1, self.samples),
+            "policy_age_1_fraction": self.age_histogram.get(1, 0) / max(1, self.samples),
+            "policy_age_2_plus_fraction": sum(
+                count for age, count in self.age_histogram.items() if age >= 2
+            ) / max(1, self.samples),
+            "terminal_target_fraction": self.terminal / max(1, self.samples),
+        }
 
 
 @dataclass
@@ -118,7 +211,7 @@ class _TerminalValueCalibration:
 
     def add(
         self,
-        examples: Sequence[_PPOExample],
+        examples: Sequence[_PPOExample | _TerminalValuePosition],
         outcome: float,
         *,
         record_phases: bool = True,
@@ -154,7 +247,12 @@ class _TerminalValueCalibration:
 
     def metrics(self, *, include_phases: bool = True) -> Dict[str, float]:
         if not self.count:
-            base = {"count": 0.0, "mae": 0.0, "rmse": 0.0, "correlation": 0.0}
+            base = {
+                "count": 0.0, "mae": 0.0, "rmse": 0.0,
+                "correlation": 0.0, "bias": 0.0,
+                "prediction_mean": 0.0, "outcome_mean": 0.0,
+                "explained_variance": 0.0, "variance_valid": 0.0,
+            }
         else:
             count = float(self.count)
             prediction_mean = self.prediction_sum / count
@@ -173,6 +271,18 @@ class _TerminalValueCalibration:
                 "count": count,
                 "mae": self.absolute_error_sum / count,
                 "rmse": float(np.sqrt(self.squared_error_sum / count)),
+                "bias": prediction_mean - outcome_mean,
+                "prediction_mean": prediction_mean,
+                "outcome_mean": outcome_mean,
+                "variance_valid": float(outcome_variance > 1e-12),
+                "explained_variance": (
+                    1.0 - max(
+                        0.0,
+                        self.squared_error_sum / count
+                        - (prediction_mean - outcome_mean)**2,
+                    ) / outcome_variance
+                    if outcome_variance > 1e-12 else 0.0
+                ),
                 "correlation": (
                     covariance / denominator if denominator > 1e-12 else 0.0
                 ),
@@ -196,6 +306,7 @@ class _PPGExample:
 
     observation: Mapping[str, np.ndarray]
     return_target: float
+    has_terminal_value: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,6 +316,7 @@ class _PPGTargetExample:
     observation: Mapping[str, np.ndarray]
     policy_log_probabilities: np.ndarray
     return_target: float
+    has_terminal_value: bool = False
 
 
 def _ppo_snapshot(
@@ -322,6 +434,7 @@ def _finish_ppo_trace(
                 if terminal_outcome is not None
                 else example.return_target
             )
+            example.has_terminal_value = terminal_outcome is not None
             result.append(example)
     result.reverse()
     return result
@@ -1313,6 +1426,7 @@ def train_vector_population(
     terminal_replay_interval: int = 1,
     terminal_replay_value_weight: float = 0.0,
     ppo_max_policy_age: int | None = None,
+    ppo_synchronous_rollouts: bool = False,
     ppg_enabled: bool = True,
     ppg_interval: int = 8,
     ppg_buffer_capacity: int = 8_192,
@@ -1333,10 +1447,10 @@ def train_vector_population(
     Only candidate actions receive an actor loss.  The per-slot trace still
     contains every intervening opponent action, so a terminal result and all
     intermediate rewards are propagated back with the correct player sign.
-    A trace normally remains in RAM until its native game terminates. A bounded
-    safety cap or the end of a training block may bootstrap an unfinished
-    trace from its observed next value; neither case is ever labelled as a
-    draw.
+    Synchronous flat rollouts freeze collection for ``ppo_rollout_steps``
+    vector steps, then bootstrap unfinished fragments before updating PPO.
+    A separate bounded value reservoir waits for the real game outcome.
+    Other callers retain the legacy completed-trajectory collector.
     """
     if num_envs < 2 or steps < 1 or max_actions < 1:
         raise ValueError("num_envs >= 2, steps and max_actions are required")
@@ -1511,6 +1625,7 @@ def train_vector_population(
             "policy_anchor_weight": policy_anchor_weight,
             "value_anchor_weight": value_anchor_weight,
             "ppo_rollout_steps": ppo_rollout_steps,
+            "ppo_synchronous_rollouts": ppo_synchronous_rollouts,
             "ppo_epochs": ppo_epochs,
             "ppo_minibatch_size": ppo_minibatch_size,
             "ppo_clip_range": ppo_clip_range,
@@ -1635,6 +1750,7 @@ def train_vector_population(
         num_threads,
         max_actions,
         visible_action_history,
+        ppo_synchronous_rollouts,
     )
     if (
         continuation_state is not None
@@ -1692,6 +1808,21 @@ def train_vector_population(
         if reused_environment
         else [[] for _ in range(num_envs)]
     )
+    value_traces: list[_TerminalValueTrace] = (
+        continuation_state.get("value_traces", [
+            _TerminalValueTrace() for _ in range(num_envs)
+        ])
+        if reused_environment else [
+            _TerminalValueTrace() for _ in range(num_envs)
+        ]
+    )
+    # Reservoir sampling must not perturb the action/opponent RNG stream.
+    value_trace_rng = (
+        continuation_state.get("value_trace_rng")
+        if reused_environment else None
+    )
+    if value_trace_rng is None:
+        value_trace_rng = np.random.default_rng(training.seed ^ 0x56414C)
     objective_histories: list[Deque[_ObjectiveReplayExample]] = (
         continuation_state.get("objective_histories")
         if reused_environment
@@ -1751,6 +1882,8 @@ def train_vector_population(
         else 0
     )
     ppo_policy_samples = 0
+    policy_usage = _PolicySampleUsage()
+    ppo_accepted_sample_presentations = 0
     ppo_behaviour_kl_limits = 0
     completed_examples: list[_PPOExample] = []
     pending_candidate_examples = int(
@@ -1759,6 +1892,8 @@ def train_vector_population(
         else 0
     )
     ppo_forced_truncations = 0
+    ppo_fragment_bootstraps = 0
+    terminal_value_positions = 0
     objective_replay_events = 0
     objective_replay_positions = 0
     objective_replay_updates = 0
@@ -1801,6 +1936,7 @@ def train_vector_population(
     # *this environment step*, otherwise tqdm misleadingly displays 0.000 on
     # every collection-only step.
     last_champion_kl = 0.0
+    last_behaviour_kl = 0.0
     reward_total = 0.0
     shaping_weight_total = 0.0
     history_tokens_seen = 0
@@ -1810,6 +1946,8 @@ def train_vector_population(
         "value_loss": 0.0,
         "policy_kl": 0.0,
     }
+    ppg_terminal_presentations = 0
+    ppg_total_presentations = 0
 
     def optimise_rollout(examples: Sequence[_PPOExample]) -> Dict[str, float]:
         """Run PPO with a local trust region around the rollout policy."""
@@ -1817,6 +1955,7 @@ def train_vector_population(
         nonlocal ema_updates
         nonlocal objective_replay_updates, objective_replay_update_credits
         nonlocal terminal_replay_updates, policy_version
+        nonlocal ppo_accepted_sample_presentations
         if not examples:
             return {
                 "loss": 0.0,
@@ -1853,6 +1992,7 @@ def train_vector_population(
             for example, age in zip(examples, policy_ages):
                 if age > ppo_max_policy_age:
                     example.policy_selected = False
+        policy_usage.add(examples, policy_ages, ppo_max_policy_age)
         totals_local = {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -2153,7 +2293,14 @@ def train_vector_population(
                         include_belief=False,
                     )
                     terminal_replay_value_loss = F.smooth_l1_loss(
-                        terminal_output.value.float(), terminal_targets
+                        (
+                            candidate.value_head(
+                                terminal_output.state.detach()
+                            ).squeeze(-1).float()
+                            if ppo_synchronous_rollouts
+                            else terminal_output.value.float()
+                        ),
+                        terminal_targets,
                     )
                     terminal_replay_updates += 1
                 loss = (
@@ -2243,6 +2390,7 @@ def train_vector_population(
                     break
                 continue
             accepted_epoch_behaviour_kls.append(behaviour_kl)
+            ppo_accepted_sample_presentations += len(examples)
             # One accepted PPO epoch is one behaviour-policy version.  Do
             # not increment for individual minibatches: a one-rollout update
             # may contain dozens of them, which made --max-policy-age=1 mean
@@ -2271,6 +2419,12 @@ def train_vector_population(
         nonlocal ppg_samples_added
         if not ppg_enabled or not examples:
             return
+        if ppo_synchronous_rollouts:
+            # Finished-game positions were already retained through the
+            # full-game reservoir. Do not double-count the last fragment.
+            examples = [e for e in examples if not e.has_terminal_value]
+            if not examples:
+                return
         kept = min(len(examples), ppg_samples_per_rollout)
         indices = (
             np.arange(len(examples), dtype=np.int64)
@@ -2287,6 +2441,7 @@ def train_vector_population(
                         if example.value_target is None
                         else example.value_target
                     ),
+                    has_terminal_value=example.has_terminal_value,
                 )
             )
         ppg_samples_added += kept
@@ -2295,6 +2450,7 @@ def train_vector_population(
         """Distil the current policy while value trains the shared encoder."""
         nonlocal ppg_phases, ppg_phases_total, ppg_updates, ema_updates
         nonlocal policy_version
+        nonlocal ppg_terminal_presentations, ppg_total_presentations
         if not ppg_enabled or len(ppg_replay) < ppg_minibatch_size:
             return {}
         phase_size = min(ppg_phase_samples, len(ppg_replay))
@@ -2344,6 +2500,7 @@ def train_vector_population(
                             row, :legal_count
                         ].astype(np.float32, copy=True),
                         return_target=example.return_target,
+                        has_terminal_value=example.has_terminal_value,
                     )
                 )
 
@@ -2366,6 +2523,10 @@ def train_vector_population(
                     targets[int(index)]
                     for index in order[start:start + ppg_minibatch_size]
                 ]
+                ppg_terminal_presentations += sum(
+                    example.has_terminal_value for example in subset
+                )
+                ppg_total_presentations += len(subset)
                 replay_batch, reference_logs, returns = _ppg_batch(subset)
                 tensors = _vector_tensors(replay_batch, device, training)
                 reference_tensor = torch.as_tensor(
@@ -2619,6 +2780,10 @@ def train_vector_population(
                         ].copy(),
                         policy_version=policy_version,
                     )
+                    if ppo_synchronous_rollouts:
+                        value_traces[env_id].add(
+                            example, value_trace_rng, ppg_samples_per_rollout
+                        )
                     pending_candidate_examples += 1
                 traces[env_id].append(
                     _PPOTransition(
@@ -2657,16 +2822,32 @@ def train_vector_population(
                         ppo_terminal_advantage_weight
                     ),
                 )
-                value_calibration.add(finished_examples, candidate_outcome)
+                if ppo_synchronous_rollouts:
+                    terminal_positions = value_traces[int(env_id)].positions
+                    value_calibration.add(terminal_positions, candidate_outcome)
+                    terminal_value_positions += len(terminal_positions)
+                    if ppg_enabled:
+                        for position in terminal_positions:
+                            ppg_replay.append(_PPGExample(
+                                position.observation, candidate_outcome,
+                                has_terminal_value=True,
+                            ))
+                        ppg_samples_added += len(terminal_positions)
+                    value_traces[int(env_id)] = _TerminalValueTrace()
+                else:
+                    terminal_positions = finished_examples
+                    value_calibration.add(finished_examples, candidate_outcome)
+                    terminal_value_positions += len(finished_examples)
                 if terminal_replay_enabled:
                     # These are immutable public observations paired only
                     # with a genuine final outcome.  They train the critic,
                     # never an off-policy actor target.
-                    for finished_example in finished_examples:
+                    for finished_example in terminal_positions:
                         terminal_replay.append(
                             _PPGExample(
                                 observation=finished_example.observation,
                                 return_target=candidate_outcome,
+                                has_terminal_value=True,
                             )
                         )
                 completed_examples.extend(finished_examples)
@@ -2706,7 +2887,27 @@ def train_vector_population(
 
             rollout_metrics: Dict[str, float] = {}
             ppg_metrics: Dict[str, float] = {}
-            if pending_candidate_examples > ppo_max_pending_examples:
+            fragment_boundary = ppo_synchronous_rollouts and (
+                (step + 1) % ppo_rollout_steps == 0 or step + 1 == steps
+                or pending_candidate_examples >= ppo_max_pending_examples
+            )
+            if fragment_boundary:
+                # Every live slot contributes a fresh bootstrapped fragment.
+                # End of fragment never means draw or terminal game.
+                for trace in traces:
+                    if not trace:
+                        continue
+                    fragment = _finish_ppo_trace(
+                        trace, gamma=gamma, gae_lambda=ppo_gae_lambda
+                    )
+                    completed_examples.extend(fragment)
+                    pending_candidate_examples -= len(fragment)
+                    trace.clear()
+                    ppo_fragment_bootstraps += 1
+            elif (
+                not ppo_synchronous_rollouts
+                and pending_candidate_examples > ppo_max_pending_examples
+            ):
                 for trace in traces:
                     if not trace:
                         continue
@@ -2717,7 +2918,10 @@ def train_vector_population(
                     pending_candidate_examples -= len(truncated_examples)
                     trace.clear()
                     ppo_forced_truncations += 1
-            if step + 1 == steps and continuation_state is None:
+            if (
+                not ppo_synchronous_rollouts
+                and step + 1 == steps and continuation_state is None
+            ):
                 # The final block boundary is a bootstrap, never a fake draw.
                 # Flat continuation instead preserves the live trajectory
                 # until its real outcome, allowing terminal replay to cover
@@ -2732,10 +2936,13 @@ def train_vector_population(
                     pending_candidate_examples -= len(truncated_examples)
                     trace.clear()
                     ppo_forced_truncations += 1
-            if completed_examples and (
-                len(completed_examples) >= ppo_update_target
-                or step + 1 == steps
-            ):
+            update_due = (
+                fragment_boundary if ppo_synchronous_rollouts else (
+                    len(completed_examples) >= ppo_update_target
+                    or step + 1 == steps
+                )
+            )
+            if completed_examples and update_due:
                 examples = completed_examples
                 completed_examples = []
                 ppo_samples += len(examples)
@@ -2747,6 +2954,9 @@ def train_vector_population(
                     ppg_metrics = optimise_ppg_phase()
                 last_champion_kl = float(
                     rollout_metrics.get("champion_kl", last_champion_kl)
+                )
+                last_behaviour_kl = float(
+                    rollout_metrics.get("behaviour_kl", last_behaviour_kl)
                 )
                 for name, value in rollout_metrics.items():
                     totals[name] += value
@@ -2769,6 +2979,13 @@ def train_vector_population(
                 ppo_pending_examples=pending_candidate_examples,
                 ppo_environment_reused=float(reused_environment),
                 ppo_forced_truncations=ppo_forced_truncations,
+                ppo_fragment_bootstraps=ppo_fragment_bootstraps,
+                ppo_synchronous_rollouts=float(ppo_synchronous_rollouts),
+                ppo_policy_eligible_fraction=(
+                    policy_usage.eligible / max(1, policy_usage.samples)
+                ),
+                ppo_actor_sample_presentations=ppo_policy_samples,
+                terminal_value_positions=terminal_value_positions,
                 ppg_enabled=float(ppg_enabled),
                 ppg_buffer_size=len(ppg_replay),
                 ppg_samples_added=ppg_samples_added,
@@ -2811,7 +3028,8 @@ def train_vector_population(
                     ppg_phases=ppg_phases,
                     replay_updates=objective_replay_updates,
                     kl=f"{last_champion_kl:.5f}",
-                    bkl=f"{float(rollout_metrics.get('behaviour_kl', 0.0)):.5f}",
+                    bkl=f"{last_behaviour_kl:.5f}",
+                    actor=f"{policy_usage.eligible / max(1, policy_usage.samples):.0%}",
                     kl_limits=ppo_behaviour_kl_limits,
                 )
 
@@ -2853,9 +3071,24 @@ def train_vector_population(
         "direct_population_ppo_forced_truncations": float(
             ppo_forced_truncations
         ),
+        "direct_population_ppo_synchronous_rollouts": float(ppo_synchronous_rollouts),
+        "direct_population_ppo_fragment_bootstraps": float(ppo_fragment_bootstraps),
+        "direct_population_terminal_value_positions": float(terminal_value_positions),
+        "direct_population_ppo_accepted_sample_presentations": float(
+            ppo_accepted_sample_presentations
+        ),
+        "direct_population_ppo_actor_applied_fraction": (
+            ppo_policy_samples / max(1, ppo_accepted_sample_presentations)
+        ),
+        "direct_population_ppg_terminal_target_fraction": (
+            ppg_terminal_presentations / max(1, ppg_total_presentations)
+        ),
         "direct_population_ppg_enabled": float(ppg_enabled),
         "direct_population_ppg_policy_phase_value_head_only": float(
             ppg_enabled
+        ),
+        "direct_population_terminal_replay_value_head_only": float(
+            ppo_synchronous_rollouts
         ),
         "direct_population_ppg_interval": float(ppg_interval),
         "direct_population_ppg_buffer_capacity": float(
@@ -2954,7 +3187,35 @@ def train_vector_population(
             "direct_population_ppo_" + name: value / divisor
             for name, value in totals.items()
         },
+        **{
+            "direct_population_ppo_" + name: value
+            for name, value in policy_usage.metrics().items()
+        },
     }
+    usage = policy_usage.metrics()
+    calibration = value_calibration.metrics()
+    print(
+        "direct population learning | "
+        f"collector={'synchronous' if ppo_synchronous_rollouts else 'completed_games'} "
+        f"| actor={usage['policy_selected_fraction']:.1%} "
+        f"({policy_usage.eligible}/{policy_usage.samples}) "
+        f"applied={ppo_policy_samples}/{ppo_accepted_sample_presentations} "
+        f"stale={policy_usage.stale} "
+        f"| age mean/p95/max={usage['policy_age_mean']:.2f}/"
+        f"{usage['policy_age_p95']:.0f}/{usage['policy_age_max']:.0f}",
+        flush=True,
+    )
+    if calibration["count"]:
+        print(
+            "direct population terminal value (collection predictions) | "
+            f"positions={calibration['count']:.0f} "
+            f"MAE={calibration['mae']:.4f} RMSE={calibration['rmse']:.4f} "
+            f"bias={calibration['bias']:+.4f} corr={calibration['correlation']:.3f} "
+            f"| PPG terminal labels={summary['direct_population_ppg_terminal_target_fraction']:.1%}",
+            flush=True,
+        )
+    else:
+        print("direct population terminal value | no completed-game labels yet", flush=True)
     if continuation_state is not None:
         # Flat curriculum blocks deliberately share optimizer moments and
         # replay.  Their policy samples remain on-policy because PPO examples
@@ -2981,6 +3242,8 @@ def train_vector_population(
             episode_moves=episode_moves,
             episode_numbers=episode_numbers,
             traces=traces,
+            value_traces=value_traces,
+            value_trace_rng=value_trace_rng,
             objective_histories=objective_histories,
             pending_candidate_examples=pending_candidate_examples,
             ppo_rollouts=ppo_rollouts,
@@ -3248,6 +3511,7 @@ def _clear_policy_replay_after_flat_rollback(
     objective_replay_horizon: int,
     objective_replay_capacity: int,
     ppg_buffer_capacity: int,
+    preserve_terminal_ppg: bool = False,
 ) -> None:
     """Discard data whose policy labels belong to a rejected flat block.
 
@@ -3263,7 +3527,14 @@ def _clear_policy_replay_after_flat_rollback(
         maxlen=objective_replay_capacity
     )
     continuation_state["objective_replay_update_credits"] = 0
-    continuation_state["ppg_replay"] = deque(maxlen=ppg_buffer_capacity)
+    continuation_state["ppg_replay"] = deque(
+        (
+            example for example in continuation_state.get("ppg_replay", ())
+            if preserve_terminal_ppg
+            and getattr(example, "has_terminal_value", False)
+        ),
+        maxlen=ppg_buffer_capacity,
+    )
     continuation_state["pending_candidate_examples"] = 0
     continuation_state["ppo_rollouts"] = 0
     continuation_state["ppg_phases_total"] = 0
@@ -3345,6 +3616,7 @@ def train_direct_population_curriculum(
     flat_terminal_replay_interval: int = 1,
     flat_terminal_replay_value_weight: float = 0.0,
     flat_ppo_max_policy_age: int | None = None,
+    flat_synchronous_rollouts: bool = False,
     flat_policy_anchor_final_weight: float | None = None,
     flat_snapshot_archive_size: int = 0,
     flat_pfsp_alpha: float = 2.0,
@@ -3674,6 +3946,7 @@ def train_direct_population_curriculum(
             "ema_enabled": ema_enabled,
             "ema_decay": ema_decay if ema_enabled else None,
             "flat_ppo_max_policy_age": flat_ppo_max_policy_age,
+            "flat_synchronous_rollouts": flat_synchronous_rollouts,
             "flat_persistent_optimizer": flat_persistent_optimizer,
             "flat_terminal_replay_capacity": flat_terminal_replay_capacity,
             "flat_terminal_replay_batch_size": flat_terminal_replay_batch_size,
@@ -4100,12 +4373,21 @@ def train_direct_population_curriculum(
                 preserved_policy_version = int(
                     flat_continuation.get("policy_version", 0)
                 )
+                preserved_terminal_ppg = [
+                    example
+                    for example in flat_continuation.get("ppg_replay", ())
+                    if flat_synchronous_rollouts
+                    and getattr(example, "has_terminal_value", False)
+                ]
                 flat_continuation.clear()
                 # Versioning is monotonic even when model/AdamW state rolls
                 # back.  Otherwise a live trajectory would appear younger
                 # merely because the curriculum cleared its local state.
                 flat_continuation["policy_version"] = (
                     preserved_policy_version
+                )
+                flat_continuation["ppg_replay"] = deque(
+                    preserved_terminal_ppg, maxlen=ppg_buffer_capacity
                 )
                 if shared_terminal_replay is not None:
                     # ``clear`` must not sever the caller-owned critic-only
@@ -4126,6 +4408,7 @@ def train_direct_population_curriculum(
                     objective_replay_horizon=objective_replay_horizon,
                     objective_replay_capacity=objective_replay_capacity,
                     ppg_buffer_capacity=ppg_buffer_capacity,
+                    preserve_terminal_ppg=flat_synchronous_rollouts,
                 )
             rollback_blocks += 1
             consecutive_regressions += 1
@@ -4398,6 +4681,7 @@ def train_direct_population_curriculum(
             terminal_replay_interval=flat_terminal_replay_interval,
             terminal_replay_value_weight=flat_terminal_replay_value_weight,
             ppo_max_policy_age=flat_ppo_max_policy_age,
+            ppo_synchronous_rollouts=flat_synchronous_rollouts,
             opponent_ids=active_ids,
             ppg_enabled=ppg_enabled,
             ppg_interval=ppg_interval,

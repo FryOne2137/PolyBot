@@ -892,6 +892,7 @@ def train_promotion_league(
     flat_population_terminal_replay_interval: int = 1,
     flat_population_terminal_replay_value_weight: float = 0.0,
     flat_population_ppo_max_policy_age: int | None = None,
+    flat_population_synchronous_rollouts: bool = False,
     flat_population_policy_anchor_final_weight: float | None = None,
     flat_population_snapshot_archive_size: int = 0,
     flat_population_pfsp_alpha: float = 2.0,
@@ -1683,6 +1684,7 @@ def train_promotion_league(
         "flat_population_terminal_replay_interval": flat_population_terminal_replay_interval,
         "flat_population_terminal_replay_value_weight": flat_population_terminal_replay_value_weight,
         "flat_population_ppo_max_policy_age": flat_population_ppo_max_policy_age,
+        "flat_population_synchronous_rollouts": flat_population_synchronous_rollouts,
         "flat_population_policy_anchor_final_weight": flat_population_policy_anchor_final_weight,
         "flat_population_snapshot_archive_size": flat_population_snapshot_archive_size,
         "flat_population_pfsp_alpha": flat_population_pfsp_alpha,
@@ -3063,6 +3065,10 @@ def train_promotion_league(
                                     flat_population_ppo_max_policy_age
                                     if training_stage == "flat" else None
                                 ),
+                                flat_synchronous_rollouts=(
+                                    training_stage == "flat"
+                                    and flat_population_synchronous_rollouts
+                                ),
                                 flat_policy_anchor_final_weight=(
                                     flat_population_policy_anchor_final_weight
                                     if training_stage == "flat" else None
@@ -3523,6 +3529,10 @@ def train_promotion_league(
                                     flat_ppo_max_policy_age=(
                                         flat_population_ppo_max_policy_age
                                         if training_stage == "flat" else None
+                                    ),
+                                    flat_synchronous_rollouts=(
+                                        training_stage == "flat"
+                                        and flat_population_synchronous_rollouts
                                     ),
                                     flat_policy_anchor_final_weight=(
                                         flat_population_policy_anchor_final_weight

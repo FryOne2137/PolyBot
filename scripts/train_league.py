@@ -512,8 +512,17 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         "--flat-population-terminal-replay-value-weight", type=float, default=0.0,
     )
     parser.add_argument(
+        "--flat-population-synchronous-rollouts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Flat-only: update PPO on fixed-length fresh fragments while "
+            "retaining full-game outcomes separately for value/PPG."
+        ),
+    )
+    parser.add_argument(
         "--flat-population-ppo-max-policy-age", type=int, default=None,
-        help="Flat-only: actor ignores trajectories older than this many PPO updates; value keeps them.",
+        help="Flat-only: actor ignores samples older than this many accepted PPO epochs/PPG phases.",
     )
     parser.add_argument(
         "--flat-population-policy-anchor-final-weight", type=float, default=None,
@@ -827,6 +836,7 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             flat_population_terminal_replay_interval=1,
             flat_population_terminal_replay_value_weight=0.25,
             flat_population_ppo_max_policy_age=1,
+            flat_population_synchronous_rollouts=True,
             flat_population_policy_anchor_final_weight=0.05,
             flat_population_snapshot_archive_size=6,
             flat_population_pfsp_alpha=2.0,
@@ -1146,6 +1156,9 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         ),
         flat_population_ppo_max_policy_age=(
             args.flat_population_ppo_max_policy_age
+        ),
+        flat_population_synchronous_rollouts=(
+            args.flat_population_synchronous_rollouts
         ),
         flat_population_policy_anchor_final_weight=(
             args.flat_population_policy_anchor_final_weight

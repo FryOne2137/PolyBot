@@ -31,6 +31,7 @@ from .routed_self_play_pool import (
     train_population_pool,
 )
 from .run_artifacts import TrainingRun
+from .flat_experiments import FlatImprovements
 from .replay_buffer import TrainingExample
 from .self_play_pool_train import train_self_play_pool
 from .vector_population import (
@@ -893,6 +894,8 @@ def train_promotion_league(
     flat_population_terminal_replay_value_weight: float = 0.0,
     flat_population_ppo_max_policy_age: int | None = None,
     flat_population_synchronous_rollouts: bool = False,
+    flat_improvements: FlatImprovements | None = None,
+    flat_resume_state: Path | None = None,
     flat_population_policy_anchor_final_weight: float | None = None,
     flat_population_snapshot_archive_size: int = 0,
     flat_population_pfsp_alpha: float = 2.0,
@@ -1011,6 +1014,12 @@ def train_promotion_league(
         raise ValueError(
             "--training-stage belief/mcts requires --champion-mode mcts"
         )
+    if flat_improvements is not None and training_stage != "flat":
+        raise ValueError("flat improvements are restricted to train_flat")
+    if flat_resume_state is not None and (
+        training_stage != "flat" or direct_population_branch_count != 1
+    ):
+        raise ValueError("flat state resume requires one flat main branch")
     if training_stage == "flat" and champion_mode != "flat":
         raise ValueError("--training-stage flat requires --champion-mode flat")
     if training_stage == "flat" and population_games:
@@ -1685,6 +1694,8 @@ def train_promotion_league(
         "flat_population_terminal_replay_value_weight": flat_population_terminal_replay_value_weight,
         "flat_population_ppo_max_policy_age": flat_population_ppo_max_policy_age,
         "flat_population_synchronous_rollouts": flat_population_synchronous_rollouts,
+        "flat_improvements": flat_improvements,
+        "flat_resume_state": str(flat_resume_state) if flat_resume_state else None,
         "flat_population_policy_anchor_final_weight": flat_population_policy_anchor_final_weight,
         "flat_population_snapshot_archive_size": flat_population_snapshot_archive_size,
         "flat_population_pfsp_alpha": flat_population_pfsp_alpha,
@@ -1775,6 +1786,10 @@ def train_promotion_league(
             and flat_population_terminal_replay_capacity > 0
         )
         else None
+    )
+    flat_critic_replay = (
+        deque(maxlen=flat_improvements.value_capacity)
+        if flat_improvements is not None else None
     )
 
     with LeagueDatabase(database_path) as database:
@@ -2417,7 +2432,14 @@ def train_promotion_league(
                         evaluation_map_seeds.update(
                             opponent_gate_seed + game_index // 2
                             for game_index in range(
-                                direct_population_gate_games
+                                max(
+                                    direct_population_gate_games,
+                                    direct_population_diagnostic_gate_games,
+                                    flat_improvements.value_validation_games if flat_improvements else 0,
+                                ) + (
+                                    flat_population_regression_confirm_games
+                                    if flat_improvements and flat_improvements.paired_rollback else 0
+                                )
                             )
                         )
                     mcts_probe_seed = _offset_seed(
@@ -3104,6 +3126,13 @@ def train_promotion_league(
                                     direct_population_gate_score
                                 ),
                                 flat_role="main",
+                                flat_improvements=flat_improvements,
+                                flat_value_replay=flat_critic_replay,
+                                flat_resume_state=(
+                                    str(flat_resume_state)
+                                    if flat_resume_state is not None and round_index == 1
+                                    and stage_name == "main" else None
+                                ),
                                 flat_terminal_replay=(
                                     flat_main_terminal_replay
                                     if stage_name == "main"
@@ -3401,7 +3430,8 @@ def train_promotion_league(
                                     gate_seed=direct_population_gate_seed,
                                     gate_score=direct_population_gate_score,
                                     historical_score_floor=(
-                                        direct_population_historical_floor
+                                        0.0 if flat_improvements and flat_improvements.exploiter_objective
+                                        else direct_population_historical_floor
                                     ),
                                     readiness_city_captures_per_game=(
                                         direct_readiness_city_captures_per_game
@@ -3535,7 +3565,9 @@ def train_promotion_league(
                                         and flat_population_synchronous_rollouts
                                     ),
                                     flat_policy_anchor_final_weight=(
-                                        flat_population_policy_anchor_final_weight
+                                        exploiter_policy_anchor_weight
+                                        if flat_improvements and flat_improvements.exploiter_objective
+                                        else flat_population_policy_anchor_final_weight
                                         if training_stage == "flat" else None
                                     ),
                                     flat_snapshot_archive_size=(
@@ -3562,6 +3594,7 @@ def train_promotion_league(
                                         if training_stage == "flat" else 0
                                     ),
                                     flat_role="main_exploiter",
+                                    flat_improvements=flat_improvements,
                                     flat_primary_opponent_id=current_main_id,
                                     flat_primary_opponent_probability=(
                                         flat_main_exploiter_probability
@@ -3579,15 +3612,25 @@ def train_promotion_league(
                                         exploiter_labels
                                     ),
                                     opponent_ids=exploiter_ids,
-                                    # Main and exploiter may collect against
-                                    # different PFSP mixtures, but promotion
-                                    # and rollback must use one fixed arena.
-                                    benchmark_opponent_models=frozen_models,
-                                    benchmark_opponent_weights=probabilities,
-                                    benchmark_opponent_labels=(
-                                        population_evaluation_labels
+                                    # A main exploiter's fixed arena is the
+                                    # current main; global strength remains
+                                    # the main lineage's separate objective.
+                                    benchmark_opponent_models=(
+                                        [current_main] if flat_improvements and flat_improvements.exploiter_objective
+                                        else frozen_models
                                     ),
-                                    benchmark_opponent_ids=population_ids,
+                                    benchmark_opponent_weights=(
+                                        [1.0] if flat_improvements and flat_improvements.exploiter_objective
+                                        else probabilities
+                                    ),
+                                    benchmark_opponent_labels=(
+                                        [exploiter_labels[0]] if flat_improvements and flat_improvements.exploiter_objective
+                                        else population_evaluation_labels
+                                    ),
+                                    benchmark_opponent_ids=(
+                                        [current_main_id] if flat_improvements and flat_improvements.exploiter_objective
+                                        else population_ids
+                                    ),
                                     run=run.child(
                                         f"round_{round_index:03d}/"
                                         "direct_population_exploiter"
@@ -3679,7 +3722,13 @@ def train_promotion_league(
                                     f"saved {archive_path}",
                                     flush=True,
                                 )
-                            if _select_exploiter_checkpoint(
+                            if flat_improvements and flat_improvements.exploiter_objective:
+                                print(
+                                    "league main exploiter objective | "
+                                    f"vs-main={exploiter_main_score:.4f} | "
+                                    "archive admission measured independently", flush=True,
+                                )
+                            elif _select_exploiter_checkpoint(
                                 direct_population_main_summary,
                                 direct_population_exploiter_summary,
                             ):

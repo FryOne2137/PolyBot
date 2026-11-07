@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "generator": "scripts/render_diagrams.py",
+  "generator_sha256": "baeff17521ed13c7bcdd96465837c1a9f088732edb27b87faa12a69748e8d872",
+  "figures": {
+    "architecture": {
+      "svg": "architecture.svg",
+      "png": "architecture.png",
+      "title": "PolyBot \u00b7 one shared network, two decision paths"
+    },
+    "training": {
+      "svg": "training.svg",
+      "png": "training.png",
+      "title": "Three explicit training jobs"
+    },
+    "belief_mcts": {
+      "svg": "belief_mcts.svg",
+      "png": "belief_mcts.png",
+      "title": "Belief-guided search and the supervision boundary"
+    }
+  },
+  "compatibility_copies": {
+    "bot_architecture_diagram.svg": "architecture.svg",
+    "polybot_architecture.png": "architecture.png",
+    "polybot_model_architecture.svg": "architecture.svg",
+    "polybot_model_architecture.png": "architecture.png",
+    "polybot_architecture_paper.svg": "belief_mcts.svg",
+    "polybot_architecture_paper.png": "belief_mcts.png"
+  }
+}

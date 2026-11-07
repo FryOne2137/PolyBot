@@ -20,6 +20,9 @@ class ModelConfig:
     # legal action to every map tile, which is both faster and less prone to
     # memorising runtime ids.  ``attention`` remains for old checkpoints.
     policy_architecture: str = "factorized"
+    # Opt-in ``relational`` policy: contextual source/target/city interactions
+    # in a narrow action space, without action-to-map cross attention.
+    action_interaction_dim: int = 64
     # Private spatial capacity for the fog-of-war decoder.  It is deliberately
     # separate from ``map_transformer`` so belief calibration can learn how
     # hidden tiles relate to one another without perturbing policy/value.

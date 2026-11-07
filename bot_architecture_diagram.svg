@@ -1,1 +1,352 @@
-<svg id="mermaid-_r_mq_-1" width="1056.65625" xmlns="http://www.w3.org/2000/svg" class="flowchart" style="max-width: none; height: 1158.06px; max-height: none; width: 1056.66px; --mermaid-surface-background: rgb(20, 20, 20);" viewBox="0 0 1056.65625 1158.059326171875" role="graphics-document document" aria-roledescription="flowchart-v2" height="1158.059326171875"><rect x="0" y="0" width="1056.65625" height="1158.059326171875" fill="rgb(20, 20, 20)"></rect><style>#mermaid-_r_mq_-1{font-family:-apple-system,"system-ui","Segoe UI",sans-serif;font-size:16px;fill:rgb(255, 255, 255);}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mermaid-_r_mq_-1 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mermaid-_r_mq_-1 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mermaid-_r_mq_-1 .error-icon{fill:rgba(255, 255, 255, 0.05);}#mermaid-_r_mq_-1 .error-text{fill:rgba(255, 255, 255, 0.498);stroke:rgba(255, 255, 255, 0.498);}#mermaid-_r_mq_-1 .edge-thickness-normal{stroke-width:1px;}#mermaid-_r_mq_-1 .edge-thickness-thick{stroke-width:3.5px;}#mermaid-_r_mq_-1 .edge-pattern-solid{stroke-dasharray:0;}#mermaid-_r_mq_-1 .edge-thickness-invisible{stroke-width:0;fill:none;}#mermaid-_r_mq_-1 .edge-pattern-dashed{stroke-dasharray:3;}#mermaid-_r_mq_-1 .edge-pattern-dotted{stroke-dasharray:2;}#mermaid-_r_mq_-1 .marker{fill:color(srgb 1 1 1 / 0.7);stroke:color(srgb 1 1 1 / 0.7);}#mermaid-_r_mq_-1 .marker.cross{stroke:color(srgb 1 1 1 / 0.7);}#mermaid-_r_mq_-1 svg{font-family:-apple-system,"system-ui","Segoe UI",sans-serif;font-size:16px;}#mermaid-_r_mq_-1 p{margin:0;}#mermaid-_r_mq_-1 .label{font-family:-apple-system,"system-ui","Segoe UI",sans-serif;color:rgb(255, 255, 255);}#mermaid-_r_mq_-1 .cluster-label text{fill:rgb(255, 255, 255);}#mermaid-_r_mq_-1 .cluster-label span{color:rgb(255, 255, 255);}#mermaid-_r_mq_-1 .cluster-label span p{background-color:transparent;}#mermaid-_r_mq_-1 .label text,#mermaid-_r_mq_-1 span{fill:rgb(255, 255, 255);color:rgb(255, 255, 255);}#mermaid-_r_mq_-1 .node rect,#mermaid-_r_mq_-1 .node circle,#mermaid-_r_mq_-1 .node ellipse,#mermaid-_r_mq_-1 .node polygon,#mermaid-_r_mq_-1 .node path{fill:rgba(54, 54, 54, 0.96);stroke:rgba(255, 255, 255, 0.157);stroke-width:1px;}#mermaid-_r_mq_-1 .rough-node .label text,#mermaid-_r_mq_-1 .node .label text,#mermaid-_r_mq_-1 .image-shape .label,#mermaid-_r_mq_-1 .icon-shape .label{text-anchor:middle;}#mermaid-_r_mq_-1 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mermaid-_r_mq_-1 .rough-node .label,#mermaid-_r_mq_-1 .node .label,#mermaid-_r_mq_-1 .image-shape .label,#mermaid-_r_mq_-1 .icon-shape .label{text-align:center;}#mermaid-_r_mq_-1 .node.clickable{cursor:pointer;}#mermaid-_r_mq_-1 .root .anchor path{fill:color(srgb 1 1 1 / 0.7)!important;stroke-width:0;stroke:color(srgb 1 1 1 / 0.7);}#mermaid-_r_mq_-1 .arrowheadPath{fill:#ebebeb;}#mermaid-_r_mq_-1 .edgePath .path{stroke:color(srgb 1 1 1 / 0.7);stroke-width:2.0px;}#mermaid-_r_mq_-1 .flowchart-link{stroke:color(srgb 1 1 1 / 0.7);fill:none;}#mermaid-_r_mq_-1 .edgeLabel{background-color:rgb(20, 20, 20);text-align:center;}#mermaid-_r_mq_-1 .edgeLabel p{background-color:rgb(20, 20, 20);}#mermaid-_r_mq_-1 .edgeLabel rect{opacity:0.5;background-color:rgb(20, 20, 20);fill:rgb(20, 20, 20);}#mermaid-_r_mq_-1 .labelBkg{background-color:rgba(20, 20, 20, 0.5);}#mermaid-_r_mq_-1 .cluster rect{fill:rgba(255, 255, 255, 0.03);stroke:rgba(255, 255, 255, 0.157);stroke-width:1px;}#mermaid-_r_mq_-1 .cluster text{fill:rgb(255, 255, 255);}#mermaid-_r_mq_-1 .cluster span{color:rgb(255, 255, 255);}#mermaid-_r_mq_-1 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:-apple-system,"system-ui","Segoe UI",sans-serif;font-size:12px;background:rgba(255, 255, 255, 0.05);border:1px solid rgba(255, 255, 255, 0.157);border-radius:2px;pointer-events:none;z-index:100;}#mermaid-_r_mq_-1 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:rgb(255, 255, 255);}#mermaid-_r_mq_-1 rect.text{fill:none;stroke-width:0;}#mermaid-_r_mq_-1 .icon-shape,#mermaid-_r_mq_-1 .image-shape{background-color:rgb(20, 20, 20);text-align:center;}#mermaid-_r_mq_-1 .icon-shape p,#mermaid-_r_mq_-1 .image-shape p{background-color:rgb(20, 20, 20);padding:2px;}#mermaid-_r_mq_-1 .icon-shape rect,#mermaid-_r_mq_-1 .image-shape rect{opacity:0.5;background-color:rgb(20, 20, 20);fill:rgb(20, 20, 20);}#mermaid-_r_mq_-1 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mermaid-_r_mq_-1 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mermaid-_r_mq_-1 .edgeLabel .label rect{fill:var(--mermaid-surface-background);opacity:1;}#mermaid-_r_mq_-1 :root{--mermaid-font-family:-apple-system,"system-ui","Segoe UI",sans-serif;}</style><g><marker id="mermaid-_r_mq_-1_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path></marker><marker id="mermaid-_r_mq_-1_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path></marker><marker id="mermaid-_r_mq_-1_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></circle></marker><marker id="mermaid-_r_mq_-1_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></circle></marker><marker id="mermaid-_r_mq_-1_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"></path></marker><marker id="mermaid-_r_mq_-1_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"></path></marker><g class="root"><g class="clusters"></g><g class="edgePaths"><path d="M426.359,60.059L466.182,66.483C506.005,72.906,585.651,85.753,625.474,97.143C665.297,108.533,665.297,118.467,665.297,123.433L665.297,128.4" id="L_A_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_M_0" data-points="W3sieCI6NDI2LjM1OTM3NSwieSI6NjAuMDU5MTA0NjU3OTUxM30seyJ4Ijo2NjUuMjk2ODc1LCJ5Ijo5OC41OTk5OTg0NzQxMjExfSx7IngiOjY2NS4yOTY4NzUsInkiOjEzMi4zOTk5OTc3MTExODE2NH1d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M375.461,73.6L384.163,77.767C392.865,81.933,410.268,90.267,418.97,97.933C427.672,105.6,427.672,112.6,427.672,116.1L427.672,119.6" id="L_A_O_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_O_0" data-points="W3sieCI6Mzc1LjQ2MTI2MTIwNTMwMjEsInkiOjczLjU5OTk5ODQ3NDEyMTF9LHsieCI6NDI3LjY3MTg3NSwieSI6OTguNTk5OTk4NDc0MTIxMX0seyJ4Ijo0MjcuNjcxODc1LCJ5IjoxMjMuNTk5OTk4NDc0MTIxMX1d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M210.038,73.6L197.726,77.767C185.413,81.933,160.789,90.267,148.476,97.933C136.164,105.6,136.164,112.6,136.164,116.1L136.164,119.6" id="L_A_L_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_L_0" data-points="W3sieCI6MjEwLjAzODE0NDM1NzQ2NDU1LCJ5Ijo3My41OTk5OTg0NzQxMjExfSx7IngiOjEzNi4xNjQwNjI1LCJ5Ijo5OC41OTk5OTg0NzQxMjExfSx7IngiOjEzNi4xNjQwNjI1LCJ5IjoxMjMuNTk5OTk4NDc0MTIxMX1d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M919.117,198L919.117,203.633C919.117,209.267,919.117,220.533,898.159,231.701C877.201,242.869,835.284,253.939,814.326,259.474L793.368,265.008" id="L_E_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_H_0" data-points="W3sieCI6OTE5LjExNzE4NzUsInkiOjE5Ny45OTk5OTYxODUzMDI3M30seyJ4Ijo5MTkuMTE3MTg3NSwieSI6MjMxLjc5OTk5NTQyMjM2MzI4fSx7IngiOjc4OS41MDAxNDMwNzk4MjgzLCJ5IjoyNjYuMDI5NjgyMTU5NDIzOH1d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M665.297,198L665.297,203.633C665.297,209.267,665.297,220.533,665.297,231.205C665.297,241.877,665.297,251.953,665.297,256.991L665.297,262.03" id="L_M_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_H_0" data-points="W3sieCI6NjY1LjI5Njg3NSwieSI6MTk3Ljk5OTk5NjE4NTMwMjczfSx7IngiOjY2NS4yOTY4NzUsInkiOjIzMS43OTk5OTU0MjIzNjMyOH0seyJ4Ijo2NjUuMjk2ODc1LCJ5IjoyNjYuMDI5NjgyMTU5NDIzOH1d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M427.672,206.8L427.672,210.967C427.672,215.133,427.672,223.467,447.255,233.157C466.838,242.848,506.003,253.896,525.586,259.42L545.169,264.944" id="L_O_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_O_H_0" data-points="W3sieCI6NDI3LjY3MTg3NSwieSI6MjA2Ljc5OTk5NTQyMjM2MzI4fSx7IngiOjQyNy42NzE4NzUsInkiOjIzMS43OTk5OTU0MjIzNjMyOH0seyJ4Ijo1NDkuMDE4NTQ2ODkxNTMwNywieSI6MjY2LjAyOTY4MjE1OTQyMzh9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M728.633,331.63L739.65,337.335C750.666,343.04,772.698,354.449,783.714,363.654C794.73,372.859,794.73,379.859,794.73,383.359L794.73,386.859" id="L_H_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_B_0" data-points="W3sieCI6NzI4LjYzMzMxNjM3NzQ2OCwieSI6MzMxLjYyOTY4MDYzMzU0NDl9LHsieCI6Nzk0LjczMDQ2ODc1LCJ5IjozNjUuODU5MzY3MzcwNjA1NDd9LHsieCI6Nzk0LjczMDQ2ODc1LCJ5IjozOTAuODU5MzY3MzcwNjA1NDd9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M610.191,331.63L600.607,337.335C591.022,343.04,571.853,354.449,562.268,372.721C552.684,390.993,552.684,416.126,552.684,441.259C552.684,466.393,552.684,491.526,552.684,509.059C552.684,526.593,552.684,536.526,552.684,541.493L552.684,546.459" id="L_H_V_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_V_0" data-points="W3sieCI6NjEwLjE5MTIwODIyODU3OTQsInkiOjMzMS42Mjk2ODA2MzM1NDQ5fSx7IngiOjU1Mi42ODM1OTM3NSwieSI6MzY1Ljg1OTM2NzM3MDYwNTQ3fSx7IngiOjU1Mi42ODM1OTM3NSwieSI6NDQxLjI1OTM2ODg5NjQ4NDR9LHsieCI6NTUyLjY4MzU5Mzc1LCJ5Ijo1MTYuNjU5MzcwNDIyMzYzM30seyJ4Ijo1NTIuNjgzNTkzNzUsInkiOjU1MC40NTkzNjk2NTk0MjM4fV0=" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M136.164,206.8L136.164,210.967C136.164,215.133,136.164,223.467,136.164,231.133C136.164,238.8,136.164,245.8,136.164,249.3L136.164,252.8" id="L_L_AE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L_AE_0" data-points="W3sieCI6MTM2LjE2NDA2MjUsInkiOjIwNi43OTk5OTU0MjIzNjMyOH0seyJ4IjoxMzYuMTY0MDYyNSwieSI6MjMxLjc5OTk5NTQyMjM2MzI4fSx7IngiOjEzNi4xNjQwNjI1LCJ5IjoyNTYuNzk5OTk1NDIyMzYzM31d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M535.438,321.553L493.236,328.937C451.035,336.322,366.633,351.09,314.111,363.802C261.589,376.514,240.948,387.17,230.627,392.497L220.307,397.825" id="L_H_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_X_0" data-points="W3sieCI6NTM1LjQzNzUsInkiOjMyMS41NTI3MjEwMTg0MDUzNX0seyJ4IjoyODIuMjMwNDY4NzUsInkiOjM2NS44NTkzNjczNzA2MDU0N30seyJ4IjoyMTYuNzUyNDE5OTgyMTI1NjcsInkiOjM5OS42NTkzNzA0MjIzNjMzfV0=" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M136.164,340.859L136.164,345.026C136.164,349.193,136.164,357.526,136.164,366.659C136.164,375.793,136.164,385.726,136.164,390.693L136.164,395.659" id="L_AE_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AE_X_0" data-points="W3sieCI6MTM2LjE2NDA2MjUsInkiOjM0MC44NTkzNjczNzA2MDU0N30seyJ4IjoxMzYuMTY0MDYyNSwieSI6MzY1Ljg1OTM2NzM3MDYwNTQ3fSx7IngiOjEzNi4xNjQwNjI1LCJ5IjozOTkuNjU5MzcwNDIyMzYzM31d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M136.164,482.859L136.164,488.493C136.164,494.126,136.164,505.393,136.164,514.526C136.164,523.659,136.164,530.659,136.164,534.159L136.164,537.659" id="L_X_P_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_X_P_0" data-points="W3sieCI6MTM2LjE2NDA2MjUsInkiOjQ4Mi44NTkzNjczNzA2MDU0N30seyJ4IjoxMzYuMTY0MDYyNSwieSI6NTE2LjY1OTM3MDQyMjM2MzN9LHsieCI6MTM2LjE2NDA2MjUsInkiOjU0MS42NTkzNzA0MjIzNjMzfV0=" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M794.73,491.659L794.73,495.826C794.73,499.993,794.73,508.326,794.73,517.388C794.73,526.449,794.73,536.24,794.73,541.135L794.73,546.03" id="L_B_W_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_W_0" data-points="W3sieCI6Nzk0LjczMDQ2ODc1LCJ5Ijo0OTEuNjU5MzcwNDIyMzYzM30seyJ4Ijo3OTQuNzMwNDY4NzUsInkiOjUxNi42NTkzNzA0MjIzNjMzfSx7IngiOjc5NC43MzA0Njg3NSwieSI6NTUwLjAyOTY4MjE1OTQyMzh9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M136.164,624.859L136.164,629.026C136.164,633.193,136.164,641.526,184.932,653.735C233.7,665.943,331.236,682.027,380.004,690.069L428.772,698.111" id="L_P_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_T_0" data-points="W3sieCI6MTM2LjE2NDA2MjUsInkiOjYyNC44NTkzNjczNzA2MDU1fSx7IngiOjEzNi4xNjQwNjI1LCJ5Ijo2NDkuODU5MzY3MzcwNjA1NX0seyJ4Ijo0MzIuNzE4NzUsInkiOjY5OC43NjE5Nzc2NzA4MDU5fV0=" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M552.684,616.059L552.684,621.693C552.684,627.326,552.684,638.593,552.017,647.738C551.35,656.883,550.017,663.906,549.35,667.418L548.683,670.93" id="L_V_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_V_T_0" data-points="W3sieCI6NTUyLjY4MzU5Mzc1LCJ5Ijo2MTYuMDU5MzY4MTMzNTQ0OX0seyJ4Ijo1NTIuNjgzNTkzNzUsInkiOjY0OS44NTkzNjczNzA2MDU1fSx7IngiOjU0Ny45MzcxNDc5NzY4Mzk0LCJ5Ijo2NzQuODU5MzY3MzcwNjA1NX1d" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M794.73,616.489L794.73,622.051C794.73,627.612,794.73,638.736,770.814,650.552C746.897,662.368,699.063,674.876,675.146,681.13L651.229,687.384" id="L_W_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W_T_0" data-points="W3sieCI6Nzk0LjczMDQ2ODc1LCJ5Ijo2MTYuNDg5MDU1NjMzNTQ0OX0seyJ4Ijo3OTQuNzMwNDY4NzUsInkiOjY0OS44NTkzNjczNzA2MDU1fSx7IngiOjY0Ny4zNTkzNzUsInkiOjY4OC4zOTU4NjQzOTQxNjZ9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M540.039,758.059L540.039,762.226C540.039,766.393,540.039,774.726,540.039,782.393C540.039,790.059,540.039,797.059,540.039,800.559L540.039,804.059" id="L_T_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T_R_0" data-points="W3sieCI6NTQwLjAzOTA2MjUsInkiOjc1OC4wNTkzNjQzMTg4NDc3fSx7IngiOjU0MC4wMzkwNjI1LCJ5Ijo3ODMuMDU5MzY0MzE4ODQ3N30seyJ4Ijo1NDAuMDM5MDYyNSwieSI6ODA4LjA1OTM2NDMxODg0Nzd9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M540.039,856.059L540.039,860.226C540.039,864.393,540.039,872.726,540.039,880.393C540.039,888.059,540.039,895.059,540.039,898.559L540.039,902.059" id="L_R_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_C_0" data-points="W3sieCI6NTQwLjAzOTA2MjUsInkiOjg1Ni4wNTkzNjQzMTg4NDc3fSx7IngiOjU0MC4wMzkwNjI1LCJ5Ijo4ODEuMDU5MzY0MzE4ODQ3N30seyJ4Ijo1NDAuMDM5MDYyNSwieSI6OTA2LjA1OTM2NDMxODg0Nzd9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M540.039,954.059L540.039,958.226C540.039,962.393,540.039,970.726,540.039,978.393C540.039,986.059,540.039,993.059,540.039,996.559L540.039,1000.059" id="L_C_ID_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_ID_0" data-points="W3sieCI6NTQwLjAzOTA2MjUsInkiOjk1NC4wNTkzNjQzMTg4NDc3fSx7IngiOjU0MC4wMzkwNjI1LCJ5Ijo5NzkuMDU5MzY0MzE4ODQ3N30seyJ4Ijo1NDAuMDM5MDYyNSwieSI6MTAwNC4wNTkzNjQzMTg4NDc3fV0=" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path><path d="M540.039,1052.059L540.039,1056.226C540.039,1060.393,540.039,1068.726,540.039,1076.393C540.039,1084.059,540.039,1091.059,540.039,1094.559L540.039,1098.059" id="L_ID_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ID_S_0" data-points="W3sieCI6NTQwLjAzOTA2MjUsInkiOjEwNTIuMDU5MzY0MzE4ODQ3N30seyJ4Ijo1NDAuMDM5MDYyNSwieSI6MTA3Ny4wNTkzNjQzMTg4NDc3fSx7IngiOjU0MC4wMzkwNjI1LCJ5IjoxMTAyLjA1OTM2NDMxODg0Nzd9XQ==" marker-end="url(#mermaid-_r_mq_-1_flowchart-v2-pointEnd)"></path></g><g class="edgeLabels"><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g><rect class="background" style="stroke: none"></rect></g><g class="edgeLabel"><g class="label" data-id="L_A_M_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_A_O_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_A_L_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_E_H_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_M_H_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_O_H_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_H_B_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_H_V_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_L_AE_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_H_X_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_AE_X_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_X_P_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_B_W_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_P_T_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_V_T_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_W_T_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_T_R_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_R_C_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_C_ID_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g><g class="edgeLabel"><g class="label" data-id="L_ID_S_0" transform="translate(0, 0)"><text y="-10.1"><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"></tspan></text></g></g></g><g class="nodes"><g class="node default" id="flowchart-A-0" transform="translate(306.9609375, 40.79999923706055)"><rect class="basic label-container" style="" x="-119.3984375" y="-32.79999923706055" width="238.796875" height="65.5999984741211"></rect><g class="label" style="" transform="translate(0, -17.799999237060547)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">PolyEnv</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">model_request_numpy()</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-M-1" transform="translate(665.296875, 165.1999969482422)"><rect class="basic label-container" style="" x="-74.28125" y="-32.79999923706055" width="148.5625" height="65.5999984741211"></rect><g class="label" style="" transform="translate(0, -17.799999237060547)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">map_tokens</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">[tiles,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> 23]</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-O-3" transform="translate(427.671875, 165.1999969482422)"><rect class="basic label-container" style="" x="-113.34375" y="-41.599998474121094" width="226.6875" height="83.19999694824219"></rect><g class="label" style="" transform="translate(0, -26.599998474121094)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">obs</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">tura,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> gwiazdki,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> income,</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">własne</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> miasta…</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-L-5" transform="translate(136.1640625, 165.1999969482422)"><rect class="basic label-container" style="" x="-128.1640625" y="-41.599998474121094" width="256.328125" height="83.19999694824219"></rect><g class="label" style="" transform="translate(0, -26.599998474121094)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">actions</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">wszystkie</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> aktualnie</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> legalne</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">akcje</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-E-6" transform="translate(919.1171875, 165.1999969482422)"><rect class="basic label-container" style="" x="-129.5390625" y="-32.79999923706055" width="259.078125" height="65.5999984741211"></rect><g class="label" style="" transform="translate(0, -17.799999237060547)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">visible_events_numpy()</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">historia</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> widocznej</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> dynamiki</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-H-7" transform="translate(665.296875, 298.8296813964844)"><rect class="basic label-container" style="" x="-129.859375" y="-32.79999923706055" width="259.71875" height="65.5999984741211"></rect><g class="label" style="" transform="translate(0, -17.799999237060547)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Wspólny</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> encoder</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> stanu</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Recurrent</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Map</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Transformer</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-B-13" transform="translate(794.73046875, 441.2593688964844)"><rect class="basic label-container" style="" x="-123.390625" y="-50.400001525878906" width="246.78125" height="100.80000305175781"></rect><g class="label" style="" transform="translate(0, -35.400001525878906)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Belief</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> head</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">K</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> hipotetycznych</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> pełnych</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">map</tspan></tspan><tspan class="text-outer-tspan" x="0" y="3.2em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">[tiles,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> 23]</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-V-15" transform="translate(552.68359375, 583.2593688964844)"><rect class="basic label-container" style="" x="-74.5" y="-32.79999923706055" width="149" height="65.5999984741211"></rect><g class="label" style="" transform="translate(0, -17.799999237060547)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Value</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> head</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">V(s)</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> ∈</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> [-1,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> 1]</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-AE-17" transform="translate(136.1640625, 298.8296813964844)"><rect class="basic label-container" style="" x="-112.2734375" y="-42.029685974121094" width="224.546875" height="84.05937194824219"></rect><g class="label" style="" transform="translate(0, -27.029685974121094)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Action</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> encoder</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">jedna</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> reprezentacja</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> na</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">legalną</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> akcję</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-X-19" transform="translate(136.1640625, 441.2593688964844)"><rect class="basic label-container" style="" x="-112.53125" y="-41.599998474121094" width="225.0625" height="83.19999694824219"></rect><g class="label" style="" transform="translate(0, -26.599998474121094)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Cross-attention:</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">stan</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> mapy</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> ↔</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> kandydat</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">akcji</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-P-23" transform="translate(136.1640625, 583.2593688964844)"><rect class="basic label-container" style="" x="-114.1171875" y="-41.599998474121094" width="228.234375" height="83.19999694824219"></rect><g class="label" style="" transform="translate(0, -26.599998474121094)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Policy</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> head</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">logit</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> dla</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> każdej</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> legalnej</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">akcji</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-W-25" transform="translate(794.73046875, 583.2593688964844)"><rect class="basic label-container" style="" x="-117.546875" y="-33.22968673706055" width="235.09375" height="66.4593734741211"></rect><g class="label" style="" transform="translate(0, -18.229686737060547)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">make_belief_env()</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">odłączony</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> świat</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> particle</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-T-27" transform="translate(540.0390625, 716.4593658447266)"><rect class="basic label-container" style="" x="-107.3203125" y="-41.599998474121094" width="214.640625" height="83.19999694824219"></rect><g class="label" style="" transform="translate(0, -26.599998474121094)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">PUCT</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> MCTS</tspan></tspan><tspan class="text-outer-tspan" x="0" y="1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">policy</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> =</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> prior,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> value</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> =</tspan></tspan><tspan class="text-outer-tspan" x="0" y="2.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">ocena</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> liścia</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-R-33" transform="translate(540.0390625, 832.0593643188477)"><rect class="basic label-container" style="" x="-120.09375" y="-24" width="240.1875" height="48"></rect><g class="label" style="" transform="translate(0, -9)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">rozkład</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> odwiedzin</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> MCTS</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-C-35" transform="translate(540.0390625, 930.0593643188477)"><rect class="basic label-container" style="" x="-104.3515625" y="-24" width="208.703125" height="48"></rect><g class="label" style="" transform="translate(0, -9)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">wybrany</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> wiersz</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> akcji</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-ID-37" transform="translate(540.0390625, 1028.0593643188477)"><rect class="basic label-container" style="" x="-119" y="-24" width="238" height="48"></rect><g class="label" style="" transform="translate(0, -9)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">actions['action_id'][row]</tspan></tspan></text></g></g></g><g class="node default" id="flowchart-S-39" transform="translate(540.0390625, 1126.0593643188477)"><rect class="basic label-container" style="" x="-117.5" y="-24" width="235" height="48"></rect><g class="label" style="" transform="translate(0, -9)"><rect></rect><g><rect class="background" style="stroke: none"></rect><text y="-10.1" style=""><tspan class="text-outer-tspan" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">env.step_fast(action_id)</tspan></tspan></text></g></g></g></g></g></g></svg>
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1296pt" height="720pt" viewBox="0 0 1296 720" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <title>PolyBot · one shared network, two decision paths</title>
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:title>PolyBot · one shared network, two decision paths</dc:title>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>PolyBot diagram generator</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 720
+L 1296 720
+L 1296 0
+L 0 0
+z
+" style="fill: #f7f9fc"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 42.84 419.4
+L 266.76 419.4
+Q 275.4 419.4 275.4 410.76
+L 275.4 172.44
+Q 275.4 163.8 266.76 163.8
+L 42.84 163.8
+Q 34.2 163.8 34.2 172.44
+L 34.2 410.76
+Q 34.2 419.4 42.84 419.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf4ff; stroke: #2457a7; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 330.84 419.4
+L 605.16 419.4
+Q 613.8 419.4 613.8 410.76
+L 613.8 172.44
+Q 613.8 163.8 605.16 163.8
+L 330.84 163.8
+Q 322.2 163.8 322.2 172.44
+L 322.2 410.76
+Q 322.2 419.4 330.84 419.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 690.84 268.2
+L 950.76 268.2
+Q 959.4 268.2 959.4 259.56
+L 959.4 136.44
+Q 959.4 127.8 950.76 127.8
+L 690.84 127.8
+Q 682.2 127.8 682.2 136.44
+L 682.2 259.56
+Q 682.2 268.2 690.84 268.2
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 690.84 419.4
+L 950.76 419.4
+Q 959.4 419.4 959.4 410.76
+L 959.4 309.24
+Q 959.4 300.6 950.76 300.6
+L 690.84 300.6
+Q 682.2 300.6 682.2 309.24
+L 682.2 410.76
+Q 682.2 419.4 690.84 419.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 330.84 621
+L 605.16 621
+Q 613.8 621 613.8 612.36
+L 613.8 482.04
+Q 613.8 473.4 605.16 473.4
+L 330.84 473.4
+Q 322.2 473.4 322.2 482.04
+L 322.2 612.36
+Q 322.2 621 330.84 621
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 1036.44 268.2
+L 1253.16 268.2
+Q 1261.8 268.2 1261.8 259.56
+L 1261.8 136.44
+Q 1261.8 127.8 1253.16 127.8
+L 1036.44 127.8
+Q 1027.8 127.8 1027.8 136.44
+L 1027.8 259.56
+Q 1027.8 268.2 1036.44 268.2
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 1036.44 563.4
+L 1253.16 563.4
+Q 1261.8 563.4 1261.8 554.76
+L 1261.8 338.04
+Q 1261.8 329.4 1253.16 329.4
+L 1036.44 329.4
+Q 1027.8 329.4 1027.8 338.04
+L 1027.8 554.76
+Q 1027.8 563.4 1036.44 563.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 273.6 288
+L 322.322949 288
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 316.722949 285.2
+L 322.322949 288
+L 316.722949 290.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 612 208.8
+L 682.322949 208.8
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 676.722949 206
+L 682.322949 208.8
+L 676.722949 211.6
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 612 360
+L 682.322949 360
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 676.722949 357.2
+L 682.322949 360
+L 676.722949 362.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 468 417.6
+L 468 473.522949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 470.8 467.922949
+L 468 473.522949
+L 465.2 467.922949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 273.6 176.4
+L 291.6 176.4
+L 291.6 108
+L 820.8 108
+L 820.8 127.922949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #2457a7; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 823.6 122.322949
+L 820.8 127.922949
+L 818 122.322949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #2457a7; stroke: #2457a7; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 154.8 417.6
+L 154.8 547.2
+L 322.322949 547.2
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #2457a7; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 316.722949 544.4
+L 322.322949 547.2
+L 316.722949 550
+z
+" clip-path="url(#p629bec8adf)" style="fill: #2457a7; stroke: #2457a7; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 957.6 201.6
+L 1027.922949 201.6
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1022.322949 198.8
+L 1027.922949 201.6
+L 1022.322949 204.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 957.6 237.6
+L 993.6 237.6
+L 993.6 352.8
+L 1027.922949 352.8
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1022.322949 350
+L 1027.922949 352.8
+L 1022.322949 355.6
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_17">
+    <path d="M 957.6 381.6
+L 1027.922949 381.6
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1022.322949 378.8
+L 1027.922949 381.6
+L 1022.322949 384.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_18">
+    <path d="M 612 540
+L 1027.922949 540
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1022.322949 537.2
+L 1027.922949 540
+L 1022.322949 542.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 24px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #172f45" x="36" y="45.835312" transform="rotate(-0 36 45.835312)">PolyBot · one shared network, two decision paths</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="36" y="80.027754" transform="rotate(-0 36 80.027754)">Public observations and legal actions in; policy, value and optional belief out. Architecture is selected by the checkpoint.</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2457a7" x="51.12" y="188.027305" transform="rotate(-0 51.12 188.027305)">PUBLIC INPUT</text>
+   </g>
+   <g id="text_4">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 222.520312)">Player-view map: T × 23</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 239.570312)">Global features + event summary</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 256.620313)">Visible history: H × 12</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 273.670313)">Current legal candidates only</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 290.720312)">Action semantics, costs, pointers</text>
+   </g>
+   <g id="text_5">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="339.12" y="188.027305" transform="rotate(-0 339.12 188.027305)">SHARED MAP / HISTORY ENCODER</text>
+   </g>
+   <g id="text_6">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 222.520312)">Semantic embeddings + 2-D positions</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 239.570312)">History Transformer → global context</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 256.620313)">L-layer map Transformer</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 273.670313)">Contextual tile states + global token</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 290.720312)">Relational variant: spatial readout</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 307.770313)">Mean / max / learned visible pooling</text>
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="699.12" y="152.027305" transform="rotate(-0 699.12 152.027305)">POLICY</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 186.205031)">Type + options + global context</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 202.790031)">Source–target / query–tile interactions</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 219.375031)">One masked logit per legal action</text>
+   </g>
+   <g id="text_9">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="699.12" y="324.827305" transform="rotate(-0 699.12 324.827305)">VALUE</text>
+   </g>
+   <g id="text_10">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 359.320312)">Spatial state → scalar in [−1, 1]</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 376.370312)">Game outcomes supervise the critic</text>
+   </g>
+   <g id="text_11">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="339.12" y="497.627305" transform="rotate(-0 339.12 497.627305)">OPTIONAL BELIEF DECODER</text>
+   </g>
+   <g id="text_12">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 532.120312)">Public legal-action evidence</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 549.170313)">Private spatial refinement</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 566.220312)">Structured hidden-world hypotheses</text>
+   </g>
+   <g id="text_13">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="1044.72" y="152.027305" transform="rotate(-0 1044.72 152.027305)">FLAT ACTION SELECTION</text>
+   </g>
+   <g id="text_14">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 186.205031)">Policy → real legal action</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 202.790031)">Native VectorGameEnv step</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 219.375031)">No particles or tree required</text>
+   </g>
+   <g id="text_15">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="1044.72" y="353.627305" transform="rotate(-0 1044.72 353.627305)">OPTIONAL BELIEF-MCTS</text>
+   </g>
+   <g id="text_16">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 388.841594)">Validate detached worlds</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 404.390031)">Policy/value guide C++ PUCT</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 420.975031)">Native SelfPlayPool trees</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 437.560031)">Visits become policy labels</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 454.145031)">Separate search/readiness gates</text>
+   </g>
+   <g id="text_17">
+    <g id="patch_19">
+     <path d="M 492.964492 453.145371
+L 543.835508 453.145371
+L 543.835508 439.654629
+L 492.964492 439.654629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #66788a" x="518.4" y="448.868145" transform="rotate(-0 518.4 448.868145)">tile states</text>
+   </g>
+   <g id="text_18">
+    <g id="patch_20">
+     <path d="M 590.05293 114.745371
+L 691.54707 114.745371
+L 691.54707 101.254629
+L 590.05293 101.254629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #2457a7" x="640.8" y="110.468145" transform="rotate(-0 640.8 110.468145)">legal action features</text>
+   </g>
+   <g id="text_19">
+    <g id="patch_21">
+     <path d="M 134.335469 471.145371
+L 240.064531 471.145371
+L 240.064531 457.654629
+L 134.335469 457.654629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #2457a7" x="187.2" y="466.868145" transform="rotate(-0 187.2 466.868145)">legal-action evidence</text>
+   </g>
+   <g id="text_20">
+    <g id="patch_22">
+     <path d="M 728.462188 528.745371
+L 898.737813 528.745371
+L 898.737813 515.254629
+L 728.462188 515.254629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #66788a" x="813.6" y="524.468145" transform="rotate(-0 813.6 524.468145)">detached, action-consistent worlds</text>
+   </g>
+   <g id="text_21">
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="36" y="688.167949" transform="rotate(-0 36 688.167949)">Hidden ground truth is training supervision only; it is not an actor/value observation or an oracle world for search.</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p629bec8adf">
+   <rect x="0" y="0" width="1296" height="720"/>
+  </clipPath>
+ </defs>
+</svg>

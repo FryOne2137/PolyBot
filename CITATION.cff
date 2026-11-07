@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use PolyBot in research, cite this repository and record the exact commit and configuration."
+title: "PolyBot: fog-of-war reinforcement learning with relational legal-action scoring"
+type: software
+authors:
+  - name: FryOne2137
+repository-code: "https://github.com/FryOne2137/PolyBot"
+url: "https://github.com/FryOne2137/PolyBot"
+license: MIT
+abstract: >-
+  A research implementation of flat PPO/PPG population training,
+  structured hidden-map belief learning, and optional belief-guided
+  MCTS for the unofficial PolyEnv game engine.

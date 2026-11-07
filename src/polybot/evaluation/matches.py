@@ -438,6 +438,7 @@ def evaluate_direct_matches(
     num_threads: int | None = None,
     max_actions: int = 1024,
     map_seeds: Sequence[int] | None = None,
+    position_callback: Optional[Callable[[int, Dict[str, np.ndarray], int], None]] = None,
 ) -> Dict[str, float]:
     """Evaluate paired greedy policies in two native vector batches.
 
@@ -455,6 +456,8 @@ def evaluate_direct_matches(
     if training.max_moves < 1:
         raise ValueError("direct evaluation max_moves must be positive")
     if map_seeds is not None:
+        if position_callback is not None:
+            raise ValueError("position collection requires the native paired arena")
         fixed_map_seeds = np.asarray(map_seeds, dtype=np.uint32)
         if fixed_map_seeds.shape != (games,):
             raise ValueError("map_seeds must contain exactly one seed per paired game")
@@ -575,6 +578,12 @@ def evaluate_direct_matches(
                     batch, selected, active
                 )
                 candidate_turn = players_before[batch_index] == candidate_player
+                if position_callback is not None:
+                    for row_index in np.flatnonzero(candidate_turn & active):
+                        position_callback(
+                            2 * int(row_index) + candidate_player,
+                            batch, int(row_index),
+                        )
                 candidate_city[batch_index] += (
                     city & candidate_turn & active
                 ).astype(np.int32)

@@ -1,7 +1,7 @@
 """Model-only persistence.
 
-Training data, games, replay buffers and optimiser state deliberately stay in
-memory.  A saved file contains only PyTorch model weights and model settings.
+A model checkpoint contains only PyTorch weights and architecture settings.
+Trainer continuation state is stored separately from this portable format.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 
 
 def save_model(path: Path, model: PolicyValueBeliefNet, config: ModelConfig) -> None:
-    """Atomically write the one allowed training artifact: model weights."""
+    """Atomically write model weights and their architecture settings."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -37,7 +37,10 @@ def save_model(path: Path, model: PolicyValueBeliefNet, config: ModelConfig) -> 
 
 def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, ModelConfig]:
     """Load a model-only checkpoint created by :func:`save_model`."""
-    payload = torch.load(path, map_location=device)
+    # Portable checkpoints contain tensors and primitive configuration only.
+    # Set this explicitly: older supported PyTorch releases default to an
+    # unrestricted pickle loader, unlike recent releases.
+    payload = torch.load(path, map_location=device, weights_only=True)
     saved_config = dict(payload["model_config"])
     # Pre-factorized checkpoints have the old cross-attention policy and do
     # not contain this field.  Keep them runnable instead of silently loading

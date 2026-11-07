@@ -217,3 +217,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local development and operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+tmp/
+.env.*
+!.env.example
+
+# Training artifacts belong in local storage or explicit model releases.
+/models/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.polygame
+*.pem
+*.key
+credentials*.json
+service-account*.json

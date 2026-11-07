@@ -21,6 +21,11 @@ from ..infrastructure.randomness import seed_everything
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .direct_curriculum import model_state_on_cpu, restore_model_state
 from .run_artifacts import TrainingRun
+from .flat_experiments import (
+    FlatImprovements, atomic_torch_save, isolated_rng, model_fingerprint,
+    paired_regression, rng_state, restore_rng, write_manifest,
+)
+from .flat_value import ValuePosition, ValueValidationCollector, fit_value_head
 from .vector_actor_critic import _normalise_advantage, _visible_action_reward
 from .vector_teacher import (
     _teacher_targets,
@@ -140,6 +145,7 @@ class _PolicySampleUsage:
     stale: int = 0
     terminal: int = 0
     age_histogram: dict[int, int] = field(default_factory=dict)
+    phase_counts: dict[str, list[int]] = field(default_factory=dict)
 
     def add(
         self, examples: Sequence[_PPOExample], ages: np.ndarray,
@@ -149,6 +155,14 @@ class _PolicySampleUsage:
         self.eligible += sum(example.policy_selected for example in examples)
         self.stale += int((ages > max_age).sum()) if max_age is not None else 0
         self.terminal += sum(example.has_terminal_value for example in examples)
+        for example in examples:
+            state = np.asarray(example.observation.get("state", ())).reshape(-1)
+            if state.size:
+                turn = int(state[0])
+                phase = "opening" if turn < 20 else "mid" if turn < 60 else "late"
+                counts = self.phase_counts.setdefault(phase, [0, 0])
+                counts[0] += 1
+                counts[1] += int(example.has_terminal_value)
         values, counts = np.unique(ages, return_counts=True)
         for age, count in zip(values, counts):
             key = int(age)
@@ -185,6 +199,10 @@ class _PolicySampleUsage:
                 count for age, count in self.age_histogram.items() if age >= 2
             ) / max(1, self.samples),
             "terminal_target_fraction": self.terminal / max(1, self.samples),
+            **{
+                f"{phase}_terminal_target_fraction": terminal / max(1, count)
+                for phase, (count, terminal) in self.phase_counts.items()
+            },
         }
 
 
@@ -1427,6 +1445,7 @@ def train_vector_population(
     terminal_replay_value_weight: float = 0.0,
     ppo_max_policy_age: int | None = None,
     ppo_synchronous_rollouts: bool = False,
+    value_replay: Deque | None = None,
     ppg_enabled: bool = True,
     ppg_interval: int = 8,
     ppg_buffer_capacity: int = 8_192,
@@ -2838,6 +2857,11 @@ def train_vector_population(
                     terminal_positions = finished_examples
                     value_calibration.add(finished_examples, candidate_outcome)
                     terminal_value_positions += len(finished_examples)
+                if value_replay is not None:
+                    for position in terminal_positions:
+                        value_replay.append(ValuePosition(
+                            position.observation, candidate_outcome
+                        ))
                 if terminal_replay_enabled:
                     # These are immutable public observations paired only
                     # with a genuine final outcome.  They train the critic,
@@ -3201,6 +3225,7 @@ def train_vector_population(
         f"({policy_usage.eligible}/{policy_usage.samples}) "
         f"applied={ppo_policy_samples}/{ppo_accepted_sample_presentations} "
         f"stale={policy_usage.stale} "
+        f"terminal_actor={usage['terminal_target_fraction']:.1%} "
         f"| age mean/p95/max={usage['policy_age_mean']:.2f}/"
         f"{usage['policy_age_p95']:.0f}/{usage['policy_age_max']:.0f}",
         flush=True,
@@ -3268,6 +3293,9 @@ def evaluate_direct_population_matches(
     opponent_labels: Sequence[str] | None = None,
     num_threads: int | None = None,
     max_actions: int = 1024,
+    evaluation_cache: dict | None = None,
+    include_game_rows: bool = False,
+    position_callback: Callable[[int, int, Mapping[str, np.ndarray], int], None] | None = None,
 ) -> Dict[str, Any]:
     """Evaluate one raw network on the same paired arena for a population."""
     if not opponent_models:
@@ -3292,34 +3320,59 @@ def evaluate_direct_population_matches(
         raise ValueError("opponent_labels must match opponent_models")
     results: list[Dict[str, Any]] = []
     device = next(candidate.parameters()).device
+    candidate_key = model_fingerprint(candidate) if evaluation_cache is not None else None
     for opponent_index, opponent in enumerate(opponent_models):
-        match = evaluate_direct_matches(
-            candidate,
-            opponent,
-            device,
-            replace(
-                training,
-                seed=(
-                    (gate_seed - 1 + opponent_index * 1_000_003)
-                    % (2**31 - 1)
-                    + 1
-                ),
-            ),
-            games,
-            game_callback=(
-                None
-                if game_callback is None
-                else lambda game, selected=opponent_index: game_callback(
-                    selected, game
+        match_training = replace(training, seed=(
+            (gate_seed - 1 + opponent_index * 1_000_003) % (2**31 - 1) + 1
+        ))
+        key = None
+        if evaluation_cache is not None:
+            key = (
+                candidate_key, model_fingerprint(opponent), repr(match_training),
+                games, visible_action_history, max_actions, num_threads,
+            )
+        # A callback collecting validation positions must actually observe
+        # the arena. Score-only cache entries cannot supply those inputs.
+        cached = evaluation_cache.get(key) if key is not None and position_callback is None else None
+        if cached is not None:
+            match = deepcopy(cached)
+            evaluation_cache["hits"] = evaluation_cache.get("hits", 0) + 1
+        else:
+            game_rows = []
+            def play():
+                kwargs = {}
+                if position_callback is not None:
+                    kwargs["position_callback"] = lambda game, batch, row: position_callback(
+                        opponent_index, game, batch, row
+                    )
+                result = evaluate_direct_matches(
+                    candidate, opponent, device, match_training, games,
+                    game_callback=lambda game: game_rows.append(dict(game)),
+                    model_a_label=candidate_label,
+                    model_b_label=resolved_opponent_labels[opponent_index],
+                    visible_action_history=visible_action_history,
+                    num_threads=num_threads, max_actions=max_actions, **kwargs,
                 )
-            ),
-            model_a_label=candidate_label,
-            model_b_label=resolved_opponent_labels[opponent_index],
-            visible_action_history=visible_action_history,
-            num_threads=num_threads,
-            max_actions=max_actions,
+                return {**result, "game_rows": game_rows}
+            if evaluation_cache is not None:
+                with isolated_rng():
+                    match = play()
+                # Bound cached evidence; no tensors or models are retained.
+                if len(evaluation_cache) > 256:
+                    hits = evaluation_cache.get("hits", 0)
+                    evaluation_cache.clear()
+                    evaluation_cache["hits"] = hits
+                evaluation_cache[key] = deepcopy(match)
+            else:
+                match = play()
+        if game_callback is not None:
+            for game in match.get("game_rows", []):
+                game_callback(opponent_index, dict(game))
+        results.append(
+            match if include_game_rows else {
+                name: value for name, value in match.items() if name != "game_rows"
+            }
         )
-        results.append(match)
     return {
         "model_a_score": float(sum(
             weight * float(row["model_a_score"])
@@ -3631,6 +3684,9 @@ def train_direct_population_curriculum(
     flat_primary_opponent_id: int | str | None = None,
     flat_primary_opponent_probability: float = 0.70,
     flat_terminal_replay: Deque[_PPGExample] | None = None,
+    flat_improvements: FlatImprovements | None = None,
+    flat_value_replay: Deque | None = None,
+    flat_resume_state: str | None = None,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -3867,6 +3923,13 @@ def train_direct_population_curriculum(
     # The caller owns the deque so the same bounded archive can be supplied
     # to several successive main curricula without sharing any actor data.
     shared_terminal_replay = flat_terminal_replay
+    replay_arena_signature = (
+        training.map_size, training.map_type, training.max_moves,
+        visible_action_history, gate_seed, gate_games,
+        resolved_diagnostic_gate_games, tuple(benchmark_ids),
+        len(active_opponents),
+        vars(flat_improvements) if flat_improvements else None,
+    )
     flat_continuation: dict[str, Any] | None = (
         {}
         if flat_persistent_optimizer or shared_terminal_replay is not None
@@ -3874,7 +3937,89 @@ def train_direct_population_curriculum(
     )
     if flat_continuation is not None and shared_terminal_replay is not None:
         flat_continuation["terminal_replay"] = shared_terminal_replay
+    resume_payload = None
+    if flat_resume_state is not None:
+        resume_payload = torch.load(flat_resume_state, map_location="cpu", weights_only=False)
+        try:
+            resume_model_config = ModelConfig(**resume_payload["model_config"])
+        except (KeyError, TypeError) as error:
+            raise ValueError("flat resume state has an invalid model configuration") from error
+        if (
+            resume_payload.get("schema_version") != 1
+            or resume_model_config != model_config
+            or resume_payload.get("champion_fingerprint") != model_fingerprint(champion)
+            or resume_payload.get("map_signature") != (training.map_size, training.map_type, visible_action_history)
+        ):
+            raise ValueError("flat resume state does not match architecture, champion or public inputs")
+        restore_model_state(candidate, resume_payload["model_state"])
+        flat_continuation = {} if flat_continuation is None else flat_continuation
+        if resume_payload.get("optimizer") is not None:
+            optimizer = torch.optim.AdamW(candidate.parameters(), lr=training.learning_rate)
+            optimizer.load_state_dict(resume_payload["optimizer"])
+            flat_continuation["optimiser"] = optimizer
+        if resume_payload.get("scaler"):
+            scaler = torch.amp.GradScaler(
+                "cuda", enabled=next(candidate.parameters()).device.type == "cuda"
+            )
+            scaler.load_state_dict(resume_payload["scaler"])
+            flat_continuation["scaler"] = scaler
+        flat_continuation["policy_version"] = resume_payload.get("policy_version", 0)
+        flat_continuation["ppg_replay"] = deque(
+            resume_payload.get("terminal_ppg", [])
+            if resume_payload.get("replay_arena_signature") == replay_arena_signature else [],
+            maxlen=ppg_buffer_capacity,
+        )
+        if resume_payload.get("generator_state") is not None:
+            restored_generator = np.random.default_rng()
+            restored_generator.bit_generator.state = resume_payload["generator_state"]
+            flat_continuation["rng"] = restored_generator
     run = run or TrainingRun.create("runs", "direct_population_curriculum")
+    evaluation_cache = {} if flat_improvements and flat_improvements.cache_evaluations else None
+    critic_replay = (
+        flat_value_replay if flat_value_replay is not None else deque(
+            maxlen=flat_improvements.value_capacity if flat_improvements else 1
+        )
+    )
+    if resume_payload is not None and resume_payload.get("replay_arena_signature") == replay_arena_signature:
+        critic_replay.extend(resume_payload.get("critic_replay", []))
+    validation_collector = (
+        ValueValidationCollector(
+            flat_improvements.value_validation_games,
+            flat_improvements.value_positions_per_game, gate_seed,
+        ) if flat_improvements and flat_improvements.value_updates else None
+    )
+    if flat_improvements and flat_improvements.scientific_artifacts:
+        write_manifest(
+            run.directory, flat_improvements, collection_seed=training.seed,
+            evaluation_seed=gate_seed, candidate=model_fingerprint(candidate),
+            champion=model_fingerprint(champion),
+            benchmark=[
+                {"id": model_id, "label": label, "fingerprint": model_fingerprint(opponent)}
+                for model_id, label, opponent in zip(benchmark_ids, benchmark_labels, benchmark_opponents)
+            ],
+        )
+        atomic_torch_save(run.directory / "initial_model.pt", {
+            "model_config": vars(model_config), "state_dict": model_state_on_cpu(candidate),
+        })
+
+    def evaluate_population(*args, collect_validation=False, **kwargs):
+        if flat_improvements is not None:
+            kwargs["include_game_rows"] = True
+        if collect_validation and validation_collector is not None:
+            original_callback = kwargs.get("game_callback")
+            def record(opponent, game):
+                if opponent == 0:
+                    validation_collector.finish(game)
+                if original_callback is not None:
+                    original_callback(opponent, game)
+            kwargs["game_callback"] = record
+            kwargs["position_callback"] = lambda opponent, game, batch, row: (
+                validation_collector.add(game, batch, row) if opponent == 0 else None
+            )
+        if evaluation_cache is not None:
+            kwargs["evaluation_cache"] = evaluation_cache
+        return evaluate_direct_population_matches(*args, **kwargs)
+
     run.write_config(
         training=training,
         model=model_config,
@@ -4069,7 +4214,7 @@ def train_direct_population_curriculum(
         population_evaluation_skipped = False
         if flat_champion_screen and not baseline:
             assert flat_champion_index is not None
-            screen_evaluation = evaluate_direct_population_matches(
+            screen_evaluation = evaluate_population(
                 training,
                 candidate,
                 [champion],
@@ -4131,7 +4276,7 @@ def train_direct_population_curriculum(
             }
             evaluation = training_evaluation
         else:
-            training_evaluation = evaluate_direct_population_matches(
+            training_evaluation = evaluate_population(
                 training,
                 candidate,
                 active_opponents,
@@ -4156,6 +4301,7 @@ def train_direct_population_curriculum(
                 opponent_labels=active_labels,
                 num_threads=num_threads,
                 max_actions=max_actions,
+                collect_validation=baseline,
             )
             benchmark_matches_active = (
                 len(active_opponents) == len(benchmark_opponents)
@@ -4168,7 +4314,7 @@ def train_direct_population_curriculum(
             if benchmark_matches_active:
                 evaluation = training_evaluation
             else:
-                evaluation = evaluate_direct_population_matches(
+                evaluation = evaluate_population(
                     training,
                     candidate,
                     benchmark_opponents,
@@ -4237,13 +4383,19 @@ def train_direct_population_curriculum(
                 range(len(results)),
                 key=lambda index: float(results[index]["model_a_score"]),
             )
-            candidate_confirmation = evaluate_direct_population_matches(
+            confirmation_seed = gate_seed
+            if flat_improvements and flat_improvements.paired_rollback:
+                # Fresh maps immediately following the original development
+                # arena, shared by candidate and reference.
+                arena_games = max(gate_games, games, flat_improvements.value_validation_games)
+                confirmation_seed = (gate_seed - 1 + arena_games // 2) % (2**31 - 1) + 1
+            candidate_confirmation = evaluate_population(
                 training,
                 candidate,
                 [benchmark_opponents[confirmation_opponent_index]],
                 [1.0],
                 games=flat_regression_confirmation_games,
-                gate_seed=gate_seed,
+                gate_seed=confirmation_seed,
                 visible_action_history=visible_action_history,
                 candidate_label=candidate_label,
                 opponent_labels=[
@@ -4257,13 +4409,13 @@ def train_direct_population_curriculum(
             )
             candidate_state = model_state_on_cpu(candidate)
             restore_model_state(candidate, best_state)
-            best_confirmation = evaluate_direct_population_matches(
+            best_confirmation = evaluate_population(
                 training,
                 candidate,
                 [benchmark_opponents[confirmation_opponent_index]],
                 [1.0],
                 games=flat_regression_confirmation_games,
-                gate_seed=gate_seed,
+                gate_seed=confirmation_seed,
                 visible_action_history=visible_action_history,
                 candidate_label=f"{candidate_label} previous-best",
                 opponent_labels=[
@@ -4274,7 +4426,27 @@ def train_direct_population_curriculum(
             )
             confirmation_best_score = float(best_confirmation["model_a_score"])
             restore_model_state(candidate, candidate_state)
-            if confirmation_candidate_score + score_tolerance >= confirmation_best_score:
+            if flat_improvements and flat_improvements.paired_rollback:
+                evidence = paired_regression(
+                    candidate_confirmation["opponents"][0].get("game_rows", []),
+                    best_confirmation["opponents"][0].get("game_rows", []),
+                    margin=score_tolerance,
+                )
+                run.log(
+                    paired_rollback_valid=float(evidence["valid"]),
+                    paired_rollback_confirmed=float(evidence["confirmed"]),
+                    paired_rollback_difference=evidence.get("difference"),
+                    paired_rollback_upper95=evidence.get("upper95"),
+                )
+                if hasattr(run, "event"):
+                    run.event("paired_rollback", block=block, **evidence)
+                print(f"direct population paired rollback | {evidence}", flush=True)
+                regression_unconfirmed = not evidence["confirmed"]
+            else:
+                regression_unconfirmed = (
+                    confirmation_candidate_score + score_tolerance >= confirmation_best_score
+                )
+            if regression_unconfirmed:
                 accepted = True
                 acceptance_reason = "regression_not_confirmed"
         selected, selection_reason = _population_block_selects_checkpoint(
@@ -4601,13 +4773,40 @@ def train_direct_population_curriculum(
                 )
         return accepted
 
-    gate("baseline", -1, baseline=True)
+    gate(
+        "baseline", -1, baseline=True,
+        games=max(
+            resolved_diagnostic_gate_games,
+            flat_improvements.value_validation_games if validation_collector is not None else 0,
+        ),
+    )
+    if resume_payload is not None:
+        restore_rng(resume_payload["rng"])
+        if hasattr(run, "event"):
+            run.event(
+                "optimization_resumed", source=str(flat_resume_state),
+                previous_completed_steps=resume_payload.get("completed_steps", 0),
+                environment_restored=False,
+                reason="native in-flight games restart; new curriculum budget",
+            )
+    if validation_collector is not None and flat_improvements.scientific_artifacts:
+        atomic_torch_save(run.directory / "value_validation.pt", {
+            "source": "frozen_baseline_development_arena",
+            "evaluation_seed": gate_seed,
+            "completed_games": validation_collector.completed_games,
+            "truncated_games": validation_collector.truncated_games,
+            "examples": validation_collector.examples,
+        })
     completed = 0
     block = 0
     early_stopped = False
     early_stop_reason = ""
     training_rows: list[Dict[str, Any]] = []
-    current_ppo_learning_rate = float(training.learning_rate)
+    value_training_rows: list[Dict[str, Any]] = []
+    current_ppo_learning_rate = float(
+        resume_payload.get("ppo_learning_rate", training.learning_rate)
+        if resume_payload is not None else training.learning_rate
+    )
     while completed < maximum_steps and (
         completed < minimum_steps
         or not ready
@@ -4625,6 +4824,16 @@ def train_direct_population_curriculum(
             seed=(training.seed - 1 + block * 2_000_003) % (2**31 - 1) + 1,
             learning_rate=current_ppo_learning_rate,
         )
+        block_rollout_steps = ppo_rollout_steps
+        if flat_improvements and flat_improvements.rollout_steps_final:
+            # Expand direct terminal coverage gradually while keeping each
+            # individual rollout frozen and on-policy.
+            progress_fraction = completed / max(1, maximum_steps - block_steps)
+            block_rollout_steps = max(1, round(
+                ppo_rollout_steps + (
+                    flat_improvements.rollout_steps_final - ppo_rollout_steps
+                ) * progress_fraction
+            ))
         result = train_vector_population(
             block_training,
             model_config,
@@ -4656,7 +4865,7 @@ def train_direct_population_curriculum(
             / max(1, maximum_steps),
             greedy_advantage_weight=greedy_advantage_weight,
             gamma=ppo_gamma,
-            ppo_rollout_steps=ppo_rollout_steps,
+            ppo_rollout_steps=block_rollout_steps,
             ppo_epochs=ppo_epochs,
             ppo_minibatch_size=ppo_minibatch_size,
             ppo_clip_range=ppo_clip_range,
@@ -4682,6 +4891,7 @@ def train_direct_population_curriculum(
             terminal_replay_value_weight=flat_terminal_replay_value_weight,
             ppo_max_policy_age=flat_ppo_max_policy_age,
             ppo_synchronous_rollouts=flat_synchronous_rollouts,
+            value_replay=critic_replay if flat_improvements else None,
             opponent_ids=active_ids,
             ppg_enabled=ppg_enabled,
             ppg_interval=ppg_interval,
@@ -4705,6 +4915,7 @@ def train_direct_population_curriculum(
             run=run.child(f"block_{block:03d}"),
         )
         training_rows.append(result)
+        result["flat_rollout_steps"] = block_rollout_steps
         completed += current_steps
         adapted_learning_rate = float(
             result.get(
@@ -4727,6 +4938,42 @@ def train_direct_population_curriculum(
             )
         accepted = gate("population", block)
         selected = bool(gate_rows[-1]["selected"])
+        if flat_improvements and validation_collector is not None:
+            value_result = fit_value_head(
+                candidate, training, critic_replay, validation_collector.examples,
+                flat_improvements, seed=block_training.seed,
+            )
+            value_training_rows.append(value_result)
+            if value_result["kept"]:
+                # External head-only updates invalidate AdamW's head moments,
+                # but neither encoder nor actor moments need to be reset.
+                if flat_continuation is not None and "optimiser" in flat_continuation:
+                    for parameter in candidate.value_head.parameters():
+                        flat_continuation["optimiser"].state.pop(parameter, None)
+                if selected or not accepted:
+                    # On rollback the actor is already restored. Retain a
+                    # separately validated critic improvement on that actor.
+                    best_state = model_state_on_cpu(candidate)
+                    if flat_continuation is not None and "optimiser" in flat_continuation:
+                        best_flat_optimiser_state = deepcopy(flat_continuation["optimiser"].state_dict())
+            if hasattr(run, "event"):
+                run.event("value_head_fit", block=block, **value_result)
+            print(
+                "direct population critic fit | "
+                f"updates={value_result['updates']} kept={int(value_result['kept'])} "
+                f"reason={value_result['reason']} "
+                f"before={value_result.get('before', {}).get('rmse')} "
+                f"after={value_result.get('after', {}).get('rmse')}", flush=True,
+            )
+        if flat_improvements and hasattr(run, "event"):
+            run.event(
+                "flat_block", block=block, collection_seed=block_training.seed,
+                environment_steps=result.get("direct_population_environment_steps", 0),
+                rollout_steps=block_rollout_steps, accepted=accepted, selected=selected,
+                actor_terminal_fraction=result.get("direct_population_ppo_terminal_target_fraction"),
+                cache_hits=evaluation_cache.get("hits", 0) if evaluation_cache is not None else 0,
+                checkpoint_fingerprint=model_fingerprint(candidate),
+            )
         if accepted and selected:
             plateau_blocks = 0
         elif accepted:
@@ -4751,6 +4998,34 @@ def train_direct_population_curriculum(
                     )
         else:
             plateau_blocks = 0
+        if flat_improvements and flat_improvements.scientific_artifacts:
+            continuation = flat_continuation or {}
+            optimizer = continuation.get("optimiser")
+            scaler = continuation.get("scaler")
+            generator = continuation.get("rng")
+            atomic_torch_save(run.directory / "latest_state.pt", {
+                "schema_version": 1,
+                "model_config": vars(model_config),
+                "map_signature": (training.map_size, training.map_type, visible_action_history),
+                "champion_fingerprint": model_fingerprint(champion),
+                "model_state": model_state_on_cpu(candidate),
+                "best_state": best_state,
+                "optimizer": optimizer.state_dict() if optimizer is not None else None,
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "policy_version": continuation.get("policy_version", 0),
+                "terminal_ppg": [
+                    e for e in continuation.get("ppg_replay", [])
+                    if e.has_terminal_value
+                ],
+                "critic_replay": list(critic_replay),
+                "rng": rng_state(),
+                "generator_state": generator.bit_generator.state if generator is not None else None,
+                "completed_steps": completed, "block": block,
+                "settings": vars(flat_improvements),
+                "replay_arena_signature": replay_arena_signature,
+                "ppo_learning_rate": current_ppo_learning_rate,
+                "environment_restored": False,
+            })
         if (
             completed >= minimum_steps
             and not accepted
@@ -4795,7 +5070,7 @@ def train_direct_population_curriculum(
     final_candidates: list[Dict[str, Any]] = []
     for label, state, label_for_log in final_variants:
         restore_model_state(candidate, state)
-        evaluation = evaluate_direct_population_matches(
+        evaluation = evaluate_population(
             training,
             candidate,
             benchmark_opponents,
@@ -5112,6 +5387,17 @@ def train_direct_population_curriculum(
         "direct_population_early_stop_reason": early_stop_reason,
         "direct_population_gate_rows": gate_rows,
         "direct_population_training_rows": training_rows,
+        "flat_value_training_rows": value_training_rows,
+        "flat_evaluation_cache_hits": evaluation_cache.get("hits", 0) if evaluation_cache is not None else 0,
     }
+    if flat_improvements and flat_improvements.scientific_artifacts:
+        atomic_torch_save(run.directory / "selected_model.pt", {
+            "model_config": vars(model_config), "state_dict": model_state_on_cpu(candidate),
+        })
+        run.event(
+            "flat_final_selection", selected=full_selection,
+            checkpoint_fingerprint=model_fingerprint(candidate),
+            score=full_score, worst_score=full_worst_score,
+        )
     summary["run_dir"] = str(run.finish(summary))
     return summary

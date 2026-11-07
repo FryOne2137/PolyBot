@@ -1,0 +1,262 @@
+{
+  "device": "cpu",
+  "torch": "2.13.0",
+  "platform": "macOS-27.0-arm64-arm-64bit",
+  "gpu": null,
+  "batch_size": 4,
+  "map_size": 11,
+  "history": 32,
+  "threads": 1,
+  "repeats": 12,
+  "warmup": 3,
+  "amp": false,
+  "synthetic_workload": true,
+  "results": [
+    {
+      "architecture": "factorized",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "factorized",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 32,
+      "mode": "inference",
+      "parameters": 7804786,
+      "median_ms": 19.83747899066657,
+      "minimum_ms": 18.459917046129704
+    },
+    {
+      "architecture": "relational",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "relational",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 32,
+      "mode": "inference",
+      "parameters": 7462561,
+      "median_ms": 21.331020980142057,
+      "minimum_ms": 19.550709053874016,
+      "time_relative_to_factorized": 1.075288900881921
+    },
+    {
+      "architecture": "factorized",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "factorized",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 32,
+      "mode": "training",
+      "parameters": 7804786,
+      "median_ms": 64.85999998403713,
+      "minimum_ms": 58.10283310711384
+    },
+    {
+      "architecture": "relational",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "relational",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 32,
+      "mode": "training",
+      "parameters": 7462561,
+      "median_ms": 63.4591665584594,
+      "minimum_ms": 56.241000071167946,
+      "time_relative_to_factorized": 0.9784021981818919
+    },
+    {
+      "architecture": "factorized",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "factorized",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 256,
+      "mode": "inference",
+      "parameters": 7804786,
+      "median_ms": 23.095374985132366,
+      "minimum_ms": 20.327833015471697
+    },
+    {
+      "architecture": "relational",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "relational",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 256,
+      "mode": "inference",
+      "parameters": 7462561,
+      "median_ms": 24.14381253765896,
+      "minimum_ms": 17.9525000276044,
+      "time_relative_to_factorized": 1.0453959960901922
+    },
+    {
+      "architecture": "factorized",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "factorized",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 256,
+      "mode": "training",
+      "parameters": 7804786,
+      "median_ms": 65.4096250073053,
+      "minimum_ms": 61.21012498624623
+    },
+    {
+      "architecture": "relational",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "relational",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 256,
+      "mode": "training",
+      "parameters": 7462561,
+      "median_ms": 69.61745844455436,
+      "minimum_ms": 62.849042005836964,
+      "time_relative_to_factorized": 1.0643304932076756
+    },
+    {
+      "architecture": "factorized",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "factorized",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 1024,
+      "mode": "inference",
+      "parameters": 7804786,
+      "median_ms": 32.605583022814244,
+      "minimum_ms": 29.403166961856186
+    },
+    {
+      "architecture": "relational",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "relational",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 1024,
+      "mode": "inference",
+      "parameters": 7462561,
+      "median_ms": 24.832770926877856,
+      "minimum_ms": 22.26220804732293,
+      "time_relative_to_factorized": 0.7616110072162267
+    },
+    {
+      "architecture": "factorized",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "factorized",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 1024,
+      "mode": "training",
+      "parameters": 7804786,
+      "median_ms": 80.95727051841095,
+      "minimum_ms": 74.59491700865328
+    },
+    {
+      "architecture": "relational",
+      "config": {
+        "d_model": 192,
+        "transformer_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.0,
+        "max_board_side": 32,
+        "max_players": 16,
+        "max_runtime_id": 512,
+        "policy_architecture": "relational",
+        "action_interaction_dim": 64,
+        "belief_decoder_layers": 2
+      },
+      "actions": 1024,
+      "mode": "training",
+      "parameters": 7462561,
+      "median_ms": 74.3848120328039,
+      "minimum_ms": 67.89187504909933,
+      "time_relative_to_factorized": 0.9188157105159274
+    }
+  ]
+}

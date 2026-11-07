@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1296pt" height="720pt" viewBox="0 0 1296 720" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <title>Belief-guided search and the supervision boundary</title>
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:title>Belief-guided search and the supervision boundary</dc:title>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>PolyBot diagram generator</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 720
+L 1296 720
+L 1296 0
+L 0 0
+z
+" style="fill: #f7f9fc"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 42.84 275.4
+L 295.56 275.4
+Q 304.2 275.4 304.2 266.76
+L 304.2 165.24
+Q 304.2 156.6 295.56 156.6
+L 42.84 156.6
+Q 34.2 156.6 34.2 165.24
+L 34.2 266.76
+Q 34.2 275.4 42.84 275.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf4ff; stroke: #2457a7; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 366.84 275.4
+L 677.16 275.4
+Q 685.8 275.4 685.8 266.76
+L 685.8 165.24
+Q 685.8 156.6 677.16 156.6
+L 366.84 156.6
+Q 358.2 156.6 358.2 165.24
+L 358.2 266.76
+Q 358.2 275.4 366.84 275.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 366.84 433.8
+L 677.16 433.8
+Q 685.8 433.8 685.8 425.16
+L 685.8 323.64
+Q 685.8 315 677.16 315
+L 366.84 315
+Q 358.2 315 358.2 323.64
+L 358.2 425.16
+Q 358.2 433.8 366.84 433.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 748.44 433.8
+L 957.96 433.8
+Q 966.6 433.8 966.6 425.16
+L 966.6 323.64
+Q 966.6 315 957.96 315
+L 748.44 315
+Q 739.8 315 739.8 323.64
+L 739.8 425.16
+Q 739.8 433.8 748.44 433.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 1036.44 433.8
+L 1253.16 433.8
+Q 1261.8 433.8 1261.8 425.16
+L 1261.8 323.64
+Q 1261.8 315 1253.16 315
+L 1036.44 315
+Q 1027.8 315 1027.8 323.64
+L 1027.8 425.16
+Q 1027.8 433.8 1036.44 433.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 1036.44 275.4
+L 1253.16 275.4
+Q 1261.8 275.4 1261.8 266.76
+L 1261.8 165.24
+Q 1261.8 156.6 1253.16 156.6
+L 1036.44 156.6
+Q 1027.8 156.6 1027.8 165.24
+L 1027.8 266.76
+Q 1027.8 275.4 1036.44 275.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 42.84 635.4
+L 295.56 635.4
+Q 304.2 635.4 304.2 626.76
+L 304.2 496.44
+Q 304.2 487.8 295.56 487.8
+L 42.84 487.8
+Q 34.2 487.8 34.2 496.44
+L 34.2 626.76
+Q 34.2 635.4 42.84 635.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff0f0; stroke: #a43131; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 366.84 635.4
+L 957.96 635.4
+Q 966.6 635.4 966.6 626.76
+L 966.6 496.44
+Q 966.6 487.8 957.96 487.8
+L 366.84 487.8
+Q 358.2 487.8 358.2 496.44
+L 358.2 626.76
+Q 358.2 635.4 366.84 635.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #ffffff; stroke: #526479; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 302.4 216
+L 358.322949 216
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 352.722949 213.2
+L 358.322949 216
+L 352.722949 218.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 518.4 273.6
+L 518.4 315.122949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 521.2 309.522949
+L 518.4 315.122949
+L 515.6 309.522949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 302.4 252
+L 331.2 252
+L 331.2 374.4
+L 358.322949 374.4
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #2457a7; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 352.722949 371.6
+L 358.322949 374.4
+L 352.722949 377.2
+z
+" clip-path="url(#p629bec8adf)" style="fill: #2457a7; stroke: #2457a7; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 684 374.4
+L 739.922949 374.4
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 734.322949 371.6
+L 739.922949 374.4
+L 734.322949 377.2
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 684 216
+L 853.2 216
+L 853.2 315.122949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 856 309.522949
+L 853.2 315.122949
+L 850.4 309.522949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 964.8 374.4
+L 1027.922949 374.4
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1022.322949 371.6
+L 1027.922949 374.4
+L 1022.322949 377.2
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 1144.8 316.8
+L 1144.8 275.277051
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1142 280.877051
+L 1144.8 275.277051
+L 1147.6 280.877051
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_17">
+    <path d="M 1144.8 158.4
+L 1144.8 115.2
+L 165.6 115.2
+L 165.6 156.722949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 168.4 151.122949
+L 165.6 156.722949
+L 162.8 151.122949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_18">
+    <path d="M 853.2 432
+L 853.2 487.922949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 856 482.322949
+L 853.2 487.922949
+L 850.4 482.322949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_19">
+    <path d="M 302.4 561.6
+L 358.322949 561.6
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke-dasharray: 5.55,2.4; stroke-dashoffset: 0; stroke: #a43131; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 352.722949 558.8
+L 358.322949 561.6
+L 352.722949 564.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #a43131; stroke-dasharray: 5.55,2.4; stroke-dashoffset: 0; stroke: #a43131; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_20">
+    <path d="M 1260 230.4
+L 1281.6 230.4
+L 1281.6 561.6
+L 966.477051 561.6
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 972.077051 564.4
+L 966.477051 561.6
+L 972.077051 558.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 24px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #172f45" x="36" y="45.835312" transform="rotate(-0 36 45.835312)">Belief-guided search and the supervision boundary</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="36" y="80.027754" transform="rotate(-0 36 80.027754)">The engine owns the hidden state. Search receives accepted detached hypotheses; PolyBot owns all neural losses.</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2457a7" x="51.12" y="180.827305" transform="rotate(-0 51.12 180.827305)">PUBLIC PLAYER VIEW</text>
+   </g>
+   <g id="text_4">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 215.005031)">Visible map + history + global features</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 231.590031)">Current public legal action list</text>
+   </g>
+   <g id="text_5">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="375.12" y="180.827305" transform="rotate(-0 375.12 180.827305)">NEURAL MODEL</text>
+   </g>
+   <g id="text_6">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 215.320312)">Policy priors and value estimates</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 232.370313)">Belief distributions → sampled worlds</text>
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="375.12" y="339.227305" transform="rotate(-0 375.12 339.227305)">VALIDATE AND MATERIALIZE</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 373.405031)">Preserve observed tiles and public actions</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 389.990031)">Reject / retry inconsistent hypotheses</text>
+   </g>
+   <g id="text_9">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="756.72" y="339.227305" transform="rotate(-0 756.72 339.227305)">NATIVE SEARCH</text>
+   </g>
+   <g id="text_10">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(756.72 374.441594)">Detached-world C++ PUCT</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(756.72 389.990031)">Batched policy/value leaves</text>
+   </g>
+   <g id="text_11">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="1044.72" y="339.227305" transform="rotate(-0 1044.72 339.227305)">ROOT DECISION</text>
+   </g>
+   <g id="text_12">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 373.405031)">Accepted visit distribution</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 389.990031)">Select a real legal action</text>
+   </g>
+   <g id="text_13">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="1044.72" y="180.827305" transform="rotate(-0 1044.72 180.827305)">REAL GAME STEP</text>
+   </g>
+   <g id="text_14">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 215.005031)">Execute in the actual engine</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(1044.72 231.590031)">Observe public view / result</text>
+   </g>
+   <g id="text_15">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a43131" x="51.12" y="512.027305" transform="rotate(-0 51.12 512.027305)">HIDDEN GROUND TRUTH</text>
+   </g>
+   <g id="text_16">
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 546.205031)">Training-only semantic labels</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 563.826594)">Never an inference observation</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 580.411594)">Never the oracle search world</text>
+   </g>
+   <g id="text_17">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="375.12" y="512.027305" transform="rotate(-0 375.12 512.027305)">POLYBOT OPTIMIZATION</text>
+   </g>
+   <g id="text_18">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 546.520313)">Policy: accepted MCTS visits; value: outcomes / configured bootstraps</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 563.570312)">Belief: hidden-map labels plus discrepancy-guided supervision masks</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(375.12 580.620312)">No gradients or neural loss are computed inside PolyEnv</text>
+   </g>
+   <g id="text_19">
+    <g id="patch_21">
+     <path d="M 218.60793 352.345371
+L 306.99207 352.345371
+L 306.99207 338.854629
+L 218.60793 338.854629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #2457a7" x="262.8" y="348.068145" transform="rotate(-0 262.8 348.068145)">public constraints</text>
+   </g>
+   <g id="text_20">
+    <g id="patch_22">
+     <path d="M 780.026406 204.745371
+L 847.173594 204.745371
+L 847.173594 191.254629
+L 780.026406 191.254629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #66788a" x="813.6" y="200.468145" transform="rotate(-0 813.6 200.468145)">policy / value</text>
+   </g>
+   <g id="text_21">
+    <g id="patch_23">
+     <path d="M 590.077461 121.945371
+L 705.922539 121.945371
+L 705.922539 108.454629
+L 590.077461 108.454629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #66788a" x="648" y="117.668145" transform="rotate(-0 648 117.668145)">next public observation</text>
+   </g>
+   <g id="text_22">
+    <g id="patch_24">
+     <path d="M 878.54332 467.545371
+L 907.05668 467.545371
+L 907.05668 454.054629
+L 878.54332 454.054629
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #66788a" x="892.8" y="463.268145" transform="rotate(-0 892.8 463.268145)">visits</text>
+   </g>
+   <g id="text_23">
+    <g id="patch_25">
+     <path d="M 1090.098477 550.345
+L 1170.701523 550.345
+L 1170.701523 536.855
+L 1090.098477 536.855
+z
+" style="fill: #f7f9fc"/>
+    </g>
+    <text style="font-size: 9.5px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #66788a" x="1130.4" y="546.067773" transform="rotate(-0 1130.4 546.067773)">game outcomes</text>
+   </g>
+   <g id="text_24">
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="36" y="688.167949" transform="rotate(-0 36 688.167949)">Flat policy/value inference uses the direct path and skips particles and search. Belief readiness alone does not establish playing strength.</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p629bec8adf">
+   <rect x="0" y="0" width="1296" height="720"/>
+  </clipPath>
+ </defs>
+</svg>

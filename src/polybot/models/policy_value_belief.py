@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from ..config import ModelConfig
+from .relational_policy import RelationalActionPolicy, SpatialStateReadout
 from ..data.token_schema import (
     ACTION_CATEGORICAL_FIELDS,
     ACTION_CONTINUOUS_FIELDS,
@@ -25,6 +26,7 @@ ACTION_FEATURE_MAX: Sequence[int] = (9, 1023, 1023, 1023, 1023, 25, 16, 90, 8, 1
 # categories.  The factorized policy handles source/target through tile states
 # and intentionally excludes the remaining runtime ids from option scoring.
 FACTOR_OPTION_FEATURES: Sequence[int] = (5, 6, 7, 8, 9, 10, 11)
+RUNTIME_MAP_FEATURES = frozenset((6, 15, 22))
 
 # Legal actions are public observations.  These fields describe their semantic
 # kind without treating short-lived runtime unit/city IDs as stable categories.
@@ -179,8 +181,17 @@ class PolicyValueBeliefNet(nn.Module):
         super().__init__()
         self.config = config
         d_model = config.d_model
+        if config.policy_architecture not in {"factorized", "attention", "relational"}:
+            raise ValueError("policy_architecture must be 'factorized', 'attention' or 'relational'")
+        if config.action_interaction_dim < 1:
+            raise ValueError("action_interaction_dim must be positive")
+        self.policy_architecture = config.policy_architecture
         self.tile_embeddings = nn.ModuleList(
-            [nn.Embedding(largest + 2, d_model) for largest in MAP_FEATURE_MAX]
+            [
+                nn.Identity() if self.policy_architecture == "relational" and index in RUNTIME_MAP_FEATURES
+                else nn.Embedding(largest + 2, d_model)
+                for index, largest in enumerate(MAP_FEATURE_MAX)
+            ]
         )
         self.x_embedding = nn.Embedding(config.max_board_side, d_model)
         self.y_embedding = nn.Embedding(config.max_board_side, d_model)
@@ -221,9 +232,6 @@ class PolicyValueBeliefNet(nn.Module):
         )
         self.map_norm = nn.LayerNorm(d_model)
 
-        if config.policy_architecture not in {"factorized", "attention"}:
-            raise ValueError("policy_architecture must be 'factorized' or 'attention'")
-        self.policy_architecture = config.policy_architecture
         self.action_embeddings = nn.ModuleList(
             [nn.Embedding(largest + 2, d_model) for largest in ACTION_FEATURE_MAX]
         )
@@ -236,6 +244,11 @@ class PolicyValueBeliefNet(nn.Module):
             )
             self.action_norm = nn.LayerNorm(d_model)
             self.policy_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
+        elif self.policy_architecture == "relational":
+            self.spatial_readout = SpatialStateReadout(d_model, config.action_interaction_dim)
+            self.relational_policy = RelationalActionPolicy(
+                d_model, config.action_interaction_dim, ACTION_FEATURE_MAX, FACTOR_OPTION_FEATURES,
+            )
         else:
             # A legal action is decomposed into semantic factors.  This is
             # equivalent to a compact action scorer, but avoids an expensive
@@ -326,12 +339,18 @@ class PolicyValueBeliefNet(nn.Module):
         action_history_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, tiles, _ = map_tokens.shape
+        if self.policy_architecture == "relational":
+            side = isqrt(tiles)
+            if side * side != tiles or side > self.config.max_board_side:
+                raise ValueError("relational board must be square and fit max_board_side")
         encoded = torch.zeros(
             (batch, tiles, self.config.d_model),
             dtype=torch.float32,
             device=map_tokens.device,
         )
         for feature_index, (embedding, largest) in enumerate(zip(self.tile_embeddings, MAP_FEATURE_MAX)):
+            if self.policy_architecture == "relational" and feature_index in RUNTIME_MAP_FEATURES:
+                continue
             encoded = encoded + embedding(_indices(map_tokens[..., feature_index], largest))
         positions = torch.arange(tiles, device=map_tokens.device)
         width = min(self.config.max_board_side, max(1, int(round(tiles ** 0.5))))
@@ -343,13 +362,23 @@ class PolicyValueBeliefNet(nn.Module):
 
         if event_features is None:
             event_features = torch.zeros((batch, EVENT_SUMMARY_SIZE), dtype=torch.float32, device=map_tokens.device)
+        if self.policy_architecture == "relational":
+            # The legacy global feature at index 6 is a scaled runtime city
+            # pointer, not an amount. City-linked legal actions already name
+            # the relevant public tile; do not feed the arbitrary number to
+            # the global encoder (ID 0 also aliases "none" in this schema).
+            global_features = global_features.clone()
+            global_features[..., 6] = 0
         all_global_features = torch.cat([global_features, event_features], dim=-1)
         global_state = self.global_encoder(all_global_features)
         global_state = global_state + self._history_context(action_history, action_history_mask, batch, map_tokens.device)
         global_token = global_state.unsqueeze(1)
         transformed = self.map_transformer(torch.cat([global_token, encoded], dim=1))
         transformed = self.map_norm(transformed)
-        return transformed[:, 0], transformed[:, 1:]
+        state, tile_states = transformed[:, 0], transformed[:, 1:]
+        if self.policy_architecture == "relational":
+            state = self.spatial_readout(state, tile_states, map_tokens[..., 0] == 1)
+        return state, tile_states
 
     def _history_context(
         self, history: torch.Tensor | None, history_mask: torch.Tensor | None,
@@ -391,6 +420,9 @@ class PolicyValueBeliefNet(nn.Module):
             (history.float() + 1.0) / scales,
             torch.zeros_like(history, dtype=torch.float32),
         ).clamp_(0.0, 1.0)
+        if self.policy_architecture == "relational":
+            # Observer-local unit IDs are links, not ordinal quantities.
+            normalised_history[..., 8:10] = (history[..., 8:10] >= 0).to(normalised_history.dtype)
         # Positional embeddings describe distance *from the latest observed
         # action*, rather than the column chosen by the largest replay item
         # in this batch.  Thus an old 16-event sequence has exactly the same
@@ -438,6 +470,10 @@ class PolicyValueBeliefNet(nn.Module):
         )
         if self.policy_architecture == "attention":
             logits = self._attention_policy(tile_states, action_categorical, action_continuous)
+        elif self.policy_architecture == "relational":
+            logits = self.relational_policy(
+                state, tile_states, map_tokens, action_categorical, action_continuous,
+            )
         else:
             logits = self._factorized_policy(
                 state, tile_states, map_tokens, action_categorical, action_continuous

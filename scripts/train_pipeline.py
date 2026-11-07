@@ -1,4 +1,4 @@
-"""Full RAM-only curriculum; persists only one final model file."""
+"""Legacy multi-stage curriculum with model checkpoints and run diagnostics."""
 
 from __future__ import annotations
 

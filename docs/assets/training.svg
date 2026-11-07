@@ -1,0 +1,388 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1296pt" height="720pt" viewBox="0 0 1296 720" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <title>Three explicit training jobs</title>
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:title>Three explicit training jobs</dc:title>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>PolyBot diagram generator</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 720
+L 1296 720
+L 1296 0
+L 0 0
+z
+" style="fill: #f7f9fc"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 42.84 239.4
+L 389.16 239.4
+Q 397.8 239.4 397.8 230.76
+L 397.8 154.44
+Q 397.8 145.8 389.16 145.8
+L 42.84 145.8
+Q 34.2 145.8 34.2 154.44
+L 34.2 230.76
+Q 34.2 239.4 42.84 239.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 216 237.6
+L 216 261.122949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 218.8 255.522949
+L 216 261.122949
+L 213.2 255.522949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 42.84 354.6
+L 389.16 354.6
+Q 397.8 354.6 397.8 345.96
+L 397.8 269.64
+Q 397.8 261 389.16 261
+L 42.84 261
+Q 34.2 261 34.2 269.64
+L 34.2 345.96
+Q 34.2 354.6 42.84 354.6
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 216 352.8
+L 216 376.322949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 218.8 370.722949
+L 216 376.322949
+L 213.2 370.722949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 42.84 469.8
+L 389.16 469.8
+Q 397.8 469.8 397.8 461.16
+L 397.8 384.84
+Q 397.8 376.2 389.16 376.2
+L 42.84 376.2
+Q 34.2 376.2 34.2 384.84
+L 34.2 461.16
+Q 34.2 469.8 42.84 469.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 216 468
+L 216 491.522949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 218.8 485.922949
+L 216 491.522949
+L 213.2 485.922949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 42.84 585
+L 389.16 585
+Q 397.8 585 397.8 576.36
+L 397.8 500.04
+Q 397.8 491.4 389.16 491.4
+L 42.84 491.4
+Q 34.2 491.4 34.2 500.04
+L 34.2 576.36
+Q 34.2 585 42.84 585
+z
+" clip-path="url(#p629bec8adf)" style="fill: #edf8f2; stroke: #18724b; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 474.84 239.4
+L 821.16 239.4
+Q 829.8 239.4 829.8 230.76
+L 829.8 154.44
+Q 829.8 145.8 821.16 145.8
+L 474.84 145.8
+Q 466.2 145.8 466.2 154.44
+L 466.2 230.76
+Q 466.2 239.4 474.84 239.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 648 237.6
+L 648 261.122949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 650.8 255.522949
+L 648 261.122949
+L 645.2 255.522949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 474.84 354.6
+L 821.16 354.6
+Q 829.8 354.6 829.8 345.96
+L 829.8 269.64
+Q 829.8 261 821.16 261
+L 474.84 261
+Q 466.2 261 466.2 269.64
+L 466.2 345.96
+Q 466.2 354.6 474.84 354.6
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 648 352.8
+L 648 376.322949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 650.8 370.722949
+L 648 376.322949
+L 645.2 370.722949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 474.84 469.8
+L 821.16 469.8
+Q 829.8 469.8 829.8 461.16
+L 829.8 384.84
+Q 829.8 376.2 821.16 376.2
+L 474.84 376.2
+Q 466.2 376.2 466.2 384.84
+L 466.2 461.16
+Q 466.2 469.8 474.84 469.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 648 468
+L 648 491.522949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 650.8 485.922949
+L 648 491.522949
+L 645.2 485.922949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 474.84 585
+L 821.16 585
+Q 829.8 585 829.8 576.36
+L 829.8 500.04
+Q 829.8 491.4 821.16 491.4
+L 474.84 491.4
+Q 466.2 491.4 466.2 500.04
+L 466.2 576.36
+Q 466.2 585 474.84 585
+z
+" clip-path="url(#p629bec8adf)" style="fill: #f5efff; stroke: #7341a6; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 906.84 239.4
+L 1253.16 239.4
+Q 1261.8 239.4 1261.8 230.76
+L 1261.8 154.44
+Q 1261.8 145.8 1253.16 145.8
+L 906.84 145.8
+Q 898.2 145.8 898.2 154.44
+L 898.2 230.76
+Q 898.2 239.4 906.84 239.4
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_17">
+    <path d="M 1080 237.6
+L 1080 261.122949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1082.8 255.522949
+L 1080 261.122949
+L 1077.2 255.522949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_18">
+    <path d="M 906.84 354.6
+L 1253.16 354.6
+Q 1261.8 354.6 1261.8 345.96
+L 1261.8 269.64
+Q 1261.8 261 1253.16 261
+L 906.84 261
+Q 898.2 261 898.2 269.64
+L 898.2 345.96
+Q 898.2 354.6 906.84 354.6
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_19">
+    <path d="M 1080 352.8
+L 1080 376.322949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1082.8 370.722949
+L 1080 376.322949
+L 1077.2 370.722949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_20">
+    <path d="M 906.84 469.8
+L 1253.16 469.8
+Q 1261.8 469.8 1261.8 461.16
+L 1261.8 384.84
+Q 1261.8 376.2 1253.16 376.2
+L 906.84 376.2
+Q 898.2 376.2 898.2 384.84
+L 898.2 461.16
+Q 898.2 469.8 906.84 469.8
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_21">
+    <path d="M 1080 468
+L 1080 491.522949
+" clip-path="url(#p629bec8adf)" style="fill: none; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1082.8 485.922949
+L 1080 491.522949
+L 1077.2 485.922949
+z
+" clip-path="url(#p629bec8adf)" style="fill: #66788a; stroke: #66788a; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_22">
+    <path d="M 906.84 585
+L 1253.16 585
+Q 1261.8 585 1261.8 576.36
+L 1261.8 500.04
+Q 1261.8 491.4 1253.16 491.4
+L 906.84 491.4
+Q 898.2 491.4 898.2 500.04
+L 898.2 576.36
+Q 898.2 585 906.84 585
+z
+" clip-path="url(#p629bec8adf)" style="fill: #fff5e8; stroke: #a85b0e; stroke-width: 1.3; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 24px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #172f45" x="36" y="45.835312" transform="rotate(-0 36 45.835312)">Three explicit training jobs</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="36" y="80.027754" transform="rotate(-0 36 80.027754)">Shared checkpoint format; separate objectives, collectors and readiness checks. A completed run does not imply a promotion.</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 12.2px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="36" y="126" transform="rotate(-0 36 126)">01  FLAT · POLICY / VALUE</text>
+   </g>
+   <g id="text_4">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="51.12" y="170.027305" transform="rotate(-0 51.12 170.027305)">PUBLIC SELF-PLAY</text>
+   </g>
+   <g id="text_5">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 204.520313)">Freeze behavior weights per fragment</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 222.635938)">Native VectorGameEnv collection</text>
+   </g>
+   <g id="text_6">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="51.12" y="285.227305" transform="rotate(-0 51.12 285.227305)">OPTIMIZE</text>
+   </g>
+   <g id="text_7">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 320.224766)">Fresh PPO/GAE; scheduled PPG</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 336.770313)">Optional terminal head-only value fit</text>
+   </g>
+   <g id="text_8">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="51.12" y="400.427305" transform="rotate(-0 51.12 400.427305)">PROTECT WORKING / BEST</text>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 434.920313)">Fixed development benchmark</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 451.970313)">Paired regression confirmation</text>
+   </g>
+   <g id="text_10">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="51.12" y="515.627305" transform="rotate(-0 51.12 515.627305)">MEASURE AND CONTINUE</text>
+   </g>
+   <g id="text_11">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 550.120313)">Independent promotion games</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 567.803672)">Main / archive / PFSP for later collection</text>
+   </g>
+   <g id="text_12">
+    <text style="font-weight: 700; font-size: 12.2px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="468" y="126" transform="rotate(-0 468 126)">02  BELIEF · HIDDEN MAP</text>
+   </g>
+   <g id="text_13">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="483.12" y="170.027305" transform="rotate(-0 483.12 170.027305)">COLLECT SUPERVISION</text>
+   </g>
+   <g id="text_14">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 205.585938)">Public observations and action evidence</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 221.570313)">Full-map semantics are training labels</text>
+   </g>
+   <g id="text_15">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="483.12" y="285.227305" transform="rotate(-0 483.12 285.227305)">FREEZE THE ACTOR</text>
+   </g>
+   <g id="text_16">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 319.720313)">Keep shared encoder and policy fixed</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 336.770313)">Train belief-specific decoder layers</text>
+   </g>
+   <g id="text_17">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="483.12" y="400.427305" transform="rotate(-0 483.12 400.427305)">CHECK WORLD PROPOSALS</text>
+   </g>
+   <g id="text_18">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 434.920313)">Compare public legal action sets</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 451.970313)">Use discrepancies to focus map losses</text>
+   </g>
+   <g id="text_19">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="483.12" y="515.627305" transform="rotate(-0 483.12 515.627305)">VALIDATE</text>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 551.185938)">Held-out mismatch and semantic metrics</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(483.12 567.170313)">Save ready apprentice or roll back</text>
+   </g>
+   <g id="text_21">
+    <text style="font-weight: 700; font-size: 12.2px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="900" y="126" transform="rotate(-0 900 126)">03  MCTS · POLICY / VALUE</text>
+   </g>
+   <g id="text_22">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="915.12" y="170.027305" transform="rotate(-0 915.12 170.027305)">REQUIRE A USEFUL TEACHER</text>
+   </g>
+   <g id="text_23">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 204.520313)">Validated belief + raw/search preflight</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 221.570313)">Same maps and frozen opponent</text>
+   </g>
+   <g id="text_24">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="915.12" y="285.227305" transform="rotate(-0 915.12 285.227305)">FROZEN SEARCH COLLECTION</text>
+   </g>
+   <g id="text_25">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 320.224766)">Detached worlds; batched neural leaves</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 336.770313)">C++ SelfPlayPool select / simulate / backup</text>
+   </g>
+   <g id="text_26">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="915.12" y="400.427305" transform="rotate(-0 915.12 400.427305)">LEARN SEARCH TARGETS</text>
+   </g>
+   <g id="text_27">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 434.920313)">Visits + outcomes / configured bootstraps</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 451.970313)">Bounded replay and optimization blocks</text>
+   </g>
+   <g id="text_28">
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="915.12" y="515.627305" transform="rotate(-0 915.12 515.627305)">GATE</text>
+   </g>
+   <g id="text_29">
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 550.120313)">Search quality and raw-policy absorption</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(915.12 567.170313)">Independent promotion or rollback</text>
+   </g>
+   <g id="text_30">
+    <text style="font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #526479" x="36" y="688.167949" transform="rotate(-0 36 688.167949)">Keep evaluation maps out of training replay. Invalid measurement, weak search and failed model promotion are different outcomes.</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p629bec8adf">
+   <rect x="0" y="0" width="1296" height="720"/>
+  </clipPath>
+ </defs>
+</svg>

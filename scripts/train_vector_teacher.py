@@ -1,4 +1,4 @@
-"""High-throughput VectorGameEnv policy curriculum; saves only model weights."""
+"""High-throughput VectorGameEnv policy curriculum with checkpoint and run metrics."""
 
 from __future__ import annotations
 

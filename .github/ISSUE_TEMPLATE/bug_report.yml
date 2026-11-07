@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem in PolyBot.
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Paste the output of python scripts/check_environment.py; remove any private details.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Command and reproduction steps
+      description: Include the commit, architecture, seed and smallest reproducer. Use generic checkpoint paths.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      description: Remove credentials, private paths and unrelated game or experiment data.
+      render: text

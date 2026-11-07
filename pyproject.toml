@@ -1,0 +1,5 @@
+# PolyBot runs from its repository; scripts bootstrap src/ automatically.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

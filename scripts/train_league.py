@@ -19,6 +19,7 @@ from polybot.training.cli import (
     training_run_from_args,
 )
 from polybot.training.league import train_promotion_league
+from polybot.training.flat_experiments import FlatImprovements
 
 
 def _simulation_ladder(value: str) -> tuple[int, ...]:
@@ -520,6 +521,22 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             "retaining full-game outcomes separately for value/PPG."
         ),
     )
+    parser.add_argument("--flat-improvements", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--flat-value-updates", type=int, default=8)
+    parser.add_argument("--flat-value-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--flat-value-batch-size", type=int, default=128)
+    parser.add_argument("--flat-value-capacity", type=int, default=16384)
+    parser.add_argument("--flat-value-validation-games", type=int, default=8)
+    parser.add_argument("--flat-resume-state", type=Path, default=None,
+                        help="Resume flat weights/AdamW/RNG; native in-flight games restart.")
+    parser.add_argument("--flat-paired-rollback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--flat-cache-evaluations", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--flat-scientific-artifacts", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--flat-exploiter-objective", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--flat-rollout-steps-final", type=int, default=256,
+        help="Final flat rollout horizon; 0 disables horizon annealing.",
+    )
     parser.add_argument(
         "--flat-population-ppo-max-policy-age", type=int, default=None,
         help="Flat-only: actor ignores samples older than this many accepted PPO epochs/PPG phases.",
@@ -837,6 +854,7 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             flat_population_terminal_replay_value_weight=0.25,
             flat_population_ppo_max_policy_age=1,
             flat_population_synchronous_rollouts=True,
+            flat_improvements=True,
             flat_population_policy_anchor_final_weight=0.05,
             flat_population_snapshot_archive_size=6,
             flat_population_pfsp_alpha=2.0,
@@ -1160,6 +1178,19 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         flat_population_synchronous_rollouts=(
             args.flat_population_synchronous_rollouts
         ),
+        flat_resume_state=args.flat_resume_state,
+        flat_improvements=(FlatImprovements(
+            value_updates=args.flat_value_updates,
+            value_batch_size=args.flat_value_batch_size,
+            value_learning_rate=args.flat_value_learning_rate,
+            value_capacity=args.flat_value_capacity,
+            value_validation_games=args.flat_value_validation_games,
+            paired_rollback=args.flat_paired_rollback,
+            cache_evaluations=args.flat_cache_evaluations,
+            scientific_artifacts=args.flat_scientific_artifacts,
+            exploiter_objective=args.flat_exploiter_objective,
+            rollout_steps_final=args.flat_rollout_steps_final,
+        ) if args.flat_improvements else None),
         flat_population_policy_anchor_final_weight=(
             args.flat_population_policy_anchor_final_weight
         ),

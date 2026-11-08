@@ -6,6 +6,7 @@ from collections import deque
 from copy import deepcopy
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from time import perf_counter
 from typing import Any, Callable, Deque, Dict, Mapping, Sequence
 
 import numpy as np
@@ -23,9 +24,9 @@ from .direct_curriculum import model_state_on_cpu, restore_model_state
 from .run_artifacts import TrainingRun
 from .flat_experiments import (
     FlatImprovements, atomic_torch_save, isolated_rng, model_fingerprint,
-    paired_regression, rng_state, restore_rng, write_manifest,
+    paired_regression, rng_state, restore_rng, write_manifest, flat_schedule,
 )
-from .flat_value import ValuePosition, ValueValidationCollector, fit_value_head
+from .flat_value import ValuePosition, ValueValidationCollector, fit_value_head, evaluate_value_head
 from .vector_actor_critic import _normalise_advantage, _visible_action_reward
 from .vector_teacher import (
     _teacher_targets,
@@ -3296,6 +3297,7 @@ def evaluate_direct_population_matches(
     evaluation_cache: dict | None = None,
     include_game_rows: bool = False,
     position_callback: Callable[[int, int, Mapping[str, np.ndarray], int], None] | None = None,
+    position_opponent_index: int | None = None,
 ) -> Dict[str, Any]:
     """Evaluate one raw network on the same paired arena for a population."""
     if not opponent_models:
@@ -3320,20 +3322,23 @@ def evaluate_direct_population_matches(
         raise ValueError("opponent_labels must match opponent_models")
     results: list[Dict[str, Any]] = []
     device = next(candidate.parameters()).device
-    candidate_key = model_fingerprint(candidate) if evaluation_cache is not None else None
+    candidate_key = model_fingerprint(candidate, policy_only=True) if evaluation_cache is not None else None
     for opponent_index, opponent in enumerate(opponent_models):
+        collect_positions = position_callback is not None and (
+            position_opponent_index is None or position_opponent_index == opponent_index
+        )
         match_training = replace(training, seed=(
             (gate_seed - 1 + opponent_index * 1_000_003) % (2**31 - 1) + 1
         ))
         key = None
         if evaluation_cache is not None:
             key = (
-                candidate_key, model_fingerprint(opponent), repr(match_training),
+                candidate_key, model_fingerprint(opponent, policy_only=True), repr(match_training),
                 games, visible_action_history, max_actions, num_threads,
             )
         # A callback collecting validation positions must actually observe
         # the arena. Score-only cache entries cannot supply those inputs.
-        cached = evaluation_cache.get(key) if key is not None and position_callback is None else None
+        cached = evaluation_cache.get(key) if key is not None and not collect_positions else None
         if cached is not None:
             match = deepcopy(cached)
             evaluation_cache["hits"] = evaluation_cache.get("hits", 0) + 1
@@ -3341,7 +3346,7 @@ def evaluate_direct_population_matches(
             game_rows = []
             def play():
                 kwargs = {}
-                if position_callback is not None:
+                if collect_positions:
                     kwargs["position_callback"] = lambda game, batch, row: position_callback(
                         opponent_index, game, batch, row
                     )
@@ -3988,6 +3993,9 @@ def train_direct_population_curriculum(
             flat_improvements.value_positions_per_game, gate_seed,
         ) if flat_improvements and flat_improvements.value_updates else None
     )
+    best_validation_collector = validation_collector
+    evaluation_seconds = 0.0
+    evaluation_calls = 0
     if flat_improvements and flat_improvements.scientific_artifacts:
         write_manifest(
             run.directory, flat_improvements, collection_seed=training.seed,
@@ -4003,22 +4011,33 @@ def train_direct_population_curriculum(
         })
 
     def evaluate_population(*args, collect_validation=False, **kwargs):
+        nonlocal evaluation_seconds, evaluation_calls
+        collector = (
+            collect_validation if isinstance(collect_validation, ValueValidationCollector)
+            else validation_collector if collect_validation else None
+        )
         if flat_improvements is not None:
             kwargs["include_game_rows"] = True
-        if collect_validation and validation_collector is not None:
+        if collector is not None:
             original_callback = kwargs.get("game_callback")
             def record(opponent, game):
                 if opponent == 0:
-                    validation_collector.finish(game)
+                    collector.finish(game)
                 if original_callback is not None:
                     original_callback(opponent, game)
             kwargs["game_callback"] = record
             kwargs["position_callback"] = lambda opponent, game, batch, row: (
-                validation_collector.add(game, batch, row) if opponent == 0 else None
+                collector.add(game, batch, row) if opponent == 0 else None
             )
+            kwargs["position_opponent_index"] = 0
         if evaluation_cache is not None:
             kwargs["evaluation_cache"] = evaluation_cache
-        return evaluate_direct_population_matches(*args, **kwargs)
+        started = perf_counter()
+        try:
+            return evaluate_direct_population_matches(*args, **kwargs)
+        finally:
+            evaluation_seconds += perf_counter() - started
+            evaluation_calls += 1
 
     run.write_config(
         training=training,
@@ -4132,6 +4151,10 @@ def train_direct_population_curriculum(
     best_training_scores = np.full(
         len(active_opponents), 0.5, dtype=np.float64
     )
+    best_screen_state = None
+    best_screen_score = -1.0
+    deferred_benchmarks = 0
+    full_benchmarks = 0
     readiness_streak = 0
     ready = False
     best_meets_readiness = False
@@ -4206,6 +4229,16 @@ def train_direct_population_curriculum(
         nonlocal active_weights, flat_pfsp_scores
         nonlocal best_flat_optimiser_state, best_flat_scaler_state
         nonlocal best_training_scores
+        nonlocal validation_collector, best_validation_collector
+        nonlocal best_screen_state, best_screen_score, deferred_benchmarks, full_benchmarks
+        # Outcomes must belong to the frozen actor currently being evaluated,
+        # not to the policy that happened to enter this curriculum.
+        if flat_improvements and flat_improvements.value_updates:
+            validation_collector = ValueValidationCollector(
+                flat_improvements.value_validation_games,
+                flat_improvements.value_positions_per_game, gate_seed,
+            )
+            games = max(games, flat_improvements.value_validation_games)
         champion_screen: Mapping[str, Any] | None = None
         champion_screen_score: float | None = None
         champion_screen_lower_95: float | None = None
@@ -4239,6 +4272,7 @@ def train_direct_population_curriculum(
                 opponent_labels=[active_labels[flat_champion_index]],
                 num_threads=num_threads,
                 max_actions=max_actions,
+                collect_validation=validation_collector or False,
             )
             champion_screen = screen_evaluation["opponents"][0]
             champion_screen_score = float(champion_screen["model_a_score"])
@@ -4263,6 +4297,51 @@ def train_direct_population_curriculum(
             )
             population_evaluation_skipped = not champion_screen_passed
 
+            if flat_improvements:
+                previous_screen_score = best_screen_score
+                if champion_screen_score > best_screen_score:
+                    best_screen_score = champion_screen_score
+                    best_screen_state = model_state_on_cpu(candidate)
+                full_due = (
+                    block % flat_improvements.diagnostic_interval == 0
+                    or completed >= maximum_steps
+                    or completed >= minimum_steps > completed - current_steps
+                    or champion_screen_score >= (
+                        previous_screen_score + flat_improvements.diagnostic_improvement
+                    )
+                )
+                if champion_screen_passed and not full_due:
+                    # This screen is not a full-population measurement. Keep
+                    # working weights and a separate best-screen snapshot,
+                    # but never replace the protected benchmark checkpoint.
+                    deferred_benchmarks += 1
+                    row = {
+                        "stage": label, "block": float(block), "games": float(games),
+                        "weighted_score": None, "worst_score": None,
+                        "accepted": 1.0, "selected": 0.0,
+                        "acceptance_reason": "benchmark_deferred",
+                        "selection_reason": "screen_only_continue",
+                        "benchmark_deferred": True, "ready": float(ready),
+                        "flat_static_benchmark_score": None,
+                        "flat_champion_screen_score": champion_screen_score,
+                        "flat_champion_screen_passed": 1.0,
+                        "value_validation_source": "current_policy_screen",
+                        "opponents": [dict(champion_screen)],
+                    }
+                    gate_rows.append(row)
+                    run.log(flat_benchmark_deferred=1.0,
+                            flat_champion_screen_score=champion_screen_score,
+                            direct_population_gate_selected=0.0)
+                    run.event("flat_screen_only", block=block,
+                              champion_score=champion_screen_score,
+                              benchmark_interval=flat_improvements.diagnostic_interval)
+                    print(
+                        f"direct population screen | block={block} "
+                        f"champion={champion_screen_score:.4f} | benchmark=deferred "
+                        "| working continued; best checkpoint protected", flush=True,
+                    )
+                    return True
+
         if population_evaluation_skipped:
             assert champion_screen is not None
             training_evaluation = {
@@ -4276,6 +4355,7 @@ def train_direct_population_curriculum(
             }
             evaluation = training_evaluation
         else:
+            full_benchmarks += 1
             training_evaluation = evaluate_population(
                 training,
                 candidate,
@@ -4301,7 +4381,10 @@ def train_direct_population_curriculum(
                 opponent_labels=active_labels,
                 num_threads=num_threads,
                 max_actions=max_actions,
-                collect_validation=baseline,
+                collect_validation=(
+                    validation_collector or False
+                    if baseline or not flat_champion_screen else False
+                ),
             )
             benchmark_matches_active = (
                 len(active_opponents) == len(benchmark_opponents)
@@ -4608,6 +4691,14 @@ def train_direct_population_curriculum(
             # Gate samples are deliberately small.  An exponential moving
             # average prevents one lucky two-game result from completely
             # changing which counterstrategy the next PPO block sees.
+            if observed_scores.shape != flat_pfsp_scores.shape:
+                # A failed champion screen supplies one matchup, not a new
+                # population vector. Preserve all other known difficulties.
+                repaired = flat_pfsp_scores.copy()
+                if not accepted:
+                    shared = min(len(repaired), len(best_training_scores))
+                    repaired[:shared] = best_training_scores[:shared]
+                observed_scores = repaired
             if observed_scores.shape == flat_pfsp_scores.shape:
                 flat_pfsp_scores = (
                     flat_pfsp_score_ema_decay * flat_pfsp_scores
@@ -4642,6 +4733,16 @@ def train_direct_population_curriculum(
                     )
                 refresh_flat_pfsp_weights()
         benchmark_score = weighted_score
+        if baseline:
+            best_validation_collector = validation_collector
+            if flat_champion_index is not None and flat_champion_index < len(training_results):
+                best_screen_score = float(training_results[flat_champion_index]["model_a_score"])
+        elif selected:
+            best_validation_collector = validation_collector
+        elif not accepted:
+            # Gate already restored the protected actor. Its previous arena
+            # outcomes are valid for it; the rejected actor's outcomes are not.
+            validation_collector = best_validation_collector
         row = {
             "stage": label,
             "block": float(block),
@@ -4683,6 +4784,10 @@ def train_direct_population_curriculum(
             "training_mix_score": float(training_evaluation["model_a_score"]),
             "training_mix_worst_score": float(training_evaluation["worst_score"]),
             "flat_static_benchmark_score": benchmark_score,
+            "benchmark_deferred": False,
+            "value_validation_source": (
+                "restored_policy_arena" if not accepted else "current_policy_arena"
+            ),
             "flat_role": flat_role,
             "flat_pfsp_score_ema": flat_pfsp_scores.tolist(),
             "flat_pfsp_weights": active_weights.tolist(),
@@ -4807,6 +4912,14 @@ def train_direct_population_curriculum(
         resume_payload.get("ppo_learning_rate", training.learning_rate)
         if resume_payload is not None else training.learning_rate
     )
+    schedule_budget = int(flat_schedule(
+        0, 0, minimum_steps=minimum_steps, maximum_steps=maximum_steps,
+        block_steps=block_steps, settings=flat_improvements,
+    )["budget"])
+    training_seconds = 0.0
+    if flat_improvements:
+        print(f"direct population schedules | endpoints at {schedule_budget} steps "
+              f"| minimum={minimum_steps} maximum={maximum_steps}", flush=True)
     while completed < maximum_steps and (
         completed < minimum_steps
         or not ready
@@ -4824,16 +4937,22 @@ def train_direct_population_curriculum(
             seed=(training.seed - 1 + block * 2_000_003) % (2**31 - 1) + 1,
             learning_rate=current_ppo_learning_rate,
         )
+        schedule = flat_schedule(
+            completed, current_steps, minimum_steps=minimum_steps,
+            maximum_steps=maximum_steps, block_steps=block_steps,
+            settings=flat_improvements,
+        )
         block_rollout_steps = ppo_rollout_steps
         if flat_improvements and flat_improvements.rollout_steps_final:
             # Expand direct terminal coverage gradually while keeping each
             # individual rollout frozen and on-policy.
-            progress_fraction = completed / max(1, maximum_steps - block_steps)
+            progress_fraction = float(schedule["block_progress"])
             block_rollout_steps = max(1, round(
                 ppo_rollout_steps + (
                     flat_improvements.rollout_steps_final - ppo_rollout_steps
                 ) * progress_fraction
             ))
+        training_started = perf_counter()
         result = train_vector_population(
             block_training,
             model_config,
@@ -4852,7 +4971,8 @@ def train_direct_population_curriculum(
                 else (
                     policy_anchor_weight
                     + (flat_policy_anchor_final_weight - policy_anchor_weight)
-                    * ((completed + current_steps * 0.5) / max(1, maximum_steps))
+                    * (float(schedule["block_progress"]) if flat_improvements else
+                       (completed + current_steps * 0.5) / max(1, maximum_steps))
                 )
             ),
             value_anchor_weight=value_anchor_weight,
@@ -4860,9 +4980,8 @@ def train_direct_population_curriculum(
             teacher_weight=teacher_weight,
             shaping_weight=shaping_weight,
             shaping_final_weight=shaping_final_weight,
-            shaping_progress_start=completed / max(1, maximum_steps),
-            shaping_progress_end=(completed + current_steps)
-            / max(1, maximum_steps),
+            shaping_progress_start=float(schedule["start"]),
+            shaping_progress_end=float(schedule["end"]),
             greedy_advantage_weight=greedy_advantage_weight,
             gamma=ppo_gamma,
             ppo_rollout_steps=block_rollout_steps,
@@ -4914,8 +5033,20 @@ def train_direct_population_curriculum(
             ),
             run=run.child(f"block_{block:03d}"),
         )
+        training_seconds += perf_counter() - training_started
         training_rows.append(result)
         result["flat_rollout_steps"] = block_rollout_steps
+        result["flat_schedule_budget"] = schedule_budget
+        result["flat_schedule_progress"] = float(schedule["end"])
+        if flat_improvements:
+            run.log(flat_schedule_budget=schedule_budget,
+                    flat_schedule_progress=float(schedule["end"]),
+                    flat_rollout_steps=block_rollout_steps,
+                    flat_shaping_weight=shaping_weight + (shaping_final_weight - shaping_weight) * float(schedule["end"]),
+                    flat_policy_anchor_weight=(
+                        policy_anchor_weight if flat_policy_anchor_final_weight is None else
+                        policy_anchor_weight + (flat_policy_anchor_final_weight - policy_anchor_weight) * float(schedule["block_progress"])
+                    ))
         completed += current_steps
         adapted_learning_rate = float(
             result.get(
@@ -4942,6 +5073,7 @@ def train_direct_population_curriculum(
             value_result = fit_value_head(
                 candidate, training, critic_replay, validation_collector.examples,
                 flat_improvements, seed=block_training.seed,
+                validation_source=gate_rows[-1].get("value_validation_source", "current_policy_arena"),
             )
             value_training_rows.append(value_result)
             if value_result["kept"]:
@@ -4963,8 +5095,18 @@ def train_direct_population_curriculum(
                 f"updates={value_result['updates']} kept={int(value_result['kept'])} "
                 f"reason={value_result['reason']} "
                 f"before={value_result.get('before', {}).get('rmse')} "
-                f"after={value_result.get('after', {}).get('rmse')}", flush=True,
+                f"after={value_result.get('after', {}).get('rmse')} "
+                f"| source={value_result['validation_source']} "
+                f"games={validation_collector.completed_games} "
+                f"attempts={value_result.get('attempts', 0)}", flush=True,
             )
+            if flat_improvements.scientific_artifacts:
+                atomic_torch_save(run.directory / "value_validation_latest.pt", {
+                    "source": value_result["validation_source"], "block": block,
+                    "completed_games": validation_collector.completed_games,
+                    "truncated_games": validation_collector.truncated_games,
+                    "examples": validation_collector.examples,
+                })
         if flat_improvements and hasattr(run, "event"):
             run.event(
                 "flat_block", block=block, collection_seed=block_training.seed,
@@ -4976,7 +5118,7 @@ def train_direct_population_curriculum(
             )
         if accepted and selected:
             plateau_blocks = 0
-        elif accepted:
+        elif accepted and not gate_rows[-1].get("benchmark_deferred", False):
             plateau_blocks += 1
             if plateau_blocks >= plateau_patience:
                 previous_temperature = current_ppo_rollout_temperature
@@ -4996,7 +5138,7 @@ def train_direct_population_curriculum(
                             current_ppo_rollout_temperature
                         ),
                     )
-        else:
+        elif not accepted:
             plateau_blocks = 0
         if flat_improvements and flat_improvements.scientific_artifacts:
             continuation = flat_continuation or {}
@@ -5066,10 +5208,24 @@ def train_direct_population_curriculum(
             final_variants.append(
                 ("best_ema", best_ema_state, f"{candidate_label} best EMA")
             )
+    if best_screen_state is not None:
+        policy_names = [name for name in best_screen_state
+                        if not name.startswith(("value_head.", "belief_"))]
+        if not any(all(torch.equal(best_screen_state[name], state[name]) for name in policy_names)
+                   for _, state, _ in final_variants):
+            # Sparse diagnostics must not throw away a promising intermediate
+            # actor merely because its next training block drifted.
+            final_variants.append(("best_screen", best_screen_state,
+                                   f"{candidate_label} best screen"))
 
     final_candidates: list[Dict[str, Any]] = []
     for label, state, label_for_log in final_variants:
         restore_model_state(candidate, state)
+        final_validation = (
+            ValueValidationCollector(flat_improvements.value_validation_games,
+                                     flat_improvements.value_positions_per_game, gate_seed)
+            if flat_improvements and flat_improvements.value_updates else None
+        )
         evaluation = evaluate_population(
             training,
             candidate,
@@ -5095,6 +5251,7 @@ def train_direct_population_curriculum(
             opponent_labels=benchmark_labels,
             num_threads=num_threads,
             max_actions=max_actions,
+            collect_validation=final_validation or False,
         )
         score = float(evaluation["model_a_score"])
         worst_score = float(evaluation["worst_score"])
@@ -5107,6 +5264,7 @@ def train_direct_population_curriculum(
                 "worst_score": worst_score,
                 "safe": score >= gate_score
                 and worst_score >= historical_score_floor,
+                "value_validation": final_validation,
             }
         )
 
@@ -5226,6 +5384,39 @@ def train_direct_population_curriculum(
         restore_model_state(candidate, parent_state)
         ready = False
         best_meets_readiness = False
+    selected_value_metrics: Dict[str, Any] = {"valid": False, "count": 0}
+    if full_safe and flat_improvements and chosen_final["value_validation"] is not None:
+        selected_validation = chosen_final["value_validation"]
+        final_value_fit = fit_value_head(
+            candidate, training, critic_replay, selected_validation.examples,
+            flat_improvements, seed=training.seed,
+            validation_source="selected_policy_arena",
+        )
+        value_training_rows.append({"stage": "final", **final_value_fit})
+        selected_value_metrics = evaluate_value_head(
+            candidate, training, selected_validation.examples,
+            batch_size=flat_improvements.value_batch_size,
+        )
+        run.event("selected_policy_value", fit=final_value_fit,
+                  metrics=selected_value_metrics,
+                  policy_fingerprint=model_fingerprint(candidate, policy_only=True))
+        print(
+            "direct population selected value | "
+            f"games={selected_validation.completed_games} "
+            f"positions={selected_value_metrics['count']} "
+            f"RMSE={selected_value_metrics.get('rmse')} "
+            f"bias={selected_value_metrics.get('bias')} "
+            f"zero_RMSE={selected_value_metrics.get('zero_rmse')} "
+            f"fit_kept={int(final_value_fit['kept'])}", flush=True,
+        )
+        if flat_improvements.scientific_artifacts:
+            atomic_torch_save(run.directory / "value_validation_selected.pt", {
+                "source": "selected_policy_arena",
+                "policy_fingerprint": model_fingerprint(candidate, policy_only=True),
+                "completed_games": selected_validation.completed_games,
+                "truncated_games": selected_validation.truncated_games,
+                "examples": selected_validation.examples, "metrics": selected_value_metrics,
+            })
     calibration_count = float(sum(
         float(row.get("direct_population_value_calibration_count", 0.0))
         for row in training_rows
@@ -5388,6 +5579,13 @@ def train_direct_population_curriculum(
         "direct_population_gate_rows": gate_rows,
         "direct_population_training_rows": training_rows,
         "flat_value_training_rows": value_training_rows,
+        "flat_value_selected_metrics": selected_value_metrics,
+        "flat_training_seconds": training_seconds,
+        "flat_evaluation_seconds": evaluation_seconds,
+        "flat_evaluation_calls": evaluation_calls,
+        "flat_full_benchmarks": full_benchmarks,
+        "flat_deferred_benchmarks": deferred_benchmarks,
+        "flat_schedule_steps": schedule_budget,
         "flat_evaluation_cache_hits": evaluation_cache.get("hits", 0) if evaluation_cache is not None else 0,
     }
     if flat_improvements and flat_improvements.scientific_artifacts:

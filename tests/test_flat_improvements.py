@@ -159,7 +159,8 @@ def test_terminal_critic_updates_only_head_and_rolls_back_bad_validation(validat
         model, TrainingConfig(device="cpu"), value_positions(1.0),
         value_positions(validation_target), settings, seed=19,
     )
-    assert result["updates"] == 8 and result["kept"] is kept
+    assert result["updates"] == (8 if kept else 24) and result["kept"] is kept
+    assert result["attempts"] == (1 if kept else 3)
     for name, tensor in model.state_dict().items():
         if not name.startswith("value_head.") or not kept:
             assert torch.equal(tensor, before[name]), name

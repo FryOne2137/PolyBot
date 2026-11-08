@@ -17,33 +17,77 @@ Defaults are eight updates, batch 128, capacity 16,384 and learning rate 0.0001.
 Opening/mid/late phase buckets are sampled evenly when present; wins and losses
 are not artificially balanced.
 
-Validation positions are copied from the first configured games of the baseline
-development arena against the first opponent. Both player sides are included;
-truncated games produce no terminal labels. A requested validation count larger
-than the diagnostic gate increases the baseline arena accordingly.
+Validation positions come from the **currently evaluated frozen policy**,
+collected alongside the existing champion screen or benchmark. Both player
+sides are included; truncated games produce no terminal labels. No extra games
+are needed. If the gate restores an earlier actor, its own saved validation is
+restored too. Outcomes of the rejected actor cannot guard a fit on that actor's
+replacement. At least two completed games and eight positions are required.
 
-The same frozen public positions measure before/after MAE, RMSE, bias and
-phase metrics. A worse RMSE or nonfinite gradient restores the previous head.
-An accepted external head update clears that head's outdated main-AdamW moments.
-The log explicitly distinguishes a fit, a rollback and insufficient data.
+The same held-out public positions measure before/after MAE, RMSE, bias, phase
+metrics and the constant-zero baseline. Each head update is checked; the best
+improving intermediate head is retained. If no update improves RMSE, the fit can
+restart from its original head with a halved learning rate, up to
+`--flat-value-fit-backoffs` retries (default two). Repeated attempts reuse frozen
+encoder features. Nonfinite or non-improving fits restore the original head.
+An accepted external update clears only that head's outdated main-AdamW moments.
+`updates` counts all attempts; `selected_updates` describes the retained fit.
 
-**Interpretation:** these labels describe outcomes under the baseline reference
-policy, not an oracle value for every later policy. They are a fitting diagnostic.
-Repeated development-set selection can overfit. Independent game-strength and
-final test arenas remain necessary.
+The selected final raw/EMA checkpoint is also measured on its own collected
+positions and receives a guarded head-only fit. Logs report actual game and
+position counts, the validation source, and comparison with predicting zero.
+
+**Interpretation:** these labels describe frozen **greedy evaluation** games,
+not an oracle for the position or the exact stochastic collection policy.
+Training replay still contains behavior-policy variation. The baseline arena
+is preserved for auditing, but no longer judges every evolving actor. Repeated
+development-set selection can overfit; independent final tests remain necessary.
 
 Controls: `--flat-value-updates`, `--flat-value-batch-size`,
 `--flat-value-learning-rate`, `--flat-value-capacity`,
-`--flat-value-validation-games`. Zero updates disable this extra fit.
+`--flat-value-validation-games`, `--flat-value-fit-backoffs`. Zero updates disable this extra fit.
 The older `--flat-population-terminal-replay-value-weight` is separate; set
 it to 0.0 consistently when isolating the new critic fit in an experiment.
 
 ## Rollout horizon
 
-Fragments can grow from `--direct-population-ppo-rollout-steps` toward
-`--flat-rollout-steps-final` (default 256) over the maximum curriculum budget.
-Weights remain fixed inside each fragment. A final horizon of zero disables
-annealing. Longer fragments reduce update frequency and need empirical testing.
+Fragments grow from `--direct-population-ppo-rollout-steps` toward
+`--flat-rollout-steps-final` (default 256). With the flat package, the default
+annealing budget is the **minimum** curriculum budget: endpoints are reached
+before the first legal early finish. Shaping reaches its final weight at that
+boundary; the last scheduled block uses the final rollout length and policy
+anchor weight. Extra blocks hold those endpoints. `--flat-schedule-steps N`
+sets an explicit budget (for example 48000 to reproduce the old longer decay).
+Schedules are per curriculum/round; a new round starts a new schedule.
+
+For minimum 24000, maximum 48000 and blocks of 4000, block six now uses rollout
+256 and final policy anchoring; shaping ends at zero when configured. Previously
+the rollout was about 186 and shaping still 0.025. Actual schedule progress,
+weights and budget are recorded. Weights remain fixed inside each fragment.
+A final horizon of zero disables horizon annealing. Longer fragments reduce
+update frequency and need empirical testing.
+
+## Less frequent population diagnostics
+
+`--flat-diagnostic-interval` defaults to two. With champion screening enabled,
+each block still plays the champion, while the full population benchmark runs
+every second block. It also runs at the minimum/maximum budget boundary or when
+the screen improves by `--flat-diagnostic-improvement` (default 0.05).
+Without champion screening, every block keeps its full diagnostic.
+
+A screen-only block can continue working weights but cannot replace the
+protected population-best checkpoint or report a population score. The best
+screen actor is separately retained and tested alongside raw/EMA candidates at
+the final full gate. A clearly losing screen still rolls back. Deferred screens
+are not counted as plateau evidence. Set the interval to one for the previous
+cadence. The full final and independent promotion game counts and thresholds
+are unchanged.
+
+Per-stage timing, full/deferred benchmark counts and cache hits are logged.
+Position collection only bypasses the cache for the matchup being collected;
+other opponents retain their cache. Raw-policy cache identities exclude the
+unused value/belief heads, while any actor or shared-encoder change invalidates
+the evidence.
 
 ## Paired rollback confirmation
 
@@ -92,6 +136,8 @@ Alongside normal run records, scientific artifacts include:
 | `source_snapshot.json` | Actual Python sources, including uncommitted edits |
 | `initial_model.pt` | Weights at curriculum entry |
 | `value_validation.pt` | Frozen public reference positions and outcomes |
+| `value_validation_latest.pt` | Current/restored actor's held-out value labels |
+| `value_validation_selected.pt` | Selected raw/EMA actor's labels and fresh metrics |
 | `events.jsonl` | Rollback, critic-fit and final-selection decisions |
 | `latest_state.pt` | Post-block working weights, best weights, AdamW/scaler, policy version, terminal replay and RNG |
 | `selected_model.pt` | Model selected by the final curriculum gate |

@@ -527,6 +527,14 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     parser.add_argument("--flat-value-batch-size", type=int, default=128)
     parser.add_argument("--flat-value-capacity", type=int, default=16384)
     parser.add_argument("--flat-value-validation-games", type=int, default=8)
+    parser.add_argument("--flat-value-fit-backoffs", type=int, default=2,
+                        help="Retry a rejected head-only fit with halved learning rates.")
+    parser.add_argument("--flat-diagnostic-interval", type=int, default=2,
+                        help="Full flat population benchmark every N blocks; champion screens still run each block.")
+    parser.add_argument("--flat-diagnostic-improvement", type=float, default=0.05,
+                        help="Champion-screen improvement triggering an earlier full benchmark.")
+    parser.add_argument("--flat-schedule-steps", type=int, default=0,
+                        help="Annealing budget; 0 reaches endpoints by the minimum flat curriculum budget.")
     parser.add_argument("--flat-resume-state", type=Path, default=None,
                         help="Resume flat weights/AdamW/RNG; native in-flight games restart.")
     parser.add_argument("--flat-paired-rollback", action=argparse.BooleanOptionalAction, default=True)
@@ -1185,6 +1193,10 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             value_learning_rate=args.flat_value_learning_rate,
             value_capacity=args.flat_value_capacity,
             value_validation_games=args.flat_value_validation_games,
+            value_fit_backoffs=args.flat_value_fit_backoffs,
+            diagnostic_interval=args.flat_diagnostic_interval,
+            diagnostic_improvement=args.flat_diagnostic_improvement,
+            schedule_steps=args.flat_schedule_steps,
             paired_rollback=args.flat_paired_rollback,
             cache_evaluations=args.flat_cache_evaluations,
             scientific_artifacts=args.flat_scientific_artifacts,

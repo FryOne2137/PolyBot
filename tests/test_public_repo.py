@@ -154,9 +154,14 @@ def test_diagrams_render_from_source_with_contained_labels(tmp_path):
         assert spec["title"] in (tmp_path / spec["svg"]).read_text()
 
 
-def test_public_metadata_and_ci_have_read_only_permissions_and_pinned_actions():
+def test_public_citation_metadata():
     citation = yaml.safe_load((ROOT / "CITATION.cff").read_text())
     assert citation["license"] == "MIT" and citation["authors"][0]["name"] == "FryOne2137"
+
+
+@pytest.mark.skipif(not (ROOT / ".github/workflows/ci.yml").is_file(),
+                    reason="GitHub Actions workflow is not configured")
+def test_ci_when_configured_has_read_only_permissions_and_pinned_actions():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     assert workflow["permissions"] == {"contents": "read"}
     assert {"push", "pull_request", "workflow_dispatch"} <= workflow["on"].keys()

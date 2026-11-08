@@ -35,6 +35,11 @@ class FlatImprovements:
     scientific_artifacts: bool = True
     exploiter_objective: bool = True
     rollout_steps_final: int = 256
+    # Zero follows the minimum curriculum budget, not its optional extension.
+    schedule_steps: int = 0
+    diagnostic_interval: int = 2
+    diagnostic_improvement: float = 0.05
+    value_fit_backoffs: int = 2
 
     def __post_init__(self):
         if self.value_updates < 0 or self.value_batch_size < 1:
@@ -45,9 +50,34 @@ class FlatImprovements:
             raise ValueError("value validation needs a positive even game count")
         if self.value_positions_per_game < 1 or self.rollout_steps_final < 0:
             raise ValueError("invalid value position or rollout budget")
+        if self.schedule_steps < 0 or self.diagnostic_interval < 1:
+            raise ValueError("invalid flat schedule or diagnostic interval")
+        if self.diagnostic_improvement < 0 or self.value_fit_backoffs < 0:
+            raise ValueError("invalid diagnostic improvement or critic backoff")
 
 
-def model_fingerprint(model: torch.nn.Module) -> str:
+def flat_schedule(
+    completed: int, steps: int, *, minimum_steps: int, maximum_steps: int,
+    block_steps: int, settings: FlatImprovements | None,
+) -> dict[str, float | int]:
+    """Reach endpoints by the earliest legal curriculum end, then hold them.
+
+    No-improvements callers keep the previous maximum-budget schedules.
+    Block-constant controls hit the endpoint in the last scheduled block;
+    the per-step shaping interpolation reaches it at the budget boundary.
+    """
+    budget = max(1, (
+        settings.schedule_steps or minimum_steps or maximum_steps
+    ) if settings is not None else maximum_steps)
+    progress = min(1.0, max(0.0, completed / max(1, budget - block_steps)))
+    return {
+        "budget": budget, "block_progress": progress,
+        "start": min(1.0, completed / budget),
+        "end": min(1.0, (completed + steps) / budget),
+    }
+
+
+def model_fingerprint(model: torch.nn.Module, *, policy_only: bool = False) -> str:
     digest = hashlib.sha256()
     config = getattr(model, "config", None)
     config_identity = repr(config)
@@ -59,6 +89,10 @@ def model_fingerprint(model: torch.nn.Module) -> str:
         )
     digest.update(config_identity.encode())
     for name, tensor in sorted(model.state_dict().items()):
+        if policy_only and (name.startswith("value_head.") or name.startswith("belief_")):
+            # Raw-policy games do not execute these branches. A safe external
+            # critic fit must not invalidate already measured action outcomes.
+            continue
         digest.update(name.encode())
         value = tensor.detach().cpu().contiguous()
         digest.update(str((value.shape, value.dtype)).encode())

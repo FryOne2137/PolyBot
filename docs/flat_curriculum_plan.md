@@ -100,10 +100,38 @@ route even if value heads differ. For a different memory/throughput tradeoff,
 set an even resident-game limit (for example 32 or 128) and measure on the target
 GPU. No hardware-independent speedup is guaranteed.
 
+Public CPU packets are now combined before transfer: each actual model forward
+receives one compact native input batch. CUDA staging reuses contiguous pinned
+allocations and retains int32 action/map storage until conversion on the GPU.
+This avoids per-domain H2D copies followed by GPU row-selection/concatenation.
+For identical paired policies, a decision can be reused in the other seat's game
+only after checking equality of its public inputs; both native games still advance
+and contribute their own outcome/position records.
+
+`--flat-evaluation-size-bucketing nearby` retains the padded size buckets.
+`--flat-evaluation-size-bucketing exact` batches only equal sizes, enabling the
+ordinary unpadded map-transformer path. The faster option depends on the GPU,
+batch population and legal-action lengths. Compare them on the actual checkpoint:
+
+```bash
+python scripts/benchmark_flat_evaluation.py --model models/mixed-flat/bootstrap.pt --device cuda --games 40 --max-moves 100 --num-threads 4 --batch-games 64 --output runs/mixed-flat/evaluation-throughput.json
+```
+
+The probe warms each case, then measures single-board evaluation, a three-type
+mixture restricted to 11x11, and the full size mixture with each bucketing mode.
+It writes wall time, actual environment steps/s, average game length, runtime
+versions, model fingerprint and GPU/VRAM details. Short truncated games are a
+throughput diagnostic, not evidence of playing strength. Compare steps/s together
+with domain sizes and steps performed: seconds/game alone mixes software cost
+with longer games on larger maps.
+
 One progress bar covers the whole arena. Results also record mean/peak inference
 batch size, model forward count, resident games, tile-padding ratio and whether
 the policy route was shared. These counters describe batching, not GPU utilization
 or training progress.
+Timing diagnostics additionally separate CPU preparation, policy input/inference,
+native engine/position callbacks and arena setup. The inference interval includes
+H2D copies and the action-result synchronization; it is not isolated kernel time.
 
 The arena horizon is calibrated to 11x11: a limit of 1600 becomes
 `ceil(1600 * size^2 / 121)` on each board, about 3386 on 16x16. Each game

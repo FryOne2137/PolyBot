@@ -429,7 +429,8 @@ def evaluate_mixed_matches(model_a, model_b, device, training, games, game_callb
     with isolated_rng():
         statistics, inference_stats = run_mixed_arenas(model_a, model_b, device, training, schedule,
             record=record, position=position if positions is not None else None,
-            max_live_games=training.flat_evaluation_batch_games, **kwargs)
+            max_live_games=training.flat_evaluation_batch_games,
+            size_bucketing=training.flat_evaluation_size_bucketing, **kwargs)
     for local_rows, (_, _, count, weight, _) in zip(rows_by_group, schedule):
         ordered = sorted(local_rows, key=lambda row: row["game_index"])
         pair_scores.extend((ordered[i]["score_a"] + ordered[i+1]["score_a"]) / 2 for i in range(0, len(ordered), 2))

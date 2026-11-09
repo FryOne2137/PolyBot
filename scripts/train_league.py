@@ -537,6 +537,8 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     parser.add_argument("--flat-domain-evaluation-groups", type=int, default=6)
     parser.add_argument("--flat-evaluation-batch-games", type=int, default=64,
                         help="Mixed flat evaluation: maximum resident games sharing inference; positive and even.")
+    parser.add_argument("--flat-evaluation-size-bucketing", choices=("nearby", "exact"), default="nearby",
+                        help="Mixed evaluation: nearby pads board storage; exact uses the homogeneous map attention path.")
     parser.add_argument("--flat-domain-score-floor", type=float, default=0.40)
     parser.add_argument("--flat-domain-min-games", type=int, default=20)
     parser.add_argument("--flat-improvements", action=argparse.BooleanOptionalAction, default=False)

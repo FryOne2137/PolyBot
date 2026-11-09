@@ -120,8 +120,9 @@ def test_identical_policy_and_value_only_changes_share_a_single_inference_route(
     _, stats = run_mixed_arenas(model, opponent, torch.device('cpu'), training, schedule,
         record=lambda group, row: rows.append((group, row)), num_threads=1, max_actions=1)
     assert stats['flat_evaluation_shared_policy']
-    assert stats['flat_evaluation_max_inference_batch'] == 12
+    assert stats['flat_evaluation_max_inference_batch'] == 6
     assert stats['flat_evaluation_model_forwards'] == 2
+    assert stats['flat_evaluation_reused_paired_decisions'] == 12
     assert_same_games(rows, _sequential(model, opponent, training, schedule, 0))
 
 
@@ -201,3 +202,99 @@ def test_padded_board_contract_rejects_invalid_sizes_and_belief():
             model(**packet, include_belief=False, board_sizes=sizes)
     with pytest.raises(ValueError, match='policy/value inference only'):
         model(**packet, board_sizes=[11, 11])
+
+
+def test_native_cpu_collation_preserves_context_history_and_all_legal_actions():
+    from polybot.evaluation.mixed_matches import _NativeCollator, _public_rows
+    packets, expected = [], []
+    for size, kind, tribes, history in [(11, 'water_world', (1, 12), 0), (16, 'drylands', (5, 7), 4)]:
+        group = EpisodeVectorPool(FlatDomain(size, kind, tribes), num_envs=2, seed=2137,
+            num_threads=1, max_actions=1, history=history)
+        for _ in range(3):
+            group.step(group.batch['action_id'][:, 0].copy())
+        packets.append(_public_rows(group.batch, np.array([1])))
+        expected.append(native_batch_to_tensors(packets[-1], torch.device('cpu'), size, kind))
+    native = _NativeCollator(torch.device('cpu'))(packets)
+    merged = native_batch_to_tensors(native, torch.device('cpu'), 11, 'lakes')
+    assert native['action_features'].dtype == np.int32
+    for row, (packet, reference) in enumerate(zip(packets, expected)):
+        tiles, width = reference.map_tokens.shape[1], reference.action_mask.shape[1]
+        torch.testing.assert_close(merged.map_tokens[row, :tiles], reference.map_tokens[0], rtol=0, atol=0)
+        torch.testing.assert_close(merged.global_features[row], reference.global_features[0], rtol=0, atol=0)
+        torch.testing.assert_close(merged.event_features[row], reference.event_features[0], rtol=0, atol=0)
+        torch.testing.assert_close(merged.action_categorical[row, :width], reference.action_categorical[0], rtol=0, atol=0)
+        torch.testing.assert_close(merged.action_continuous[row, :width], reference.action_continuous[0], rtol=0, atol=0)
+        assert merged.action_mask[row].sum() == reference.action_mask.sum()
+        count = reference.action_history.shape[1]
+        if count:
+            torch.testing.assert_close(merged.action_history[row, -count:], reference.action_history[0], rtol=0, atol=0)
+        else:
+            assert not merged.action_history_mask[row].any()
+
+
+@pytest.mark.parametrize('bucketing', ['nearby', 'exact'])
+def test_one_cpu_input_batch_per_forward_and_measured_work(bucketing):
+    model = network()
+    training = TrainingConfig(seed=1531842, max_moves=3,
+        flat_curriculum=FlatCurriculumConfig(evaluation_groups=3))
+    schedule = evaluation_schedule(training.flat_curriculum, training.seed, 12)
+    rows = []
+    _, stats = run_mixed_arenas(model, model, torch.device('cpu'), training, schedule,
+        record=lambda group, row: rows.append((group, row)), visible_action_history=4,
+        num_threads=1, max_actions=1, size_bucketing=bucketing)
+    assert_same_games(rows, _sequential(model, model, training, schedule, 4))
+    assert stats['flat_evaluation_input_batches'] == stats['flat_evaluation_model_forwards']
+    assert stats['flat_evaluation_environment_steps'] == sum(row['moves'] for _, row in rows)
+    assert stats['flat_evaluation_elapsed_seconds'] > 0
+    assert stats['flat_evaluation_policy_inference_seconds'] > 0
+    assert stats['flat_evaluation_environment_steps_per_second'] > 0
+    if bucketing == 'exact':
+        assert stats['flat_evaluation_tile_padding_ratio'] == 1
+
+
+def test_paired_reuse_requires_equal_public_inputs():
+    from polybot.evaluation.mixed_matches import _Arena, _same_paired_inputs
+    arena = _Arena(0, FlatDomain(11, 'lakes', (1, 5)), 1073743961, 0, 2,
+        TrainingConfig(max_moves=3), torch.device('cpu'), num_threads=1,
+        max_actions=1, history=2, position=None)
+    assert _same_paired_inputs(arena)
+    arena.batches[1]['own_techs'][0, 0] ^= 1
+    assert not _same_paired_inputs(arena)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA device is unavailable')
+def test_cuda_native_staging_is_pinned_contiguous_and_reused():
+    from polybot.evaluation.mixed_matches import _NativeCollator
+    collator = _NativeCollator(torch.device('cuda'))
+    first = collator._array('actions', (4, 100, 17), np.dtype(np.int32))
+    owner = collator.owners['actions']
+    assert first.flags.c_contiguous and torch.as_tensor(first).is_pinned()
+    second = collator._array('actions', (2, 75, 17), np.dtype(np.int32))
+    assert collator.owners['actions'] is owner
+    assert second.flags.c_contiguous and torch.as_tensor(second).is_pinned()
+    assert collator._array('history', (2, 0, 26), np.dtype(np.int32)).shape == (2, 0, 26)
+
+
+def test_real_throughput_probe_writes_reproducible_work_counts(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+    import runpy
+    import sys
+    from polybot.infrastructure.model_io import save_model
+    model = network()
+    checkpoint, report = tmp_path / 'model.pt', tmp_path / 'probe.json'
+    save_model(checkpoint, model, model.config)
+    script = Path(__file__).resolve().parents[1] / 'scripts/benchmark_flat_evaluation.py'
+    monkeypatch.syspath_prepend(str(script.parent))
+    monkeypatch.setattr(sys, 'argv', [str(script), '--model', str(checkpoint), '--device', 'cpu',
+        '--games', '6', '--max-moves', '2', '--num-threads', '1', '--history', '2',
+        '--modes', 'single,mixed-one-size,mixed-nearby,mixed-exact', '--batch-games', '6', '--output', str(report)])
+    runpy.run_path(str(script), run_name='__main__')
+    data = json.loads(report.read_text())
+    assert len(data['cases']) == 4 and data['fingerprint']
+    for case in data['cases']:
+        assert case['environment_steps_per_second'] > 0
+        assert case['seconds_per_game'] > 0
+        assert case['model_score'] == .5
+        if case['mode'] != 'single':
+            assert case['flat_evaluation_input_batches'] == case['flat_evaluation_model_forwards']

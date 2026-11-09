@@ -85,6 +85,7 @@ def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
     return TrainingConfig(
         seed=seed, flat_curriculum=curriculum,
         flat_evaluation_batch_games=getattr(args, "flat_evaluation_batch_games", 64),
+        flat_evaluation_size_bucketing=getattr(args, "flat_evaluation_size_bucketing", "nearby"),
         device=args.device,
         map_size=args.map_size,
         map_type=args.map_type,

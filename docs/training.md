@@ -160,6 +160,7 @@ benchmark. A game stopped at a move limit is truncated.
 | `train_self_play_pool.py` | Standalone native pool trainer |
 | `train_pipeline.py` | Older multi-stage orchestration; not the dedicated flat league |
 | `train_league.py` | Configurable guarded curriculum, including `auto` |
+| `benchmark_flat_evaluation.py` | Real-engine throughput probe for single/mixed flat arenas |
 
 Use `--help` for the actual options. Do not infer one script's options from
 another script with a similar name.

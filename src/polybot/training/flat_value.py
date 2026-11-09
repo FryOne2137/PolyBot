@@ -18,7 +18,7 @@ class ValuePosition:
     observation: Mapping[str, np.ndarray]
     return_target: float
     has_terminal_value: bool = True
-    game_key: tuple[int, int] | None = None
+    game_key: tuple[Any, ...] | None = None
 
 
 @dataclass
@@ -63,7 +63,8 @@ class ValueValidationCollector:
             return
         self.completed_games += 1
         outcome = 2.0 * float(game["score_a"]) - 1.0
-        game_key = (int(game.get("map_seed", self.seed + key // 2)),
+        game_key = (game.get("map_size"), game.get("map_type"), tuple(game.get("player_tribes", ())),
+                    int(game.get("map_seed", self.seed + key // 2)),
                     int(game.get("model_a_player", key % 2)))
         self.examples.extend(ValuePosition(position, outcome, game_key=game_key)
                              for position in positions)
@@ -72,19 +73,28 @@ class ValueValidationCollector:
 def _states(model, examples, training):
     from .vector_population import _collate_public_observations
     from .vector_teacher import _vector_tensors
-    batch = _collate_public_observations(examples)
-    tensors = _vector_tensors(batch, next(model.parameters()).device, training)
-    with torch.no_grad():
-        state, tiles = model.encode_map(
-            tensors["map_tokens"], tensors["global_features"],
-            tensors["event_features"], tensors["action_history"],
-            tensors["action_history_mask"],
-        )
-        _, state = model.action_encoder(
-            state, tiles, tensors["map_tokens"], tensors["action_categorical"],
-            tensors["action_continuous"], tensors["action_mask"],
-        )
-    return state.detach()
+    from dataclasses import replace
+    import math
+    groups = {}
+    for i, example in enumerate(examples):
+        tiles = len(example.observation["map_tokens"])
+        groups.setdefault(tiles, []).append(i)
+    states, indexes = [], []
+    for tiles, rows in groups.items():
+        batch = _collate_public_observations([examples[i] for i in rows])
+        local = replace(training, map_size=math.isqrt(tiles))
+        tensors = _vector_tensors(batch, next(model.parameters()).device, local)
+        with torch.no_grad():
+            state, encoded_tiles = model.encode_map(
+                tensors["map_tokens"], tensors["global_features"],
+                tensors["event_features"], tensors["action_history"], tensors["action_history_mask"],
+            )
+            _, state = model.action_encoder(state, encoded_tiles, tensors["map_tokens"],
+                tensors["action_categorical"], tensors["action_continuous"], tensors["action_mask"])
+        states.append(state.detach())
+        indexes.extend(rows)
+    stacked = torch.cat(states)
+    return stacked[torch.as_tensor(np.argsort(indexes), device=stacked.device)]
 
 
 def value_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, Any]:

@@ -368,6 +368,11 @@ def _ppo_snapshot(
     )[row, legal_rows].astype(np.int16, copy=True)
     result["action_mask"] = np.ones(legal_rows.size, dtype=bool)
     result["player_context"] = native_player_context(batch)[row].copy()
+    if "domain_meta" in batch:
+        result["domain_meta"] = np.asarray(batch["domain_meta"])[row].copy()
+    if "map_seed" in batch:
+        # Provenance only: never part of the neural observation vector.
+        result["map_seed"] = np.asarray(batch["map_seed"], dtype=np.int64)[row].copy()
     return result, compact_action_row
 
 
@@ -403,6 +408,11 @@ def _collate_public_observations(
         for field in _OBJECTIVE_REPLAY_FIELDS
         if field not in {"action_features", "action_mask"}
     }
+    if any("domain_meta" in example.observation for example in examples):
+        observation["domain_meta"] = np.stack([
+            example.observation.get("domain_meta", np.asarray((round(len(example.observation["map_tokens"]) ** .5), -1, -1, -1)))
+            for example in examples
+        ])
     observation["action_features"] = action_features
     observation["action_mask"] = action_mask
     observation["player_context"] = np.stack([
@@ -1464,6 +1474,9 @@ def train_vector_population(
     continuation_state: dict[str, Any] | None = None,
     game_callback: Callable[[Mapping[str, Any]], None] | None = None,
     run: TrainingRun | None = None,
+    complete_episodes_only: bool = False,
+    finalize_plots: bool = True,
+    step_callback: Callable[[], None] | None = None,
 ) -> Dict[str, float | str]:
     """Train the raw policy with signed, multi-step PPO/GAE trajectories.
 
@@ -1475,14 +1488,20 @@ def train_vector_population(
     A separate bounded value reservoir waits for the real game outcome.
     Other callers retain the legacy completed-trajectory collector.
     """
+    if training.flat_curriculum is not None:
+        if num_envs < 2 or steps < 1 or max_actions < 1:
+            raise ValueError("mixed flat training requires num_envs >= 2 and positive budgets")
+        if max(training.flat_curriculum.map_sizes) > model_config.max_board_side:
+            raise ValueError("flat curriculum board sizes exceed the model's max_board_side")
+        from .flat_domains import train_mixed_population
+        arguments = locals().copy()
+        for key in ("training", "model_config", "candidate", "opponent_models", "opponent_weights", "train_mixed_population"):
+            arguments.pop(key)
+        return train_mixed_population(training, model_config, candidate, opponent_models, opponent_weights, **arguments)
     if num_envs < 2 or steps < 1 or max_actions < 1:
         raise ValueError("num_envs >= 2, steps and max_actions are required")
     if not 0 <= visible_action_history <= 1024:
         raise ValueError("visible_action_history must be between 0 and 1024")
-    if training.map_type != "lakes":
-        raise ValueError(
-            "VectorGameEnv population play currently supports lakes only"
-        )
     if not opponent_models:
         raise ValueError("direct population play requires an opponent")
     if anchor_model is candidate or any(
@@ -1770,6 +1789,7 @@ def train_vector_population(
     continuation_signature = (
         num_envs,
         training.map_size,
+        training.map_type, tuple(training.player_tribes), complete_episodes_only,
         num_threads,
         max_actions,
         visible_action_history,
@@ -1786,16 +1806,25 @@ def train_vector_population(
         batch = continuation_state["batch"]
         reused_environment = True
     else:
-        env = exact_vector_env(VectorGameEnv,
-            num_envs=num_envs,
-            seed=training.seed,
-            map_size=training.map_size,
-            players=(Bardur, Imperius),
-            num_threads=num_threads,
-            max_actions=max_actions,
-            auto_reset=True,
-            visible_event_history=visible_action_history,
-        )
+        if complete_episodes_only:
+            from .flat_domains import EpisodeVectorPool, FlatDomain
+            env = continuation_state.get("env") if continuation_state is not None else None
+            if env is None:
+                env = EpisodeVectorPool(FlatDomain(training.map_size, training.map_type, tuple(training.player_tribes)),
+                    num_envs=num_envs, seed=training.seed, num_threads=num_threads,
+                    max_actions=max_actions, history=visible_action_history)
+        else:
+            env = exact_vector_env(VectorGameEnv,
+                num_envs=num_envs,
+                seed=training.seed,
+                map_size=training.map_size,
+                players=training.player_tribes,
+                map_type=training.map_type,
+                num_threads=num_threads,
+                max_actions=max_actions,
+                auto_reset=True,
+                visible_event_history=visible_action_history,
+            )
         batch = env.reset(seed=training.seed)
         run.event("full_legal_actions", native_action_capacity=int(getattr(env, "max_actions", max_actions)))
         reused_environment = False
@@ -1883,6 +1912,7 @@ def train_vector_population(
         else np.zeros(num_envs, dtype=np.int64)
     )
     completed_games = wins = losses = draws = 0
+    truncated_games = 0
     value_calibration = _TerminalValueCalibration()
     candidate_turns = opponent_turns = 0
     # PPO/PPG blocks are intentionally shorter than many native games.  The
@@ -2627,6 +2657,7 @@ def train_vector_population(
             for name, total in local_totals.items()
         }
 
+    actual_environment_steps = 0
     with tqdm(
         total=steps,
         desc=(
@@ -2636,20 +2667,23 @@ def train_vector_population(
         ),
         unit="step",
         dynamic_ncols=True,
+        disable=complete_episodes_only,
     ) as progress:
         for step in range(steps):
+            active_slots = env.active_mask.copy() if complete_episodes_only else np.ones(num_envs, dtype=bool)
+            active_rows = np.flatnonzero(active_slots)
             candidate.eval()
             tensors = _vector_tensors(batch, device, training)
             history_tokens_seen += int(
-                np.asarray(batch["visible_event_mask"], dtype=bool).sum()
+                np.asarray(batch["visible_event_mask"], dtype=bool)[active_rows].sum()
             )
-            history_rows_seen += num_envs
+            history_rows_seen += len(active_rows)
             features = np.asarray(batch["action_features"], dtype=np.int64)
             legal = np.asarray(batch["action_mask"], dtype=bool)
             state = np.asarray(batch["state"], dtype=np.int32)
             players_before = state[:, 1]
-            candidate_rows = np.flatnonzero(players_before == candidate_players)
-            opponent_rows = np.flatnonzero(players_before != candidate_players)
+            candidate_rows = np.flatnonzero(active_slots & (players_before == candidate_players))
+            opponent_rows = np.flatnonzero(active_slots & (players_before != candidate_players))
             candidate_turns += int(candidate_rows.size)
             opponent_turns += int(opponent_rows.size)
             with torch.inference_mode():
@@ -2664,14 +2698,14 @@ def train_vector_population(
                     action_history_mask=tensors["action_history_mask"],
                     include_belief=False,
                 )
-                rollout_distribution = Categorical(
-                    logits=output.policy_logits / ppo_rollout_temperature
-                )
+                sampling_logits = output.policy_logits.clone() / ppo_rollout_temperature
+                # Finished slots in a draining group have no actions. This
+                # neutral sampling row is never stepped or used for a loss.
+                sampling_logits[~torch.as_tensor(active_slots, device=device), 0] = 0
+                rollout_distribution = Categorical(logits=sampling_logits)
                 action_rows = rollout_distribution.sample()
                 old_log_probabilities = rollout_distribution.log_prob(action_rows)
-                rollout_policy_log_probabilities = F.log_softmax(
-                    output.policy_logits / ppo_rollout_temperature, dim=-1
-                )
+                rollout_policy_log_probabilities = F.log_softmax(sampling_logits, dim=-1)
                 values_before = output.value.float()
             # ``sample`` is intentionally run under ``inference_mode`` because it
             # is behaviour-policy data, not part of the PPO gradient.  Opponent
@@ -2693,7 +2727,7 @@ def train_vector_population(
                 )
                 action_rows.index_copy_(0, row_tensor, selected)
             selected_rows = action_rows.detach().cpu().numpy().astype(np.int64)
-            if not legal[np.arange(num_envs), selected_rows].all():
+            if not legal[active_rows, selected_rows[active_rows]].all():
                 raise RuntimeError("raw PPO selected an illegal VectorGameEnv action")
             shaped = _visible_action_reward(
                 features,
@@ -2706,8 +2740,10 @@ def train_vector_population(
                 np.arange(num_envs), selected_rows
             ]
             next_batch = env.step(action_ids)
+            actual_environment_steps += len(active_rows)
             terminal = np.asarray(next_batch["terminated"], dtype=bool)
             terminal_reward = np.asarray(next_batch["reward"], dtype=np.float32)
+            truncated = np.asarray(next_batch.get("domain_truncated", np.zeros(num_envs)), dtype=bool)
             local_progress = (step + 1) / max(1, steps)
             shaping_progress = (
                 shaping_progress_start
@@ -2719,7 +2755,7 @@ def train_vector_population(
                 + (resolved_shaping_final_weight - shaping_weight)
                 * shaping_progress
             )
-            reward = current_shaping_weight * shaped + terminal_reward
+            reward = (current_shaping_weight * shaped + terminal_reward) * active_slots
             reward_total += float(reward.mean())
             shaping_weight_total += current_shaping_weight
             if objective_replay_weight > 0.0 and candidate_rows.size:
@@ -2788,7 +2824,7 @@ def train_vector_population(
                 rollout_policy_log_probabilities.float().cpu().numpy()
             )
             old_values = values_before.cpu().numpy()
-            for env_id in range(num_envs):
+            for env_id in active_rows:
                 example = None
                 if candidate_mask[env_id]:
                     observation, compact_action_row = _ppo_snapshot(
@@ -2820,9 +2856,12 @@ def train_vector_population(
                     )
                 )
 
-            episode_moves += 1
-            for env_id in np.flatnonzero(terminal):
-                if terminal_reward[env_id] != 0.0:
+            episode_moves[active_slots] += 1
+            for env_id in np.flatnonzero(terminal | truncated):
+                if truncated[env_id]:
+                    winner_player = -1
+                    candidate_outcome = None
+                elif terminal_reward[env_id] != 0.0:
                     winner_player = int(players_before[env_id])
                     if terminal_reward[env_id] < 0.0:
                         winner_player = 1 - winner_player
@@ -2834,9 +2873,8 @@ def train_vector_population(
                 else:
                     winner_player = -1
                     candidate_outcome = 0.0
-                # Finish only a real game here.  The return crosses every
-                # opponent action stored in this slot before reaching its own
-                # candidate decisions.
+                # True outcomes supervise value. An explicit mixed-domain
+                # episode horizon bootstraps PPO but supplies no terminal label.
                 finished_examples = _finish_ppo_trace(
                     traces[int(env_id)],
                     gamma=gamma,
@@ -2848,7 +2886,10 @@ def train_vector_population(
                 )
                 if ppo_synchronous_rollouts:
                     terminal_positions = value_traces[int(env_id)].positions
-                    value_calibration.add(terminal_positions, candidate_outcome)
+                    if truncated[env_id]:
+                        terminal_positions = []
+                    else:
+                        value_calibration.add(terminal_positions, candidate_outcome)
                     terminal_value_positions += len(terminal_positions)
                     if ppg_enabled:
                         for position in terminal_positions:
@@ -2859,8 +2900,9 @@ def train_vector_population(
                         ppg_samples_added += len(terminal_positions)
                     value_traces[int(env_id)] = _TerminalValueTrace()
                 else:
-                    terminal_positions = finished_examples
-                    value_calibration.add(finished_examples, candidate_outcome)
+                    terminal_positions = [] if truncated[env_id] else finished_examples
+                    if not truncated[env_id]:
+                        value_calibration.add(finished_examples, candidate_outcome)
                     terminal_value_positions += len(finished_examples)
                 if value_replay is not None:
                     for position in terminal_positions:
@@ -2882,9 +2924,12 @@ def train_vector_population(
                 completed_examples.extend(finished_examples)
                 pending_candidate_examples -= len(finished_examples)
                 traces[int(env_id)].clear()
-                completed_games += 1
+                completed_games += int(not truncated[env_id])
+                truncated_games += int(truncated[env_id])
                 selected_opponent = int(opponent_indices[env_id])
-                if terminal_reward[env_id] != 0.0:
+                if truncated[env_id]:
+                    score = 0.5
+                elif terminal_reward[env_id] != 0.0:
                     candidate_won = candidate_outcome > 0.0
                     wins += int(candidate_won)
                     losses += int(not candidate_won)
@@ -2895,9 +2940,13 @@ def train_vector_population(
                     score = 0.5
                 if game_callback is not None:
                     game_callback({
-                        "game_index": completed_games - 1,
-                        "map_seed": int(training.seed),
-                        "map_seed_is_collection_seed": 1,
+                        "game_index": completed_games + truncated_games - 1,
+                        "truncated": int(truncated[env_id]),
+                        "map_seed": int(batch["map_seed"][env_id]) if "map_seed" in batch else int(training.seed),
+                        "map_seed_is_collection_seed": int("map_seed" not in batch),
+                        "map_size": training.map_size,
+                        "map_type": training.map_type,
+                        "player_tribes": tuple(training.player_tribes),
                         "vector_env_id": int(env_id),
                         "vector_episode": int(episode_numbers[env_id]),
                         "model_a_player": int(candidate_players[env_id]),
@@ -2918,6 +2967,7 @@ def train_vector_population(
             ppg_metrics: Dict[str, float] = {}
             fragment_boundary = ppo_synchronous_rollouts and (
                 (step + 1) % ppo_rollout_steps == 0 or step + 1 == steps
+                or (complete_episodes_only and not env.active_mask.any())
                 or pending_candidate_examples >= ppo_max_pending_examples
             )
             if fragment_boundary:
@@ -2993,7 +3043,7 @@ def train_vector_population(
             batch = next_batch
             run.log(
                 step=step + 1,
-                environment_step=(step + 1) * num_envs,
+                environment_step=actual_environment_steps,
                 completed_games=completed_games,
                 candidate_wins=wins,
                 candidate_losses=losses,
@@ -3048,9 +3098,11 @@ def train_vector_population(
                 },
             )
             progress.update(1)
+            if step_callback is not None:
+                step_callback()
             if (step + 1) % 20 == 0 or step == 0:
                 progress.set_postfix(
-                    env_steps=(step + 1) * num_envs,
+                    env_steps=actual_environment_steps,
                     games=completed_games,
                     score=f"{(wins + 0.5 * draws) / max(1, completed_games):.3f}",
                     ppo_updates=ppo_updates,
@@ -3061,6 +3113,8 @@ def train_vector_population(
                     actor=f"{policy_usage.eligible / max(1, policy_usage.samples):.0%}",
                     kl_limits=ppo_behaviour_kl_limits,
                 )
+            if complete_episodes_only and not env.active_mask.any():
+                break
 
     divisor = max(1, ppo_rollouts_this_call)
     summary: Dict[str, float | str] = {
@@ -3078,8 +3132,9 @@ def train_vector_population(
             candidate.history_gate[-1].weight.detach().float().norm().cpu()
         ),
         "direct_population_steps": float(step + 1),
-        "direct_population_environment_steps": float((step + 1) * num_envs),
+        "direct_population_environment_steps": float(actual_environment_steps),
         "direct_population_completed_games": float(completed_games),
+        "direct_population_truncated_games": float(truncated_games),
         "direct_population_wins": float(wins),
         "direct_population_losses": float(losses),
         "direct_population_draws": float(draws),
@@ -3221,31 +3276,42 @@ def train_vector_population(
             for name, value in policy_usage.metrics().items()
         },
     }
+    if complete_episodes_only:
+        summary["flat_policy_usage"] = deepcopy(vars(policy_usage))
+        summary["flat_value_moments"] = {
+            k: v for k, v in vars(value_calibration).items() if k != "phase_calibrations"
+        }
+        summary["flat_value_phase_moments"] = {
+            phase: {k: v for k, v in vars(calibration).items() if k != "phase_calibrations"}
+            for phase, calibration in value_calibration.phase_calibrations.items()
+        }
     usage = policy_usage.metrics()
     calibration = value_calibration.metrics()
-    print(
-        "direct population learning | "
-        f"collector={'synchronous' if ppo_synchronous_rollouts else 'completed_games'} "
-        f"| actor={usage['policy_selected_fraction']:.1%} "
-        f"({policy_usage.eligible}/{policy_usage.samples}) "
-        f"applied={ppo_policy_samples}/{ppo_accepted_sample_presentations} "
-        f"stale={policy_usage.stale} "
-        f"terminal_actor={usage['terminal_target_fraction']:.1%} "
-        f"| age mean/p95/max={usage['policy_age_mean']:.2f}/"
-        f"{usage['policy_age_p95']:.0f}/{usage['policy_age_max']:.0f}",
-        flush=True,
-    )
-    if calibration["count"]:
+    if not complete_episodes_only:
         print(
-            "direct population terminal value (collection predictions) | "
-            f"positions={calibration['count']:.0f} "
-            f"MAE={calibration['mae']:.4f} RMSE={calibration['rmse']:.4f} "
-            f"bias={calibration['bias']:+.4f} corr={calibration['correlation']:.3f} "
-            f"| PPG terminal labels={summary['direct_population_ppg_terminal_target_fraction']:.1%}",
+            "direct population learning | "
+            f"collector={'synchronous' if ppo_synchronous_rollouts else 'completed_games'} "
+            f"| actor={usage['policy_selected_fraction']:.1%} "
+            f"({policy_usage.eligible}/{policy_usage.samples}) "
+            f"applied={ppo_policy_samples}/{ppo_accepted_sample_presentations} "
+            f"stale={policy_usage.stale} "
+            f"terminal_actor={usage['terminal_target_fraction']:.1%} "
+            f"| age mean/p95/max={usage['policy_age_mean']:.2f}/"
+            f"{usage['policy_age_p95']:.0f}/{usage['policy_age_max']:.0f}",
             flush=True,
         )
-    else:
-        print("direct population terminal value | no completed-game labels yet", flush=True)
+        if calibration["count"]:
+            print(
+                "direct population terminal value (collection predictions) | "
+                f"positions={calibration['count']:.0f} "
+                f"MAE={calibration['mae']:.4f} RMSE={calibration['rmse']:.4f} "
+                f"bias={calibration['bias']:+.4f} corr={calibration['correlation']:.3f} "
+                f"| PPG terminal labels={summary['direct_population_ppg_terminal_target_fraction']:.1%}",
+                flush=True,
+            )
+        else:
+            print("direct population terminal value | no completed-game labels yet", flush=True)
+
     if continuation_state is not None:
         # Flat curriculum blocks deliberately share optimizer moments and
         # replay.  Their policy samples remain on-policy because PPO examples
@@ -3280,7 +3346,7 @@ def train_vector_population(
             policy_version=policy_version,
             ppg_phases_total=ppg_phases_total,
         )
-    summary["run_dir"] = str(run.finish(summary))
+    summary["run_dir"] = str(run.finish(summary) if finalize_plots else run.finish(summary, plots=False))
     return summary
 
 
@@ -3398,6 +3464,7 @@ def evaluate_direct_population_matches(
             weight * float(row["completion_rate"])
             for weight, row in zip(weights, results)
         )),
+        "domain_gate_passed": all(bool(row.get("domain_gate_passed", True)) for row in results),
         "opponents": results,
     }
 
@@ -3566,6 +3633,18 @@ def _flat_pfsp_weights(
     return weights
 
 
+def _flat_domain_signature(training, history):
+    if training.flat_curriculum is None:
+        return (training.map_size, training.map_type, history)
+    from .flat_domains import domain_signature
+    return domain_signature(training, history)
+
+
+def _portable_domain_session(session):
+    from .flat_domains import portable_session
+    return portable_session(session)
+
+
 def _clear_policy_replay_after_flat_rollback(
     continuation_state: dict[str, Any],
     *,
@@ -3581,6 +3660,12 @@ def _clear_policy_replay_after_flat_rollback(
     and actual game outcomes, so it remains valid critic supervision after a
     policy rollback.
     """
+    if continuation_state.get("domain_session"):
+        for domain_state in continuation_state["domain_session"]["pools"]:
+            _clear_policy_replay_after_flat_rollback(domain_state, num_envs=num_envs,
+                objective_replay_horizon=objective_replay_horizon,
+                objective_replay_capacity=objective_replay_capacity,
+                ppg_buffer_capacity=ppg_buffer_capacity, preserve_terminal_ppg=preserve_terminal_ppg)
     continuation_state["traces"] = [[] for _ in range(num_envs)]
     continuation_state["objective_histories"] = [
         deque(maxlen=objective_replay_horizon) for _ in range(num_envs)
@@ -3696,6 +3781,7 @@ def train_direct_population_curriculum(
     flat_improvements: FlatImprovements | None = None,
     flat_value_replay: Deque | None = None,
     flat_resume_state: str | None = None,
+    flat_domain_state: dict[str, Any] | None = None,
     gate_game_callback: Callable[[str, int, int, Mapping[str, Any]], None]
     | None = None,
     training_game_callback: Callable[[int, Mapping[str, Any]], None]
@@ -3934,6 +4020,7 @@ def train_direct_population_curriculum(
     shared_terminal_replay = flat_terminal_replay
     replay_arena_signature = (
         training.map_size, training.map_type, training.max_moves,
+        repr(training.flat_curriculum), tuple(training.player_tribes),
         visible_action_history, gate_seed, gate_games,
         resolved_diagnostic_gate_games, tuple(benchmark_ids),
         len(active_opponents),
@@ -3946,11 +4033,21 @@ def train_direct_population_curriculum(
     )
     if flat_continuation is not None and shared_terminal_replay is not None:
         flat_continuation["terminal_replay"] = shared_terminal_replay
+    if training.flat_curriculum is not None:
+        from .flat_domains import new_session
+        if flat_domain_state is None:
+            flat_domain_state = {}
+        if not flat_domain_state:
+            flat_domain_state.update(new_session(training.flat_curriculum, training.seed))
+        flat_continuation = {} if flat_continuation is None else flat_continuation
+        flat_continuation["domain_session"] = flat_domain_state
     resume_payload = None
     if flat_resume_state is not None:
         resume_payload = torch.load(flat_resume_state, map_location="cpu", weights_only=False)
         if resume_payload.get("model_config", {}).get("action_encoder_version") != 2:
             raise ValueError("flat resume state predates the single shared-action policy (action encoder v2); start a new experiment")
+        if resume_payload.get("model_config", {}).get("history_encoder_version") != 2:
+            raise ValueError("flat resume state uses the previous history encoder; initialize a new model and experiment for semantic history v2")
         if resume_payload.get("model_config", {}).get("tile_encoder_version") != 2:
             raise ValueError(
                 "flat resume state uses the previous tile encoder; initialize "
@@ -3970,9 +4067,12 @@ def train_direct_population_curriculum(
             resume_payload.get("schema_version") != 1
             or resume_model_config != model_config
             or resume_payload.get("champion_fingerprint") != model_fingerprint(champion)
-            or resume_payload.get("map_signature") != (training.map_size, training.map_type, visible_action_history)
+            or resume_payload.get("map_signature") != _flat_domain_signature(training, visible_action_history)
         ):
             raise ValueError("flat resume state does not match architecture, champion or public inputs")
+        if training.flat_curriculum is not None:
+            from .flat_domains import restore_session
+            restore_session(flat_domain_state, resume_payload.get("domain_session"), training.flat_curriculum)
         restore_model_state(candidate, resume_payload["model_state"])
         flat_continuation = {} if flat_continuation is None else flat_continuation
         if resume_payload.get("optimizer") is not None:
@@ -4651,7 +4751,10 @@ def train_direct_population_curriculum(
                     if flat_synchronous_rollouts
                     and getattr(example, "has_terminal_value", False)
                 ]
+                domain_session = flat_continuation.get("domain_session")
                 flat_continuation.clear()
+                if domain_session is not None:
+                    flat_continuation["domain_session"] = domain_session
                 # Versioning is monotonic even when model/AdamW state rolls
                 # back.  Otherwise a live trajectory would appear younger
                 # merely because the curriculum cleared its local state.
@@ -5165,7 +5268,8 @@ def train_direct_population_curriculum(
             atomic_torch_save(run.directory / "latest_state.pt", {
                 "schema_version": 1,
                 "model_config": vars(model_config),
-                "map_signature": (training.map_size, training.map_type, visible_action_history),
+                "map_signature": _flat_domain_signature(training, visible_action_history),
+                "domain_session": _portable_domain_session(continuation.get("domain_session")),
                 "champion_fingerprint": model_fingerprint(champion),
                 "model_state": model_state_on_cpu(candidate),
                 "best_state": best_state,
@@ -5280,7 +5384,8 @@ def train_direct_population_curriculum(
                 "score": score,
                 "worst_score": worst_score,
                 "safe": score >= gate_score
-                and worst_score >= historical_score_floor,
+                and worst_score >= historical_score_floor
+                and bool(evaluation.get("domain_gate_passed", True)),
                 "value_validation": final_validation,
             }
         )

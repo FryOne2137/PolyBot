@@ -14,6 +14,8 @@ context features, a 12-field visible-event summary and an optional bounded
 history of compact 12-field event tokens. The history encoder pools visible
 events into the global token before the map Transformer. This is a bounded
 history model, not a recurrent hidden state carried between network calls.
+[Semantic history v2](history_encoder.md) embeds categories and X/Y coordinates
+without clipping valid unit types together.
 
 The context contains the observer's technology bits and tribe, initial player
 count, own player ID, public player scores, explicitly known statuses, and a

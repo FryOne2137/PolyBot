@@ -165,6 +165,19 @@ class ExactActionNative:
         self.step_into_checked(action_ids, state_ids, result)
         return result
 
+    def step_slots_checked(self, env_ids, action_ids, state_ids):
+        # Slot capacities change as finite episode groups drain. Keep the
+        # same bounded cache policy as native search leaves.
+        keys = [key for key in self._buffers if key[0] == "slot_batch_spec"]
+        key = ("slot_batch_spec", len(env_ids))
+        if key not in self._buffers and len(keys) >= 2:
+            del self._buffers[keys[0]]
+        raw = self._raw("slot_batch_spec", len(env_ids))
+        self.native.step_slots_into_checked(env_ids, action_ids, state_ids, raw)
+        result = {}
+        self._write(result, raw)
+        return result
+
     def belief_requests_into(self, buffers):
         raw = self._raw("belief_batch_spec")
         self.native.belief_requests_into(raw)

@@ -35,6 +35,8 @@ class ModelConfig:
     action_encoder_dim: int = 64
     action_encoder_heads: int = 4
     action_latent_count: int = 16
+    # Semantic event categories and board coordinates replace clipped ID scalars.
+    history_encoder_version: int = 2
 
 
 @dataclass
@@ -93,6 +95,42 @@ class MCTSConfig:
     teacher_prior_weight: float = 0.20
 
 
+@dataclass(frozen=True)
+class FlatCurriculumConfig:
+    """Opt-in flat-only domain mixture; budgets count native vector steps."""
+
+    tribes: tuple[int, ...] = tuple(range(1, 13))
+    map_sizes: tuple[int, ...] = (11, 12, 13, 14, 15, 16)
+    map_types: tuple[str, ...] = ("lakes", "drylands", "water_world")
+    map_type_weights: tuple[float, ...] = (0.60, 0.25, 0.15)
+    small_map_probability: float = 0.70
+    intro_steps: int = 8_000
+    expansion_steps: int = 24_000
+    pools: int = 3
+    segment_steps: int = 512
+    episode_max_moves: int = 3200
+    evaluation_groups: int = 6
+    domain_score_floor: float = 0.40
+    domain_min_games: int = 20
+
+    def __post_init__(self):
+        if not self.tribes or len(set(self.tribes)) != len(self.tribes) or any(t not in range(1, 13) for t in self.tribes):
+            raise ValueError("flat curriculum tribes must be distinct regular tribe IDs 1..12")
+        if not self.map_sizes or len(set(self.map_sizes)) != len(self.map_sizes) or any(s < 11 or s > 32 for s in self.map_sizes):
+            raise ValueError("flat curriculum map sizes must be distinct values in 11..32")
+        if not self.map_types or len(set(self.map_types)) != len(self.map_types) or any(t not in {"lakes", "drylands", "water_world"} for t in self.map_types):
+            raise ValueError("invalid flat curriculum map types")
+        from math import isfinite
+        if len(self.map_type_weights) != len(self.map_types) or any(not isfinite(w) or w <= 0 for w in self.map_type_weights):
+            raise ValueError("flat map-type weights must be finite, positive and match map types")
+        if not 0 < self.small_map_probability < 1 or not 0 <= self.intro_steps <= self.expansion_steps:
+            raise ValueError("invalid flat curriculum schedule")
+        if min(self.pools, self.segment_steps, self.evaluation_groups, self.episode_max_moves) < 1:
+            raise ValueError("flat curriculum pool, segment and evaluation counts must be positive")
+        if not 0 <= self.domain_score_floor <= 1 or self.domain_min_games < 2:
+            raise ValueError("invalid flat domain score floor or sample count")
+
+
 @dataclass
 class TrainingConfig:
     """Self-play and optimisation settings."""
@@ -101,6 +139,10 @@ class TrainingConfig:
     device: str = "auto"  # auto, mps, cuda, cpu
     map_size: int = 11
     map_type: str = "lakes"
+    # Used by flat mixed-domain collection/evaluation. Other stages keep their
+    # existing default two-player setup and never enable the curriculum.
+    player_tribes: tuple[int, int] = (3, 2)
+    flat_curriculum: Optional[FlatCurriculumConfig] = None
     batch_size: int = 16
     replay_capacity: int = 20_000
     # Safety cap for one self-play game. A truncated training game keeps its

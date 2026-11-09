@@ -40,7 +40,7 @@ def _new_env(
     arguments = {
         "seed": seed,
         "map_size": training.map_size,
-        "players": (Bardur, Imperius),
+        "players": training.player_tribes,
         "map_type": training.map_type,
     }
     # ``visible_event_history`` was added after the original scalar GameEnv
@@ -273,7 +273,7 @@ def _new_paired_vector_envs(
         "num_envs": maps,
         "seed": training.seed,
         "map_size": training.map_size,
-        "players": (Bardur, Imperius),
+        "players": training.player_tribes,
         "map_type": training.map_type,
         "num_threads": num_threads,
         "max_actions": max_actions,
@@ -472,6 +472,12 @@ def evaluate_direct_matches(
     paired-map schedule while reducing model inference from one forward per
     game action to at most one batched forward per model and vector step.
     """
+    if training.flat_curriculum is not None:
+        from ..training.flat_domains import evaluate_mixed_matches
+        return evaluate_mixed_matches(model_a, model_b, device, training, games, game_callback,
+            model_a_label=model_a_label, model_b_label=model_b_label,
+            visible_action_history=visible_action_history, num_threads=num_threads,
+            max_actions=max_actions, map_seeds=map_seeds, position_callback=position_callback)
     if games < 2 or games % 2:
         raise ValueError("direct evaluation games must be positive and even")
     if not 0 <= visible_action_history <= 1024:

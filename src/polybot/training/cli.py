@@ -62,8 +62,28 @@ def training_run_from_args(args: argparse.Namespace, stage: str) -> TrainingRun:
 def training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
     seed = secrets.randbelow(2**31 - 1) + 1 if getattr(args, "random_seed", False) else args.seed
     seed = (int(seed) - 1) % (2**31 - 1) + 1
+    curriculum = None
+    if getattr(args, "flat_curriculum", False):
+        from ..config import FlatCurriculumConfig
+        from PolyEnv import NAME_TO_TRIBE
+        tribe_text = args.flat_tribes.strip().lower()
+        tribes = tuple(range(1, 13)) if tribe_text == "all" else tuple(
+            int(value) if value.isdigit() else int(NAME_TO_TRIBE[value])
+            for value in (item.strip().lower() for item in tribe_text.split(","))
+        )
+        curriculum = FlatCurriculumConfig(
+            tribes=tribes, map_sizes=tuple(int(v) for v in args.flat_map_sizes.split(",")),
+            map_types=tuple(v.strip().lower() for v in args.flat_map_types.split(",")),
+            map_type_weights=tuple(float(v) for v in args.flat_map_type_weights.split(",")),
+            small_map_probability=args.flat_small_map_probability,
+            intro_steps=args.flat_curriculum_intro_steps, expansion_steps=args.flat_curriculum_expansion_steps,
+            pools=args.flat_domain_pools, segment_steps=args.flat_domain_segment_steps,
+            episode_max_moves=args.flat_domain_max_moves,
+            evaluation_groups=args.flat_domain_evaluation_groups,
+            domain_score_floor=args.flat_domain_score_floor, domain_min_games=args.flat_domain_min_games,
+        )
     return TrainingConfig(
-        seed=seed,
+        seed=seed, flat_curriculum=curriculum,
         device=args.device,
         map_size=args.map_size,
         map_type=args.map_type,

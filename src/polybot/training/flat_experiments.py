@@ -146,6 +146,16 @@ def paired_regression(
     a, b = rows_by_key(candidate), rows_by_key(reference)
     if not a or a.keys() != b.keys():
         return {"valid": False, "confirmed": False, "reason": "unpaired_evidence"}
+    candidate_domains = {
+        (int(r["map_seed"]), int(r["model_a_player"])):
+        (r.get("domain"), float(r.get("domain_weight", 1.0))) for r in candidate
+    }
+    reference_domains = {
+        (int(r["map_seed"]), int(r["model_a_player"])):
+        (r.get("domain"), float(r.get("domain_weight", 1.0))) for r in reference
+    }
+    if candidate_domains != reference_domains:
+        return {"valid": False, "confirmed": False, "reason": "unpaired_domain_evidence"}
     maps = sorted({key[0] for key in a})
     if any((seed, side) not in a for seed in maps for side in (0, 1)):
         return {"valid": False, "confirmed": False, "reason": "incomplete_pairs"}
@@ -155,8 +165,13 @@ def paired_regression(
     ])
     if len(differences) < 8:
         return {"valid": False, "confirmed": False, "reason": "too_few_pairs"}
-    mean = float(differences.mean())
-    se = float(differences.std(ddof=1) / np.sqrt(len(differences)))
+    weights = np.asarray([sum(candidate_domains[seed, side][1] for side in (0, 1)) for seed in maps])
+    if not np.isfinite(weights).all() or np.any(weights <= 0):
+        return {"valid": False, "confirmed": False, "reason": "invalid_domain_weights"}
+    weights /= weights.sum()
+    mean = float(np.dot(weights, differences))
+    sum_squares = float(np.square(weights).sum())
+    se = float(np.sqrt(np.dot(weights, np.square(differences - mean)) * sum_squares / (1 - sum_squares)))
     # A conservative small-sample normal approximation. Evidence is clustered
     # by map; no certainty is inferred from one paired map.
     radius = (1.96 + 2.0 / len(differences)) * se

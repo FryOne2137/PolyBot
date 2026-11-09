@@ -13,6 +13,7 @@ from ..config import ModelConfig
 from ..data.player_context import CONTEXT_SIZE, LEGACY_GLOBAL_SIZE
 from .tile_encoder import TileEncoder
 from .action_encoder import ActionEncoder
+from .history_encoder import HistoryEncoder
 from .relational_policy import SpatialStateReadout
 from ..data.token_schema import (
     EVENT_SUMMARY_SIZE,
@@ -186,6 +187,8 @@ class PolicyValueBeliefNet(nn.Module):
             raise ValueError("unsupported tile_encoder_version; initialize a new model with the joint tile encoder")
         if config.action_encoder_version != 2:
             raise ValueError("unsupported action_encoder_version")
+        if config.history_encoder_version != 2:
+            raise ValueError("unsupported history_encoder_version; initialize a new model with semantic history")
         if min(config.action_encoder_dim, config.action_encoder_heads, config.action_latent_count) < 1 or config.action_encoder_dim % config.action_encoder_heads:
             raise ValueError("action encoder width must be positive and divisible by its heads; latents must be positive")
         d_model = config.d_model
@@ -206,9 +209,7 @@ class PolicyValueBeliefNet(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
-        self.history_encoder = nn.Sequential(
-            nn.Linear(VISIBLE_ACTION_HISTORY_FEATURES, d_model), nn.GELU(), nn.Linear(d_model, d_model)
-        )
+        self.history_encoder = HistoryEncoder(d_model, config.max_board_side, config.max_players)
         self.history_position = nn.Embedding(1024, d_model)
         history_block = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=config.attention_heads, dim_feedforward=2 * d_model,
@@ -362,7 +363,9 @@ class PolicyValueBeliefNet(nn.Module):
             # biases; old replay must never mean an empty technology tree.
             present = (context != 0).any(dim=-1, keepdim=True)
             global_state = global_state + self.observation_context(context) * present
-        global_state = global_state + self._history_context(action_history, action_history_mask, batch, map_tokens.device)
+        global_state = global_state + self._history_context(
+            action_history, action_history_mask, batch, map_tokens.device, board_side=width,
+        )
         global_token = global_state.unsqueeze(1)
         transformed = self.map_transformer(torch.cat([global_token, encoded], dim=1))
         transformed = self.map_norm(transformed)
@@ -373,7 +376,7 @@ class PolicyValueBeliefNet(nn.Module):
 
     def _history_context(
         self, history: torch.Tensor | None, history_mask: torch.Tensor | None,
-        batch: int, device: torch.device,
+        batch: int, device: torch.device, *, board_side: int | None = None,
     ) -> torch.Tensor:
         if history is None or history.numel() == 0:
             return torch.zeros((batch, self.config.d_model), dtype=torch.float32, device=device)
@@ -382,38 +385,6 @@ class PolicyValueBeliefNet(nn.Module):
         if history_mask is None or history_mask.shape != history.shape[:2]:
             raise ValueError("visible_action_history_mask must have shape [batch, length]")
         valid_mask = history_mask.bool()
-        # PolyEnv history fields are categorical ids, bit flags, tile indexes
-        # and observer-local unit ids. Feeding those raw integers into one
-        # linear layer makes a tile index numerically dominate event kind and
-        # actor identity. Map every valid value to a comparable [0, 1] range;
-        # -1 (unknown under fog) becomes zero. The mask still distinguishes
-        # real all-zero tokens from left padding.
-        scales = torch.tensor(
-            (
-                16.0,  # event type
-                16.0,  # player
-                16.0,  # tribe
-                16.0,  # visibility bit mask
-                float(self.config.max_board_side**2),
-                float(self.config.max_board_side**2),
-                32.0,  # source unit type
-                32.0,  # target unit type
-                1024.0,  # observer-local source unit id
-                1024.0,  # observer-local target unit id
-                4.0,  # detail kind
-                128.0,  # tile/build/spawn/upgrade detail
-            ),
-            dtype=torch.float32,
-            device=device,
-        )
-        normalised_history = torch.where(
-            history >= 0,
-            (history.float() + 1.0) / scales,
-            torch.zeros_like(history, dtype=torch.float32),
-        ).clamp_(0.0, 1.0)
-        if self.policy_architecture == "relational":
-            # Observer-local unit IDs are links, not ordinal quantities.
-            normalised_history[..., 8:10] = (history[..., 8:10] >= 0).to(normalised_history.dtype)
         # Positional embeddings describe distance *from the latest observed
         # action*, rather than the column chosen by the largest replay item
         # in this batch.  Thus an old 16-event sequence has exactly the same
@@ -424,7 +395,9 @@ class PolicyValueBeliefNet(nn.Module):
         chronological_index = valid_mask.long().cumsum(dim=1) - 1
         positions = (valid_counts - 1 - chronological_index).clamp_min(0)
         positions = positions.clamp_max(self.history_position.num_embeddings - 1)
-        encoded = self.history_encoder(normalised_history) + self.history_position(positions)
+        encoded = self.history_encoder(
+            history, self.config.max_board_side if board_side is None else board_side,
+        ) + self.history_position(positions)
         no_history = ~valid_mask.any(dim=1)
         if bool(no_history.all()):
             return torch.zeros(

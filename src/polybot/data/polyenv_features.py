@@ -279,6 +279,16 @@ def native_global_features(batch: Dict[str, np.ndarray] | np.ndarray, map_size: 
     base[:, 6] = np.maximum(state[:, 8], 0) / 1024.0
     base[:, 7] = float(map_size) / 32.0
     base[:, 8] = float(canonical_map_type(map_type) == "drylands")
+    if "domain_meta" in batch:
+        from .player_context import MAP_TYPE_IDS
+        meta = np.asarray(batch["domain_meta"])
+        base[:, 7] = meta[:, 0] / 32.0
+        base[:, 8] = meta[:, 1] == MAP_TYPE_IDS["drylands"]
+        context = native_player_context(batch)
+        known = meta[:, 1] >= 0
+        context[known, 122:125] = meta[known, 1, None] == np.arange(3)
+        context[known, 125] = 1
+        return np.concatenate([base, context], axis=-1)
     return np.concatenate([base, native_player_context(batch, map_type)], axis=-1)
 
 

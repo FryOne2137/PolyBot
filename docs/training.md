@@ -47,15 +47,20 @@ checkpoint while retaining the champion and its league database as the reference
 Reusing only the initial champion starts the candidate from that champion.
 
 The current [joint tile encoder](observation_context.md) is architecture version
-2 and the [shared action encoder](shared_actions.md) is version 2. Start from
+2, the [shared action encoder](shared_actions.md) is version 2, and the
+[semantic history encoder](history_encoder.md) is version 2. Start from
 random initialization, with a new checkpoint directory and
-league database. Previous tile-encoder or parallel-scorer checkpoints and optimizer continuation
+league database. Previous tile/history-encoder or parallel-scorer checkpoints and optimizer continuation
 files cannot initialize this architecture. Once version-2 weights exist, resume
 normally with compatible `--challenger-in` or `--flat-resume-state` files.
 Revalidate belief before entering MCTS with changed model weights or inputs.
 Use fresh replay as well: old stored observations may have incomplete action
 lists. Native `max_actions` CLI settings are capacity hints; current adapters
 always deliver every legal action and trim only padding.
+
+The opt-in [mixed-domain flat curriculum](flat_curriculum_plan.md) adds twelve
+tribes, staged map sizes/types and weighted mixed arenas. Enable it with
+`--flat-curriculum`; the separate collector keeps other training stages unchanged.
 
 ### What a block does
 

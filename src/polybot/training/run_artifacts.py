@@ -145,14 +145,15 @@ class TrainingRun:
         with self._events_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
 
-    def finish(self, summary: Mapping[str, Any]) -> Path:
+    def finish(self, summary: Mapping[str, Any], *, plots: bool = True) -> Path:
         """Write final CSV/JSON and PNG plots; return the absolute run path."""
         final_summary = dict(_jsonable(dict(summary)))
         final_summary["finished_at"] = datetime.now(timezone.utc).isoformat()
         final_summary["run_dir"] = str(self.directory.resolve())
         self._write_json("summary.json", final_summary)
         self._write_csv()
-        self._write_plots()
+        if plots:
+            self._write_plots()
         return self.directory.resolve()
 
     def _write_json(self, filename: str, payload: Any) -> None:

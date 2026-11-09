@@ -78,11 +78,13 @@ finite gradients, rather than softmax over entirely masked keys.
 
 This is a new architecture requiring random initialization. Checkpoints record
 both `tile_encoder_version=2` and `action_encoder_version=2`, plus action width,
-heads and latent count. Earlier weights and optimizer continuation files are
+heads and latent count. Semantic history additionally records
+`history_encoder_version=2`; see [the history schema](history_encoder.md).
+Earlier weights and optimizer continuation files are
 rejected explicitly. `init_model.py` exposes `--action-encoder-dim`,
 `--action-encoder-heads` and `--action-latent-count` and saves them in experiment
-artifacts. The default relational network has 6,843,809 parameters
-(4,879,298 on the flat path and 1,964,511 belief-specific). The old parallel
+artifacts. The default relational network has 6,945,185 parameters
+(4,980,674 on the flat path and 1,964,511 belief-specific). The old parallel
 relational scorer and legacy factorized/attention scorers have been removed.
 The historical `policy_architecture` names now select map-encoding profiles
 only: `relational` uses runtime-ID-invariant inputs and spatial readout;

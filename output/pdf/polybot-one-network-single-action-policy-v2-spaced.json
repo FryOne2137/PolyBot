@@ -15,26 +15,27 @@
     "action_encoder_version": 2,
     "action_encoder_dim": 64,
     "action_encoder_heads": 4,
-    "action_latent_count": 16
+    "action_latent_count": 16,
+    "history_encoder_version": 2
   },
   "map_tiles": 121,
   "history_length": 32,
   "parameters": {
-    "total": 6843809,
-    "flat": 4879298,
+    "total": 6945185,
+    "flat": 4980674,
     "belief": 1964511,
     "unused_compatibility": 0,
     "joint_tile_encoder": 215424,
     "joint_fusion": 74880,
     "shared_action_encoder": 163648
   },
-  "layout_revision": "expanded 44x20 layout; action encoder centered in its own whitespace; legal input above; long map readouts routed below the action encoder",
+  "layout_revision": "semantic history v2; expanded 44x20 layout; action encoder centered in its own whitespace; legal input above; long map readouts routed below the action encoder",
   "module_parameters": {
     "tile_encoder": 215424,
     "x_embedding": 6144,
     "y_embedding": 6144,
     "global_encoder": 41280,
-    "history_encoder": 39552,
+    "history_encoder": 140928,
     "history_position": 196608,
     "history_transformer": 297024,
     "history_gate": 37440,

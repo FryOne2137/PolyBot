@@ -34,7 +34,7 @@ BELIEF = TOTAL - FLAT - UNUSED
 TILE = COUNTS["tile_encoder"]
 FUSION = sum(p.numel() for p in MODEL.tile_encoder.fusion.parameters())
 ACTION = COUNTS["action_encoder"]
-assert (TOTAL, FLAT, BELIEF, UNUSED, ACTION) == (6843809, 4879298, 1964511, 0, 163648)
+assert (TOTAL, FLAT, BELIEF, UNUSED, ACTION) == (6945185, 4980674, 1964511, 0, 163648)
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "pdf.fonttype": 42,
                      "svg.fonttype": "none", "svg.hashsalt": STEM})
@@ -217,7 +217,7 @@ text(7.55, 4.11, "Policy ocenia każdy token; value i belief odczytują cały zb
 text(7.55, 3.63, "Bufory obejmują pełną przestrzeń silnika; sieć dostaje tylko rzeczywiste ruchy.", 12.5, INK, ha="left")
 text(7.55, 2.65, "Kafelek: 24 pola → embeddingi + populacja i maska → MLP 194 → 192 → 192.\nKontekst 126: własne techy / plemię, gracze, publiczne punkty, statusy / maski, typ mapy.\nRelational: runtime ID są odnośnikami. Lista akcji nie ma embeddingów kolejności.", 11.8, FAINT, ha="left")
 text(7.55, 1.48, "Wersja akcji v2: trening od zera. Belief-only zamraża wspólny encoder.\nPolicy: tylko wspólne tokeny → MLP. Bez starego scorera i sumowania logitów.", 11.8, FAINT, ha="left")
-text(.8, 1.8, "Historia: 12 → 192 → 192; Transformer ×1 (8 głowic, FFN 384), gate.\nBaza: 9 globalnych + 12 zdarzeń → 192 → 192.\nT + 1: mapa 13 × 13 → 170 tokenów; mapa 16 × 16 → 257.", 10.7, FAINT, ha="left")
+text(.8, 1.8, "Historia: embeddingi kategorii i X/Y → MLP 386 → 192 → 192.\nTransformer historii ×1 (8 głowic, FFN 384), gate.\nBaza: 9 globalnych + 12 zdarzeń → 192 → 192.\nT + 1: mapa 13 × 13 → 170 tokenów; mapa 16 × 16 → 257.", 10.7, FAINT, ha="left")
 
 text(.8, .32, "Kółka i połączenia są symboliczne; podpisy podają rzeczywiste rozmiary. To jeden model ze wspólnym encoderem i trzema głowicami.",
      11.3, FAINT, ha="left")
@@ -250,7 +250,7 @@ svg_path.write_text("\n".join(line.rstrip() for line in svg_path.read_text().spl
 manifest = {"model_config": vars(CFG), "map_tiles": 121, "history_length": 32,
             "parameters": {"total": TOTAL, "flat": FLAT, "belief": BELIEF,
                            "unused_compatibility": UNUSED, "joint_tile_encoder": TILE, "joint_fusion": FUSION, "shared_action_encoder": ACTION},
-            "layout_revision": "expanded 44x20 layout; action encoder centered in its own whitespace; legal input above; long map readouts routed below the action encoder",
+            "layout_revision": "semantic history v2; expanded 44x20 layout; action encoder centered in its own whitespace; legal input above; long map readouts routed below the action encoder",
             "module_parameters": COUNTS, "belief_head_class_counts": [x+2 for x in MAP_FEATURE_MAX]}
 (OUT / f"{STEM}.json").write_text(json.dumps(manifest, indent=2)+"\n", encoding="utf-8")
 print(json.dumps({"stem": str(OUT / STEM), "parameters": manifest["parameters"]}))

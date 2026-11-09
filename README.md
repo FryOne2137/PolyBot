@@ -82,6 +82,10 @@ python scripts/play_self.py --model models/demo/teacher.pt --mode flat --games 1
 
 `train_league.py` also exposes a guarded `auto` curriculum. The older `train_pipeline.py`, teacher and standalone self-play scripts remain available for experiments. They are not interchangeable with the three main entry points; consult each script's `--help`.
 
+Flat training optionally supports a [mixed-domain curriculum](docs/flat_curriculum_plan.md)
+with twelve regular tribes, board sizes 11–16 and lakes/drylands/water_world.
+Use `--flat-curriculum` for the bounded native group collector and mixed arenas.
+
 ## Model and information flow
 
 - The shared encoder consumes a **player-visible** map, public global features and visible event history.
@@ -93,7 +97,7 @@ python scripts/play_self.py --model models/demo/teacher.pt --mode flat --games 1
 - MCTS operates on detached sampled worlds that must respect the public observation and legal-action constraints.
 - Ground truth is training supervision, never a policy/value input or an oracle world for search. Legacy training-only targets are documented separately.
 
-The map-encoding profile is selected by the **checkpoint configuration**, not by renaming a file. Every profile uses the same single policy scorer. Joint tile encoder v2 and shared action encoder v2 require random initialization, a separate experiment/replay directory and a compatible league population; earlier weights are rejected explicitly. See the [complete action contract](docs/shared_actions.md).
+The map-encoding profile is selected by the **checkpoint configuration**, not by renaming a file. Every profile uses the same single policy scorer. Joint tile encoder v2, shared action encoder v2 and semantic history encoder v2 require random initialization, a separate experiment/replay directory and a compatible league population; earlier weights are rejected explicitly. See the [complete action contract](docs/shared_actions.md).
 
 ## Results, artifacts and limits
 

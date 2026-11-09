@@ -50,6 +50,8 @@ def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, 
         )
     if saved_config.get("action_encoder_version") != 2:
         raise ValueError("checkpoint predates the single shared-action policy (action encoder v2); initialize a new model with scripts/init_model.py")
+    if saved_config.get("history_encoder_version") != 2:
+        raise ValueError("checkpoint uses the previous history encoder; semantic history v2 requires a new model initialized with scripts/init_model.py")
     # The saved map-encoding profile must not be inferred from the file name.
     saved_config.setdefault("policy_architecture", "attention")
     config = ModelConfig(**saved_config)

@@ -58,7 +58,8 @@ This creates recorded random weights; it does not train. It refuses to overwrite
 an existing model. Follow the [training guide](training.md) for bootstrap,
 flat self-play, calibration and optional search.
 
-Checkpoints record joint tile encoder version 2 and action encoder version 2.
+Checkpoints record joint tile encoder version 2, action encoder version 2,
+and [semantic history encoder version 2](history_encoder.md).
 Both model loading and optimizer continuation reject older action-scoring
 schemas explicitly. Use fresh random initialization and separate checkpoint,
 replay and league directories. Supported new checkpoints can be compared by the
@@ -88,8 +89,8 @@ Raw metadata/results: [relational_cpu.json](benchmarks/relational_cpu.json).
 This short measurement does not predict CUDA performance or league wall time.
 
 With the current joint encoders and these dimensions, the default relational
-profile has 6,843,809 parameters, including 163,648 in the shared action encoder.
-The flat path uses 4,879,298 parameters; belief-specific layers add 1,964,511.
+profile has 6,945,185 parameters, including 163,648 in the shared action encoder.
+The flat path uses 4,980,674 parameters; belief-specific layers add 1,964,511.
 The benchmark script compares map-encoding profiles with the same current action
 encoder/scorer. Re-run it for current timings; the table above records the earlier
 architecture with different scorers. Greater expressiveness alone is not evidence

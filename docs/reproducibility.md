@@ -30,12 +30,13 @@ not explicitly reported; the score participation mask is not an alive flag.
 Tile encoder version 2 jointly fuses tile semantics and population in one MLP;
 the threshold is implicit in city level. Action encoder version 2 uses a single
 shared-token policy scorer, with no parallel raw-action scorer. Record all three
-version fields and this
+version fields, plus `history_encoder_version=2` for semantic event encoding, and this
 [input schema](observation_context.md) with architecture ablations.
 
-Native flat population training currently supports the `lakes` map path. Do not
-assume that a generic CLI `--map-type` choice implies support in every collector.
-Most current training examples use two players, Bardur/Imperius and 11×11 maps.
+Baseline native flat training uses two fixed tribes and lakes. The opt-in
+[mixed flat collector](flat_curriculum_plan.md) supports twelve regular tribes,
+multiple square sizes and all three map types with recorded domain metadata.
+Teacher, belief and MCTS scripts do not automatically inherit this curriculum.
 Support for a larger input shape does not establish generalization to that size,
 different tribes, longer histories or another ruleset.
 
@@ -92,7 +93,7 @@ compatibility checks, with a new curriculum budget. Native in-flight games and
 local opponents restart. It is not a bitwise continuation of the whole process.
 See [the detailed limits](flat_improvements.md#continuation-and-artifacts).
 Checkpoints and optimizer continuation files predating tile encoder version 2
-are incompatible with the joint encoder. Start a separate experiment from random
+or semantic history version 2 are incompatible with the current encoders. Start a separate experiment from random
 weights; existing recordings/replay can still represent missing population.
 
 ## Existing benchmark

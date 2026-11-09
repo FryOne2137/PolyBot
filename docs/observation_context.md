@@ -65,8 +65,11 @@ This applies to every map-encoding profile; policy has one shared-token scorer.
 
 Checkpoints record `observation_context_version=1` and `tile_encoder_version=2`.
 The [shared action encoder](shared_actions.md) additionally records
-`action_encoder_version=2`; it is required by all current training entry points.
-Weights and optimizer state from previous tile encoders or parallel scorers are incompatible.
+`action_encoder_version=2`. The [semantic history encoder](history_encoder.md)
+records `history_encoder_version=2`. Both are required by all current training
+entry points.
+Weights and optimizer state from previous tile/history encoders or parallel
+scorers are incompatible.
 Initialize a new model with `scripts/init_model.py`, use a separate checkpoint
 directory and league database, and train from scratch. Loading previous weights
 fails explicitly rather than silently substituting a new randomly initialized

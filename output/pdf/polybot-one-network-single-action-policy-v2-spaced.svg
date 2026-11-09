@@ -8143,7 +8143,7 @@ L 2806.972656 23.765
 z
 " style="fill: #fbfcfe"/>
     </g>
-    <text style="font-weight: 700; font-size: 25px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #26374a" x="3114" y="52.038438" transform="rotate(-0 3114 52.038438)">6,84 mln parametrów</text>
+    <text style="font-weight: 700; font-size: 25px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #26374a" x="3114" y="52.038438" transform="rotate(-0 3114 52.038438)">6,95 mln parametrów</text>
    </g>
    <g id="text_4">
     <g id="patch_354">
@@ -8154,7 +8154,7 @@ L 2702.817187 75.105
 z
 " style="fill: #fbfcfe"/>
     </g>
-    <text style="font-size: 15px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #317b5b" x="3114" y="93.744844" transform="rotate(-0 3114 93.744844)">4,88 mln w ścieżce flat · bez obcinania legalnych akcji</text>
+    <text style="font-size: 15px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #317b5b" x="3114" y="93.744844" transform="rotate(-0 3114 93.744844)">4,98 mln w ścieżce flat · bez obcinania legalnych akcji</text>
    </g>
    <g id="text_5">
     <g id="patch_355">
@@ -9053,16 +9053,17 @@ z
    </g>
    <g id="text_85">
     <g id="patch_435">
-     <path d="M 53.641 1336.0265
-L 427.423766 1336.0265
-L 427.423766 1284.7735
-L 53.641 1284.7735
+     <path d="M 53.641 1343.249
+L 388.007641 1343.249
+L 388.007641 1277.551
+L 53.641 1277.551
 z
 " style="fill: #fbfcfe"/>
     </g>
-    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1298.907531)">Historia: 12 → 192 → 192; Transformer ×1 (8 głowic, FFN 384), gate.</text>
-    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1313.584922)">Baza: 9 globalnych + 12 zdarzeń → 192 → 192.</text>
-    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1328.011531)">T + 1: mapa 13 × 13 → 170 tokenów; mapa 16 × 16 → 257.</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1291.685031)">Historia: embeddingi kategorii i X/Y → MLP 386 → 192 → 192.</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1306.130031)">Transformer historii ×1 (8 głowic, FFN 384), gate.</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1320.807422)">Baza: 9 globalnych + 12 zdarzeń → 192 → 192.</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #778394" transform="translate(57.6 1335.234031)">T + 1: mapa 13 × 13 → 170 tokenów; mapa 16 × 16 → 257.</text>
    </g>
    <g id="text_86">
     <g id="patch_436">
@@ -9084,7 +9085,7 @@ L 2724.564688 1405.7785
 z
 " style="fill: #fbfcfe"/>
     </g>
-    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #778394" x="3110.4" y="1419.912531" transform="rotate(-0 3110.4 1419.912531)">6 843 809 = 4 879 298 flat + 1 964 511 belief · encoder akcji: 163 648</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #778394" x="3110.4" y="1419.912531" transform="rotate(-0 3110.4 1419.912531)">6 945 185 = 4 980 674 flat + 1 964 511 belief · encoder akcji: 163 648</text>
    </g>
   </g>
  </g>

@@ -311,12 +311,14 @@ def _promotion_gate_decision(
         and champion_lower_95 >= promotion_lower_bound
         and weighted_population_score >= population_score
         and minimum_historical_score >= historical_score_floor
+        and all(bool(result.get("domain_gate_passed", True)) for result in evaluation_results)
     )
     return {
         "candidate_score": candidate_score,
         "champion_lower_95": champion_lower_95,
         "population_score": weighted_population_score,
         "minimum_historical_score": minimum_historical_score,
+        "domain_gate_passed": all(bool(r.get("domain_gate_passed", True)) for r in evaluation_results),
         "promoted": promoted,
     }
 
@@ -1014,6 +1016,8 @@ def train_promotion_league(
         raise ValueError(
             "--training-stage belief/mcts requires --champion-mode mcts"
         )
+    if training.flat_curriculum is not None and training_stage != "flat":
+        raise ValueError("mixed domain curriculum is supported only by flat training")
     if flat_improvements is not None and training_stage != "flat":
         raise ValueError("flat improvements are restricted to train_flat")
     if flat_resume_state is not None and (
@@ -1787,6 +1791,7 @@ def train_promotion_league(
         )
         else None
     )
+    flat_domain_sessions: dict[str, dict[str, Any]] = {}
     flat_critic_replay = (
         deque(maxlen=flat_improvements.value_capacity)
         if flat_improvements is not None else None
@@ -3127,6 +3132,7 @@ def train_promotion_league(
                                 ),
                                 flat_role="main",
                                 flat_improvements=flat_improvements,
+                                flat_domain_state=(flat_domain_sessions.setdefault(stage_name, {}) if training.flat_curriculum else None),
                                 flat_value_replay=flat_critic_replay,
                                 flat_resume_state=(
                                     str(flat_resume_state)

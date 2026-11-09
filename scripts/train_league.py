@@ -521,6 +521,22 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             "retaining full-game outcomes separately for value/PPG."
         ),
     )
+    parser.add_argument("--flat-curriculum", action=argparse.BooleanOptionalAction, default=False,
+                        help="Flat-only: varied regular tribes, board sizes and map types with one learner")
+    parser.add_argument("--flat-tribes", default="all", help="all, or comma-separated regular tribe names/IDs")
+    parser.add_argument("--flat-map-sizes", default="11,12,13,14,15,16")
+    parser.add_argument("--flat-map-types", default="lakes,drylands,water_world")
+    parser.add_argument("--flat-map-type-weights", default="0.60,0.25,0.15")
+    parser.add_argument("--flat-small-map-probability", type=float, default=0.70)
+    parser.add_argument("--flat-curriculum-intro-steps", type=int, default=8000)
+    parser.add_argument("--flat-curriculum-expansion-steps", type=int, default=24000)
+    parser.add_argument("--flat-domain-pools", type=int, default=3)
+    parser.add_argument("--flat-domain-segment-steps", type=int, default=512)
+    parser.add_argument("--flat-domain-max-moves", type=int, default=3200,
+                        help="Mixed collector episode horizon; unfinished games bootstrap and never create terminal value labels")
+    parser.add_argument("--flat-domain-evaluation-groups", type=int, default=6)
+    parser.add_argument("--flat-domain-score-floor", type=float, default=0.40)
+    parser.add_argument("--flat-domain-min-games", type=int, default=20)
     parser.add_argument("--flat-improvements", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--flat-value-updates", type=int, default=8)
     parser.add_argument("--flat-value-learning-rate", type=float, default=1e-4)
@@ -882,6 +898,11 @@ def main(*, fixed_training_stage: str | None = None) -> None:
             breakthrough_exploiter=True,
         )
     args = parser.parse_args()
+
+    if args.flat_curriculum and args.training_stage != "flat":
+        parser.error("--flat-curriculum is available only for the flat training stage")
+    if args.flat_curriculum and (not args.flat_population_persistent_optimizer or not args.flat_population_synchronous_rollouts):
+        parser.error("--flat-curriculum requires persistent optimizer and synchronous rollouts")
 
     # ``train_direct_population_curriculum`` deliberately uses one horizon
     # for both collection and its raw-policy gates.  Historically train_flat

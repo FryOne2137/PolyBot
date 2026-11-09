@@ -42,7 +42,7 @@ class ActionEncoder(nn.Module):
         self.to_position = nn.Linear(width, state_width, bias=False)
         self.position_norm = nn.LayerNorm(state_width)
 
-    def forward(self, state, tiles, map_tokens, categorical, continuous, mask):
+    def forward(self, state, tiles, map_tokens, categorical, continuous, mask, *, board_sizes=None):
         if categorical.shape[:2] != mask.shape or continuous.shape[:2] != mask.shape:
             raise ValueError("action encoder needs aligned action features and legal mask")
         batch, count = mask.shape
@@ -56,10 +56,19 @@ class ActionEncoder(nn.Module):
         tokens = tokens + self.continuous(torch.asinh(continuous.float()/20.0))
         tokens = tokens + self.state_projection(state).unsqueeze(1)
         tile_count = tiles.shape[1]
+        side = max(1, int(round(tile_count**.5)))
+        tile_limit = tile_count
+        if board_sizes is not None:
+            # Ragged evaluation batches retain each board's original linear
+            # tile pointers and coordinate system. Padding is never a tile.
+            side = torch.as_tensor(board_sizes, device=tiles.device, dtype=torch.long)[:, None]
+            tile_limit = side.square()
+            valid_tiles = torch.arange(tile_count, device=tiles.device)[None] < tile_limit
+            map_tokens = map_tokens.masked_fill(~valid_tiles.unsqueeze(-1), -1)
         unit_index, unit_present = unit_tile_indices(map_tokens, categorical[..., 3])
         def endpoint(column, projection):
             raw = categorical[..., column]
-            present = (raw >= 0) & (raw < tile_count)
+            present = (raw >= 0) & (raw < tile_limit)
             safe = raw.clamp(0, tile_count-1)
             if column == 1:
                 safe = torch.where(present, safe, unit_index)
@@ -72,10 +81,10 @@ class ActionEncoder(nn.Module):
         city_index, city_present = city_tile_indices(map_tokens, categorical[..., 4])
         cities = self.city_projection(tiles).gather(1, city_index.unsqueeze(-1).expand(-1, -1, self.width))
         cities = cities * city_present.unsqueeze(-1)
-        side = max(1, int(round(tile_count**.5)))
         both = src_present & dst_present
-        dx = ((dst % side - src % side).float()/max(1, side-1)) * both
-        dy = ((dst // side - src // side).float()/max(1, side-1)) * both
+        denominator = max(1, side-1) if isinstance(side, int) else (side-1).clamp_min(1)
+        dx = ((dst % side - src % side).float()/denominator) * both
+        dy = ((dst // side - src // side).float()/denominator) * both
         geometry = torch.stack([src_present, dst_present, city_present, dx, dy, dx.abs(), dy.abs(), dx.square()+dy.square()], -1).to(tokens.dtype)
         tokens = self.token_norm(tokens + source + target + cities + self.geometry(geometry))
         tokens = tokens.masked_fill(~mask.unsqueeze(-1), 0)

@@ -535,6 +535,8 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     parser.add_argument("--flat-domain-max-moves", type=int, default=3200,
                         help="Mixed collector episode horizon; unfinished games bootstrap and never create terminal value labels")
     parser.add_argument("--flat-domain-evaluation-groups", type=int, default=6)
+    parser.add_argument("--flat-evaluation-batch-games", type=int, default=64,
+                        help="Mixed flat evaluation: maximum resident games sharing inference; positive and even.")
     parser.add_argument("--flat-domain-score-floor", type=float, default=0.40)
     parser.add_argument("--flat-domain-min-games", type=int, default=20)
     parser.add_argument("--flat-improvements", action=argparse.BooleanOptionalAction, default=False)
@@ -903,6 +905,8 @@ def main(*, fixed_training_stage: str | None = None) -> None:
         parser.error("--flat-curriculum is available only for the flat training stage")
     if args.flat_curriculum and (not args.flat_population_persistent_optimizer or not args.flat_population_synchronous_rollouts):
         parser.error("--flat-curriculum requires persistent optimizer and synchronous rollouts")
+    if args.flat_curriculum and (args.flat_evaluation_batch_games < 2 or args.flat_evaluation_batch_games % 2):
+        parser.error("--flat-evaluation-batch-games must be positive, even and at least 2")
 
     # ``train_direct_population_curriculum`` deliberately uses one horizon
     # for both collection and its raw-policy gates.  Historically train_flat

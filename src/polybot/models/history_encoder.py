@@ -49,10 +49,14 @@ class HistoryEncoder(nn.Module):
         known = (values >= 0) & (values <= largest)
         return torch.where(known, values + 1, 0)
 
-    def forward(self, history: torch.Tensor, board_side: int) -> torch.Tensor:
+    def forward(self, history: torch.Tensor, board_side: int | torch.Tensor) -> torch.Tensor:
         if history.ndim != 3 or history.shape[-1] != VISIBLE_ACTION_HISTORY_FEATURES:
             raise ValueError("history encoder expects [batch, length, 12]")
-        if not 1 <= board_side <= self.max_board_side:
+        if isinstance(board_side, torch.Tensor):
+            if board_side.shape != history.shape[:1]:
+                raise ValueError("history needs one board side per batch row")
+            board_side = board_side[:, None]
+        elif not 1 <= board_side <= self.max_board_side:
             raise ValueError("history board side must fit max_board_side")
         # Replay can store these categorical values as float32. Integer
         # conversion here keeps scalar, vector and replay paths identical.

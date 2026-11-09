@@ -143,6 +143,9 @@ class TrainingConfig:
     # existing default two-player setup and never enable the curriculum.
     player_tribes: tuple[int, int] = (3, 2)
     flat_curriculum: Optional[FlatCurriculumConfig] = None
+    # Resident games in the mixed evaluation scheduler; inference additionally
+    # bounds action tokens. Does not change the arena's sampled map schedule.
+    flat_evaluation_batch_games: int = 64
     batch_size: int = 16
     replay_capacity: int = 20_000
     # Safety cap for one self-play game. A truncated training game keeps its

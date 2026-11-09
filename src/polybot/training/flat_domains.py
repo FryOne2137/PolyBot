@@ -391,14 +391,13 @@ def evaluation_schedule(settings, seed, games):
 
 
 def evaluate_mixed_matches(model_a, model_b, device, training, games, game_callback=None, **kwargs):
-    from ..evaluation.matches import evaluate_direct_matches
+    from ..evaluation.mixed_matches import run_mixed_arenas
     from .flat_experiments import isolated_rng
     if kwargs.get("map_seeds") is not None:
         raise ValueError("mixed flat evaluation uses its recorded domain/seed schedule, not a scalar map-seed override")
     settings = training.flat_curriculum
     records, pair_scores, pair_weights = [], [], []
     positions = kwargs.pop("position_callback", None)
-    statistics = []
     schedule = evaluation_schedule(settings, training.seed, games)
     # Interleave global game indexes so small validation reservoirs cover
     # multiple domains instead of taking only the first arena group.
@@ -409,28 +408,32 @@ def evaluate_mixed_matches(model_a, model_b, device, training, games, game_callb
             if level < item[2]:
                 pair_indexes[group].append(sequence)
                 sequence += 1
+    rows_by_group = [[] for _ in schedule]
+    def record(group, row):
+        domain, _, count, weight, _ = schedule[group]
+        global_pairs = pair_indexes[group]
+        row = dict(row)
+        row.update(game_index=2 * global_pairs[int(row["game_index"]) // 2] + int(row["game_index"]) % 2, map_size=domain.size,
+                   map_type=domain.kind, player_tribes=domain.tribes,
+                   domain_weight=weight / (2 * count), domain=domain.label,
+                   move_limit=domain.training(training, 1, evaluation=True).max_moves)
+        records.append(row)
+        rows_by_group[group].append(row)
+        if game_callback is not None:
+            game_callback(row)
+    def position(group, game, batch, row):
+        positions(2 * pair_indexes[group][game // 2] + game % 2, batch, row)
+    # map_seeds=None is part of evaluate_direct_matches' legacy signature,
+    # rather than a scheduling argument for the bounded mixed runner.
+    kwargs.pop("map_seeds", None)
     with isolated_rng():
-        for group, (domain, seed, count, weight, offset) in enumerate(schedule):
-            global_pairs = pair_indexes[group]
-            local_rows = []
-            def record(row, domain=domain, global_pairs=global_pairs, weight=weight, count=count):
-                row = dict(row)
-                row.update(game_index=2 * global_pairs[int(row["game_index"]) // 2] + int(row["game_index"]) % 2, map_size=domain.size,
-                           map_type=domain.kind, player_tribes=domain.tribes,
-                           domain_weight=weight / (2 * count), domain=domain.label,
-                           move_limit=domain.training(training, 1, evaluation=True).max_moves)
-                records.append(row)
-                local_rows.append(row)
-                if game_callback is not None:
-                    game_callback(row)
-            def position(game, batch, row, domain=domain, global_pairs=global_pairs, seed=seed):
-                positions(2 * global_pairs[game // 2] + game % 2, annotate_domain(dict(batch), domain, seed), row)
-            result = evaluate_direct_matches(model_a, model_b, device, domain.training(training, seed, evaluation=True), 2 * count,
-                game_callback=record, position_callback=position if positions is not None else None, **kwargs)
-            statistics.append((result, weight))
-            ordered = sorted(local_rows, key=lambda row: row["game_index"])
-            pair_scores.extend((ordered[i]["score_a"] + ordered[i+1]["score_a"]) / 2 for i in range(0, len(ordered), 2))
-            pair_weights.extend([weight / count] * count)
+        statistics, inference_stats = run_mixed_arenas(model_a, model_b, device, training, schedule,
+            record=record, position=position if positions is not None else None,
+            max_live_games=training.flat_evaluation_batch_games, **kwargs)
+    for local_rows, (_, _, count, weight, _) in zip(rows_by_group, schedule):
+        ordered = sorted(local_rows, key=lambda row: row["game_index"])
+        pair_scores.extend((ordered[i]["score_a"] + ordered[i+1]["score_a"]) / 2 for i in range(0, len(ordered), 2))
+        pair_weights.extend([weight / count] * count)
     score, se, lower, upper, effective_maps = _weighted_interval(pair_scores, pair_weights)
     numeric = ("model_a_city_captures", "model_a_capital_captures", "opponent_city_captures", "opponent_capital_captures",
                "model_a_decisions", "moves", "terminated_games", "truncated_games", "model_a_wins", "model_a_losses", "draws")
@@ -441,6 +444,7 @@ def evaluate_mixed_matches(model_a, model_b, device, training, games, game_callb
                   evaluation_maps=float(len(pair_scores)), score_standard_error=se, score_lower_95=lower, score_upper_95=upper, effective_evaluation_maps=effective_maps,
                   evaluation_seed=float(training.seed), visible_action_history=float(kwargs.get("visible_action_history", 0)),
                   flat_domain_evaluation=True)
+    result.update(inference_stats)
     reports = {}
     for family, key in (("map_type", "map_type"), ("map_size", "map_size"), ("tribe", "tribe")):
         buckets = defaultdict(list)

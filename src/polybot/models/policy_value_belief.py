@@ -325,6 +325,8 @@ class PolicyValueBeliefNet(nn.Module):
         event_features: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
         action_history_mask: torch.Tensor | None = None,
+        *,
+        board_sizes: Sequence[int] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, tiles, _ = map_tokens.shape
         if map_tokens.shape[-1] not in (23, 24):
@@ -333,18 +335,27 @@ class PolicyValueBeliefNet(nn.Module):
             raise ValueError("incompatible global observation schema")
         context = global_features[..., LEGACY_GLOBAL_SIZE:]
         global_features = global_features[..., :LEGACY_GLOBAL_SIZE]
-        if self.policy_architecture == "relational":
+        padding = None
+        if board_sizes is not None:
+            if len(board_sizes) != batch or any(s < 1 or s > self.config.max_board_side or s*s > tiles for s in board_sizes):
+                raise ValueError("padded batch needs one valid board size per row")
+            widths = torch.as_tensor(board_sizes, dtype=torch.long, device=map_tokens.device)
+            padding = torch.arange(tiles, device=map_tokens.device)[None] >= widths[:, None].square()
+            map_tokens = map_tokens.masked_fill(padding.unsqueeze(-1), -1)
+        elif self.policy_architecture == "relational":
             side = isqrt(tiles)
             if side * side != tiles or side > self.config.max_board_side:
                 raise ValueError("relational board must be square and fit max_board_side")
         perspective = torch.round(global_features[..., 1] * 16).long()
         encoded = self.tile_encoder(map_tokens, perspective)
         positions = torch.arange(tiles, device=map_tokens.device)
-        width = min(self.config.max_board_side, max(1, int(round(tiles ** 0.5))))
-        x_positions = self.x_embedding(positions % width)[None]
-        y_positions = self.y_embedding(
-            (positions // width).clamp_max(self.config.max_board_side - 1)
-        )[None]
+        width = min(self.config.max_board_side, max(1, int(round(tiles ** 0.5)))) if board_sizes is None else widths
+        if board_sizes is None:
+            x_positions = self.x_embedding(positions % width)[None]
+            y_positions = self.y_embedding((positions // width).clamp_max(self.config.max_board_side - 1))[None]
+        else:
+            x_positions = self.x_embedding(positions[None] % widths[:, None])
+            y_positions = self.y_embedding((positions[None] // widths[:, None]).clamp_max(self.config.max_board_side - 1))
         encoded = encoded + x_positions + y_positions
 
         if event_features is None:
@@ -367,7 +378,12 @@ class PolicyValueBeliefNet(nn.Module):
             action_history, action_history_mask, batch, map_tokens.device, board_side=width,
         )
         global_token = global_state.unsqueeze(1)
-        transformed = self.map_transformer(torch.cat([global_token, encoded], dim=1))
+        transformer_input = torch.cat([global_token, encoded], dim=1)
+        if padding is None:
+            transformed = self.map_transformer(transformer_input)
+        else:
+            key_padding = torch.cat([padding.new_zeros((batch, 1)), padding], dim=1)
+            transformed = self.map_transformer(transformer_input, src_key_padding_mask=key_padding)
         transformed = self.map_norm(transformed)
         state, tile_states = transformed[:, 0], transformed[:, 1:]
         if self.policy_architecture == "relational":
@@ -376,7 +392,7 @@ class PolicyValueBeliefNet(nn.Module):
 
     def _history_context(
         self, history: torch.Tensor | None, history_mask: torch.Tensor | None,
-        batch: int, device: torch.device, *, board_side: int | None = None,
+        batch: int, device: torch.device, *, board_side: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
         if history is None or history.numel() == 0:
             return torch.zeros((batch, self.config.d_model), dtype=torch.float32, device=device)
@@ -428,12 +444,17 @@ class PolicyValueBeliefNet(nn.Module):
         action_history_mask: torch.Tensor | None = None,
         *,
         include_belief: bool = True,
+        board_sizes: Sequence[int] | None = None,
     ) -> ModelOutput:
+        if board_sizes is not None and include_belief:
+            raise ValueError("padded map batches support policy/value inference only")
         state, tile_states = self.encode_map(
-            map_tokens, global_features, event_features, action_history, action_history_mask
+            map_tokens, global_features, event_features, action_history, action_history_mask,
+            board_sizes=board_sizes,
         )
         encoded_actions, value_state = self.action_encoder(
             state, tile_states, map_tokens, action_categorical, action_continuous, action_mask,
+            board_sizes=board_sizes,
         )
         # Policy has one scoring path. Raw semantics and endpoints are encoded
         # once by action_encoder and shared with value and belief.

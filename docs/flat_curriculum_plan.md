@@ -66,8 +66,8 @@ slots. Such episodes bootstrap PPO/GAE, are reported as truncated, and create
 no terminal value labels. A block/segment boundary alone never creates an
 outcome. Both true outcomes and truncations are recorded in game callbacks.
 
-Legal lists remain complete. Different map sizes are inferred in separate
-batches; no artificial map tiles are inserted. Auxiliary replay stays local to
+Legal lists remain complete. Training groups of different map sizes are inferred
+in separate batches; auxiliary replay stays local to
 its homogeneous group. Terminal critic replay spans domains, preserves domain
 metadata, and is grouped by tile count for inference without changing sample
 order or map-type features.
@@ -83,6 +83,27 @@ coverage means six groups cover all twelve candidate tribes when all are
 selected. Larger `--flat-domain-evaluation-groups` increases domain coverage
 and native setup/inference overhead. A small diagnostic is a sampled benchmark,
 not exhaustive coverage of all size/type/tribe combinations.
+
+Arena groups advance together instead of waiting for each domain to finish.
+Inference combines live games across tribes/types and nearby sizes. Smaller
+boards use masked trailing storage with explicit per-row board sizes; real tile
+indexes, coordinates, history and action endpoints retain their original meaning.
+Padding does not become visible or hidden map content. This changes no parameters
+or checkpoint schema, and belief/MCTS do not use this padded inference path.
+
+`--flat-evaluation-batch-games` defaults to 64 resident games, not 64 extra test
+games. Larger promotion arenas run bounded chunks of the same seed schedule.
+Completed rows are excluded from inference. Size buckets limit additional tile
+padding to 50%, and a separate action-token budget splits inference batches
+without truncating legal lists. Identical policy weights share one inference
+route even if value heads differ. For a different memory/throughput tradeoff,
+set an even resident-game limit (for example 32 or 128) and measure on the target
+GPU. No hardware-independent speedup is guaranteed.
+
+One progress bar covers the whole arena. Results also record mean/peak inference
+batch size, model forward count, resident games, tile-padding ratio and whether
+the policy route was shared. These counters describe batching, not GPU utilization
+or training progress.
 
 The arena horizon is calibrated to 11x11: a limit of 1600 becomes
 `ceil(1600 * size^2 / 121)` on each board, about 3386 on 16x16. Each game

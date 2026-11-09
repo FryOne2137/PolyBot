@@ -1,8 +1,9 @@
 # Fresh flat-policy rollouts
 
 The dedicated flat trainer enables `--flat-population-synchronous-rollouts`.
-Existing checkpoints retain their architecture. The other training stages keep
-their own collectors.
+Compatible checkpoints retain their scorer architecture. The shared tile encoder
+is version 2 and requires a new experiment if upgrading from earlier weights.
+The other training stages keep their own collectors.
 
 ## Policy fragments
 

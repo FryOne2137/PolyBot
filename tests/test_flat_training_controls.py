@@ -188,7 +188,7 @@ def test_raw_evaluation_cache_ignores_value_head_but_not_policy_changes():
         assert model_fingerprint(candidate, policy_only=True) == policy
         evaluate()
         assert call.call_count == 1
-        with torch.no_grad(): next(candidate.relational_policy.parameters()).add_(.1)
+        with torch.no_grad(): next(candidate.shared_action_policy.parameters()).add_(.1)
         evaluate()
         assert call.call_count == 2
 

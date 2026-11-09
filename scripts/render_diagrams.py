@@ -73,31 +73,31 @@ def architecture():
         "Public observations and legal actions in; policy, value and optional belief out. Architecture is selected by the checkpoint.",
     )
     card(ax, bounds, .5, 4.2, 3.3, 3.5, "PUBLIC INPUT", [
-        "Player-view map: T × 23",
-        "Global features + event summary",
+        "Map: T × 24 (own-city population)",
+        "Own techs/tribe + public context",
         "Visible history: H × 12",
         "Current legal candidates only",
         "Action semantics, costs, pointers",
     ], "blue")
-    card(ax, bounds, 4.5, 4.2, 4, 3.5, "SHARED MAP / HISTORY ENCODER", [
-        "Semantic embeddings + 2-D positions",
-        "History Transformer → global context",
-        "L-layer map Transformer",
-        "Contextual tile states + global token",
-        "Relational variant: spatial readout",
-        "Mean / max / learned visible pooling",
+    card(ax, bounds, 4.5, 4.2, 4, 3.5, "SHARED MAP / ACTION ENCODER", [
+        "Joint tile MLP (194 → 192 → 192)",
+        "History + L-layer map Transformer",
+        "All legal actions: shared 64-D tokens",
+        "16 latents; induced set attention",
+        "Action context + map / tile states",
+        "Spatial readout over visible tiles",
     ], "purple")
     card(ax, bounds, 9.5, 6.3, 3.8, 1.9, "POLICY", [
-        "Type + options + global context",
-        "Source–target / query–tile interactions",
+        "Shared tokens → one MLP (64→128→1)",
+        "No parallel raw-action scorer",
         "One masked logit per legal action",
     ], "green", 10.7)
     card(ax, bounds, 9.5, 4.2, 3.8, 1.6, "VALUE", [
-        "Spatial state → scalar in [−1, 1]",
+        "Map + action readout → [−1, 1]",
         "Game outcomes supervise the critic",
     ], "orange")
     card(ax, bounds, 4.5, 1.4, 4, 2.0, "OPTIONAL BELIEF DECODER", [
-        "Public legal-action evidence",
+        "Shared actions + public tile evidence",
         "Private spatial refinement",
         "Structured hidden-world hypotheses",
     ], "purple")

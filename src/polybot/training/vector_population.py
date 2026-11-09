@@ -15,7 +15,9 @@ from torch.distributions import Categorical
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_vector_env, require_complete_actions
 from ..config import ModelConfig, TrainingConfig
+from ..data.player_context import CONTEXT_SIZE, native_player_context, pad_map_tokens
 from ..evaluation.matches import evaluate_direct_matches
 from ..infrastructure.device import select_device
 from ..infrastructure.randomness import seed_everything
@@ -342,6 +344,7 @@ def _ppo_snapshot(
     batch: Mapping[str, np.ndarray], row: int, action_row: int
 ) -> tuple[Dict[str, np.ndarray], int]:
     """Copy and compact only public observations needed for PPO replay."""
+    require_complete_actions(batch)
     result: Dict[str, np.ndarray] = {}
     for field in _OBJECTIVE_REPLAY_FIELDS:
         if field in {"action_features", "action_mask"}:
@@ -364,6 +367,7 @@ def _ppo_snapshot(
         batch["action_features"]
     )[row, legal_rows].astype(np.int16, copy=True)
     result["action_mask"] = np.ones(legal_rows.size, dtype=bool)
+    result["player_context"] = native_player_context(batch)[row].copy()
     return result, compact_action_row
 
 
@@ -393,13 +397,18 @@ def _collate_public_observations(
         action_mask[row, : actions.shape[0]] = True
     observation = {
         field: np.stack(
-            [example.observation[field] for example in examples], axis=0
+            [pad_map_tokens(example.observation[field]) if field == "map_tokens"
+             else example.observation[field] for example in examples], axis=0
         )
         for field in _OBJECTIVE_REPLAY_FIELDS
         if field not in {"action_features", "action_mask"}
     }
     observation["action_features"] = action_features
     observation["action_mask"] = action_mask
+    observation["player_context"] = np.stack([
+        example.observation.get("player_context", np.zeros(CONTEXT_SIZE, dtype=np.float32))
+        for example in examples
+    ])
     return observation
 
 
@@ -650,12 +659,10 @@ def _objective_replay_snapshot(
     batch: Mapping[str, np.ndarray], row: int, action_row: int
 ) -> _ObjectiveReplayExample:
     """Copy one visible decision before VectorGameEnv advances the slot."""
+    observation, compact_row = _ppo_snapshot(batch, row, action_row)
     return _ObjectiveReplayExample(
-        observation={
-            field: np.asarray(batch[field])[row].copy()
-            for field in _OBJECTIVE_REPLAY_FIELDS
-        },
-        action_row=int(action_row),
+        observation=observation,
+        action_row=compact_row,
         weight=1.0,
     )
 
@@ -667,12 +674,7 @@ def _objective_replay_batch(
     if not examples:
         raise ValueError("objective replay batch must not be empty")
     return (
-        {
-            field: np.stack(
-                [example.observation[field] for example in examples], axis=0
-            )
-            for field in _OBJECTIVE_REPLAY_FIELDS
-        },
+        _collate_public_observations(examples),
         np.asarray(
             [example.action_row for example in examples], dtype=np.int64
         ),
@@ -849,7 +851,7 @@ def _train_vector_population_legacy(
     )
     cuda_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
-    env = VectorGameEnv(
+    env = exact_vector_env(VectorGameEnv,
         num_envs=num_envs,
         seed=training.seed,
         map_size=training.map_size,
@@ -860,6 +862,7 @@ def _train_vector_population_legacy(
         visible_event_history=0,
     )
     batch = env.reset(seed=training.seed)
+    run.event("full_legal_actions", native_action_capacity=int(getattr(env, "max_actions", max_actions)))
     rng = np.random.default_rng(training.seed ^ 0xD1EC7)
     opponent_indices = rng.choice(
         len(frozen), size=num_envs, p=weights
@@ -1783,7 +1786,7 @@ def train_vector_population(
         batch = continuation_state["batch"]
         reused_environment = True
     else:
-        env = VectorGameEnv(
+        env = exact_vector_env(VectorGameEnv,
             num_envs=num_envs,
             seed=training.seed,
             map_size=training.map_size,
@@ -1794,6 +1797,7 @@ def train_vector_population(
             visible_event_history=visible_action_history,
         )
         batch = env.reset(seed=training.seed)
+        run.event("full_legal_actions", native_action_capacity=int(getattr(env, "max_actions", max_actions)))
         reused_environment = False
     rng = (
         continuation_state.get("rng")
@@ -3945,6 +3949,19 @@ def train_direct_population_curriculum(
     resume_payload = None
     if flat_resume_state is not None:
         resume_payload = torch.load(flat_resume_state, map_location="cpu", weights_only=False)
+        if resume_payload.get("model_config", {}).get("action_encoder_version") != 2:
+            raise ValueError("flat resume state predates the single shared-action policy (action encoder v2); start a new experiment")
+        if resume_payload.get("model_config", {}).get("tile_encoder_version") != 2:
+            raise ValueError(
+                "flat resume state uses the previous tile encoder; initialize "
+                "a new model and experiment for the joint 24-field tile encoder"
+            )
+        if "observation_context_version" not in resume_payload.get("model_config", {}):
+            raise ValueError(
+                "flat resume state predates the observation context inputs; "
+                "continue from its portable model checkpoint with --challenger-in "
+                "and omit --flat-resume-state to initialize a compatible optimizer"
+            )
         try:
             resume_model_config = ModelConfig(**resume_payload["model_config"])
         except (KeyError, TypeError) as error:

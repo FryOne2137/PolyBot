@@ -20,7 +20,7 @@ def add_environment_options(parser: argparse.ArgumentParser) -> None:
         help="Draw a fresh base seed for this run and print it in the final summary.",
     )
     parser.add_argument("--map-size", type=int, default=11)
-    parser.add_argument("--map-type", default="lakes", choices=["lakes", "drylands"])
+    parser.add_argument("--map-type", default="lakes", choices=["lakes", "drylands", "water_world"])
     parser.add_argument("--max-moves", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=2.0e-4)
     parser.add_argument("--replay-capacity", type=int, default=20_000)

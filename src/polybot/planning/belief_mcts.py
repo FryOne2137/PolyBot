@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from ..data.full_actions import exact_mcts_pool
 from ..config import MCTSConfig
 from ..data.polyenv_features import (
     event_action_history,
@@ -534,8 +535,8 @@ class BeliefMCTS:
 
         # Passing detached belief worlds is the documented fog-safe MctsPool
         # entry point. The original GameEnv is never given to the pool.
-        pool = mcts_pool_type(
-            belief_envs,
+        pool = exact_mcts_pool(
+            mcts_pool_type, belief_envs,
             num_threads=self.config.native_threads,
             max_actions=self.config.native_max_actions,
             c_puct=self.config.c_puct,

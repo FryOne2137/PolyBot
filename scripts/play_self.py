@@ -291,7 +291,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("flat", "mcts"), default="flat")
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--map-size", type=int, default=11)
-    parser.add_argument("--map-type", choices=("lakes", "drylands"), default="lakes")
+    parser.add_argument("--map-type", choices=("lakes", "drylands", "water_world"), default="lakes")
     parser.add_argument(
         "--tribes",
         nargs=2,

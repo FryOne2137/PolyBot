@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_vector_env
 from ..config import MCTSConfig, TrainingConfig
 from ..data.polyenv_features import (
     capture_flags,
@@ -282,7 +283,7 @@ def _new_paired_vector_envs(
         "include_combat_preview": True,
         "visible_event_history": visible_action_history,
     }
-    return VectorGameEnv(**arguments), VectorGameEnv(**arguments)
+    return exact_vector_env(VectorGameEnv, **arguments), exact_vector_env(VectorGameEnv, **arguments)
 
 
 def _allocate_vector_buffers(
@@ -352,6 +353,30 @@ def _join_tensor_rows(
     name: str,
 ) -> torch.Tensor:
     values = [group[name] for group in groups]
+    if name in {
+        "action_categorical", "action_continuous", "action_mask",
+        "action_history", "action_history_mask",
+    }:
+        # Independently stepped arenas have independently compacted legal
+        # lists. Pad their observation axes, never truncate either arena.
+        width = max(value.shape[1] for value in values)
+        padded = []
+        for value in values:
+            if value.shape[1] == width:
+                padded.append(value)
+                continue
+            result = value.new_full(
+                (value.shape[0], width, *value.shape[2:]),
+                -1 if name == "action_categorical" else 0,
+            )
+            count = value.shape[1]
+            if count:
+                if name in {"action_history", "action_history_mask"}:
+                    result[:, -count:] = value
+                else:
+                    result[:, :count] = value
+            padded.append(result)
+        values = padded
     return values[0] if len(values) == 1 else torch.cat(values, dim=0)
 
 

@@ -42,24 +42,26 @@ def load_model(path: Path, device: torch.device) -> tuple[PolicyValueBeliefNet, 
     # unrestricted pickle loader, unlike recent releases.
     payload = torch.load(path, map_location=device, weights_only=True)
     saved_config = dict(payload["model_config"])
-    # Pre-factorized checkpoints have the old cross-attention policy and do
-    # not contain this field.  Keep them runnable instead of silently loading
-    # them into a different architecture with random policy weights.
+    if saved_config.get("tile_encoder_version") != 2:
+        raise ValueError(
+            "checkpoint uses the previous tile encoder; the joint 24-field "
+            "encoder requires a new model initialized with scripts/init_model.py "
+            "and a separate experiment/checkpoint directory"
+        )
+    if saved_config.get("action_encoder_version") != 2:
+        raise ValueError("checkpoint predates the single shared-action policy (action encoder v2); initialize a new model with scripts/init_model.py")
+    # The saved map-encoding profile must not be inferred from the file name.
     saved_config.setdefault("policy_architecture", "attention")
     config = ModelConfig(**saved_config)
     model = PolicyValueBeliefNet(config).to(device)
     incompatible = model.load_state_dict(payload["state_dict"], strict=False)
-    # New action-conditioned belief layers are zero-gated initially, so old
-    # checkpoints remain behaviourally identical until subsequent training.
+    # Version 2 is a new architecture with a complete, explicit schema.
+    # Missing layers must never turn into silently random checkpoint weights.
     unexpected = set(incompatible.unexpected_keys)
     missing = set(incompatible.missing_keys)
-    allowed_missing = {
-        name for name in missing
-        if name.startswith(("belief_", "history_"))
-    }
-    if unexpected or missing != allowed_missing:
+    if unexpected or missing:
         raise RuntimeError(
             "checkpoint architecture is incompatible; unexpected="
-            f"{sorted(unexpected)}, missing={sorted(missing - allowed_missing)}"
+            f"{sorted(unexpected)}, missing={sorted(missing)}"
         )
     return model, config

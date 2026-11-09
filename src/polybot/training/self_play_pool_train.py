@@ -14,14 +14,17 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_self_play_pool, require_complete_actions
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
 from ..data.polyenv_features import (
     NATIVE_ACTION_CATEGORICAL_COLUMNS,
     NATIVE_ACTION_CONTINUOUS_COLUMNS,
     native_batch_to_tensors,
+    native_global_features,
     stack_examples,
 )
 from ..data.token_schema import EVENT_SUMMARY_SIZE
+from ..data.player_context import flatten_player_context, polyenv_map_type
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
 from ..infrastructure.randomness import seed_everything
@@ -53,18 +56,7 @@ from .value_targets import Transition, assign_td_lambda_targets
 
 def _native_globals(state: np.ndarray, map_size: int, map_type: str) -> np.ndarray:
     """CPU counterpart of ``native_batch_to_tensors`` global features."""
-    state = np.asarray(state, dtype=np.int32)
-    result = np.empty((state.shape[0], 9), dtype=np.float32)
-    result[:, 0] = state[:, 0] / 100.0
-    result[:, 1] = state[:, 1] / 16.0
-    result[:, 2] = state[:, 4] / 50.0
-    result[:, 3] = state[:, 7] / 20.0
-    result[:, 4] = state[:, 5] / 32.0
-    result[:, 5] = state[:, 6] / 16.0
-    result[:, 6] = np.maximum(state[:, 8], 0) / 1024.0
-    result[:, 7] = float(map_size) / 32.0
-    result[:, 8] = 1.0 if map_type == "drylands" else 0.0
-    return result
+    return native_global_features(state, map_size, map_type)
 
 
 def _allocate_native_buffers(pool: object, method: str, device: torch.device, *args: int) -> Tuple[Dict[str, np.ndarray], Dict[str, torch.Tensor]]:
@@ -107,6 +99,7 @@ def _root_examples(
     never enter the belief completion, legal-action check, policy or value
     inference path, so they cannot leak hidden state into a played action.
     """
+    require_complete_actions(request)
     maps = np.asarray(request["map_tokens"], dtype=np.int64)
     state = np.asarray(request["state"], dtype=np.int32)
     features = np.asarray(request["action_features"], dtype=np.int64)
@@ -116,7 +109,7 @@ def _root_examples(
     histories = np.asarray(request.get("visible_action_history", np.empty((maps.shape[0], 0, 12), dtype=np.int32)))
     history_masks = np.asarray(request.get("visible_action_history_mask", np.empty((maps.shape[0], 0), dtype=bool)), dtype=bool)
     examples: List[TrainingExample] = []
-    globals_ = _native_globals(state, training.map_size, training.map_type)
+    globals_ = native_global_features(request, training.map_size, training.map_type)
     for index in range(maps.shape[0]):
         count = int(action_mask[index].sum())
         if count <= 0:
@@ -305,7 +298,7 @@ def _all_player_particles(
     action_mask = torch.zeros((count, 1), dtype=torch.bool, device=device)
     output = model(
         torch.as_tensor(flat_maps, dtype=torch.long, device=device),
-        torch.as_tensor(_native_globals(flat_states, training.map_size, training.map_type), dtype=torch.float32, device=device),
+        torch.as_tensor(native_global_features(flatten_player_context(request), training.map_size, training.map_type), dtype=torch.float32, device=device),
         categorical, continuous, action_mask,
         action_history=torch.as_tensor(flat_history, dtype=torch.float32, device=device),
         action_history_mask=torch.as_tensor(flat_history_mask, dtype=torch.bool, device=device),
@@ -632,8 +625,8 @@ def train_self_play_pool(
             parameter.requires_grad_(False)
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     native_threads = 0 if num_threads is None else max(1, int(num_threads))
-    map_type = MapType.Drylands if training.map_type == "drylands" else MapType.Lakes
-    pool = SelfPlayPool(
+    map_type = polyenv_map_type(training.map_type, MapType)
+    pool = exact_self_play_pool(SelfPlayPool,
         num_envs=num_envs,
         seed=training.seed,
         map_size=training.map_size,

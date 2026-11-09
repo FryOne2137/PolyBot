@@ -205,16 +205,10 @@ class NativeLeafInference:
                 requests.append(request)
                 leaf_count += len(request.leaves["leaf_id"])
             try:
-                # Every MctsPool leaf schema is dense and has the same board
-                # shape/max_actions, so concatenation is a single NumPy op per
-                # field, not a Python loop over individual leaves.
-                import numpy as np
-
-                keys = tuple(requests[0].leaves.keys())
-                merged = {
-                    key: np.concatenate([np.asarray(request.leaves[key]) for request in requests], axis=0)
-                    for key in keys
-                }
+                # Independent pools can have different complete action counts.
+                # Pad their action axes, retaining each request's exact order.
+                from ..data.full_actions import merge_action_batches
+                merged = merge_action_batches([request.leaves for request in requests])
                 logits, values = self._evaluate(merged)
                 with self._stats_lock:
                     self._batches += 1
@@ -222,7 +216,8 @@ class NativeLeafInference:
                 offset = 0
                 for request in requests:
                     size = len(request.leaves["leaf_id"])
-                    request.result = (logits[offset:offset + size], values[offset:offset + size])
+                    width = request.leaves["action_mask"].shape[1]
+                    request.result = (logits[offset:offset + size, :width], values[offset:offset + size])
                     offset += size
                     request.ready.set()
             except BaseException as error:

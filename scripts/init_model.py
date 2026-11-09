@@ -22,12 +22,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_run_options(parser)
     parser.add_argument("--model-out", type=Path, required=True)
-    parser.add_argument("--architecture", choices=("relational", "factorized", "attention"), default="relational")
+    parser.add_argument("--architecture", choices=("relational", "factorized", "attention"), default="relational",
+                        help="Map-encoding profile; all profiles share one action encoder and policy scorer")
     parser.add_argument("--seed", type=int, default=2137)
     parser.add_argument("--d-model", type=int, default=192)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--action-interaction-dim", type=int, default=64)
+    parser.add_argument("--action-encoder-dim", type=int, default=64)
+    parser.add_argument("--action-encoder-heads", type=int, default=4)
+    parser.add_argument("--action-latent-count", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.08)
     parser.add_argument("--max-board-side", type=int, default=32)
     args = parser.parse_args()
@@ -37,12 +41,16 @@ def main():
         parser.error("positive d-model divisible by heads and positive layers are required")
     if args.action_interaction_dim < 1 or args.max_board_side < 1 or not 0 <= args.dropout < 1:
         parser.error("invalid interaction dimension, board side or dropout")
+    if min(args.action_encoder_dim, args.action_encoder_heads, args.action_latent_count) < 1 or args.action_encoder_dim % args.action_encoder_heads:
+        parser.error("action encoder width must be positive and divisible by action heads; latent count must be positive")
     seed = seed_everything(args.seed)
     config = ModelConfig(
         d_model=args.d_model, transformer_layers=args.layers,
         attention_heads=args.heads, dropout=args.dropout,
         max_board_side=args.max_board_side, policy_architecture=args.architecture,
         action_interaction_dim=args.action_interaction_dim,
+        action_encoder_dim=args.action_encoder_dim, action_encoder_heads=args.action_encoder_heads,
+        action_latent_count=args.action_latent_count,
     )
     model = PolicyValueBeliefNet(config).eval()
     run = training_run_from_args(args, "initialization")

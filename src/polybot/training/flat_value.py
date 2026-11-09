@@ -75,10 +75,14 @@ def _states(model, examples, training):
     batch = _collate_public_observations(examples)
     tensors = _vector_tensors(batch, next(model.parameters()).device, training)
     with torch.no_grad():
-        state, _ = model.encode_map(
+        state, tiles = model.encode_map(
             tensors["map_tokens"], tensors["global_features"],
             tensors["event_features"], tensors["action_history"],
             tensors["action_history_mask"],
+        )
+        _, state = model.action_encoder(
+            state, tiles, tensors["map_tokens"], tensors["action_categorical"],
+            tensors["action_continuous"], tensors["action_mask"],
         )
     return state.detach()
 

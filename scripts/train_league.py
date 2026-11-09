@@ -809,7 +809,8 @@ def main(*, fixed_training_stage: str | None = None) -> None:
     parser.add_argument("--late-temperature", type=float, default=0.0, help="MCTS visit-sampling temperature after --temperature-drop-move.")
     parser.add_argument("--root-dirichlet-epsilon", type=float, default=0.25, help="Self-play-only root-prior noise share; 0 disables it.")
     parser.add_argument("--root-dirichlet-concentration", type=float, default=10.0, help="Total Dirichlet concentration across legal root actions.")
-    parser.add_argument("--mcts-max-actions", type=int, default=1024)
+    parser.add_argument("--mcts-max-actions", type=int, default=1024,
+                        help="Capacity hint; exact native adapters reserve the full ActionSpace and never truncate legal observations.")
     parser.add_argument(
         "--mcts-top-actions", type=int, default=0,
         help="PolyBot-only leaf prior filter; 0 disables, 48 is a conservative experiment.",

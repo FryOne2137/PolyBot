@@ -23,6 +23,16 @@ specific capability of the scorer, not tournament performance.
 - Search labels: accepted MCTS visit distributions and configured value targets
   from detached hypothetical worlds and game outcomes.
 
+Observation context version 1 adds own technologies/tribe, own-city population,
+initial player count, own identity, public scores,
+known-status masks and three-way map type. Opponent statuses are unknown when
+not explicitly reported; the score participation mask is not an alive flag.
+Tile encoder version 2 jointly fuses tile semantics and population in one MLP;
+the threshold is implicit in city level. Action encoder version 2 uses a single
+shared-token policy scorer, with no parallel raw-action scorer. Record all three
+version fields and this
+[input schema](observation_context.md) with architecture ablations.
+
 Native flat population training currently supports the `lakes` map path. Do not
 assume that a generic CLI `--map-type` choice implies support in every collector.
 Most current training examples use two players, Bardur/Imperius and 11×11 maps.
@@ -81,6 +91,9 @@ SQLite's backup API. Its paths may need attention after moving machines.
 compatibility checks, with a new curriculum budget. Native in-flight games and
 local opponents restart. It is not a bitwise continuation of the whole process.
 See [the detailed limits](flat_improvements.md#continuation-and-artifacts).
+Checkpoints and optimizer continuation files predating tile encoder version 2
+are incompatible with the joint encoder. Start a separate experiment from random
+weights; existing recordings/replay can still represent missing population.
 
 ## Existing benchmark
 

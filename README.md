@@ -15,7 +15,7 @@ PolyBot trains neural agents in [PolyEnv](https://github.com/FryOne2137/PolyEnv)
 | Install and check native dependencies | [Installation](docs/installation.md) |
 | Create a model, train, evaluate, save games | [Training guide](docs/training.md) |
 | Understand inputs, heads and action scoring | [Architecture](docs/architecture.md) |
-| Inspect the new relational scorer | [Relational architecture and benchmark](docs/relational_architecture.md) |
+| Inspect shared action scoring | [Relational architecture and benchmark](docs/relational_architecture.md) |
 | Understand fresh PPO fragments and terminal labels | [Flat rollouts](docs/flat_rollouts.md) |
 | Configure critic fitting, rollback and experiment records | [Flat improvements](docs/flat_improvements.md) |
 | Interpret results and reproduce experiments | [Reproducibility and model card](docs/reproducibility.md) |
@@ -85,13 +85,15 @@ python scripts/play_self.py --model models/demo/teacher.pt --mode flat --games 1
 ## Model and information flow
 
 - The shared encoder consumes a **player-visible** map, public global features and visible event history.
-- The relational policy jointly scores action type, semantic options, costs, context, and source/target/city representations. Runtime IDs act as pointers rather than learned ordinal features.
+- One joint tile encoder fuses all 24 map fields, including own-city population and city level, before map attention. There is no separate population branch.
+- A shared action encoder reads the complete legal set for policy, value and belief. Induced attention uses 16 latent tokens instead of a quadratic action-by-action matrix; native adapters trim padding only.
+- Policy scores only the shared contextual action tokens through one MLP. Type, options, costs and source/target/city features enter the shared action encoder once; there is no parallel relational scorer. Runtime IDs act as pointers rather than learned ordinal features.
 - Value predicts a scalar in `[-1, 1]`. An optional belief branch predicts hidden semantic map fields.
 - Flat action selection uses policy directly. It does not reconstruct a hidden world before every move.
 - MCTS operates on detached sampled worlds that must respect the public observation and legal-action constraints.
 - Ground truth is training supervision, never a policy/value input or an oracle world for search. Legacy training-only targets are documented separately.
 
-The relational variant is selected by the **checkpoint configuration**, not by renaming a file. Loading a factorized or attention checkpoint preserves that architecture. A new relational experiment needs its own initialization and compatible league population.
+The map-encoding profile is selected by the **checkpoint configuration**, not by renaming a file. Every profile uses the same single policy scorer. Joint tile encoder v2 and shared action encoder v2 require random initialization, a separate experiment/replay directory and a compatible league population; earlier weights are rejected explicitly. See the [complete action contract](docs/shared_actions.md).
 
 ## Results, artifacts and limits
 

@@ -23,6 +23,7 @@ from polybot.infrastructure.device import select_device
 from polybot.infrastructure.randomness import seed_everything
 from polybot.models.policy_value_belief import PolicyValueBeliefNet
 from polybot.data.token_schema import MAP_FEATURE_MAX
+from polybot.data.player_context import GLOBAL_SIZE
 
 
 def inputs(batch, side, actions, history, device):
@@ -35,13 +36,19 @@ def inputs(batch, side, actions, history, device):
     centres = min(2, side * side)
     board[:, :centres, 14] = 2
     board[:, :centres, 15] = torch.arange(centres, device=device)
+    board[:, :centres, 16] = 0
+    board = torch.cat([board, torch.randint(-2, 8, (*board.shape[:2], 1), device=device)], dim=-1)
+    globals_ = torch.zeros(batch, GLOBAL_SIZE, device=device)
+    globals_[:, :9] = torch.randn(batch, 9, device=device)
+    globals_[:, 1] = 0  # observer owns the synthetic cities above
+    globals_[:, 9+25] = 1  # known technology vector; exercise public context MLP
     categorical = torch.full((batch, actions, 12), -1, dtype=torch.long, device=device)
     categorical[..., 0] = torch.randint(0, 10, (batch, actions), device=device)
     categorical[..., 1:3] = torch.randint(0, side * side, (batch, actions, 2), device=device)
     categorical[..., 4] = torch.arange(actions, device=device) % 3 - 1
     categorical[..., 5:] = 0
     return (
-        board, torch.randn(batch, 9, device=device), categorical,
+        board, globals_, categorical,
         torch.rand(batch, actions, 4, device=device),
         torch.ones(batch, actions, dtype=torch.bool, device=device),
         torch.zeros(batch, 12, device=device),

@@ -162,9 +162,9 @@ def test_unit_only_pointer_is_equivalent_to_explicit_source_tile():
     torch.testing.assert_close(inferred.policy_logits, explicit.policy_logits, atol=0, rtol=0)
 
 
-def test_shared_relational_scorer_learns_nonadditive_source_target_preferences():
+def test_shared_action_encoder_learns_nonadditive_source_target_preferences():
     torch.manual_seed(731)
-    legacy, relational = model("factorized"), model()
+    network = model()
     state = torch.randn(1, 16)
     tiles = torch.randn(1, 9, 16)
     data = tensors()
@@ -172,14 +172,15 @@ def test_shared_relational_scorer_learns_nonadditive_source_target_preferences()
     actions[..., 4] = -1
     actions[0, :, 1] = torch.tensor([0, 0, 1, 1])
     actions[0, :, 2] = torch.tensor([2, 3, 2, 3])
-    additive = legacy._factorized_policy(state, tiles, data[0], actions, data[3])[0]
-    assert abs(float((additive[0] + additive[3] - additive[1] - additive[2]).detach())) < 1e-5
-    # Prefer opposite destinations for the two sources. No sum of independent
-    # source and destination scores can fit these preferences simultaneously.
+    # Opposite destinations for the two sources cannot be represented by an
+    # additive source + target score. The one shared encoder must learn this.
     target = torch.tensor([[0.45, 0.05, 0.05, 0.45]])
-    optimizer = torch.optim.Adam(relational.relational_policy.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(
+        [*network.action_encoder.parameters(), *network.shared_action_policy.parameters()], lr=0.001,
+    )
     for _ in range(100):
-        logits = relational.relational_policy(state, tiles, data[0], actions, data[3])
+        tokens, _ = network.action_encoder(state, tiles, data[0], actions, data[3], data[4])
+        logits = network.shared_action_policy(tokens).squeeze(-1)
         loss = -(target * logits.log_softmax(dim=-1)).sum()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -201,7 +202,7 @@ def test_empty_visibility_and_history_have_finite_backward_gradients():
     assert torch.isfinite(loss)
     assert all(torch.isfinite(p.grad).all() for p in network.parameters() if p.grad is not None)
     assert network.spatial_readout.combine[0].weight.grad.abs().sum() > 0
-    assert network.relational_policy.source_projection.weight.grad is not None
+    assert network.action_encoder.source_projection.weight.grad is not None
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
@@ -240,7 +241,7 @@ def test_checkpoint_roundtrip_and_legacy_config_default(tmp_path, architecture):
     torch.testing.assert_close(original.value, restored.value, atol=0, rtol=0)
     if architecture == "relational":
         payload = torch.load(file, weights_only=False)
-        payload["state_dict"].pop("relational_policy.score.3.weight")
+        payload["state_dict"].pop("shared_action_policy.3.weight")
         torch.save(payload, file)
         with pytest.raises(RuntimeError, match="architecture is incompatible"):
             load_model(file, torch.device("cpu"))

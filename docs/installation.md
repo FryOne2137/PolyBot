@@ -66,7 +66,8 @@ selecting CUDA does not move game simulation to the GPU.
 `check_environment.py` reports package versions, the installed PolyEnv VCS
 revision when available, device availability and required native methods.
 It deliberately omits local installation paths. A successful reset checks
-the public `[1, 121, 23]` map packet and legal actions for an 11×11 map.
+the public `[1, 121, 24]` map packet, observer metadata and legal actions for an
+11×11 map. Model/replay adapters also accept the older 23-field map format.
 
 ## Updating PolyEnv
 

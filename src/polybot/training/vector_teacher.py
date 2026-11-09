@@ -12,8 +12,10 @@ import torch
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_vector_env, require_complete_actions
 from ..config import ModelConfig, TrainingConfig
 from ..data.polyenv_features import (
+    native_global_features,
     vector_event_action_history,
     vector_event_summary,
 )
@@ -120,17 +122,7 @@ def _visible_goal_progress(
 
 def _global_features(state: np.ndarray, map_size: int, map_type: str) -> np.ndarray:
     """Adapt VectorGameEnv's documented compact state to the policy input."""
-    result = np.empty((state.shape[0], 9), dtype=np.float32)
-    result[:, 0] = state[:, 0] / 100.0       # turn
-    result[:, 1] = state[:, 1] / 16.0        # current player
-    result[:, 2] = state[:, 4] / 50.0        # stars
-    result[:, 3] = state[:, 7] / 20.0        # income
-    result[:, 4] = state[:, 5] / 32.0        # own units
-    result[:, 5] = state[:, 6] / 16.0        # own cities
-    result[:, 6] = np.maximum(state[:, 8], 0) / 1024.0  # pending city id
-    result[:, 7] = float(map_size) / 32.0
-    result[:, 8] = 1.0 if map_type == "drylands" else 0.0
-    return result
+    return native_global_features(state, map_size, map_type)
 
 
 def _teacher_targets(
@@ -178,10 +170,11 @@ def _vector_tensors(
 ) -> Dict[str, torch.Tensor]:
     features = np.asarray(batch["action_features"], dtype=np.int64)
     mask = np.asarray(batch["action_mask"], dtype=bool)
+    require_complete_actions(batch)
     action_history, action_history_mask = vector_event_action_history(batch)
     return {
         "map_tokens": torch.as_tensor(batch["map_tokens"], dtype=torch.long, device=device),
-        "global_features": torch.as_tensor(_global_features(batch["state"], training.map_size, training.map_type), device=device),
+        "global_features": torch.as_tensor(native_global_features(batch, training.map_size, training.map_type), device=device),
         "event_features": torch.as_tensor(
             vector_event_summary(batch), dtype=torch.float32, device=device
         ),
@@ -265,7 +258,7 @@ def train_vector_teacher(
     optimiser = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay)
     cuda_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
-    env = VectorGameEnv(
+    env = exact_vector_env(VectorGameEnv,
         num_envs=num_envs,
         seed=training.seed,
         map_size=training.map_size,
@@ -276,6 +269,7 @@ def train_vector_teacher(
         visible_event_history=visible_event_history,
     )
     batch = env.reset(seed=training.seed)
+    run.event("full_legal_actions", native_action_capacity=int(getattr(env, "max_actions", max_actions)))
     loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     policy_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     policy_anchor_loss_sum = torch.zeros((), dtype=torch.float32, device=device)

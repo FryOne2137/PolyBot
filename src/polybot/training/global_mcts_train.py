@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_mcts_pool
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
 from ..data.polyenv_features import (
     action_features, capture_flags, global_features_from_obs, packets_to_tensors,
@@ -228,7 +229,7 @@ def _plan_many(
     visits_by_episode = [np.zeros(len(packet["actions"]["action_id"]), dtype=np.float64) for packet in packets]
     if not belief_envs:
         return [(row, visits_by_episode[row], root_priors[row], None) for row in range(len(episodes))]
-    pool = MctsPool(
+    pool = exact_mcts_pool(MctsPool,
         belief_envs, num_threads=_transient_pool_threads(config.native_threads),
         max_actions=config.native_max_actions, c_puct=config.c_puct,
     )

@@ -9,8 +9,9 @@ from __future__ import annotations
 from typing import Sequence
 
 
-# Largest valid value in each of PolyEnv's 23 map-token columns.  The model
-# reserves class zero for -1 (hidden / unavailable / no object).
+# Largest valid value in the first 23 categorical map-token columns.
+# PolyEnv's 24th field, own_city_population, is a signed continuous auxiliary
+# input (not a belief head). The model accepts 23-field legacy observations.
 MAP_FEATURE_MAX: Sequence[int] = (
     1, 1, 100, 16, 127, 100, 1023, 3, 16, 1, 1, 16, 32, 32,
     4, 1023, 16, 100, 6, 4, 16, 100, 1023,

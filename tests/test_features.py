@@ -1,6 +1,7 @@
 import numpy as np
 
 from polybot.config import MCTSConfig
+from polybot.data.player_context import GLOBAL_SIZE
 from polybot.data.polyenv_features import (
     action_features,
     event_action_history,
@@ -64,7 +65,7 @@ def test_self_play_temperature_becomes_greedy_after_opening():
 
 def test_global_feature_vector_is_stable_when_optional_obs_keys_are_absent():
     vector = global_features_from_obs({"turn": 3, "stars": 5, "map_type": "lakes"})
-    assert vector.shape == (9,)
+    assert vector.shape == (GLOBAL_SIZE,)
     assert np.isfinite(vector).all()
 
 

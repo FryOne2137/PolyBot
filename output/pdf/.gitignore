@@ -1,0 +1,8 @@
+# Keep superseded local diagram drafts out of source control.
+*
+!.gitignore
+!render_single_action_network.py
+!polybot-one-network-single-action-policy-v2-spaced.json
+!polybot-one-network-single-action-policy-v2-spaced.pdf
+!polybot-one-network-single-action-policy-v2-spaced.png
+!polybot-one-network-single-action-policy-v2-spaced.svg

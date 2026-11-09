@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generator": "scripts/render_diagrams.py",
-  "generator_sha256": "baeff17521ed13c7bcdd96465837c1a9f088732edb27b87faa12a69748e8d872",
+  "generator_sha256": "d09270de49d80ba70b90c7682bc8a915183fd6534691c0165281af145476513d",
   "figures": {
     "architecture": {
       "svg": "architecture.svg",

@@ -21,6 +21,7 @@ from torch.distributions import Categorical
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_vector_env
 from ..config import ModelConfig, TrainingConfig
 from ..infrastructure.device import select_device
 from ..infrastructure.model_io import save_model
@@ -183,7 +184,7 @@ def train_vector_objective_curriculum(
     )
     cuda_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=cuda_amp)
-    env = VectorGameEnv(
+    env = exact_vector_env(VectorGameEnv,
         num_envs=num_envs,
         seed=training.seed,
         map_size=training.map_size,
@@ -194,6 +195,7 @@ def train_vector_objective_curriculum(
         visible_event_history=0,
     )
     batch = env.reset(seed=training.seed)
+    run.event("full_legal_actions", native_action_capacity=int(getattr(env, "max_actions", max_actions)))
     rng = np.random.default_rng(int(training.seed) ^ 0x6F424A)
     totals = {
         "loss": 0.0,

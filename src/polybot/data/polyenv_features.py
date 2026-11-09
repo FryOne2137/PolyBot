@@ -11,6 +11,12 @@ from typing import Any, Dict, Iterable, List
 
 import numpy as np
 import torch
+from .full_actions import require_complete_actions
+
+from .player_context import (
+    canonical_map_type, context_from_obs, native_player_context,
+    pad_global_features, pad_map_tokens,
+)
 
 from .token_schema import (
     ACTION_CATEGORICAL_FIELDS,
@@ -201,6 +207,7 @@ def native_batch_to_tensors(
     has no per-leaf Python packet construction, which is essential for MCTS
     throughput.
     """
+    require_complete_actions(batch)
     state = np.asarray(batch["state"], dtype=np.int32)
     # PolyEnv already emits compact int32 action features.  Do not widen this
     # entire [leaves, actions, 17] tensor on CPU: with 512 MCTS leaves and
@@ -209,16 +216,7 @@ def native_batch_to_tensors(
     # selected categorical columns are widened later, directly on the device.
     features = np.asarray(batch["action_features"], dtype=np.int32)
     count = state.shape[0]
-    global_features = np.empty((count, 9), dtype=np.float32)
-    global_features[:, 0] = state[:, 0] / 100.0
-    global_features[:, 1] = state[:, 1] / 16.0
-    global_features[:, 2] = state[:, 4] / 50.0
-    global_features[:, 3] = state[:, 7] / 20.0
-    global_features[:, 4] = state[:, 5] / 32.0
-    global_features[:, 5] = state[:, 6] / 16.0
-    global_features[:, 6] = np.maximum(state[:, 8], 0) / 1024.0
-    global_features[:, 7] = float(map_size) / 32.0
-    global_features[:, 8] = 1.0 if map_type == "drylands" else 0.0
+    global_features = native_global_features(batch, map_size, map_type)
     # Keep native packets as their compact integer dtype until they reach the
     # accelerator.  SelfPlayPool can provide pinned NumPy views, so this makes
     # the large map/action copies asynchronous on CUDA instead of first making
@@ -264,6 +262,26 @@ def native_batch_to_tensors(
     )
 
 
+def native_global_features(batch: Dict[str, np.ndarray] | np.ndarray, map_size: int, map_type: str) -> np.ndarray:
+    """Shared scalar layout for vector collection, replay and native leaves."""
+    if not isinstance(batch, dict) and not hasattr(batch, "keys"):
+        batch = {"state": batch}
+    state = np.asarray(batch["state"], dtype=np.int32)
+    if state.ndim != 2:
+        raise ValueError("native globals expect a flattened [batch,state] packet")
+    base = np.empty((len(state), 9), dtype=np.float32)
+    base[:, 0] = state[:, 0] / 100.0
+    base[:, 1] = state[:, 1] / 16.0
+    base[:, 2] = state[:, 4] / 50.0
+    base[:, 3] = state[:, 7] / 20.0
+    base[:, 4] = state[:, 5] / 32.0
+    base[:, 5] = state[:, 6] / 16.0
+    base[:, 6] = np.maximum(state[:, 8], 0) / 1024.0
+    base[:, 7] = float(map_size) / 32.0
+    base[:, 8] = float(canonical_map_type(map_type) == "drylands")
+    return np.concatenate([base, native_player_context(batch, map_type)], axis=-1)
+
+
 def _scalar(value: Any, default: float = 0.0) -> float:
     """Convert PolyEnv scalar/list values to a safe numeric feature."""
     if value is None:
@@ -279,8 +297,8 @@ def _scalar(value: Any, default: float = 0.0) -> float:
 
 
 def global_features_from_obs(obs: Dict[str, Any]) -> np.ndarray:
-    """Small, stable global vector; unknown keys are deliberately ignored."""
-    map_type = str(obs.get("map_type", "lakes")).lower()
+    """Legacy global fields plus masked observer/public context."""
+    map_type = canonical_map_type(obs.get("map_type", "lakes"))
     # Scalar ``GameEnv`` exposes the city which still needs a reward choice as
     # ``pending_city_id``.  The native path stores the same id in state[8].
     # Older PolyEnv packet names remain as a compatibility fallback, but must
@@ -302,7 +320,7 @@ def global_features_from_obs(obs: Dict[str, Any]) -> np.ndarray:
         _scalar(obs.get("map_size")) / 32.0,
         1.0 if map_type == "drylands" else 0.0,
     ]
-    return np.asarray(values, dtype=np.float32)
+    return np.concatenate([np.asarray(values, dtype=np.float32), context_from_obs(obs)])
 
 
 def event_summary(
@@ -519,8 +537,8 @@ def packet_to_tensors(
 ) -> PacketTensors:
     """Make a batch of one, retaining the current legal-action order."""
     map_tokens = np.asarray(packet["map_tokens"], dtype=np.int64)
-    if map_tokens.ndim != 2 or map_tokens.shape[1] != len(MAP_FEATURE_MAX):
-        raise ValueError("expected map_tokens with shape [tiles, 23]")
+    if map_tokens.ndim != 2 or map_tokens.shape[1] not in (23, 24):
+        raise ValueError("expected map_tokens with shape [tiles, 23 or 24]")
     categorical, continuous = action_features(packet["actions"])
     history, history_mask = event_action_history(
         events, visible_action_history
@@ -575,9 +593,9 @@ def packets_to_tensors(
     event_rows = list(events) if events is not None else [None] * len(rows)
     if len(event_rows) != len(rows):
         raise ValueError("events must have one row per packet")
-    maps = [np.asarray(packet["map_tokens"], dtype=np.int64) for packet in rows]
-    if any(row.ndim != 2 or row.shape[1] != len(MAP_FEATURE_MAX) for row in maps):
-        raise ValueError("expected every map_tokens row to have shape [tiles, 23]")
+    maps = [pad_map_tokens(np.asarray(packet["map_tokens"], dtype=np.int64)) for packet in rows]
+    if any(row.ndim != 2 or row.shape[1] != 24 for row in maps):
+        raise ValueError("expected every map_tokens row to have shape [tiles, 23 or 24]")
     if any(row.shape != maps[0].shape for row in maps[1:]):
         raise ValueError("MCTS inference batch mixes incompatible board shapes")
     action_rows = [action_features(packet["actions"]) for packet in rows]
@@ -633,10 +651,10 @@ def stack_examples(examples: Iterable[Any], device: torch.device) -> Dict[str, t
     cat_dim = rows[0].action_categorical.shape[1]
     cont_dim = rows[0].action_continuous.shape[1]
 
-    maps = np.stack([row.map_tokens for row in rows]).astype(np.int64)
-    globals_ = np.stack([row.global_features for row in rows]).astype(np.float32)
+    maps = np.stack([pad_map_tokens(row.map_tokens) for row in rows]).astype(np.int64)
+    globals_ = np.stack([pad_global_features(row.global_features) for row in rows]).astype(np.float32)
     events_ = np.stack([row.event_features for row in rows]).astype(np.float32)
-    full_maps = np.stack([row.full_map_target for row in rows]).astype(np.int64)
+    full_maps = np.stack([pad_map_tokens(row.full_map_target) for row in rows]).astype(np.int64)
     hidden = np.stack([row.hidden_mask for row in rows]).astype(bool)
     constraint_masks = np.stack([
         np.zeros_like(row.hidden_mask, dtype=bool)

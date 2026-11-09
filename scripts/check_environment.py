@@ -46,6 +46,17 @@ def main():
             batch = engine.reset(seed=2137)
             result["smoke"] = {"public_map_shape": list(batch["map_tokens"].shape),
                                "legal_actions": int(batch["action_mask"].sum())}
+            expected = {"own_techs": (1, 25), "own_tribe": (1,),
+                        "initial_player_count": (1,), "player_scores": (1, 16),
+                        "player_scores_mask": (1, 16)}
+            result["smoke"]["context_fields"] = {
+                name: name in batch and tuple(batch[name].shape) == shape
+                for name, shape in expected.items()
+            }
+            if tuple(batch["map_tokens"].shape) != (1, 121, 24) or not all(
+                result["smoke"]["context_fields"].values()
+            ):
+                result["errors"].append("unsupported_observation_context_api")
     except (ImportError, AttributeError, RuntimeError, ValueError, TypeError) as error:
         # Detailed exceptions may contain private paths; report the class only.
         result["errors"].append(f"runtime_check_failed:{type(error).__name__}")

@@ -3,4 +3,4 @@ torch>=2.3
 tqdm>=4.66
 matplotlib>=3.8
 # Tested native API baseline. Upgrade deliberately and run the full suite.
-PolyEnv @ git+https://github.com/FryOne2137/PolyEnv.git@e35a4b60b30b58504de8e3cf2b6f3fb5a36012cd
+PolyEnv @ git+https://github.com/FryOne2137/PolyEnv.git@9e82192f7eb0d9daa1cda8152673b371dcc2aba4

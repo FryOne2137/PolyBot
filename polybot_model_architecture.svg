@@ -237,43 +237,43 @@ z
     <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #2457a7" x="51.12" y="188.027305" transform="rotate(-0 51.12 188.027305)">PUBLIC INPUT</text>
    </g>
    <g id="text_4">
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 222.520312)">Player-view map: T × 23</text>
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 239.570312)">Global features + event summary</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 222.520312)">Map: T × 24 (own-city population)</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 239.570312)">Own techs/tribe + public context</text>
     <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 256.620313)">Visible history: H × 12</text>
     <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 273.670313)">Current legal candidates only</text>
     <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(51.12 290.720312)">Action semantics, costs, pointers</text>
    </g>
    <g id="text_5">
-    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="339.12" y="188.027305" transform="rotate(-0 339.12 188.027305)">SHARED MAP / HISTORY ENCODER</text>
+    <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="339.12" y="188.027305" transform="rotate(-0 339.12 188.027305)">SHARED MAP / ACTION ENCODER</text>
    </g>
    <g id="text_6">
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 222.520312)">Semantic embeddings + 2-D positions</text>
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 239.570312)">History Transformer → global context</text>
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 256.620313)">L-layer map Transformer</text>
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 273.670313)">Contextual tile states + global token</text>
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 290.720312)">Relational variant: spatial readout</text>
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 307.770313)">Mean / max / learned visible pooling</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 222.563281)">Joint tile MLP (194 → 192 → 192)</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 239.570312)">History + L-layer map Transformer</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 256.620313)">All legal actions: shared 64-D tokens</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 274.174766)">16 latents; induced set attention</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 290.720312)">Action context + map / tile states</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 307.770313)">Spatial readout over visible tiles</text>
    </g>
    <g id="text_7">
     <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #18724b" x="699.12" y="152.027305" transform="rotate(-0 699.12 152.027305)">POLICY</text>
    </g>
    <g id="text_8">
-    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 186.205031)">Type + options + global context</text>
-    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 202.790031)">Source–target / query–tile interactions</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 186.612133)">Shared tokens → one MLP (64→128→1)</text>
+    <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 202.790031)">No parallel raw-action scorer</text>
     <text style="font-size: 10.7px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 219.375031)">One masked logit per legal action</text>
    </g>
    <g id="text_9">
     <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #a85b0e" x="699.12" y="324.827305" transform="rotate(-0 699.12 324.827305)">VALUE</text>
    </g>
    <g id="text_10">
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 359.320312)">Spatial state → scalar in [−1, 1]</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 359.320312)">Map + action readout → [−1, 1]</text>
     <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(699.12 376.370312)">Game outcomes supervise the critic</text>
    </g>
    <g id="text_11">
     <text style="font-weight: 700; font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #7341a6" x="339.12" y="497.627305" transform="rotate(-0 339.12 497.627305)">OPTIONAL BELIEF DECODER</text>
    </g>
    <g id="text_12">
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 532.120312)">Public legal-action evidence</text>
+    <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 532.120312)">Shared actions + public tile evidence</text>
     <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 549.170313)">Private spatial refinement</text>
     <text style="font-size: 11px; font-family: 'DejaVu Sans'; fill: #24394d" transform="translate(339.12 566.220312)">Structured hidden-world hypotheses</text>
    </g>

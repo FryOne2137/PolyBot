@@ -16,10 +16,13 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from ..data.full_actions import exact_self_play_pool
 from ..config import MCTSConfig, ModelConfig, TrainingConfig
 from ..evaluation.matches import evaluate_direct_matches
+from ..data.player_context import flatten_player_context, polyenv_map_type
 from ..data.polyenv_features import (
     native_batch_to_tensors,
+    native_global_features,
     native_capture_flags,
     stack_examples,
 )
@@ -55,7 +58,6 @@ from .self_play_pool_train import (
     _allocate_native_buffers,
     _belief_rejection_kind,
     _finish_trajectory,
-    _native_globals,
     _root_examples,
 )
 from .value_targets import Transition
@@ -962,9 +964,9 @@ class RoutedPoolSearch:
         self._root_noise_rng = np.random.default_rng(int(seed) ^ 0xA17C0DE)
         for model in self.models:
             model.to(self.device).eval()
-        map_type = MapType.Drylands if training.map_type == "drylands" else MapType.Lakes
+        map_type = polyenv_map_type(training.map_type, MapType)
         native_threads = 0 if num_threads is None else max(1, int(num_threads))
-        self.pool = SelfPlayPool(
+        self.pool = exact_self_play_pool(SelfPlayPool,
             num_envs=self.num_envs,
             seed=int(seed),
             map_size=training.map_size,
@@ -1433,6 +1435,7 @@ class RoutedPoolSearch:
         flat_history = history.reshape(envs * players, history.shape[-2], history.shape[-1])
         flat_history_mask = history_mask.reshape(envs * players, history_mask.shape[-1])
         flat_agents = agents.reshape(-1)
+        flat_context = flatten_player_context(request)["player_context"]
         _validate_agents(flat_agents, len(self.models), "all-player belief packet")
         result = np.empty(
             (envs * players, particle_count, tiles, fields), dtype=np.int32
@@ -1456,8 +1459,9 @@ class RoutedPoolSearch:
             output = model(
                 map_tensor,
                 torch.as_tensor(
-                    _native_globals(
-                        flat_states[rows], self.training.map_size, self.training.map_type
+                    native_global_features(
+                        {"state": flat_states[rows], "player_context": flat_context[rows]},
+                        self.training.map_size, self.training.map_type
                     ),
                     dtype=torch.float32,
                     device=self.device,

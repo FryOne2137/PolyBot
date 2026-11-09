@@ -15,18 +15,26 @@ class ModelConfig:
     max_board_side: int = 32
     max_players: int = 16
     max_runtime_id: int = 512
-    # ``factorized`` scores a legal action as type + source tile + target
-    # tile + option fields.  It avoids materialising attention from every
-    # legal action to every map tile, which is both faster and less prone to
-    # memorising runtime ids.  ``attention`` remains for old checkpoints.
-    policy_architecture: str = "factorized"
-    # Opt-in ``relational`` policy: contextual source/target/city interactions
-    # in a narrow action space, without action-to-map cross attention.
+    # All heads share one legal-action encoder and policy has one token scorer.
+    # Legacy names remain as map-encoding ablations: "relational" removes
+    # runtime-ID features and adds spatial readout; the other two names use
+    # the base map/global readout. They never select a second action scorer.
+    policy_architecture: str = "relational"
+    # Spatial state-readout width (historical serialized field name).
     action_interaction_dim: int = 64
     # Private spatial capacity for the fog-of-war decoder.  It is deliberately
     # separate from ``map_transformer`` so belief calibration can learn how
     # hidden tiles relate to one another without perturbing policy/value.
     belief_decoder_layers: int = 2
+    observation_context_version: int = 1
+    # Version 2 fuses all tile semantics and population inside one encoder.
+    # It starts a new experiment; older tile weights are not interchangeable.
+    tile_encoder_version: int = 2
+    # Version 2 removes every legacy parallel policy scorer.
+    action_encoder_version: int = 2
+    action_encoder_dim: int = 64
+    action_encoder_heads: int = 4
+    action_latent_count: int = 16
 
 
 @dataclass

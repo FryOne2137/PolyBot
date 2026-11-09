@@ -2,46 +2,68 @@
 
 ![Neural model and decision paths](assets/architecture.png)
 
+A detailed [single-network diagram](../output/pdf/polybot-one-network-single-action-policy-v2-spaced.pdf)
+shows the actual default layer dimensions. Its [renderer](../output/pdf/render_single_action_network.py)
+and parameter manifest are versioned with the figure.
+
 ## Shared public-state encoder
 
-The model receives a player-view map with 23 categorical fields per tile,
-nine global features, a 12-field visible-event summary and an optional bounded
+The model receives a player-view map with 23 categorical fields plus an own-city
+population field per tile, nine legacy global features plus 126 observer/public
+context features, a 12-field visible-event summary and an optional bounded
 history of compact 12-field event tokens. The history encoder pools visible
 events into the global token before the map Transformer. This is a bounded
 history model, not a recurrent hidden state carried between network calls.
+
+The context contains the observer's technology bits and tribe, initial player
+count, own player ID, public player scores, explicitly known statuses, and a
+three-way map type. Unknown values have separate masks. Opponent technology and
+tribe data never enter this vector. One tile encoder jointly fuses categorical
+fields, including city level, with normalized own-city population and its known
+mask: at width 192 its shared MLP is `194 -> 192 -> 192`, followed by LayerNorm.
+There is no separate population branch. See the exact
+[observation schema and architecture versions](observation_context.md).
 
 The Transformer returns a global state and contextual tile representations.
 The relational variant adds mean, maximum and learned attention pooling over
 revealed tiles to the global state. Its default initializer uses width 192,
 eight map layers, eight attention heads and action interaction width 64.
 
-## Checkpoint-selected policy architectures
+A [shared action-set encoder](shared_actions.md) then encodes every legal
+candidate at width 64. Four-head induced attention uses 16 latent tokens and
+returns one contextual vector per action. Policy, value and belief all consume
+these shared features. Native adapters reserve the complete action space and
+remove only padding before the model, never actual legal candidates.
 
-| Configuration | Action scorer | Intended use |
-| --- | --- | --- |
-| `relational` | Joint nonlinear context/type/options/source/target/city interactions | Explicit new experiments initialized with `init_model.py` |
-| `factorized` | Sum of type, tile and option scores | Existing checkpoints and ablations; still the generic `ModelConfig` default |
-| `attention` | Per-action cross-attention over map tiles | Compatibility with older checkpoints |
+## One action encoder and one policy scorer
 
-All variants produce one score per currently legal candidate, followed by a
-padding/legality mask. The size of the output is not a fixed vocabulary of
-every possible game action.
+Every profile uses the same policy path:
 
-The relational scorer gathers low-dimensional source and target features,
-resolves public city/unit pointers, and combines them with action semantics
-and geometry. It does not build an action-by-map attention matrix. Runtime
-unit/city/origin IDs are omitted from its map embeddings; their magnitudes
-are not learned features. See the [detailed scorer](relational_architecture.md).
+`all legal actions + map -> shared action encoder -> A x 64 tokens -> MLP -> A logits`
+
+The policy MLP is `LayerNorm(64) -> Linear(64,128) -> GELU -> Linear(128,1)`.
+There is no separate relational scorer, old raw-action embedding table, or
+parallel sum of logits. The output has one score per currently legal candidate,
+followed by the padding mask, rather than a fixed vocabulary of all possible
+moves. Value and belief consume the same contextual action tokens.
+
+The default `policy_architecture="relational"` now names the map-encoding profile:
+it omits runtime unit/city/origin IDs as learned features, resolves IDs as public
+pointers, and uses spatial state readout. The historical `factorized` and
+`attention` names remain available for base-map encoding ablations; neither
+selects an alternative action scorer. See [shared actions](shared_actions.md)
+and the [spatial encoding details](relational_architecture.md).
 
 ## Value and belief
 
-Value is a scalar in `[-1, 1]`. Its terminal targets use candidate-relative
+Value reads both the map state and the complete contextual action set, then
+predicts a scalar in `[-1, 1]`. Its terminal targets use candidate-relative
 outcomes: win `+1`, draw `0`, loss `-1`. A learned estimate is not a calibrated
 win probability unless evaluated as such. Extra head-only critic fitting can
 update value without changing the encoder or policy.
 
-The optional belief branch conditions tile representations on the public legal
-action set, refines them spatially and predicts semantic map distributions.
+The optional belief branch conditions tile representations on the shared legal
+action tokens, refines them spatially and predicts semantic map distributions.
 Structured sampling handles terrain, settlements, units and their attributes.
 Observed tiles must be preserved; public action constraints reject inconsistent
 world proposals. Runtime IDs for sampled entities are materialization details,

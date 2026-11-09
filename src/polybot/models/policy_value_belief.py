@@ -10,10 +10,11 @@ import torch
 from torch import nn
 
 from ..config import ModelConfig
-from .relational_policy import RelationalActionPolicy, SpatialStateReadout
+from ..data.player_context import CONTEXT_SIZE, LEGACY_GLOBAL_SIZE
+from .tile_encoder import TileEncoder
+from .action_encoder import ActionEncoder
+from .relational_policy import SpatialStateReadout
 from ..data.token_schema import (
-    ACTION_CATEGORICAL_FIELDS,
-    ACTION_CONTINUOUS_FIELDS,
     EVENT_SUMMARY_SIZE,
     MAP_FEATURE_MAX,
     VISIBLE_ACTION_HISTORY_FEATURES,
@@ -22,9 +23,8 @@ from ..data.token_schema import (
 
 ACTION_FEATURE_MAX: Sequence[int] = (9, 1023, 1023, 1023, 1023, 25, 16, 90, 8, 14, 5, 1)
 
-# Runtime IDs (unit, city, source and target indexes) are not stable semantic
-# categories.  The factorized policy handles source/target through tile states
-# and intentionally excludes the remaining runtime ids from option scoring.
+# Runtime IDs are lookup keys, not stable semantic categories. The shared
+# action encoder resolves source/target/city pointers through tile states.
 FACTOR_OPTION_FEATURES: Sequence[int] = (5, 6, 7, 8, 9, 10, 11)
 RUNTIME_MAP_FEATURES = frozenset((6, 15, 22))
 
@@ -180,18 +180,24 @@ class PolicyValueBeliefNet(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
+        if config.observation_context_version != 1:
+            raise ValueError("unsupported observation_context_version")
+        if config.tile_encoder_version != 2:
+            raise ValueError("unsupported tile_encoder_version; initialize a new model with the joint tile encoder")
+        if config.action_encoder_version != 2:
+            raise ValueError("unsupported action_encoder_version")
+        if min(config.action_encoder_dim, config.action_encoder_heads, config.action_latent_count) < 1 or config.action_encoder_dim % config.action_encoder_heads:
+            raise ValueError("action encoder width must be positive and divisible by its heads; latents must be positive")
         d_model = config.d_model
         if config.policy_architecture not in {"factorized", "attention", "relational"}:
             raise ValueError("policy_architecture must be 'factorized', 'attention' or 'relational'")
         if config.action_interaction_dim < 1:
             raise ValueError("action_interaction_dim must be positive")
         self.policy_architecture = config.policy_architecture
-        self.tile_embeddings = nn.ModuleList(
-            [
-                nn.Identity() if self.policy_architecture == "relational" and index in RUNTIME_MAP_FEATURES
-                else nn.Embedding(largest + 2, d_model)
-                for index, largest in enumerate(MAP_FEATURE_MAX)
-            ]
+        self.tile_encoder = TileEncoder(
+            d_model,
+            ignored_fields=RUNTIME_MAP_FEATURES if self.policy_architecture == "relational" else (),
+            max_players=config.max_players,
         )
         self.x_embedding = nn.Embedding(config.max_board_side, d_model)
         self.y_embedding = nn.Embedding(config.max_board_side, d_model)
@@ -232,37 +238,17 @@ class PolicyValueBeliefNet(nn.Module):
         )
         self.map_norm = nn.LayerNorm(d_model)
 
-        self.action_embeddings = nn.ModuleList(
-            [nn.Embedding(largest + 2, d_model) for largest in ACTION_FEATURE_MAX]
+        self.action_encoder = ActionEncoder(
+            d_model, config.action_encoder_dim, config.action_encoder_heads,
+            config.action_latent_count, ACTION_FEATURE_MAX, FACTOR_OPTION_FEATURES, config.dropout,
         )
-        self.action_continuous = nn.Sequential(
-            nn.Linear(len(ACTION_CONTINUOUS_FIELDS), d_model), nn.GELU(), nn.Linear(d_model, d_model)
+        self.shared_action_policy = nn.Sequential(
+            nn.LayerNorm(config.action_encoder_dim), nn.Linear(config.action_encoder_dim, 2*config.action_encoder_dim),
+            nn.GELU(), nn.Linear(2*config.action_encoder_dim, 1),
         )
-        if self.policy_architecture == "attention":
-            self.action_to_map = nn.MultiheadAttention(
-                embed_dim=d_model, num_heads=config.attention_heads, dropout=config.dropout, batch_first=True
-            )
-            self.action_norm = nn.LayerNorm(d_model)
-            self.policy_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
-        elif self.policy_architecture == "relational":
+        self.belief_shared_actions = nn.Linear(config.action_encoder_dim, d_model)
+        if self.policy_architecture == "relational":
             self.spatial_readout = SpatialStateReadout(d_model, config.action_interaction_dim)
-            self.relational_policy = RelationalActionPolicy(
-                d_model, config.action_interaction_dim, ACTION_FEATURE_MAX, FACTOR_OPTION_FEATURES,
-            )
-        else:
-            # A legal action is decomposed into semantic factors.  This is
-            # equivalent to a compact action scorer, but avoids an expensive
-            # [batch, actions, tiles] attention operation at every MCTS leaf.
-            self.type_policy_head = nn.Linear(d_model, ACTION_FEATURE_MAX[0] + 2)
-            self.source_tile_policy_head = nn.Linear(d_model, 1)
-            self.target_tile_policy_head = nn.Linear(d_model, 1)
-            self.city_tile_policy_head = nn.Linear(d_model, 1)
-            self.source_present_head = nn.Linear(d_model, 1)
-            self.target_present_head = nn.Linear(d_model, 1)
-            self.city_present_head = nn.Linear(d_model, 1)
-            self.option_policy_head = nn.Sequential(
-                nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1)
-            )
         self.value_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Tanh())
         # The belief decoder receives an explicit, masked summary of the
         # current legal-action set. Source/target tile embeddings make this
@@ -283,12 +269,8 @@ class PolicyValueBeliefNet(nn.Module):
         self.belief_action_gate = nn.Sequential(
             nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model),
         )
-        # Start as the old map-only decoder. Existing checkpoints can load
-        # safely, then learn the new public action conditioning gradually.
-        nn.init.zeros_(self.belief_action_gate[-1].weight)
-        nn.init.zeros_(self.belief_action_gate[-1].bias)
-        # Preserve existing checkpoints until belief-only warm-up trains this
-        # new public-action feature path.
+        # The decoder learns a private projection of shared action tokens.
+        # The shared encoder stays frozen during belief-only calibration.
         nn.init.zeros_(self.belief_action_evidence.weight)
         nn.init.zeros_(self.belief_action_evidence.bias)
         # The shared map encoder is deliberately frozen during belief-only
@@ -329,6 +311,11 @@ class PolicyValueBeliefNet(nn.Module):
         self.belief_heads = nn.ModuleList(
             [nn.Linear(d_model, largest + 2) for largest in MAP_FEATURE_MAX]
         )
+        # Observer/public globals remain a shared addition to the global token.
+        self.observation_context = nn.Sequential(
+            nn.Linear(CONTEXT_SIZE, d_model), nn.GELU(), nn.Linear(d_model, d_model, bias=False),
+        )
+        nn.init.zeros_(self.observation_context[-1].weight)
 
     def encode_map(
         self,
@@ -339,19 +326,18 @@ class PolicyValueBeliefNet(nn.Module):
         action_history_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, tiles, _ = map_tokens.shape
+        if map_tokens.shape[-1] not in (23, 24):
+            raise ValueError("expected 23 legacy or 24 population map fields")
+        if global_features.shape[-1] not in (LEGACY_GLOBAL_SIZE, LEGACY_GLOBAL_SIZE + CONTEXT_SIZE):
+            raise ValueError("incompatible global observation schema")
+        context = global_features[..., LEGACY_GLOBAL_SIZE:]
+        global_features = global_features[..., :LEGACY_GLOBAL_SIZE]
         if self.policy_architecture == "relational":
             side = isqrt(tiles)
             if side * side != tiles or side > self.config.max_board_side:
                 raise ValueError("relational board must be square and fit max_board_side")
-        encoded = torch.zeros(
-            (batch, tiles, self.config.d_model),
-            dtype=torch.float32,
-            device=map_tokens.device,
-        )
-        for feature_index, (embedding, largest) in enumerate(zip(self.tile_embeddings, MAP_FEATURE_MAX)):
-            if self.policy_architecture == "relational" and feature_index in RUNTIME_MAP_FEATURES:
-                continue
-            encoded = encoded + embedding(_indices(map_tokens[..., feature_index], largest))
+        perspective = torch.round(global_features[..., 1] * 16).long()
+        encoded = self.tile_encoder(map_tokens, perspective)
         positions = torch.arange(tiles, device=map_tokens.device)
         width = min(self.config.max_board_side, max(1, int(round(tiles ** 0.5))))
         x_positions = self.x_embedding(positions % width)[None]
@@ -371,6 +357,11 @@ class PolicyValueBeliefNet(nn.Module):
             global_features[..., 6] = 0
         all_global_features = torch.cat([global_features, event_features], dim=-1)
         global_state = self.global_encoder(all_global_features)
+        if context.shape[-1]:
+            # No data is a zero contribution even after the new branch learns
+            # biases; old replay must never mean an empty technology tree.
+            present = (context != 0).any(dim=-1, keepdim=True)
+            global_state = global_state + self.observation_context(context) * present
         global_state = global_state + self._history_context(action_history, action_history_mask, batch, map_tokens.device)
         global_token = global_state.unsqueeze(1)
         transformed = self.map_transformer(torch.cat([global_token, encoded], dim=1))
@@ -468,29 +459,25 @@ class PolicyValueBeliefNet(nn.Module):
         state, tile_states = self.encode_map(
             map_tokens, global_features, event_features, action_history, action_history_mask
         )
-        if self.policy_architecture == "attention":
-            logits = self._attention_policy(tile_states, action_categorical, action_continuous)
-        elif self.policy_architecture == "relational":
-            logits = self.relational_policy(
-                state, tile_states, map_tokens, action_categorical, action_continuous,
-            )
-        else:
-            logits = self._factorized_policy(
-                state, tile_states, map_tokens, action_categorical, action_continuous
-            )
+        encoded_actions, value_state = self.action_encoder(
+            state, tile_states, map_tokens, action_categorical, action_continuous, action_mask,
+        )
+        # Policy has one scoring path. Raw semantics and endpoints are encoded
+        # once by action_encoder and shared with value and belief.
+        logits = self.shared_action_policy(encoded_actions).squeeze(-1)
         logits = logits.masked_fill(~action_mask, float("-inf"))
         # Simulated MCTS leaves need only policy/value.  Belief decoding is
         # reserved for real observations that seed particle worlds.
         belief_states = (
-            self._belief_tile_states(tile_states, action_categorical, action_continuous, action_mask)
+            self._belief_tile_states(tile_states, action_categorical, action_mask, encoded_actions)
             if include_belief else None
         )
         belief_logits = self._structured_belief_logits(belief_states) if belief_states is not None else []
         return ModelOutput(
             policy_logits=logits,
-            value=self.value_head(state).squeeze(-1),
+            value=self.value_head(value_state).squeeze(-1),
             belief_logits=belief_logits,
-            state=state,
+            state=value_state,
             tile_states=tile_states,
         )
 
@@ -498,32 +485,22 @@ class PolicyValueBeliefNet(nn.Module):
         self,
         tile_states: torch.Tensor,
         action_categorical: torch.Tensor,
-        action_continuous: torch.Tensor,
         action_mask: torch.Tensor,
+        encoded_actions: torch.Tensor,
     ) -> torch.Tensor:
         """Condition hidden-tile logits on the public legal action set."""
-        action_states = self.action_continuous(action_continuous)
-        for feature_index in BELIEF_ACTION_FEATURES:
-            action_states = action_states + self.action_embeddings[feature_index](
-                _indices(action_categorical[..., feature_index], ACTION_FEATURE_MAX[feature_index])
-            )
-        # Source and target are tile indexes, not learned runtime IDs.
-        for column in (1, 2):
-            indexes = action_categorical[..., column]
-            present = indexes >= 0
-            clamped = indexes.clamp_min(0).clamp_max(tile_states.shape[1] - 1)
-            spatial = tile_states.gather(
-                1, clamped.unsqueeze(-1).expand(-1, -1, tile_states.shape[-1])
-            )
-            action_states = action_states + spatial * present.unsqueeze(-1)
+        action_states = self.belief_shared_actions(encoded_actions)
         no_actions = ~action_mask.any(dim=1)
-        safe_mask = action_mask.clone()
-        if no_actions.any():
-            safe_mask[no_actions, 0] = True
-        attended, _ = self.belief_action_to_tile(
-            tile_states, action_states, action_states,
-            key_padding_mask=~safe_mask, need_weights=False,
-        )
+        if action_mask.shape[1] == 0:
+            attended = torch.zeros_like(tile_states)
+        else:
+            safe_mask = action_mask.clone()
+            if no_actions.any():
+                safe_mask[no_actions, 0] = True
+            attended, _ = self.belief_action_to_tile(
+                tile_states, action_states, action_states,
+                key_padding_mask=~safe_mask, need_weights=False,
+            )
         if no_actions.any():
             attended = attended.masked_fill(no_actions[:, None, None], 0.0)
         evidence = self._belief_action_tile_evidence(
@@ -596,91 +573,6 @@ class PolicyValueBeliefNet(nn.Module):
             logits[field] = self.belief_heads[field](unit_state)
         return logits
 
-    def _attention_policy(
-        self,
-        tile_states: torch.Tensor,
-        action_categorical: torch.Tensor,
-        action_continuous: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compatibility scorer for checkpoints created before factorization."""
-        batch, actions, _ = action_categorical.shape
-        action_states = torch.zeros(
-            (batch, actions, self.config.d_model),
-            dtype=torch.float32,
-            device=tile_states.device,
-        )
-        for feature_index, (embedding, largest) in enumerate(zip(self.action_embeddings, ACTION_FEATURE_MAX)):
-            action_states = action_states + embedding(_indices(action_categorical[..., feature_index], largest))
-        action_states = action_states + self.action_continuous(action_continuous)
-        for action_column in (1, 2):
-            indices = action_categorical[..., action_column]
-            existing = indices >= 0
-            tile_indices = indices.clamp_min(0).clamp_max(tile_states.shape[1] - 1)
-            gathered = tile_states.gather(
-                1, tile_indices.unsqueeze(-1).expand(-1, -1, tile_states.shape[-1])
-            )
-            action_states = action_states + gathered * existing.unsqueeze(-1)
-        attended, _ = self.action_to_map(action_states, tile_states, tile_states, need_weights=False)
-        return self.policy_head(self.action_norm(action_states + attended)).squeeze(-1)
-
-    def _factorized_policy(
-        self,
-        state: torch.Tensor,
-        tile_states: torch.Tensor,
-        map_tokens: torch.Tensor,
-        action_categorical: torch.Tensor,
-        action_continuous: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score legal actions using only semantic action factors.
-
-        Source/target indexes select encoded map tiles; they are never passed
-        through a learned id embedding.  Consequently the score transfers to
-        new boards and does not memorise ephemeral unit/city ids.
-        """
-        option_states = self.action_continuous(action_continuous)
-        for feature_index in FACTOR_OPTION_FEATURES:
-            option_states = option_states + self.action_embeddings[feature_index](
-                _indices(action_categorical[..., feature_index], ACTION_FEATURE_MAX[feature_index])
-            )
-        option_score = self.option_policy_head(option_states).squeeze(-1)
-
-        type_scores = self.type_policy_head(state)
-        type_index = _indices(action_categorical[..., 0], ACTION_FEATURE_MAX[0])
-        type_score = type_scores.gather(1, type_index)
-
-        def tile_score(column: int, tile_head: nn.Linear, present_head: nn.Linear) -> torch.Tensor:
-            indices = action_categorical[..., column]
-            present = indices >= 0
-            safe_indices = indices.clamp_min(0).clamp_max(tile_states.shape[1] - 1)
-            scores = tile_head(tile_states).squeeze(-1)
-            selected = scores.gather(1, safe_indices)
-            present_bias = present_head(state).squeeze(-1).unsqueeze(1)
-            return (selected + present_bias) * present.to(selected.dtype)
-
-        # City actions name a runtime city id instead of a tile. Resolve that
-        # pointer through the observed city-centre token (map column 15), then
-        # score its encoded local state. This preserves city-specific choices
-        # without learning an arbitrary city-id embedding.
-        city_ids = action_categorical[..., 4]
-        city_present = city_ids >= 0
-        map_city_ids = map_tokens[..., 15]
-        city_matches = city_ids.unsqueeze(-1).eq(map_city_ids.unsqueeze(1)) & city_present.unsqueeze(-1)
-        city_tile_scores = self.city_tile_policy_head(tile_states).squeeze(-1).unsqueeze(1)
-        matched_city_score = city_tile_scores.masked_fill(~city_matches, float("-inf")).amax(dim=-1)
-        city_score = torch.where(
-            city_matches.any(dim=-1),
-            matched_city_score + self.city_present_head(state).squeeze(-1).unsqueeze(1),
-            torch.zeros_like(matched_city_score),
-        )
-
-        return (
-            option_score
-            + type_score
-            + tile_score(1, self.source_tile_policy_head, self.source_present_head)
-            + tile_score(2, self.target_tile_policy_head, self.target_present_head)
-            + city_score
-        )
-
     @torch.no_grad()
     def sample_completed_maps(
         self,
@@ -704,12 +596,15 @@ class PolicyValueBeliefNet(nn.Module):
         """
         if map_tokens.shape[0] != 1:
             raise ValueError("MCTS particle generation currently expects a batch of one")
-        _, tile_states = self.encode_map(
+        state, tile_states = self.encode_map(
             map_tokens, global_features, event_features, action_history, action_history_mask
         )
         if action_categorical is not None and action_continuous is not None and action_mask is not None:
+            encoded_actions, _ = self.action_encoder(
+                state, tile_states, map_tokens, action_categorical, action_continuous, action_mask,
+            )
             tile_states = self._belief_tile_states(
-                tile_states, action_categorical, action_continuous, action_mask
+                tile_states, action_categorical, action_mask, encoded_actions
             )
         belief_logits = self._structured_belief_logits(tile_states)
         return self.sample_completed_maps_from_belief_logits(
@@ -745,7 +640,7 @@ class PolicyValueBeliefNet(nn.Module):
         # its road/building/settlement/resource/terrain/tribe fields.
         empty_tile = torch.tensor(
             [0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
-             0, -1, -1, -1, 0, 2, 0, -1, -1],
+             0, -1, -1, -1, 0, 2, 0, -1, -1] + [-1] * (observed.shape[-1] - 23),
             dtype=observed.dtype,
             device=observed.device,
         )
@@ -877,7 +772,7 @@ class PolicyValueBeliefNet(nn.Module):
         known = observed[..., 0] == 1
         empty_tile = torch.tensor(
             [0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
-             0, -1, -1, -1, 0, 2, 0, -1, -1],
+             0, -1, -1, -1, 0, 2, 0, -1, -1] + [-1] * (observed.shape[-1] - 23),
             dtype=observed.dtype,
             device=observed.device,
         )
@@ -1120,7 +1015,7 @@ class PolicyValueBeliefNet(nn.Module):
         known = observed[..., 0] == 1
         empty_tile = torch.tensor(
             [0, 0, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, -1,
-             0, -1, -1, -1, 0, 2, 0, -1, -1],
+             0, -1, -1, -1, 0, 2, 0, -1, -1] + [-1] * (observed.shape[-1] - 23),
             dtype=observed.dtype,
             device=observed.device,
         )

@@ -316,9 +316,11 @@ def run_mixed_arenas(model_a, model_b, device, training, schedule, *, record, po
     collator = _NativeCollator(device)
     games = sum(2 * item[2] for item in schedule)
     completed, turns = 0, 0
+    outcomes = dict(wins=0, losses=0, draws=0, truncated=0)
     maximum_moves = 0
     with tqdm(total=games, desc=f"evaluate mixed {model_a_label} vs {model_b_label}",
               unit="game", dynamic_ncols=True) as progress:
+        progress.set_postfix(**outcomes, live=0, pending=games, batch=0, moves=0)
         while pending or active:
             resident = sum(arena.maps for arena in active)
             while pending and resident + pending[0][2] <= capacity:
@@ -332,13 +334,21 @@ def run_mixed_arenas(model_a, model_b, device, training, schedule, *, record, po
             stats["max_resident_games"] = max(stats["max_resident_games"], 2 * resident)
             choices = _policy_actions(model_a, model_b, active, device, same_policy, stats, collator, size_bucketing)
             environment_started = perf_counter()
+            previous_completed = completed
             for arena, actions in zip(active, choices):
-                previous = int(arena.done.sum())
+                previous = arena.done.copy()
                 arena.advance(actions)
                 maximum_moves = max(maximum_moves, int(arena.counts["moves"].max()))
-                newly_done = int(arena.done.sum()) - previous
-                completed += newly_done
-                progress.update(newly_done)
+                finished = arena.done & ~previous
+                terminal = finished & arena.terminated
+                candidate_players = np.arange(2)[:, None]
+                outcomes["wins"] += int(np.count_nonzero(terminal & (arena.winners == candidate_players)))
+                outcomes["losses"] += int(np.count_nonzero(terminal & (arena.winners >= 0) & (arena.winners != candidate_players)))
+                outcomes["draws"] += int(np.count_nonzero(terminal & (arena.winners < 0)))
+                outcomes["truncated"] += int(np.count_nonzero(finished & ~arena.terminated))
+                count = int(finished.sum())
+                completed += count
+                progress.update(count)
                 if arena.done.all():
                     rows = arena.game_rows()
                     rows_by_group[arena.group].extend(rows)
@@ -350,8 +360,8 @@ def run_mixed_arenas(model_a, model_b, device, training, schedule, *, record, po
             del arena
             active = [arena for arena in active if not arena.done.all()]
             turns += 1
-            if turns % 10 == 0 or not active:
-                progress.set_postfix(live=sum(int((~a.done).sum()) for a in active),
+            if completed != previous_completed or turns % 10 == 0 or not active:
+                progress.set_postfix(**outcomes, live=sum(int((~a.done).sum()) for a in active),
                     pending=games-completed-sum(int((~a.done).sum()) for a in active),
                     batch=stats["max_inference_batch"],
                     moves=maximum_moves)
@@ -359,8 +369,12 @@ def run_mixed_arenas(model_a, model_b, device, training, schedule, *, record, po
     stats["elapsed_seconds"] = perf_counter() - started
     stats["environment_steps"] = sum(row["moves"] for row, _ in statistics)
     stats["environment_steps_per_second"] = stats["environment_steps"] / max(.000001, stats["elapsed_seconds"])
+    stats.update(wins=outcomes["wins"], losses=outcomes["losses"],
+                 terminal_draws=outcomes["draws"], truncated_games=outcomes["truncated"])
     mean_batch = stats["inference_rows"] / max(1, stats["model_forwards"])
     padding = stats["padded_tile_tokens"] / max(1, stats["real_tile_tokens"])
+    print("mixed evaluation results | " + " | ".join(f"{name}={count}" for name, count in outcomes.items())
+          + f" | games={games}", flush=True)
     print(f"mixed evaluation batching | mean_batch={mean_batch:.1f} | peak_batch={stats['max_inference_batch']} "
           f"| forwards={stats['model_forwards']} | tile_padding={padding:.2f}x "
           f"| shared_policy={int(same_policy)} | size_bucketing={size_bucketing}", flush=True)

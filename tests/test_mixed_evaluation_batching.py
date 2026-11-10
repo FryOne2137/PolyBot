@@ -192,6 +192,60 @@ def test_terminal_rows_stop_stepping_while_sibling_games_continue(monkeypatch):
     assert submitted[0][0] >= 0 and submitted[1][0] == submitted[2][0] == -1
 
 
+def test_live_outcome_counters_separate_draws_and_truncations_across_cohorts(monkeypatch, capsys):
+    from polybot.evaluation import mixed_matches
+    class Progress:
+        def __init__(self):
+            self.n, self.frames = 0, []
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def update(self, count):
+            self.n += count
+        def set_postfix(self, **values):
+            self.frames.append((self.n, values))
+    progress = Progress()
+    monkeypatch.setattr(mixed_matches, 'tqdm', lambda **kwargs: progress)
+    original = mixed_matches._Arena.advance
+    def controlled_endings(arena, actions):
+        original(arena, actions)
+        age = getattr(arena, '_test_age', 0) + 1
+        arena._test_age = age
+        # Actual native sibling positions keep running. Control only terminal
+        # notifications so all four result categories occur deterministically.
+        if arena.group == 1 and age == 1:
+            arena.done[:] = True
+            arena.terminated[:] = True
+            arena.winners[:] = -1
+        elif arena.group == 0 and age <= 3:
+            player, row, winner = ((0, 0, 0), (1, 0, 0), (0, 1, -1))[age-1]
+            arena.done[player, row] = True
+            arena.terminated[player, row] = True
+            arena.winners[player, row] = winner
+    monkeypatch.setattr(mixed_matches._Arena, 'advance', controlled_endings)
+    schedule = [(FlatDomain(11, 'lakes', (1, 5)), 1073743961, 2, .5, 0),
+                (FlatDomain(11, 'drylands', (3, 7)), 1073743963, 1, .5, 4)]
+    model = network()
+    summaries, stats = run_mixed_arenas(model, model, torch.device('cpu'),
+        TrainingConfig(max_moves=4), schedule, record=lambda *args: None,
+        num_threads=1, max_actions=1, max_live_games=8)
+    expected = [(0, 0, 0, 0, 0), (3, 1, 0, 2, 0), (4, 1, 1, 2, 0),
+                (5, 1, 1, 3, 0), (6, 1, 1, 3, 1)]
+    assert [(done, row['wins'], row['losses'], row['draws'], row['truncated'])
+            for done, row in progress.frames] == expected
+    for done, row in progress.frames:
+        assert sum(row[k] for k in ('wins', 'losses', 'draws', 'truncated')) == done
+        assert done + row['live'] + row['pending'] == 6
+    assert stats['flat_evaluation_wins'] == stats['flat_evaluation_losses'] == 1
+    assert stats['flat_evaluation_terminal_draws'] == 3
+    assert stats['flat_evaluation_truncated_games'] == 1
+    # Existing score-compatible aggregate draws still include the truncated
+    # half-point game; the newly displayed counts are mutually exclusive.
+    assert sum(result['draws'] for result, _ in summaries) == 4
+    assert 'mixed evaluation results | wins=1 | losses=1 | draws=3 | truncated=1 | games=6' in capsys.readouterr().out
+
+
 def test_padded_board_contract_rejects_invalid_sizes_and_belief():
     model = network()
     group = EpisodeVectorPool(FlatDomain(11, 'lakes', (1, 5)), num_envs=2, seed=2137,

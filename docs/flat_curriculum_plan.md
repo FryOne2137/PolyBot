@@ -129,6 +129,14 @@ One progress bar covers the whole arena. Results also record mean/peak inference
 batch size, model forward count, resident games, tile-padding ratio and whether
 the policy route was shared. These counters describe batching, not GPU utilization
 or training progress.
+The progress bar and final `mixed evaluation results` line show disjoint counts:
+`wins`, `losses`, terminal `draws`, and `truncated` games stopped at the arena
+move limit. They update as individual games finish, even while other games in
+their native cohort remain live. Their sum equals completed games. Matching
+`flat_evaluation_wins`, `flat_evaluation_losses`, `flat_evaluation_terminal_draws`
+and `flat_evaluation_truncated_games` counters are returned for run artifacts.
+The existing aggregate `draws`/score contract still counts a move-limit game as
+half a point; promotion thresholds and game outcomes are unchanged.
 Timing diagnostics additionally separate CPU preparation, policy input/inference,
 native engine/position callbacks and arena setup. The inference interval includes
 H2D copies and the action-result synchronization; it is not isolated kernel time.

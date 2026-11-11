@@ -192,7 +192,7 @@ def test_terminal_rows_stop_stepping_while_sibling_games_continue(monkeypatch):
     assert submitted[0][0] >= 0 and submitted[1][0] == submitted[2][0] == -1
 
 
-def test_live_outcome_counters_separate_draws_and_truncations_across_cohorts(monkeypatch, capsys):
+def test_progress_merges_draws_and_truncations_and_counts_all_unfinished_games(monkeypatch, capsys):
     from polybot.evaluation import mixed_matches
     class Progress:
         def __init__(self):
@@ -203,8 +203,8 @@ def test_live_outcome_counters_separate_draws_and_truncations_across_cohorts(mon
             pass
         def update(self, count):
             self.n += count
-        def set_postfix(self, **values):
-            self.frames.append((self.n, values))
+        def set_postfix(self, ordered_dict=None, **values):
+            self.frames.append((self.n, dict(ordered_dict or {}) | values))
     progress = Progress()
     monkeypatch.setattr(mixed_matches, 'tqdm', lambda **kwargs: progress)
     original = mixed_matches._Arena.advance
@@ -230,20 +230,23 @@ def test_live_outcome_counters_separate_draws_and_truncations_across_cohorts(mon
     summaries, stats = run_mixed_arenas(model, model, torch.device('cpu'),
         TrainingConfig(max_moves=4), schedule, record=lambda *args: None,
         num_threads=1, max_actions=1, max_live_games=8)
-    expected = [(0, 0, 0, 0, 0), (3, 1, 0, 2, 0), (4, 1, 1, 2, 0),
-                (5, 1, 1, 3, 0), (6, 1, 1, 3, 1)]
-    assert [(done, row['wins'], row['losses'], row['draws'], row['truncated'])
+    expected = [(0, 0, 0, 0), (3, 1, 0, 2), (4, 1, 1, 2),
+                (5, 1, 1, 3), (6, 1, 1, 4)]
+    assert [(done, row['wins'], row['losses'], row['draws'])
             for done, row in progress.frames] == expected
     for done, row in progress.frames:
-        assert sum(row[k] for k in ('wins', 'losses', 'draws', 'truncated')) == done
-        assert done + row['live'] + row['pending'] == 6
+        assert list(row) == ['unfinished', 'moves', 'draws', 'losses', 'wins']
+        assert sum(row[k] for k in ('wins', 'losses', 'draws')) == done
+        assert done + row['unfinished'] == 6
     assert stats['flat_evaluation_wins'] == stats['flat_evaluation_losses'] == 1
     assert stats['flat_evaluation_terminal_draws'] == 3
     assert stats['flat_evaluation_truncated_games'] == 1
-    # Existing score-compatible aggregate draws still include the truncated
-    # half-point game; the newly displayed counts are mutually exclusive.
+    # Console draws match the score contract, while artifacts retain the
+    # distinction needed to exclude truncated games from terminal value labels.
     assert sum(result['draws'] for result, _ in summaries) == 4
-    assert 'mixed evaluation results | wins=1 | losses=1 | draws=3 | truncated=1 | games=6' in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert 'mixed evaluation results | games=6 | draws=4 | losses=1 | wins=1' in output
+    assert 'truncated=' not in output and 'batch=' not in output
 
 
 def test_padded_board_contract_rejects_invalid_sizes_and_belief():

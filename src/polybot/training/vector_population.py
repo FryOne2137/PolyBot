@@ -5289,6 +5289,7 @@ def train_direct_population_curriculum(
                 "ppo_learning_rate": current_ppo_learning_rate,
                 "environment_restored": False,
             })
+        print(flush=True)
         if (
             completed >= minimum_steps
             and not accepted

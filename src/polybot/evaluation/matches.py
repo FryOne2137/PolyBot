@@ -667,13 +667,13 @@ def evaluate_direct_matches(
                         completed_scores.append(
                             0.5 if winner < 0 else float(winner == player)
                         )
-                progress.set_postfix(
-                    wins=sum(score == 1.0 for score in completed_scores),
+                progress.set_postfix(dict(
+                    unfinished=games - completed,
+                    moves=max(int(item.max()) for item in moves),
                     draws=sum(score == 0.5 for score in completed_scores),
                     losses=sum(score == 0.0 for score in completed_scores),
-                    live=games - completed,
-                    moves=max(int(item.max()) for item in moves),
-                )
+                    wins=sum(score == 1.0 for score in completed_scores),
+                ))
 
     game_rows: list[Dict[str, float | int]] = []
     scores: list[float] = []
@@ -888,12 +888,13 @@ def _evaluate_direct_matches_on_map_seeds(
                     "truncated": int(not terminal),
                 })
             progress.update(1)
-            progress.set_postfix(
-                wins=int(totals["model_a_wins"]),
+            progress.set_postfix(dict(
+                unfinished=games - game_index - 1,
+                moves=moves,
                 draws=int(totals["draws"]),
                 losses=int(totals["model_a_losses"]),
-                moves=moves,
-            )
+                wins=int(totals["model_a_wins"]),
+            ))
     totals["model_a_win_rate"] = totals["model_a_wins"] / max(1.0, float(games))
     totals["model_a_score"] = float(np.mean(scores)) if scores else 0.0
     map_scores = [

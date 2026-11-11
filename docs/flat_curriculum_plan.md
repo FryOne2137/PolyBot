@@ -129,10 +129,12 @@ One progress bar covers the whole arena. Results also record mean/peak inference
 batch size, model forward count, resident games, tile-padding ratio and whether
 the policy route was shared. These counters describe batching, not GPU utilization
 or training progress.
-The progress bar and final `mixed evaluation results` line show disjoint counts:
-`wins`, `losses`, terminal `draws`, and `truncated` games stopped at the arena
-move limit. They update as individual games finish, even while other games in
-their native cohort remain live. Their sum equals completed games. Matching
+The progress bar shows `unfinished` (all active and queued games), `moves`,
+`draws`, `losses`, and finally `wins`. Console draws include games stopped at
+the arena move limit. They update as individual games finish, even while other
+games in their native cohort remain live. Their sum equals completed games.
+The final `mixed evaluation results` line uses the same aggregate draws.
+Batching details are retained in run artifacts rather than printed separately. Matching
 `flat_evaluation_wins`, `flat_evaluation_losses`, `flat_evaluation_terminal_draws`
 and `flat_evaluation_truncated_games` counters are returned for run artifacts.
 The existing aggregate `draws`/score contract still counts a move-limit game as

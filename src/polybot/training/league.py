@@ -7093,6 +7093,7 @@ def train_promotion_league(
                     raise
                 finally:
                     current_round_id[0] = None
+                    print("\n", flush=True)
 
             summary: Dict[str, float | str] = {
                 "league_rounds": float(rounds),

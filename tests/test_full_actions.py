@@ -164,6 +164,54 @@ def test_routed_unsearched_roots_keep_the_public_action_packet(active, searched)
     assert request["action_valid"][active].all()
 
 
+def test_belief_calibration_trains_on_public_rollouts_with_rejected_particles(
+    monkeypatch, tmp_path
+):
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch, train_population_pool
+    from polybot.training.run_artifacts import TrainingRun
+
+    monkeypatch.setattr(TrainingRun, "_write_plots", lambda self: None)
+
+    def invalid_particles(maps, count, axis):
+        particles = np.repeat(np.expand_dims(maps, axis), count, axis=axis)
+        particles[..., 0] = 2  # A proposal must preserve the observed visibility mask.
+        return particles
+
+    monkeypatch.setattr(
+        RoutedPoolSearch, "_all_player_particles",
+        lambda self, request, count, *args: invalid_particles(request["map_tokens"], count, 2),
+    )
+    monkeypatch.setattr(
+        RoutedPoolSearch, "_actor_particles",
+        lambda self, request, rows, count, *args: invalid_particles(
+            request["map_tokens"][rows], count, 1
+        ),
+    )
+    candidate = tiny_model()
+    before = {name: tensor.clone() for name, tensor in candidate.state_dict().items()}
+    replay = []
+    result = train_population_pool(
+        TrainingConfig(device="cpu", seed=1732409, max_moves=96, batch_size=8),
+        candidate.config, MCTSConfig(simulations=3, particles=2),
+        games=4, updates_per_game=1, candidate=candidate,
+        opponent_models=[tiny_model()], opponent_weights=[1.0],
+        belief_only=True, raw_policy_only=True, offline_collection=True,
+        max_envs=4, num_threads=1, visible_action_history=32,
+        replay_snapshot_callback=replay.extend,
+        run=TrainingRun.create(tmp_path, "belief-regression"),
+    )
+
+    assert result["population_pool_completion_rate"] == 1
+    assert result["population_pool_updates"] == 4
+    assert result["belief_action_equivalence_checked_particles"] > 0
+    assert result["belief_action_equivalence_rejection_rate"] == 1
+    assert result["belief_slot_resets"] == result["population_pool_leaf_rows"] == 0
+    assert replay and all(example.policy_loss_weight == 0 for example in replay)
+    changed = [name for name, tensor in candidate.state_dict().items()
+               if not torch.equal(before[name], tensor)]
+    assert changed and all(name.startswith("belief_") for name in changed)
+
+
 @pytest.mark.parametrize("phase", ["teacher", "actor_critic", "objectives"])
 def test_native_vector_training_phases_learn_with_capacity_hint_one(tmp_path, monkeypatch, phase):
     from polybot.training.run_artifacts import TrainingRun

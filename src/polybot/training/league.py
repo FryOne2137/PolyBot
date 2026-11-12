@@ -95,6 +95,7 @@ def _belief_validation_signature(
 ) -> dict[str, Any]:
     """Describe every setting that changes a belief held-out measurement."""
     return {
+        "collector": "public_raw_without_belief_recovery",
         "map_size": int(training.map_size),
         "map_type": str(training.map_type),
         "particles": int(mcts.particles),
@@ -5918,11 +5919,8 @@ def train_promotion_league(
                                 max_envs=min(num_envs, population_max_envs),
                                 offline_collection=population_offline_collection,
                                 belief_only=belief_calibration_required,
-                                # Calibration learns whether particles respect
-                                # public action evidence. It does not need a
-                                # tree or MCTS visit targets, so execute raw
-                                # actions after the same strict particle
-                                # validation and keep this stage affordable.
+                                # Measure particle mismatches on the games
+                                # actually played by the public raw policy.
                                 raw_policy_only=belief_calibration_required,
                                 game_callback=record_training_game,
                                 reserved_seeds=evaluation_map_seeds,

@@ -1628,13 +1628,13 @@ class RoutedPoolSearch:
         mcts_mask: np.ndarray | None = None,
         direct_policy: np.ndarray | None = None,
         direct_value: np.ndarray | None = None,
+        raw_policy_only: bool = False,
     ) -> Dict[str, np.ndarray]:
         """Run full or selective routed belief-MCTS for one vector decision.
 
-        Rows outside ``mcts_mask`` execute the public raw policy. Belief
-        diagnostics and submission still run because the native SelfPlayPool
-        requires beliefs for checked stepping. Standalone raw evaluation
-        uses the public environment directly.
+        Rows outside ``mcts_mask`` execute the public raw policy. In raw-only
+        collection, learned particles are measured for belief supervision and
+        the public decision is returned without constructing a search forest.
         """
         for model in self.models:
             model.eval()
@@ -1642,7 +1642,7 @@ class RoutedPoolSearch:
         if active.shape != (self.num_envs,):
             raise ValueError("active mask must have shape [num_envs]")
         if mcts_mask is None:
-            mcts_mask = active.copy()
+            mcts_mask = np.zeros_like(active) if raw_policy_only else active.copy()
         else:
             mcts_mask = np.asarray(mcts_mask, dtype=bool)
             if mcts_mask.shape != (self.num_envs,):
@@ -1650,8 +1650,12 @@ class RoutedPoolSearch:
             if np.any(mcts_mask & ~active):
                 raise ValueError("mcts_mask must be a subset of active slots")
             mcts_mask = mcts_mask.copy()
+        if raw_policy_only and mcts_mask.any():
+            raise ValueError("raw-policy collection cannot run MCTS")
         direct_rows = active & ~mcts_mask
-        if direct_rows.any() and (direct_policy is None or direct_value is None):
+        if (raw_policy_only or direct_rows.any()) and (
+            direct_policy is None or direct_value is None
+        ):
             inferred_policy, inferred_value = self.direct_policy_value(
                 request, np.flatnonzero(direct_rows).astype(np.int32)
             )
@@ -1710,15 +1714,36 @@ class RoutedPoolSearch:
             candidate_active.sum() * particle_count
         )
         candidate_rows = np.flatnonzero(candidate_active)
-        if candidate_rows.size:
-            self.counters.belief_action_equivalence_rejected_particles += int(
-                initial_action_rejected_mask[
-                    candidate_rows, actors[candidate_rows]
-                ].sum()
+        rejected_candidates = initial_action_rejected_mask[
+            candidate_rows, actors[candidate_rows]
+        ]
+        if raw_policy_only and candidate_rows.size:
+            # The action diff may be empty when a proposed world cannot even
+            # be built. Count those proposals as failures of calibration too.
+            _, native_rejected_mask, _, _ = ismcts_rejected_envs(
+                self.pool, state_ids, particles, submit_failed=False
             )
+            rejected_candidates |= native_rejected_mask[
+                candidate_rows, actors[candidate_rows]
+            ]
+        self.counters.belief_action_equivalence_rejected_particles += int(
+            rejected_candidates.sum()
+        )
         self._capture_engine_action_constraints(
             initial_action_diagnostics, active, actors, request
         )
+        if raw_policy_only:
+            assert direct_policy is not None and direct_value is not None
+            self.counters.belief_action_equivalence_rejected_envs += int(
+                rejected_candidates.any(axis=1).sum()
+            )
+            return {
+                "action_id": request["action_id"],
+                "action_mask": request["action_mask"],
+                "state_id": state_ids,
+                "policy": direct_policy,
+                "root_value": direct_value,
+            }
         # A particle which changes the active player's public action set is
         # not merely a root-display issue: its descendants would be searched
         # in an impossible world. ``root_shield`` may remap a completed root
@@ -2009,6 +2034,25 @@ class RoutedPoolSearch:
                 probabilities.max()
             )
         return self.root
+
+    def step_public_policy(
+        self,
+        actions: np.ndarray,
+        state_ids: np.ndarray,
+        request: dict[str, np.ndarray],
+    ) -> None:
+        """Advance already chosen public actions in the pinned SelfPlayPool."""
+        # The binding requires a submitted root even for a checked live step.
+        # Install a single exact snapshot only after the raw actions have been
+        # chosen, preserve the actor's view, then step immediately. Never use
+        # this snapshot for inference, particle diagnostics or tree expansion.
+        public_map = request["map_tokens"]
+        visible = public_map[..., 0] == 1
+        snapshot = self.pool.belief_targets_numpy(state_ids)
+        snapshot[..., 0] = public_map[..., 0]
+        snapshot[visible] = public_map[visible]
+        self.pool.submit_beliefs(state_ids, np.ascontiguousarray(snapshot))
+        self.pool.step_into_checked(actions, state_ids, request)
 
     def drain_completed(self) -> Dict[str, np.ndarray]:
         count = int(self.pool.drain_completed_into(self.completed))
@@ -3272,9 +3316,6 @@ def train_population_pool(
                 direct_value = None
                 if raw_policy_only:
                     mcts_mask = np.zeros(count, dtype=bool)
-                    direct_policy, direct_value = search.direct_policy_value(
-                        request, np.flatnonzero(active).astype(np.int32)
-                    )
                 elif selective_mcts:
                     (
                         mcts_mask,
@@ -3304,6 +3345,7 @@ def train_population_pool(
                         mcts_mask=mcts_mask,
                         direct_policy=direct_policy,
                         direct_value=direct_value,
+                        raw_policy_only=raw_policy_only,
                     )
                 except BeliefRecoveryRequired as error:
                     reset_rows, active_reset_rows, inactive_reset_rows = partition_recovery_envs(
@@ -3544,11 +3586,10 @@ def train_population_pool(
                 actions[active_rows] = np.asarray(root["action_id"], dtype=np.int32)[
                     active_rows, action_rows[active_rows]
                 ]
-                search.pool.step_into_checked(
-                    actions,
-                    np.asarray(root["state_id"], dtype=np.uint64),
-                    request,
-                )
+                if raw_policy_only:
+                    search.step_public_policy(actions, root["state_id"], request)
+                else:
+                    search.pool.step_into_checked(actions, root["state_id"], request)
                 for env in active_rows:
                     action_prefixes[int(env)].append(int(actions[int(env)]))
                 moves[active] += 1

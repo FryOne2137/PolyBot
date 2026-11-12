@@ -224,9 +224,28 @@ class ExactActionNative:
             logits = padded
         self.native.expand_and_backup(leaf_ids, logits, values)
 
-    def root_policy_into(self, buffers, temperature=1.0):
+    def root_policy_into(self, buffers, temperature=1.0, *, public_request=None, search_mask=None):
+        """Read search roots, using public actions for slots outside the search."""
         raw = self._raw("root_policy_spec")
         self.native.root_policy_into(raw, temperature=temperature)
+        if public_request is not None:
+            searched = np.asarray(search_mask, dtype=bool)
+            if searched.shape != raw["action_mask"].shape[:1]:
+                raise ValueError("root search mask must have one entry per slot")
+            unsearched = ~searched
+            if unsearched.any():
+                # An unexpanded native root can have an empty tree-action
+                # mask and still report the live game's legal action count.
+                # Assemble the public rows before validating or compacting.
+                width = public_request["action_mask"].shape[1]
+                for name, padding in (("action_id", -1), ("action_mask", 0)):
+                    raw[name][unsearched, :width] = public_request[name][unsearched]
+                    raw[name][unsearched, width:] = padding
+                for name in ("total_legal_action_count", "action_truncated"):
+                    if name in raw:
+                        raw[name][unsearched] = public_request[name][unsearched]
+                for name in ("policy", "visit_count", "root_visit_count", "root_value"):
+                    raw[name][unsearched] = 0
         self._write(buffers, raw)
 
     def root_policy(self, temperature=1.0):

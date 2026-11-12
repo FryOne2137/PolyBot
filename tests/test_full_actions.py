@@ -124,6 +124,46 @@ def test_routed_search_runs_multiple_masked_waves_with_all_actions():
     require_complete_actions(request)
 
 
+@pytest.mark.parametrize("active, searched", [
+    ([True, True], [False, False]),  # belief calibration
+    ([True, True], [False, True]),   # selective MCTS
+    ([False, True], [False, True]),  # a slot has reached its move limit
+])
+def test_routed_unsearched_roots_keep_the_public_action_packet(active, searched):
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    search = RoutedPoolSearch(
+        TrainingConfig(device="cpu"), MCTSConfig(simulations=3, particles=1, native_max_actions=1),
+        [tiny_model()], num_envs=2, num_threads=1, max_pending_leaves=2,
+        visible_action_history=2, belief_retries=0, seed=1732409,
+    )
+    request = search.reset(np.array([1732409, 1732410], dtype=np.uint32),
+                           np.zeros((2, 2), dtype=np.int32))
+    # The unsearched slot has the widest public action row in the batch.
+    assert request["total_legal_action_count"].tolist() == [15, 14]
+    worlds = exact_test_worlds(search.pool, request["state_id"].copy())
+    search._all_player_particles = lambda *args: worlds.copy()
+    search._actor_particles = lambda request, rows, *args: worlds[
+        rows, request["to_play"][rows]].copy()
+    active, searched = np.array(active), np.array(searched)
+    direct = active & ~searched
+    policy, value = search.direct_policy_value(request, np.flatnonzero(direct))
+    root = search.search(request, active, root_temperature=1, belief_temperature=.15,
+                         prior_scale=0, mcts_mask=searched, direct_policy=policy,
+                         direct_value=value)
+
+    require_complete_actions(root)
+    np.testing.assert_array_equal(root["action_id"], request["action_id"])
+    np.testing.assert_array_equal(root["action_mask"], request["action_mask"])
+    np.testing.assert_allclose(root["policy"][direct], policy[direct])
+    np.testing.assert_allclose(root["root_value"][direct], value[direct])
+    np.testing.assert_array_equal(root["visit_count"].sum(axis=1), 2 * searched)
+    actions = np.where(active, root["action_id"][:, 0], -1).astype(np.int32)
+    search.pool.step_into_checked(actions, root["state_id"], request)
+    require_complete_actions(request)
+    assert request["action_valid"][active].all()
+
+
 @pytest.mark.parametrize("phase", ["teacher", "actor_critic", "objectives"])
 def test_native_vector_training_phases_learn_with_capacity_hint_one(tmp_path, monkeypatch, phase):
     from polybot.training.run_artifacts import TrainingRun

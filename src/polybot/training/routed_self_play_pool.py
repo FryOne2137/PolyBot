@@ -1259,39 +1259,6 @@ class RoutedPoolSearch:
         )
         return selected, policies, values
 
-    def _install_direct_root_rows(
-        self,
-        request: Mapping[str, np.ndarray],
-        direct_rows: np.ndarray,
-        policies: np.ndarray,
-        values: np.ndarray,
-        *,
-        preserve_native_metadata: bool = False,
-    ) -> None:
-        """Make direct rows safe for the common action-sampling path."""
-        rows = np.flatnonzero(np.asarray(direct_rows, dtype=bool))
-        if not rows.size:
-            return
-        public_ids = np.asarray(request["action_id"], dtype=np.int32)
-        public_mask = np.asarray(request["action_mask"], dtype=np.uint8)
-        if public_ids.shape != np.asarray(self.root["action_id"]).shape:
-            raise RuntimeError("direct policy action capacity differs from native root capacity")
-        self.root["action_id"][rows] = public_ids[rows]
-        self.root["action_mask"][rows] = public_mask[rows]
-        self.root["policy"][rows] = np.asarray(policies[rows], dtype=np.float32)
-        if "visit_count" in self.root:
-            self.root["visit_count"][rows] = 0
-        if "root_visit_count" in self.root:
-            self.root["root_visit_count"][rows] = 0
-        if "root_value" in self.root:
-            self.root["root_value"][rows] = np.asarray(values[rows], dtype=np.float32)
-        if not preserve_native_metadata:
-            for name in ("state_id", "episode_id", "agent_id", "map_seed"):
-                if name in self.root and name in request:
-                    self.root[name][rows] = np.asarray(request[name])[rows]
-            if "root_player" in self.root:
-                self.root["root_player"][rows] = np.asarray(request["to_play"])[rows]
-
     def _capture_engine_action_constraints(
         self,
         differences: Sequence[Mapping[str, Any]],
@@ -1664,12 +1631,10 @@ class RoutedPoolSearch:
     ) -> Dict[str, np.ndarray]:
         """Run full or selective routed belief-MCTS for one vector decision.
 
-        An all-false ``mcts_mask`` is intentionally a raw-policy path. Value/
-        belief bootstrap never uses particles for action selection or policy
-        targets. It must also not submit particles: a direct-policy baseline
-        is a public-information measurement, and rejecting it because an
-        unrelated hidden-world reconstruction failed makes an MCTS-vs-raw
-        comparison invalid by construction.
+        Rows outside ``mcts_mask`` execute the public raw policy. Belief
+        diagnostics and submission still run because the native SelfPlayPool
+        requires beliefs for checked stepping. Standalone raw evaluation
+        uses the public environment directly.
         """
         for model in self.models:
             model.eval()
@@ -1931,27 +1896,11 @@ class RoutedPoolSearch:
                     diagnostics,
                 ) from error
 
-        if not mcts_mask.any():
-            # This is a raw-player turn inside an asymmetric MCTS game.  The
-            # native pool still needs beliefs to advance its live ISMCTS state,
-            # but this row owns no tree leaves.  Recover the native state id
-            # after submission, then replace the executable policy with the
-            # public direct policy before stepping.
-            if direct_policy is None or direct_value is None:
-                raise RuntimeError("raw policy path requires direct policy and value")
-            self.pool.root_policy_into(self.root, temperature=root_temperature)
-            self._install_direct_root_rows(
-                request,
-                direct_rows,
-                direct_policy,
-                direct_value,
-                preserve_native_metadata=True,
+        waves = 0
+        if mcts_mask.any():
+            waves = 1 + int(
+                np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)
             )
-            return self.root
-
-        waves = 1 + int(
-            np.ceil(max(0, self.mcts.simulations - 1) / self.max_pending_leaves)
-        )
         self._root_candidate_action_ids = {}
         for wave in range(waves):
             # The first native selection expands one root leaf.  Every later
@@ -1992,16 +1941,16 @@ class RoutedPoolSearch:
                 break
             self._expand_leaves(leaf_buffers, leaf_count, prior_scale)
         self._capture_root_candidates = False
-        self.pool.root_policy_into(self.root, temperature=root_temperature)
+        self.pool.root_policy_into(
+            self.root, temperature=root_temperature, public_request=request,
+            search_mask=mcts_mask,
+        )
         if direct_rows.any():
             assert direct_policy is not None and direct_value is not None
-            self._install_direct_root_rows(
-                request,
-                direct_rows,
-                direct_policy,
-                direct_value,
-                preserve_native_metadata=True,
-            )
+            self.root["policy"][direct_rows] = direct_policy[direct_rows]
+            self.root["root_value"][direct_rows] = direct_value[direct_rows]
+        if not waves:
+            return self.root
         if self.belief_action_mode == "root_shield":
             shield = shield_root_policy_with_public_actions(
                 self.root, request, mcts_mask

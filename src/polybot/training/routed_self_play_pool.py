@@ -625,6 +625,7 @@ class SearchCounters:
     belief_action_equivalence_rejected_particles: int = 0
     belief_action_equivalence_rejected_envs: int = 0
     belief_particle_diagnostics: Counter[str] = field(default_factory=Counter)
+    belief_build_errors: dict[str, dict[str, int]] = field(default_factory=dict)
     # ``root_shield`` keeps public action legality authoritative even when a
     # learned determinisation has a different private action set. These are
     # separate from action-pruning counters: shielding corrects a belief
@@ -676,6 +677,12 @@ class SearchCounters:
         for name in self.__dataclass_fields__:
             if name == "belief_particle_diagnostics":
                 self.belief_particle_diagnostics.update(other.belief_particle_diagnostics)
+            elif name == "belief_build_errors":
+                for message, example in other.belief_build_errors.items():
+                    if message in self.belief_build_errors:
+                        self.belief_build_errors[message]["count"] += example["count"]
+                    else:
+                        self.belief_build_errors[message] = example.copy()
             elif name in {
                 "search_prior_mass_retained_sum",
                 "search_root_policy_entropy_sum",
@@ -1337,6 +1344,7 @@ class RoutedPoolSearch:
         rejected: np.ndarray,
         action_diagnostics: Sequence[Mapping[str, Any]],
         native_diagnostics: Sequence[Mapping[str, Any]],
+        moves_played: np.ndarray | None,
     ) -> None:
         """Measure submitted hypotheses before any recovery or optimisation."""
         counts = self.counters.belief_particle_diagnostics
@@ -1357,13 +1365,29 @@ class RoutedPoolSearch:
             (int(candidate_rows[row]), int(candidate_actors[row]), int(particle))
             for row, particle in np.argwhere(rejected)
         }
-        reasons: dict[tuple[int, ...], str] = {}
+        details: dict[tuple[int, ...], Mapping[str, Any]] = {}
         for diagnostic in (*action_diagnostics, *native_diagnostics):
             key = tuple(int(diagnostic.get(name, -1)) for name in ("env_id", "player", "particle"))
             if key in rejected_keys:
-                reasons[key] = str(diagnostic.get("reason", "unknown"))
-        for key in rejected_keys:
-            counts[f"rejected_{reasons.get(key, 'unknown')}"] += 1
+                details[key] = diagnostic
+        for key in sorted(rejected_keys):
+            diagnostic = details.get(key, {})
+            reason = str(diagnostic.get("reason", "unknown"))
+            counts[f"rejected_{reason}"] += 1
+            if reason == "belief_build_error" and moves_played is not None:
+                env, player, particle = key
+                # Keep the engine's message and omit any attached stack trace.
+                message, _, _ = str(diagnostic.get("error") or "no engine message").strip().partition("\n")
+                errors = self.counters.belief_build_errors
+                if message not in errors:
+                    errors[message] = {
+                        "count": 0,
+                        "map_seed": int(request["map_seed"][env]),
+                        "move": int(moves_played[env]) + 1,
+                        "player": player,
+                        "particle": particle,
+                    }
+                errors[message]["count"] += 1
         for diagnostic in action_diagnostics:
             key = tuple(int(diagnostic.get(name, -1)) for name in ("env_id", "player", "particle"))
             if key not in rejected_keys:
@@ -1680,6 +1704,7 @@ class RoutedPoolSearch:
         direct_policy: np.ndarray | None = None,
         direct_value: np.ndarray | None = None,
         raw_policy_only: bool = False,
+        moves_played: np.ndarray | None = None,
     ) -> Dict[str, np.ndarray]:
         """Run full or selective routed belief-MCTS for one vector decision.
 
@@ -1785,6 +1810,7 @@ class RoutedPoolSearch:
                 rejected_candidates,
                 initial_action_diagnostics,
                 native_diagnostics,
+                moves_played,
             )
         self.counters.belief_action_equivalence_rejected_particles += int(
             rejected_candidates.sum()
@@ -2728,7 +2754,7 @@ def train_population_pool(
     replay_snapshot_callback: Callable[[Sequence[TrainingExample]], None] | None = None,
     extra_replay_updates: int = 0,
     run: TrainingRun | None = None,
-) -> Dict[str, float | str]:
+) -> Dict[str, Any]:
     """Train candidate agent 0 against PFSP with frozen-policy retention.
 
     When ``offline_collection`` is set, MCTS generates a complete fixed
@@ -3406,6 +3432,7 @@ def train_population_pool(
                         direct_policy=direct_policy,
                         direct_value=direct_value,
                         raw_policy_only=raw_policy_only,
+                        moves_played=moves if raw_policy_only else None,
                     )
                 except BeliefRecoveryRequired as error:
                     reset_rows, active_reset_rows, inactive_reset_rows = partition_recovery_envs(
@@ -3784,7 +3811,7 @@ def train_population_pool(
         reanalysis_store.save()
     if replay_snapshot_callback is not None:
         replay_snapshot_callback(replay.snapshot())
-    summary: Dict[str, float | str] = {
+    summary: Dict[str, Any] = {
         "population_pool_games": float(games),
         "population_pool_terminals": float(terminal_count),
         "population_pool_truncated": float(truncated_count),
@@ -3962,6 +3989,13 @@ def train_population_pool(
         summary.update({f"belief_sampled_{name}": float(count) for name, count in counts.items()})
         summary["belief_sampled_unit_precision"] = counts["unit_correct"] / max(1, counts["unit_predicted"])
         summary["belief_sampled_unit_recall"] = counts["unit_correct"] / max(1, counts["unit_actual"])
+        summary["belief_build_errors"] = [
+            {"message": message, **example}
+            for message, example in sorted(
+                routing.belief_build_errors.items(),
+                key=lambda item: (-item[1]["count"], item[0]),
+            )
+        ]
     for index, stats in enumerate(opponent_stats):
         summary[f"opponent_{index}_games"] = float(stats["games"])
         summary[f"opponent_{index}_score"] = float(

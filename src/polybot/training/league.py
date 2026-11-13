@@ -6168,6 +6168,14 @@ def train_promotion_league(
                                         )
                                         details = ", ".join(f"{key}={count:.0f}" for key, count in items)
                                         print(f"league belief held-out {label} | {details or '0'}", flush=True)
+                                    for error in held_out_summary.get("belief_build_errors", ()):
+                                        print(
+                                            "league belief held-out belief_build_error | "
+                                            f"count={error['count']} | seed={error['map_seed']} | "
+                                            f"move={error['move']} | player={error['player']} | "
+                                            f"particle={error['particle']} | {error['message']}",
+                                            flush=True,
+                                        )
                                 # The particle mismatch is the admission
                                 # metric, but it alone cannot identify whether
                                 # a plateau comes from terrain, rare entities,

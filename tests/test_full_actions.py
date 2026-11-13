@@ -228,7 +228,7 @@ def test_belief_calibration_trains_on_public_rollouts_with_rejected_particles(
         games=4, updates_per_game=1, candidate=candidate,
         opponent_models=[tiny_model()], opponent_weights=[1.0],
         belief_only=True, raw_policy_only=True, offline_collection=True,
-        max_envs=4, num_threads=1, visible_action_history=32,
+        max_envs=2, num_threads=1, visible_action_history=32,
         replay_snapshot_callback=replay.extend,
         run=TrainingRun.create(tmp_path, "belief-regression"),
     )
@@ -240,6 +240,14 @@ def test_belief_calibration_trains_on_public_rollouts_with_rejected_particles(
     assert result["belief_sampled_rejected_belief_build_error"] == result[
         "belief_action_equivalence_rejected_particles"
     ]
+    assert result["belief_build_errors"] == [{
+        "message": "completed_map_tokens must preserve the source visibility mask",
+        "count": result["belief_action_equivalence_rejected_particles"],
+        "map_seed": 1732409,
+        "move": 1,
+        "player": 0,
+        "particle": 0,
+    }]
     assert result["belief_sampled_unit_predicted"] == 0
     assert result["belief_slot_resets"] == result["population_pool_leaf_rows"] == 0
     assert replay and all(example.policy_loss_weight == 0 for example in replay)

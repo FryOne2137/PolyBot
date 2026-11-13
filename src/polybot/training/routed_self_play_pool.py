@@ -8,7 +8,8 @@ scatters neural outputs back to the original native order.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, replace
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Sequence
 
@@ -623,6 +624,7 @@ class SearchCounters:
     belief_action_equivalence_checked_particles: int = 0
     belief_action_equivalence_rejected_particles: int = 0
     belief_action_equivalence_rejected_envs: int = 0
+    belief_particle_diagnostics: Counter[str] = field(default_factory=Counter)
     # ``root_shield`` keeps public action legality authoritative even when a
     # learned determinisation has a different private action set. These are
     # separate from action-pruning counters: shielding corrects a belief
@@ -672,7 +674,9 @@ class SearchCounters:
     def add(self, other: "SearchCounters") -> None:
         """Merge counters from one short-lived routed pool."""
         for name in self.__dataclass_fields__:
-            if name in {
+            if name == "belief_particle_diagnostics":
+                self.belief_particle_diagnostics.update(other.belief_particle_diagnostics)
+            elif name in {
                 "search_prior_mass_retained_sum",
                 "search_root_policy_entropy_sum",
                 "search_root_top_visit_share_sum",
@@ -1324,6 +1328,53 @@ class RoutedPoolSearch:
             self.last_engine_action_constraint_tiles.sum()
         )
 
+    def _record_particle_diagnostics(
+        self,
+        request: Mapping[str, np.ndarray],
+        candidate_rows: np.ndarray,
+        candidate_actors: np.ndarray,
+        sampled_particles: np.ndarray,
+        rejected: np.ndarray,
+        action_diagnostics: Sequence[Mapping[str, Any]],
+        native_diagnostics: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Measure submitted hypotheses before any recovery or optimisation."""
+        counts = self.counters.belief_particle_diagnostics
+        truth = self.pool.belief_targets_numpy(request["state_id"])[candidate_rows]
+        hidden = request["map_tokens"][candidate_rows, None, :, 0] == 0
+        actual_units = np.broadcast_to(
+            hidden & (truth[:, None, :, 4] >= 1), sampled_particles.shape[:-1]
+        )
+        predicted_units = hidden & (sampled_particles[..., 4] >= 1)
+        counts["unit_actual"] += int(actual_units.sum())
+        counts["unit_predicted"] += int(predicted_units.sum())
+        counts["unit_correct"] += int((actual_units & predicted_units).sum())
+        counts["own_hidden_units"] += int(
+            (predicted_units & (sampled_particles[..., 3] == candidate_actors[:, None, None])).sum()
+        )
+
+        rejected_keys = {
+            (int(candidate_rows[row]), int(candidate_actors[row]), int(particle))
+            for row, particle in np.argwhere(rejected)
+        }
+        reasons: dict[tuple[int, ...], str] = {}
+        for diagnostic in (*action_diagnostics, *native_diagnostics):
+            key = tuple(int(diagnostic.get(name, -1)) for name in ("env_id", "player", "particle"))
+            if key in rejected_keys:
+                reasons[key] = str(diagnostic.get("reason", "unknown"))
+        for key in rejected_keys:
+            counts[f"rejected_{reasons.get(key, 'unknown')}"] += 1
+        for diagnostic in action_diagnostics:
+            key = tuple(int(diagnostic.get(name, -1)) for name in ("env_id", "player", "particle"))
+            if key not in rejected_keys:
+                continue
+            for direction in ("missing", "extra"):
+                for action in diagnostic[f"{direction}_actions"]:
+                    action_type = "unknown"
+                    if isinstance(action, Mapping):
+                        action_type = action.get("type_fullname") or action.get("type", "unknown")
+                    counts[f"{direction}_action_{action_type}"] += 1
+
     @torch.inference_mode()
     def _actor_particles(
         self,
@@ -1720,12 +1771,21 @@ class RoutedPoolSearch:
         if raw_policy_only and candidate_rows.size:
             # The action diff may be empty when a proposed world cannot even
             # be built. Count those proposals as failures of calibration too.
-            _, native_rejected_mask, _, _ = ismcts_rejected_envs(
+            _, native_rejected_mask, _, native_diagnostics = ismcts_rejected_envs(
                 self.pool, state_ids, particles, submit_failed=False
             )
             rejected_candidates |= native_rejected_mask[
                 candidate_rows, actors[candidate_rows]
             ]
+            self._record_particle_diagnostics(
+                request,
+                candidate_rows,
+                actors[candidate_rows],
+                particles[candidate_rows, actors[candidate_rows]],
+                rejected_candidates,
+                initial_action_diagnostics,
+                native_diagnostics,
+            )
         self.counters.belief_action_equivalence_rejected_particles += int(
             rejected_candidates.sum()
         )
@@ -3897,6 +3957,11 @@ def train_population_pool(
         "mcts_random_actions": float(mcts.search_random_actions),
     }
     summary.update(_action_pruning_metrics(routing))
+    if raw_policy_only:
+        counts = routing.belief_particle_diagnostics
+        summary.update({f"belief_sampled_{name}": float(count) for name, count in counts.items()})
+        summary["belief_sampled_unit_precision"] = counts["unit_correct"] / max(1, counts["unit_predicted"])
+        summary["belief_sampled_unit_recall"] = counts["unit_correct"] / max(1, counts["unit_actual"])
     for index, stats in enumerate(opponent_stats):
         summary[f"opponent_{index}_games"] = float(stats["games"])
         summary[f"opponent_{index}_score"] = float(

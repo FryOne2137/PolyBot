@@ -96,6 +96,7 @@ def _belief_validation_signature(
     """Describe every setting that changes a belief held-out measurement."""
     return {
         "collector": "public_raw_without_belief_recovery",
+        "particle_sampler": "hidden_units_exclude_observer",
         "map_size": int(training.map_size),
         "map_type": str(training.map_type),
         "particles": int(mcts.particles),
@@ -1407,6 +1408,11 @@ def train_promotion_league(
         raise ValueError("belief_calibration_replay_capacity must be positive")
     if belief_replay_updates < 0:
         raise ValueError("belief_replay_updates must not be negative")
+    belief_validation_only = (
+        training_stage == "belief"
+        and population_games == 0
+        and belief_replay_updates == 0
+    )
     if population_belief_search_mode not in {"strict", "root_shield"}:
         raise ValueError(
             "population_belief_search_mode must be 'strict' or 'root_shield'"
@@ -2147,6 +2153,12 @@ def train_promotion_league(
                     )
                     if training_stage == "belief":
                         belief_calibration_required = True
+                        if belief_validation_only and not apprentice_matches_champion:
+                            raise ValueError(
+                                "Belief validation requires a saved apprentice and its "
+                                f"matching calibration metadata for {champion_path}: "
+                                f"{belief_apprentice_path}"
+                            )
                     elif training_stage == "mcts":
                         if not (
                             active_belief_matches_champion
@@ -5323,6 +5335,7 @@ def train_promotion_league(
                     # from the champion: a later rung or promotion gate can
                     # still reject it without losing this verified progress.
                     verified_mcts_path: Path | None = None
+                    raw_population_baseline = {}
                     if direct_population_summary:
                         raw_population_baseline = {
                             "model_a_score": float(
@@ -5347,7 +5360,7 @@ def train_promotion_league(
                                 )
                             ),
                         }
-                    else:
+                    elif not belief_validation_only:
                         def record_raw_population_baseline_game(
                             opponent_index: int,
                             game: Mapping[str, Any],
@@ -5381,23 +5394,14 @@ def train_promotion_league(
                                 max_actions=mcts.native_max_actions,
                             )
                         )
-                    population_summary["raw_population_baseline"] = (
-                        raw_population_baseline
-                    )
-                    best_raw_policy_score = float(
-                        raw_population_baseline["model_a_score"]
-                    )
-                    best_raw_worst_score = float(
-                        raw_population_baseline["worst_score"]
-                    )
-                    best_raw_city_capture_rate = float(
-                        raw_population_baseline[
-                            "model_a_city_captures_per_game"
-                        ]
-                    )
-                    best_raw_completion_rate = float(
-                        raw_population_baseline["completion_rate"]
-                    )
+                    if raw_population_baseline:
+                        population_summary["raw_population_baseline"] = raw_population_baseline
+                        best_raw_policy_score = float(raw_population_baseline["model_a_score"])
+                        best_raw_worst_score = float(raw_population_baseline["worst_score"])
+                        best_raw_city_capture_rate = float(
+                            raw_population_baseline["model_a_city_captures_per_game"]
+                        )
+                        best_raw_completion_rate = float(raw_population_baseline["completion_rate"])
                     if population_games or (
                         belief_calibration_required
                         and _belief_calibration_can_run(
@@ -5754,7 +5758,7 @@ def train_promotion_league(
                             calibration_replay: Sequence[TrainingExample] = ()
                             calibration_replay_saved = [0]
                             replay_snapshot_callback = None
-                            if belief_calibration_required:
+                            if belief_calibration_required and not belief_validation_only:
                                 calibration_replay = _load_belief_calibration_replay(
                                     belief_calibration_replay_path,
                                     belief_calibration_replay_capacity,
@@ -6046,7 +6050,8 @@ def train_promotion_league(
                                 # not overwrite a better apprentice merely
                                 # because a worse score is close to it.
                                 rolled_back = bool(
-                                    previous_held_out_rate is not None
+                                    not belief_validation_only
+                                    and previous_held_out_rate is not None
                                     and rate >= previous_held_out_rate
                                 )
                                 if rolled_back:
@@ -6058,9 +6063,10 @@ def train_promotion_league(
                                         candidate, belief_calibration_start_state
                                     )
                                 else:
-                                    save_model(
-                                        belief_apprentice_path, candidate, model_config
-                                    )
+                                    if not belief_validation_only:
+                                        save_model(
+                                            belief_apprentice_path, candidate, model_config
+                                        )
                                     _save_belief_apprentice_state(
                                         belief_apprentice_state_path,
                                         {
@@ -6111,6 +6117,7 @@ def train_promotion_league(
                                         else -1.0
                                     ),
                                     "held_out_rollback": float(rolled_back),
+                                    "validation_only": float(belief_validation_only),
                                     "target_rejection_rate": (
                                         belief_action_equivalence_target
                                     ),
@@ -6119,19 +6126,48 @@ def train_promotion_league(
                                 population_summary["belief_calibration"] = (
                                     belief_calibration_summary
                                 )
+                                outcome = (
+                                    "validation metadata refreshed"
+                                    if belief_validation_only
+                                    else "regression: restored prior apprentice"
+                                    if rolled_back
+                                    else f"saved {belief_apprentice_path}"
+                                )
+                                collection_text = (
+                                    f"collection={collection_rate:.2%} | "
+                                    if collection_checked
+                                    else ""
+                                )
                                 print(
                                     "league belief calibration | "
-                                    f"collection={collection_rate:.2%} | "
+                                    f"{collection_text}"
                                     f"held-out mismatch={rate:.2%} "
                                     f"({rejected}/{checked}) | "
-                                    f"ready={int(ready)} | "
-                                    + (
-                                        "regression: restored prior apprentice"
-                                        if rolled_back
-                                        else f"saved {belief_apprentice_path}"
-                                    ),
+                                    f"ready={int(ready)} | {outcome}",
                                     flush=True,
                                 )
+                                if "belief_sampled_unit_precision" in held_out_summary:
+                                    print(
+                                        "league belief held-out units | "
+                                        f"precision={held_out_summary['belief_sampled_unit_precision']:.2%} | "
+                                        f"recall={held_out_summary['belief_sampled_unit_recall']:.2%} | "
+                                        f"predicted={held_out_summary.get('belief_sampled_unit_predicted', 0):.0f} | "
+                                        f"actual={held_out_summary.get('belief_sampled_unit_actual', 0):.0f} | "
+                                        f"own hidden={held_out_summary.get('belief_sampled_own_hidden_units', 0):.0f}",
+                                        flush=True,
+                                    )
+                                    for label, prefix in (
+                                        ("rejections", "belief_sampled_rejected_"),
+                                        ("missing actions", "belief_sampled_missing_action_"),
+                                        ("extra actions", "belief_sampled_extra_action_"),
+                                    ):
+                                        items = sorted(
+                                            (key.removeprefix(prefix), count)
+                                            for key, count in held_out_summary.items()
+                                            if key.startswith(prefix)
+                                        )
+                                        details = ", ".join(f"{key}={count:.0f}" for key, count in items)
+                                        print(f"league belief held-out {label} | {details or '0'}", flush=True)
                                 # The particle mismatch is the admission
                                 # metric, but it alone cannot identify whether
                                 # a plateau comes from terrain, rare entities,

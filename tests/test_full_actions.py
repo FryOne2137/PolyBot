@@ -8,6 +8,7 @@ from polybot.data.full_actions import (
     require_complete_actions, merge_action_batches,
 )
 from polybot.data.polyenv_features import native_batch_to_tensors
+from polybot.data.token_schema import MAP_FEATURE_MAX
 from polybot.models.policy_value_belief import PolicyValueBeliefNet
 
 
@@ -15,6 +16,37 @@ def tiny_model():
     return PolicyValueBeliefNet(ModelConfig(d_model=16, transformer_layers=1, attention_heads=4,
         belief_decoder_layers=1, dropout=0, policy_architecture="relational",
         action_encoder_dim=16, action_encoder_heads=4, action_latent_count=4)).eval()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.15])
+def test_belief_samplers_choose_an_enemy_owner_for_hidden_units(temperature):
+    model = tiny_model()
+    observed = torch.full((2, 9, 24), -1, dtype=torch.long)
+    observed[..., 0] = 0
+    observed[:, 0, 0] = 1
+    observed[:, 0, 4] = 1
+    observed[:, 0, 3] = torch.arange(2)
+    logits = [torch.full((2, 9, maximum + 2), -100.0) for maximum in MAP_FEATURE_MAX]
+    for values in logits:
+        values[..., 0] = 0.0
+    logits[4][..., 2] = 10.0
+    logits[19][..., 3] = 10.0
+    logits[3][0, :, 1] = 10.0
+    logits[3][1, :, 2] = 10.0
+    batched = model.sample_completed_map_batch_from_belief_logits(
+        observed, logits, temperature=temperature, perspective_players=torch.arange(2)
+    )
+    for player in range(2):
+        scalar = model.sample_completed_maps_from_belief_logits(
+            observed[player:player + 1],
+            [values[player:player + 1] for values in logits],
+            particles=1, temperature=temperature, perspective_player=player,
+        )[0]
+        for particle in (scalar, batched[player]):
+            assert torch.equal(particle[0], observed[player, 0])
+            hidden_units = (particle[:, 0] == 0) & (particle[:, 4] >= 1)
+            assert hidden_units.any()
+            assert (particle[hidden_units, 3] == 1 - player).all()
 
 
 def test_full_vector_packet_survives_capacity_one_and_keeps_old_observations():
@@ -205,6 +237,10 @@ def test_belief_calibration_trains_on_public_rollouts_with_rejected_particles(
     assert result["population_pool_updates"] == 4
     assert result["belief_action_equivalence_checked_particles"] > 0
     assert result["belief_action_equivalence_rejection_rate"] == 1
+    assert result["belief_sampled_rejected_belief_build_error"] == result[
+        "belief_action_equivalence_rejected_particles"
+    ]
+    assert result["belief_sampled_unit_predicted"] == 0
     assert result["belief_slot_resets"] == result["population_pool_leaf_rows"] == 0
     assert replay and all(example.policy_loss_weight == 0 for example in replay)
     changed = [name for name, tensor in candidate.state_dict().items()

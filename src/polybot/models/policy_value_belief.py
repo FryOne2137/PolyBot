@@ -650,6 +650,10 @@ class PolicyValueBeliefNet(nn.Module):
         def sample_feature(feature_index: int) -> torch.Tensor:
             if has_hidden:
                 logits = belief_logits[feature_index][0, hidden]
+                if feature_index == 3 and perspective_player is not None:
+                    logits = self._hidden_unit_owner_logits(
+                        logits, torch.as_tensor(perspective_player, device=logits.device)
+                    )
                 if temperature <= 0.0:
                     return (logits.argmax(dim=-1) - 1).expand(particles, -1)
                 probabilities = torch.softmax(logits / max(temperature, 1e-4), dim=-1)
@@ -777,6 +781,10 @@ class PolicyValueBeliefNet(nn.Module):
 
         def sample_feature(feature_index: int) -> torch.Tensor:
             logits = belief_logits[feature_index]
+            if feature_index == 3 and perspective_players is not None:
+                logits = self._hidden_unit_owner_logits(
+                    logits, perspective_players.to(device=logits.device).reshape(batch, 1)
+                )
             if temperature <= 0.0:
                 return logits.argmax(dim=-1) - 1
             scaled = logits / max(float(temperature), 1e-4)
@@ -854,6 +862,16 @@ class PolicyValueBeliefNet(nn.Module):
                 completed_cpu[row], perspective_player=perspectives[row], known_city_count=city_counts[row]
             )
         return completed_cpu
+
+    @staticmethod
+    def _hidden_unit_owner_logits(
+        logits: torch.Tensor, perspective: torch.Tensor
+    ) -> torch.Tensor:
+        """Own units are always visible in the supported two-player samplers."""
+        owners = torch.arange(logits.shape[-1], device=logits.device) - 1
+        known_perspective = (perspective >= 0) & (perspective < 2)
+        allowed = (owners >= 0) & (owners < 2) & (owners != perspective[..., None])
+        return logits.masked_fill(known_perspective[..., None] & ~allowed, -torch.inf)
 
     @staticmethod
     def _batch_constraint_values(

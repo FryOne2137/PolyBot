@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--model-b", type=Path, help="optional MCTS opponent; default is random")
     parser.add_argument(
         "--mode",
-        choices=("mcts", "flat", "mcts-vs-raw", "mcts-diagnostics"),
+        choices=("mcts", "flat", "mcts-vs-raw", "mcts-diagnostics", "mcts-value-ablation"),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics",
     )
@@ -65,7 +65,7 @@ def main() -> None:
         help="Set to a nonzero value only when evaluating the anchored search policy.",
     )
     args = parser.parse_args()
-    if args.mode in {"flat", "mcts-vs-raw", "mcts-diagnostics"} and args.model_b is None:
+    if args.mode in {"flat", "mcts-vs-raw", "mcts-diagnostics", "mcts-value-ablation"} and args.model_b is None:
         parser.error(f"--mode {args.mode} requires --model-b")
     if args.mode == "mcts-diagnostics" and args.positions_per_game < 1:
         parser.error("--positions-per-game must be positive")
@@ -141,6 +141,34 @@ def main() -> None:
                 model_a, model_b, training, mcts, args.games,
                 positions_per_game=args.positions_per_game, **pool_options,
             )
+        elif args.mode == "mcts-value-ablation":
+            seeds = [training.seed + index // 2 for index in range(args.games)]
+            pool_options.update(
+                model_b_uses_mcts=False,
+                map_seeds=seeds,
+                replace_failed_pairs=False,
+                belief_action_mode="root_shield",
+            )
+            with_value = evaluate_matches_pool(
+                model_a, model_b, training, mcts, args.games,
+                **{**pool_options, "model_a_label": f"{args.model_a.stem} (learned value)"},
+            )
+            zero_value = evaluate_matches_pool(
+                model_a, model_b, training, mcts, args.games,
+                zero_leaf_values=True,
+                **{**pool_options, "model_a_label": f"{args.model_a.stem} (zero leaf value)"},
+            )
+            valid = (
+                bool(with_value["valid"] and zero_value["valid"])
+                and with_value.get("evaluated_map_seeds") == zero_value.get("evaluated_map_seeds") == seeds
+            )
+            summary = {
+                "learned_value": with_value,
+                "zero_leaf_value": zero_value,
+                "score_gain_zero_value": (
+                    zero_value["model_a_score"] - with_value["model_a_score"] if valid else None
+                ),
+            }
         elif args.mode == "mcts-vs-raw":
             seeds = [training.seed + index // 2 for index in range(args.games)]
             pool_options.update(

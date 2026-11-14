@@ -213,13 +213,28 @@ def test_full_self_play_masked_into_expands_and_checked_step_preserves_actions()
     assert request["action_mask"].sum() == request["total_legal_action_count"][0]
 
 
-def test_routed_search_runs_multiple_masked_waves_with_all_actions():
+@pytest.mark.parametrize("zero_leaf_values", [False, True])
+def test_routed_search_runs_multiple_masked_waves_with_all_actions(monkeypatch, zero_leaf_values):
     from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    model = tiny_model()
+    with torch.no_grad():
+        model.value_head[-2].weight.zero_()
+        model.value_head[-2].bias.fill_(0.5)
     search = RoutedPoolSearch(
         TrainingConfig(device="cpu"), MCTSConfig(simulations=3, particles=1, native_max_actions=1),
-        [tiny_model()], num_envs=1, num_threads=1, max_pending_leaves=2,
+        [model], num_envs=1, num_threads=1, max_pending_leaves=2,
         visible_action_history=2, belief_retries=0, seed=2137,
+        zero_leaf_values=zero_leaf_values,
     )
+    expand_and_backup = search.pool.expand_and_backup
+    backed_up_values = []
+
+    def record_backup(leaf_ids, logits, values):
+        backed_up_values.append(values.copy())
+        expand_and_backup(leaf_ids, logits, values)
+
+    monkeypatch.setattr(search.pool, "expand_and_backup", record_backup)
     request = search.reset(np.array([2137], dtype=np.uint32), np.zeros((1, 2), dtype=np.int32))
     worlds = exact_test_worlds(search.pool, request["state_id"].copy())
     # Exact proposals are a controlled fixture, not a production generator.
@@ -230,6 +245,8 @@ def test_routed_search_runs_multiple_masked_waves_with_all_actions():
                          belief_temperature=.15, prior_scale=0)
     assert root["action_mask"].sum() == 14
     assert root["visit_count"].sum() == 2
+    expected_value = 0.0 if zero_leaf_values else np.tanh(0.5)
+    np.testing.assert_allclose(np.concatenate(backed_up_values), expected_value)
     search.pool.step_into_checked(root["action_id"][:, 0].copy(), root["state_id"].copy(), request)
     require_complete_actions(request)
 

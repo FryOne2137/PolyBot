@@ -2345,6 +2345,9 @@ def evaluate_matches_pool(
     be trusted as policy targets; MCTS on both sides can otherwise hide an
     equal search gain behind an unchanged win rate.
 
+    When both models play raw, reuse the pool's public observations and
+    action encoding. Step the chosen actions without sampling belief.
+
     ``excluded_map_seeds`` reserves maps which must never be used as a
     recovery replacement.  Callers use it to keep an invalid evaluation pair
     from being silently replaced with a map used by any training collection.
@@ -2355,6 +2358,7 @@ def evaluate_matches_pool(
         raise ValueError("max_envs must be at least two")
     if belief_action_mode not in {"strict", "root_shield"}:
         raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
+    raw_only = not (model_a_uses_mcts or model_b_uses_mcts)
     fixed_map_seeds = None
     if map_seeds is not None:
         fixed_map_seeds = np.asarray(map_seeds, dtype=np.uint32)
@@ -2472,13 +2476,17 @@ def evaluate_matches_pool(
                     | ((agent_ids == 1) & bool(model_b_uses_mcts))
                 )
                 try:
-                    root, recovery_failures = _evaluation_search_with_recovery(
-                        search,
-                        request,
-                        active,
-                        mcts_mask=mcts_mask,
-                    )
-                    evaluation_position_recovery_cycles += len(recovery_failures)
+                    if raw_only:
+                        policy, _ = search.direct_policy_value(request, np.flatnonzero(active))
+                        root = {**request, "policy": policy}
+                    else:
+                        root, recovery_failures = _evaluation_search_with_recovery(
+                            search,
+                            request,
+                            active,
+                            mcts_mask=mcts_mask,
+                        )
+                        evaluation_position_recovery_cycles += len(recovery_failures)
                 except BeliefRecoveryRequired as error:
                     evaluation_position_recovery_cycles += (
                         _EVALUATION_POSITION_RECOVERY_CYCLES
@@ -2579,11 +2587,11 @@ def evaluate_matches_pool(
                 ]
                 candidate_turns = active & (np.asarray(request["agent_id"]) == 0)
                 candidate_decisions[candidate_turns] += 1
-                candidate_particles[candidate_turns] += max(1, int(mcts.particles))
                 totals["model_a_decisions"] += float(candidate_turns.sum())
-                totals["model_a_particles"] += float(
-                    candidate_turns.sum() * max(1, int(mcts.particles))
-                )
+                if model_a_uses_mcts:
+                    particle_count = max(1, int(mcts.particles))
+                    candidate_particles[candidate_turns] += particle_count
+                    totals["model_a_particles"] += float(candidate_turns.sum() * particle_count)
                 city_by_env, capital_by_env = native_capture_flags(
                     request, action_rows, active
                 )
@@ -2594,11 +2602,11 @@ def evaluate_matches_pool(
                     else:
                         opponent_city_captures[env] += int(city_by_env[env])
                         opponent_capital_captures[env] += int(capital_by_env[env])
-                search.pool.step_into_checked(
-                    actions,
-                    np.asarray(root["state_id"], dtype=np.uint64),
-                    request,
-                )
+                state_ids = np.asarray(root["state_id"], dtype=np.uint64)
+                if raw_only:
+                    search.step_public_policy(actions, state_ids, request)
+                else:
+                    search.pool.step_into_checked(actions, state_ids, request)
                 moves[active] += 1
                 drained = search.drain_completed()
                 for row in range(len(drained.get("env_id", []))):
@@ -2672,6 +2680,7 @@ def evaluate_matches_pool(
     totals["evaluated_map_seeds"] = [
         int(row["map_seed"]) for row in completed_game_rows
     ]
+    totals["truncated_games"] = sum(row["truncated"] for row in completed_game_rows)
     totals["evaluation_position_recovery_cycles"] = float(
         evaluation_position_recovery_cycles
     )

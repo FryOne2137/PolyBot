@@ -24,9 +24,9 @@ def main() -> None:
     parser.add_argument("--model-b", type=Path, help="optional MCTS opponent; default is random")
     parser.add_argument(
         "--mode",
-        choices=("mcts", "flat"),
+        choices=("mcts", "flat", "mcts-vs-raw"),
         default="mcts",
-        help="Evaluate full search or the raw greedy policy without MCTS",
+        help="Evaluate search, raw policy, or the gain from adding search to model A only",
     )
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--simulations", type=int, default=32)
@@ -61,14 +61,14 @@ def main() -> None:
         help="Set to a nonzero value only when evaluating the anchored search policy.",
     )
     args = parser.parse_args()
+    if args.mode in {"flat", "mcts-vs-raw"} and args.model_b is None:
+        parser.error(f"--mode {args.mode} requires --model-b")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
     model_a, _ = load_model(args.model_a, device)
     model_b = load_model(args.model_b, device)[0] if args.model_b is not None else None
     if args.mode == "flat":
-        if model_b is None:
-            parser.error("--mode flat requires --model-b")
         summary = evaluate_direct_matches(
             model_a,
             model_b,
@@ -117,12 +117,7 @@ def main() -> None:
             visible_action_history=args.visible_action_history,
         )
     else:
-        summary = evaluate_matches_pool(
-            model_a,
-            model_b,
-            training,
-            mcts,
-            args.games,
+        pool_options = dict(
             num_threads=args.mcts_threads,
             max_pending_leaves=args.max_pending_leaves,
             visible_action_history=args.visible_action_history,
@@ -133,6 +128,34 @@ def main() -> None:
             model_a_label=args.model_a.stem,
             model_b_label=args.model_b.stem,
         )
+        if args.mode == "mcts-vs-raw":
+            seeds = [training.seed + index // 2 for index in range(args.games)]
+            pool_options.update(
+                model_b_uses_mcts=False,
+                map_seeds=seeds,
+                replace_failed_pairs=False,
+                belief_action_mode="root_shield",
+            )
+            raw = evaluate_matches_pool(
+                model_a, model_b, training, mcts, args.games,
+                model_a_uses_mcts=False, **pool_options,
+            )
+            search = evaluate_matches_pool(
+                model_a, model_b, training, mcts, args.games, **pool_options,
+            )
+            valid = (
+                bool(raw["valid"] and search["valid"])
+                and raw.get("evaluated_map_seeds") == search.get("evaluated_map_seeds") == seeds
+            )
+            summary = {
+                "raw": raw,
+                "mcts": search,
+                "score_gain": search["model_a_score"] - raw["model_a_score"] if valid else None,
+            }
+        else:
+            summary = evaluate_matches_pool(
+                model_a, model_b, training, mcts, args.games, **pool_options,
+            )
     print_summary(summary)
 
 

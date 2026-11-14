@@ -21,6 +21,20 @@ class ValuePosition:
     game_key: tuple[Any, ...] | None = None
 
 
+@dataclass(frozen=True)
+class EncodedValuePosition:
+    features: np.ndarray
+    turn: int
+    return_target: float
+    game_key: tuple[Any, ...]
+
+
+def _turn(example: ValuePosition | EncodedValuePosition) -> int:
+    if isinstance(example, EncodedValuePosition):
+        return example.turn
+    return int(np.asarray(example.observation["state"]).reshape(-1)[0])
+
+
 @dataclass
 class ValueValidationCollector:
     games: int
@@ -71,6 +85,11 @@ class ValueValidationCollector:
 
 
 def _states(model, examples, training):
+    if isinstance(examples[0], EncodedValuePosition):
+        return torch.as_tensor(
+            np.stack([example.features for example in examples]),
+            device=next(model.parameters()).device,
+        )
     from .vector_population import _collate_public_observations
     from .vector_teacher import _vector_tensors
     from dataclasses import replace
@@ -133,7 +152,7 @@ def _metrics_by_phase(predictions, targets, examples):
     metrics["games"] = len(keys)
     for phase, lo, hi in (("opening", 0, 20), ("mid", 20, 60), ("late", 60, float("inf"))):
         mask = np.asarray([
-            lo <= int(np.asarray(e.observation["state"]).reshape(-1)[0]) < hi for e in examples
+            lo <= _turn(e) < hi for e in examples
         ])
         metrics[phase] = value_metrics(predictions[mask], targets[mask])
     return metrics
@@ -179,7 +198,7 @@ def fit_value_head(
         # original distribution and reports each phase separately.
         groups = {}
         for index, example in enumerate(rows):
-            turn = int(np.asarray(example.observation["state"]).reshape(-1)[0])
+            turn = _turn(example)
             groups.setdefault(0 if turn < 20 else 1 if turn < 60 else 2, []).append(index)
         buckets = list(groups.values())
         # The encoder is frozen. Reuse identical sampled features when trying

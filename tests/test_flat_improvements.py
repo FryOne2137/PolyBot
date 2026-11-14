@@ -24,7 +24,8 @@ from polybot.training.flat_experiments import (
     FlatImprovements, model_fingerprint, paired_regression,
 )
 from polybot.training.flat_value import (
-    ValuePosition, ValueValidationCollector, fit_value_head,
+    EncodedValuePosition, ValuePosition, ValueValidationCollector,
+    evaluate_value_head, fit_value_head,
 )
 from polybot.training.run_artifacts import TrainingRun
 from polybot.training.vector_population import (
@@ -173,17 +174,51 @@ def test_native_arena_position_callback_supplies_candidate_public_states():
     collector = ValueValidationCollector(2, 4, 13)
     model = tiny_model()
     rows = []
+    features = []
     result = evaluate_direct_matches(
         model, deepcopy(model), torch.device("cpu"),
         TrainingConfig(device="cpu", seed=287, max_moves=4), games=2,
         num_threads=1, max_actions=1024, visible_action_history=32,
         position_callback=collector.add,
+        raw_value_callback=lambda game, turn, state: features.append((game, turn, state.copy())),
+        include_event_summary=False,
         game_callback=lambda row: (rows.append(row), collector.finish(row)),
     )
     assert result["games"] == 2 and len(rows) == 2
     assert collector.seen and max(collector.seen) <= 1
     assert not collector.examples  # Move limit does not invent a terminal label.
     assert collector.truncated_games == 2
+    assert features and all(state.shape == (model.config.d_model,) for _, _, state in features)
+    assert {game for game, _, _ in features} == set(collector.seen)
+
+
+def test_encoded_critic_learns_terminal_targets_on_frozen_features():
+    model = tiny_model()
+    model.requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    trainable = model.value_head[-2]
+    with torch.no_grad():
+        trainable.weight.zero_()
+        trainable.bias.fill_(0.5)
+    before = deepcopy(model.state_dict())
+    features = np.ones(model.config.d_model, dtype=np.float32)
+    def positions(seed):
+        return [
+            EncodedValuePosition(features, 30, -1.0, (seed + index, 0))
+            for index in range(8)
+        ]
+    training = TrainingConfig(device="cpu")
+    fit = fit_value_head(
+        model, training, positions(10), positions(20),
+        FlatImprovements(value_updates=4, value_batch_size=8, value_learning_rate=0.05),
+        seed=7, validation_source="raw_selection",
+    )
+    metrics = evaluate_value_head(model, training, positions(30))
+    assert fit["kept"] and metrics["rmse"] < metrics["zero_rmse"]
+    assert metrics["mid"]["count"] == 8
+    for name, tensor in model.state_dict().items():
+        if not name.startswith("value_head."):
+            assert torch.equal(tensor, before[name]), name
 
 
 def test_scientific_state_roundtrip_restores_working_weights_and_adamw(tmp_path):

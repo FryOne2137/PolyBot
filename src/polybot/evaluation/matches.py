@@ -22,6 +22,9 @@ from ..models.policy_value_belief import PolicyValueBeliefNet
 from ..planning.belief_mcts import BeliefMCTS
 
 
+RawValueCallback = Callable[[int, int, np.ndarray], None]
+
+
 def _paired_seed_and_slot(base_seed: int, game_index: int) -> tuple[int, int]:
     """Use the same map for consecutive games and swap the candidate slot."""
     return int(base_seed) + int(game_index) // 2, int(game_index) % 2
@@ -389,6 +392,9 @@ def _batched_direct_policy_actions(
     active: Sequence[np.ndarray],
     device: torch.device,
     training: TrainingConfig,
+    *,
+    raw_value_callback: RawValueCallback | None = None,
+    include_event_summary: bool = True,
 ) -> list[np.ndarray]:
     """Route all live rows through at most one forward per frozen model."""
     tensor_batches = [
@@ -418,13 +424,16 @@ def _batched_direct_policy_actions(
                 placements.append((batch_index, rows))
         if not groups:
             continue
+        event_features = _join_tensor_rows(groups, "event_features")
+        if not include_event_summary:
+            event_features = torch.zeros_like(event_features)
         output = model(
             _join_tensor_rows(groups, "map_tokens"),
             _join_tensor_rows(groups, "global_features"),
             _join_tensor_rows(groups, "action_categorical"),
             _join_tensor_rows(groups, "action_continuous"),
             _join_tensor_rows(groups, "action_mask"),
-            _join_tensor_rows(groups, "event_features"),
+            event_features,
             action_history=_join_tensor_rows(groups, "action_history"),
             action_history_mask=_join_tensor_rows(
                 groups, "action_history_mask"
@@ -432,10 +441,22 @@ def _batched_direct_policy_actions(
             include_belief=False,
         )
         choices = output.policy_logits.argmax(dim=-1).cpu().numpy()
+        features = (
+            output.state.float().cpu().numpy()
+            if candidate_turn and raw_value_callback is not None else None
+        )
         offset = 0
         for batch_index, rows in placements:
             count = int(rows.size)
             selected[batch_index][rows] = choices[offset:offset + count]
+            if features is not None:
+                assert raw_value_callback is not None
+                for local, row in enumerate(rows):
+                    raw_value_callback(
+                        2 * int(row) + candidate_players[batch_index],
+                        int(batches[batch_index]["state"][row, 0]),
+                        features[offset + local],
+                    )
             offset += count
     return selected
 
@@ -464,6 +485,8 @@ def evaluate_direct_matches(
     max_actions: int = 1024,
     map_seeds: Sequence[int] | None = None,
     position_callback: Optional[Callable[[int, Dict[str, np.ndarray], int], None]] = None,
+    raw_value_callback: RawValueCallback | None = None,
+    include_event_summary: bool = True,
 ) -> Dict[str, float]:
     """Evaluate paired greedy policies in two native vector batches.
 
@@ -471,7 +494,13 @@ def evaluate_direct_matches(
     the first batch and candidate slot one in the second, preserving the old
     paired-map schedule while reducing model inference from one forward per
     game action to at most one batched forward per model and vector step.
+    The optional raw value callback receives the game index, turn and
+    value-head input for each candidate decision.
     """
+    if (training.flat_curriculum is not None or map_seeds is not None) and (
+        raw_value_callback is not None or not include_event_summary
+    ):
+        raise ValueError("encoded value collection and event controls require the paired vector arena")
     if training.flat_curriculum is not None:
         from ..training.flat_domains import evaluate_mixed_matches
         return evaluate_mixed_matches(model_a, model_b, device, training, games, game_callback,
@@ -584,6 +613,8 @@ def evaluate_direct_matches(
                 live,
                 device,
                 training,
+                raw_value_callback=raw_value_callback,
+                include_event_summary=include_event_summary,
             )
             previous_completed = sum(int(item.sum()) for item in done)
             for batch_index, (

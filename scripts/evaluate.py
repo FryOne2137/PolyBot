@@ -36,6 +36,10 @@ def main() -> None:
         "--positions-per-game", type=int, default=4,
         help="Maximum diagnostic positions per game (disagreements in mcts-diagnostics, raw turns in mcts-value-diagnostics)",
     )
+    parser.add_argument(
+        "--play-disagreement-games", action="store_true",
+        help="In mcts-value-diagnostics, play both actions on the real map and finish with raw policies",
+    )
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
     parser.add_argument("--inference-batch-size", type=int, default=32)
@@ -73,6 +77,8 @@ def main() -> None:
         parser.error(f"--mode {args.mode} requires --model-b")
     if args.mode in diagnostic_modes and args.positions_per_game < 1:
         parser.error("--positions-per-game must be positive")
+    if args.play_disagreement_games and args.mode != "mcts-value-diagnostics":
+        parser.error("--play-disagreement-games requires --mode mcts-value-diagnostics")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
@@ -148,6 +154,8 @@ def main() -> None:
                 evaluate_mcts_value_diagnostics if args.mode == "mcts-value-diagnostics"
                 else evaluate_mcts_diagnostics
             )
+            if args.mode == "mcts-value-diagnostics":
+                pool_options["play_disagreement_games"] = args.play_disagreement_games
             summary = diagnose(
                 model_a, model_b, training, mcts, args.games,
                 positions_per_game=args.positions_per_game, **pool_options,

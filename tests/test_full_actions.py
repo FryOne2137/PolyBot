@@ -163,6 +163,45 @@ def exact_test_worlds(pool, state_ids):
     return np.ascontiguousarray(worlds)
 
 
+@pytest.mark.parametrize("root_player", (0, 1))
+@pytest.mark.parametrize("turn_changes", [(False,), (True,), (True, False), (True, True), (False, True)])
+def test_native_mcts_backup_respects_leaf_player(root_player, turn_changes):
+    from PolyEnv import SelfPlayPool
+
+    pool = exact_self_play_pool(SelfPlayPool, num_envs=1, seed=2137, num_threads=1)
+    request = pool.reset(seed=2137)
+    if root_player:
+        ids = request["state_id"].copy()
+        pool.submit_beliefs(ids, exact_test_worlds(pool, ids))
+        pool.step_into_checked(np.array([0], dtype=np.int32), ids, request)
+    assert int(request["to_play"][0]) == root_player
+    ids = request["state_id"].copy()
+    pool.submit_beliefs(ids, exact_test_worlds(pool, ids))
+
+    acting_player = root_player
+    for switch in (*turn_changes, None):
+        leaf = pool.select_leaves_masked(np.ones(1, dtype=np.uint8), max_leaves=1)
+        assert len(leaf["leaf_id"]) == 1
+        assert int(leaf["to_play"][0]) == acting_player
+        legal = leaf["action_mask"][0].astype(bool)
+        logits = np.full((1, len(legal)), -np.inf, dtype=np.float32)
+        if switch is None:
+            logits[0, legal] = 0.0
+            value = 0.75
+        else:
+            target = leaf["action_id"][0] == 0 if switch else leaf["action_features"][0, :, 0] == 0
+            logits[0, np.flatnonzero(legal & target)[0]] = 0.0
+            value = 0.0
+            acting_player ^= switch
+        pool.expand_and_backup(leaf["leaf_id"], logits, np.array([value], dtype=np.float32))
+
+    root = pool.root_policy()
+    visits = int(root["root_visit_count"][0])
+    assert visits == len(turn_changes) + 1
+    expected_value = -0.75 if sum(turn_changes) % 2 else 0.75
+    assert float(root["root_value"][0]) == pytest.approx(expected_value / visits)
+
+
 def test_mcts_diagnostics_replays_only_disagreements_on_the_same_positions():
     from polybot.evaluation.mcts_diagnostics import evaluate_mcts_diagnostics
 
@@ -218,6 +257,7 @@ def test_mcts_value_diagnostics_reuses_the_same_roots_and_particles(monkeypatch)
         positions_per_game=2, num_threads=2, max_pending_leaves=4,
         visible_action_history=32, belief_retries=4, max_envs=4,
         model_a_label="apprentice", model_b_label="champion",
+        play_disagreement_games=True,
     )
     assert report["raw"]["valid"] and report["raw"]["self_play_pool_leaf_rows"] == 0
     assert [(game["map_seed"], game["model_a_player"]) for game in report["raw_games"]] == [
@@ -242,6 +282,71 @@ def test_mcts_value_diagnostics_reuses_the_same_roots_and_particles(monkeypatch)
             position["belief_value_1"]["action_id"] != position["belief_value_0"]["action_id"]
             or position["true_map_value_1"]["action_id"] != position["true_map_value_0"]["action_id"]
         )
+        expected_actions = set()
+        for mode in ("belief", "true_map"):
+            action_0 = position[f"{mode}_value_0"]["action_id"]
+            action_1 = position[f"{mode}_value_1"]["action_id"]
+            if action_0 != action_1:
+                expected_actions.update((action_0, action_1))
+        assert position["continuations"].keys() == expected_actions
+        for outcome in position["continuations"].values():
+            assert outcome["truncated"] and outcome["score_a"] is None
+            assert outcome["moves_from_position"] == 17 - position["move"]
+    continuation_summary = report["continuations"]
+    assert continuation_summary["played_branches"] == sum(
+        len(position["continuations"]) for position in report["positions"]
+    )
+    assert continuation_summary["terminal_branches"] == 0
+    assert continuation_summary["truncated_branches"] == continuation_summary["played_branches"]
+    assert continuation_summary["belief"]["pairs"] == report["changes"]["belief_only"] + report["changes"]["both"]
+    assert continuation_summary["true_map"]["pairs"] == report["changes"]["true_map_only"] + report["changes"]["both"]
+    for mode in ("belief", "true_map"):
+        assert continuation_summary[mode]["incomplete"] == continuation_summary[mode]["pairs"]
+        assert continuation_summary[mode]["mean_score_delta_value_1_minus_value_0"] is None
+
+
+def test_raw_continuations_distinguish_a_terminal_win_from_the_move_limit():
+    from PolyEnv import GameEnv
+    from polybot.evaluation.mcts_diagnostics import (
+        _ReplayPosition, _play_raw_continuations, _position_fingerprint,
+    )
+    from polybot.planning.heuristic_policy import choose_teacher_action
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    seed = 2137
+    env = GameEnv(seed=seed)
+    rng = np.random.default_rng(seed)
+    model = tiny_model()
+    search = RoutedPoolSearch(
+        TrainingConfig(device="cpu"), MCTSConfig(), [model, model],
+        num_envs=2, num_threads=1, max_pending_leaves=4, visible_action_history=32,
+        belief_retries=0, seed=seed,
+    )
+    seeds = np.full(2, seed, dtype=np.uint32)
+    assignments = np.array([[0, 1], [0, 1]], dtype=np.int32)
+    request = search.reset(seeds, assignments)
+    prefix = []
+    for _ in range(1000):
+        packet = env.model_request_numpy()
+        action = int(packet["actions"]["action_id"][choose_teacher_action(packet, rng)])
+        ok, done, _, winner, _ = env.step_fast(action)
+        assert ok
+        if done:
+            break
+        prefix.append(action)
+        search.step_public_policy(np.full(2, action, dtype=np.int32), request["state_id"], request)
+        assert request["action_valid"].all()
+    else:
+        pytest.fail("the fixture did not reach a terminal state")
+    assert winner == int(request["to_play"][0]) == 0
+    assert action != 0 and 0 in request["action_id"][0, request["action_mask"][0].astype(bool)]
+    position = _ReplayPosition(0, seed, 0, len(prefix), _position_fingerprint(request, 0), action, 0.0)
+
+    win, truncated = _play_raw_continuations(
+        search, [position, position], [action, 0], {0: prefix}, max_moves=len(prefix) + 3,
+    )
+    assert win == {"score_a": 1.0, "winner_player": 0, "truncated": False, "moves_from_position": 1}
+    assert truncated == {"score_a": None, "winner_player": None, "truncated": True, "moves_from_position": 3}
 
 
 def test_full_self_play_masked_into_expands_and_checked_step_preserves_actions():

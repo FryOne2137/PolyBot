@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from functools import partial
 from hashlib import sha256
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -61,7 +62,6 @@ def _true_map_worlds(
     search: RoutedPoolSearch,
     request: Mapping[str, np.ndarray],
 ) -> np.ndarray:
-    # This separate, offline pool never plays a move chosen by this search.
     # Preserve each observer's visible tokens and fog mask. Replace only
     # hidden-map hypotheses, keeping the same ISMCTS routing and leaf model.
     state_ids = request["state_id"]
@@ -207,6 +207,112 @@ def _diagnostic_search(
             mcts.search_random_actions if model_b_search_random_actions is None else model_b_search_random_actions,
         ),
     )
+
+
+def _play_raw_continuations(
+    search: RoutedPoolSearch,
+    positions: Sequence[_ReplayPosition],
+    first_actions: Sequence[int],
+    prefixes: Mapping[int, Sequence[int]],
+    max_moves: int,
+) -> list[dict[str, Any]]:
+    """Play one forced action per branch, followed by greedy public policies."""
+    request = _replay_positions(search, positions, prefixes)
+    moves = np.array([position.prefix_length for position in positions], dtype=np.int32)
+    terminated = np.zeros(len(positions), dtype=bool)
+    winners = np.full(len(positions), -1, dtype=np.int32)
+
+    def step(actions: np.ndarray) -> None:
+        search.step_public_policy(actions, request["state_id"], request)
+        played = actions >= 0
+        if not np.all(request["action_valid"][played]):
+            raise RuntimeError("a continuation action was rejected on the original map")
+        moves[played] += 1
+        finished = played & request["terminated"].astype(bool)
+        # Subsequent held steps in this slot may clear the winner field.
+        winners[finished] = request["winner"][finished]
+        terminated[:] |= finished
+
+    step(np.asarray(first_actions, dtype=np.int32))
+    while True:
+        active = np.flatnonzero(~terminated & (moves < max_moves))
+        if not active.size:
+            break
+        policy, _ = search.direct_policy_value(request, active)
+        actions = np.full(len(positions), -1, dtype=np.int32)
+        actions[active] = request["action_id"][active, policy[active].argmax(axis=1)]
+        step(actions)
+
+    results = []
+    for row, position in enumerate(positions):
+        winner = int(winners[row]) if terminated[row] else None
+        results.append({
+            "score_a": None if winner is None else (0.5 if winner < 0 else float(winner == position.player)),
+            "winner_player": winner,
+            "truncated": not bool(terminated[row]),
+            "moves_from_position": int(moves[row]) - position.prefix_length,
+        })
+    return results
+
+
+def _play_disagreement_pairs(
+    disagreements: Sequence[tuple[_ReplayPosition, dict[str, Any]]],
+    prefixes: Mapping[int, Sequence[int]],
+    new_search: Callable[[Sequence[_ReplayPosition]], RoutedPoolSearch],
+    max_envs: int,
+    max_moves: int,
+) -> dict[str, Any]:
+    pairs: dict[str, list[tuple[dict[int, dict[str, Any]], int, int]]] = {"belief": [], "true_map": []}
+    branches = []
+    for position, result in disagreements:
+        continuations: dict[int, dict[str, Any]] = {}
+        result["continuations"] = continuations
+        actions: set[int] = set()
+        for world, world_pairs in pairs.items():
+            action_0 = result[f"{world}_value_0"]["action_id"]
+            action_1 = result[f"{world}_value_1"]["action_id"]
+            if action_0 != action_1:
+                world_pairs.append((continuations, action_0, action_1))
+                actions.update((action_0, action_1))
+        # The same real action has the same raw continuation regardless of
+        # which search produced it. Play it once and reuse the outcome.
+        branches.extend((position, action, continuations) for action in sorted(actions))
+
+    terminal_branches = 0
+    for start in tqdm(range(0, len(branches), max_envs), desc="play raw continuations", unit="batch"):
+        chunk = branches[start:start + max_envs]
+        positions = [position for position, _, _ in chunk]
+        first_actions = [action for _, action, _ in chunk]
+        search = new_search(positions)
+        outcomes = _play_raw_continuations(search, positions, first_actions, prefixes, max_moves)
+        for (_, action, continuations), outcome in zip(chunk, outcomes):
+            continuations[action] = outcome
+            terminal_branches += not outcome["truncated"]
+        del search
+
+    summary: dict[str, Any] = {
+        "policy": "raw_argmax",
+        "played_branches": len(branches),
+        "terminal_branches": terminal_branches,
+        "truncated_branches": len(branches) - terminal_branches,
+    }
+    for world, world_pairs in pairs.items():
+        deltas = []
+        for continuations, action_0, action_1 in world_pairs:
+            score_0 = continuations[action_0]["score_a"]
+            score_1 = continuations[action_1]["score_a"]
+            if score_0 is not None and score_1 is not None:
+                deltas.append(score_1 - score_0)
+        summary[world] = {
+            "pairs": len(world_pairs),
+            "both_terminal": len(deltas),
+            "incomplete": len(world_pairs) - len(deltas),
+            "value_1_better": sum(delta > 0.0 for delta in deltas),
+            "value_0_better": sum(delta < 0.0 for delta in deltas),
+            "same_outcome": sum(delta == 0.0 for delta in deltas),
+            "mean_score_delta_value_1_minus_value_0": sum(deltas) / len(deltas) if deltas else None,
+        }
+    return summary
 
 
 def evaluate_mcts_diagnostics(
@@ -357,6 +463,7 @@ def evaluate_mcts_value_diagnostics(
     model_b_label: str,
     model_b_search_top_actions: int | None = None,
     model_b_search_random_actions: int | None = None,
+    play_disagreement_games: bool = False,
 ) -> dict[str, Any]:
     """Compare leaf value scales on sampled apprentice turns from paired raw games."""
     if positions_per_game < 1:
@@ -424,20 +531,21 @@ def evaluate_mcts_value_diagnostics(
     compared = 0
     changes = {"belief_only": 0, "true_map_only": 0, "both": 0, "neither": 0}
     agreement = {"value_1": 0, "value_0": 0}
-    results = []
+    disagreements: list[tuple[_ReplayPosition, dict[str, Any]]] = []
     seed_everything(training.seed)
+    new_search = partial(
+        _diagnostic_search, model_a, model_b, training, mcts,
+        num_threads=num_threads, max_pending_leaves=max_pending_leaves,
+        visible_action_history=visible_action_history,
+        belief_retries=_evaluation_belief_retries(belief_retries),
+        model_b_search_top_actions=model_b_search_top_actions,
+        model_b_search_random_actions=model_b_search_random_actions,
+    )
     batches = deque(positions[start:start + max_envs] for start in range(0, len(positions), max_envs))
     with tqdm(total=len(positions), desc="compare MCTS leaf values", unit="position") as progress:
         while batches:
             chunk = batches.popleft()
-            search = _diagnostic_search(
-                model_a, model_b, training, mcts, chunk,
-                num_threads=num_threads, max_pending_leaves=max_pending_leaves,
-                visible_action_history=visible_action_history,
-                belief_retries=_evaluation_belief_retries(belief_retries),
-                model_b_search_top_actions=model_b_search_top_actions,
-                model_b_search_random_actions=model_b_search_random_actions,
-            )
+            search = new_search(chunk)
             request = _replay_positions(search, chunk, prefixes)
             try:
                 decisions = _compare_leaf_scales(search, request)
@@ -475,12 +583,12 @@ def evaluate_mcts_value_diagnostics(
                     agreement[scale] += actions[f"belief_{scale}"] == actions[f"true_map_{scale}"]
                 if change != "neither":
                     game = outcomes[position.game]
-                    results.append({
+                    disagreements.append((position, {
                         "game": position.game, "seed": position.seed, "move": position.prefix_length + 1,
                         "player": position.player, "raw_action": position.raw_action, "raw_value": position.raw_value,
                         "observed_raw_game_outcome": None if game["truncated"] else 2 * game["score_a"] - 1,
                         "change": change, **choices,
-                    })
+                    }))
             compared += len(chunk)
             progress.update(len(chunk))
 
@@ -489,6 +597,10 @@ def evaluate_mcts_value_diagnostics(
         compared_positions=compared,
         changes=changes,
         belief_true_map_action_agreement=agreement,
-        positions=results,
+        positions=[result for _, result in disagreements],
     )
+    if play_disagreement_games:
+        report["continuations"] = _play_disagreement_pairs(
+            disagreements, prefixes, new_search, max_envs, training.max_moves,
+        )
     return report

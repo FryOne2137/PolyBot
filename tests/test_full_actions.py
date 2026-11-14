@@ -308,7 +308,7 @@ def test_mcts_value_diagnostics_reuses_the_same_roots_and_particles(monkeypatch)
 def test_raw_continuations_distinguish_a_terminal_win_from_the_move_limit():
     from PolyEnv import GameEnv
     from polybot.evaluation.mcts_diagnostics import (
-        _ReplayPosition, _play_raw_continuations, _position_fingerprint,
+        _ReplayPosition, _play_continuations, _position_fingerprint,
     )
     from polybot.planning.heuristic_policy import choose_teacher_action
     from polybot.training.routed_self_play_pool import RoutedPoolSearch
@@ -340,13 +340,85 @@ def test_raw_continuations_distinguish_a_terminal_win_from_the_move_limit():
         pytest.fail("the fixture did not reach a terminal state")
     assert winner == int(request["to_play"][0]) == 0
     assert action != 0 and 0 in request["action_id"][0, request["action_mask"][0].astype(bool)]
-    position = _ReplayPosition(0, seed, 0, len(prefix), _position_fingerprint(request, 0), action, 0.0)
+    position = _ReplayPosition(0, seed, 0, len(prefix), _position_fingerprint(request, 0))
 
-    win, truncated = _play_raw_continuations(
+    win, truncated = _play_continuations(
         search, [position, position], [action, 0], {0: prefix}, max_moves=len(prefix) + 3,
     )
     assert win == {"score_a": 1.0, "winner_player": 0, "truncated": False, "moves_from_position": 1}
     assert truncated == {"score_a": None, "winner_player": None, "truncated": True, "moves_from_position": 3}
+
+
+def test_first_divergence_replays_only_opposite_winners_with_shared_mcts(monkeypatch):
+    from polybot.evaluation import mcts_diagnostics as diagnostics
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    seed = 2137
+    model = tiny_model()
+    training = TrainingConfig(device="cpu", seed=seed, max_moves=4)
+    mcts = MCTSConfig(simulations=32, particles=1)
+    fixture = RoutedPoolSearch(
+        training, mcts, [model, model], num_envs=1, num_threads=1,
+        max_pending_leaves=4, visible_action_history=32, belief_retries=4, seed=seed,
+    )
+    seeds = np.array([seed], dtype=np.uint32)
+    assignments = np.array([[1, 0]], dtype=np.int32)
+    game_index = np.array([1], dtype=np.int64)
+    evaluated_scales = []
+
+    def play_baseline(*args, **kwargs):
+        scale = kwargs["leaf_value_scale"]
+        evaluated_scales.append(scale)
+        assert kwargs["map_seeds"] == [seed, seed, seed + 1, seed + 1]
+        assert kwargs["model_b_uses_mcts"] is False and kwargs["replace_failed_pairs"] is False
+        record = kwargs["action_callback"]
+        request = fixture.reset(seeds, assignments)
+        end_turn = np.array([0], dtype=np.int32)
+        record(game_index, request, end_turn)
+        fixture.step_public_policy(end_turn, request["state_id"], request)
+        assert request["agent_id"].tolist() == [0]
+        moves = request["action_id"][0, request["action_features"][0, :, 0] == 0]
+        record(game_index, request, np.array([moves[int(scale)]], dtype=np.int32))
+        for index in (3, 1, 0, 2):
+            winner = (0, 1, 1, -1)[index] if scale else 0
+            kwargs["game_callback"]({
+                "game_index": index, "map_seed": seed + index // 2, "model_a_player": index % 2,
+                "winner_player": winner, "truncated": bool(scale and index == 2),
+            })
+        return {"valid": True, "evaluated_map_seeds": kwargs["map_seeds"]}
+
+    searched = []
+    evaluate = diagnostics._evaluation_search_with_recovery
+
+    def record_search(search, request, active, **kwargs):
+        assert search.mcts.simulations == 32
+        np.testing.assert_array_equal(kwargs["mcts_mask"], active & (request["agent_id"] == 0))
+        searched.append((search.num_envs, search.leaf_value_scale))
+        return evaluate(search, request, active, **kwargs)
+
+    monkeypatch.setattr(diagnostics, "evaluate_matches_pool", play_baseline)
+    monkeypatch.setattr(diagnostics, "_evaluation_search_with_recovery", record_search)
+    report = diagnostics.evaluate_mcts_first_divergence(
+        model, model, training, mcts, games=4, num_threads=1,
+        max_pending_leaves=4, visible_action_history=32, belief_retries=4, max_envs=4,
+        model_a_label="apprentice", model_b_label="champion", continuation_value_scale=0.0,
+    )
+    assert evaluated_scales == [1.0, 0.0]
+    assert searched and set(searched) == {(2, 0.0)}
+    assert report["diagnostics_valid"]
+    assert report["changed_winner_pairs"] == 1
+    assert report["excluded_truncated_pairs"] == report["excluded_draw_pairs"] == 1
+    position, = report["positions"]
+    assert (position["seed"], position["model_a_player"], position["move"]) == (seed, 1, 2)
+    assert position["actor"] == "apprentice"
+    assert position["action_value_0"] != position["action_value_1"]
+    assert report["continuations"]["mcts"]["leaf_value_scale"] == 0.0
+    for policy in ("raw", "mcts"):
+        assert report["continuations"][policy]["incomplete"] == 1
+        assert all(
+            branch["truncated"] and branch["moves_from_position"] == 3
+            for branch in position["continuations"][policy].values()
+        )
 
 
 def test_full_self_play_masked_into_expands_and_checked_step_preserves_actions():

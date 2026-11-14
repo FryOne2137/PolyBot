@@ -1,4 +1,4 @@
-"""Compare belief search and true-map search on replayed evaluation positions."""
+"""Diagnose MCTS choices and replay alternatives on paired maps."""
 
 from __future__ import annotations
 
@@ -47,12 +47,16 @@ class _ReplayPosition:
     player: int
     prefix_length: int
     fingerprint: str
+
+
+@dataclass
+class _RawPosition(_ReplayPosition):
     raw_action: int
     raw_value: float
 
 
 @dataclass
-class _Disagreement(_ReplayPosition):
+class _Disagreement(_RawPosition):
     belief_action: int
     belief_value: float
     belief_visits: int
@@ -209,21 +213,26 @@ def _diagnostic_search(
     )
 
 
-def _play_raw_continuations(
+def _play_continuations(
     search: RoutedPoolSearch,
     positions: Sequence[_ReplayPosition],
     first_actions: Sequence[int],
     prefixes: Mapping[int, Sequence[int]],
     max_moves: int,
+    *,
+    mcts_value_scale: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Play one forced action per branch, followed by greedy public policies."""
+    """Force the first move, then use raw policies or MCTS on model A's turns."""
     request = _replay_positions(search, positions, prefixes)
     moves = np.array([position.prefix_length for position in positions], dtype=np.int32)
     terminated = np.zeros(len(positions), dtype=bool)
     winners = np.full(len(positions), -1, dtype=np.int32)
 
-    def step(actions: np.ndarray) -> None:
-        search.step_public_policy(actions, request["state_id"], request)
+    def step(actions: np.ndarray, *, searched: bool = False) -> None:
+        if searched:
+            search.pool.step_into_checked(actions, request["state_id"], request)
+        else:
+            search.step_public_policy(actions, request["state_id"], request)
         played = actions >= 0
         if not np.all(request["action_valid"][played]):
             raise RuntimeError("a continuation action was rejected on the original map")
@@ -233,15 +242,25 @@ def _play_raw_continuations(
         winners[finished] = request["winner"][finished]
         terminated[:] |= finished
 
+    if mcts_value_scale is not None:
+        search.leaf_value_scale = mcts_value_scale
     step(np.asarray(first_actions, dtype=np.int32))
     while True:
-        active = np.flatnonzero(~terminated & (moves < max_moves))
-        if not active.size:
+        active = ~terminated & (moves < max_moves)
+        rows = np.flatnonzero(active)
+        if not rows.size:
             break
-        policy, _ = search.direct_policy_value(request, active)
+        mcts_mask = active & (request["agent_id"] == 0)
+        searched = mcts_value_scale is not None and bool(mcts_mask.any())
+        if searched:
+            root, _ = _evaluation_search_with_recovery(search, request, active, mcts_mask=mcts_mask)
+            policy, action_ids = root["policy"], root["action_id"]
+        else:
+            policy, _ = search.direct_policy_value(request, rows)
+            action_ids = request["action_id"]
         actions = np.full(len(positions), -1, dtype=np.int32)
-        actions[active] = request["action_id"][active, policy[active].argmax(axis=1)]
-        step(actions)
+        actions[rows] = action_ids[rows, policy[rows].argmax(axis=1)]
+        step(actions, searched=searched)
 
     results = []
     for row, position in enumerate(positions):
@@ -253,6 +272,21 @@ def _play_raw_continuations(
             "moves_from_position": int(moves[row]) - position.prefix_length,
         })
     return results
+
+
+def _continuation_pair_summary(
+    scores: Sequence[tuple[float | None, float | None]],
+) -> dict[str, Any]:
+    deltas = [one - zero for zero, one in scores if zero is not None and one is not None]
+    return {
+        "pairs": len(scores),
+        "both_terminal": len(deltas),
+        "incomplete": len(scores) - len(deltas),
+        "value_1_better": sum(delta > 0.0 for delta in deltas),
+        "value_0_better": sum(delta < 0.0 for delta in deltas),
+        "same_outcome": sum(delta == 0.0 for delta in deltas),
+        "mean_score_delta_value_1_minus_value_0": sum(deltas) / len(deltas) if deltas else None,
+    }
 
 
 def _play_disagreement_pairs(
@@ -284,7 +318,7 @@ def _play_disagreement_pairs(
         positions = [position for position, _, _ in chunk]
         first_actions = [action for _, action, _ in chunk]
         search = new_search(positions)
-        outcomes = _play_raw_continuations(search, positions, first_actions, prefixes, max_moves)
+        outcomes = _play_continuations(search, positions, first_actions, prefixes, max_moves)
         for (_, action, continuations), outcome in zip(chunk, outcomes):
             continuations[action] = outcome
             terminal_branches += not outcome["truncated"]
@@ -297,21 +331,10 @@ def _play_disagreement_pairs(
         "truncated_branches": len(branches) - terminal_branches,
     }
     for world, world_pairs in pairs.items():
-        deltas = []
-        for continuations, action_0, action_1 in world_pairs:
-            score_0 = continuations[action_0]["score_a"]
-            score_1 = continuations[action_1]["score_a"]
-            if score_0 is not None and score_1 is not None:
-                deltas.append(score_1 - score_0)
-        summary[world] = {
-            "pairs": len(world_pairs),
-            "both_terminal": len(deltas),
-            "incomplete": len(world_pairs) - len(deltas),
-            "value_1_better": sum(delta > 0.0 for delta in deltas),
-            "value_0_better": sum(delta < 0.0 for delta in deltas),
-            "same_outcome": sum(delta == 0.0 for delta in deltas),
-            "mean_score_delta_value_1_minus_value_0": sum(deltas) / len(deltas) if deltas else None,
-        }
+        summary[world] = _continuation_pair_summary([
+            (continuations[action_0]["score_a"], continuations[action_1]["score_a"])
+            for continuations, action_0, action_1 in world_pairs
+        ])
     return summary
 
 
@@ -473,7 +496,7 @@ def evaluate_mcts_value_diagnostics(
     rng = np.random.default_rng(training.seed ^ 0xD1A6)
     seeds = [training.seed + index // 2 for index in range(games)]
     prefixes: dict[int, list[int]] = defaultdict(list)
-    samples: dict[int, list[_ReplayPosition]] = defaultdict(list)
+    samples: dict[int, list[_RawPosition]] = defaultdict(list)
     seen: dict[int, int] = defaultdict(int)
     outcomes: dict[int, Mapping[str, Any]] = {}
 
@@ -488,7 +511,7 @@ def evaluate_mcts_value_diagnostics(
                     rng.integers(seen[game])
                 )
                 if index < positions_per_game:
-                    position = _ReplayPosition(
+                    position = _RawPosition(
                         game, int(raw["map_seed"][row]), int(raw["to_play"][row]), len(prefix),
                         _position_fingerprint(raw, row), int(actions[row]), float(raw["root_value"][row]),
                     )
@@ -603,4 +626,180 @@ def evaluate_mcts_value_diagnostics(
         report["continuations"] = _play_disagreement_pairs(
             disagreements, prefixes, new_search, max_envs, training.max_moves,
         )
+    return report
+
+
+def evaluate_mcts_first_divergence(
+    model_a: PolicyValueBeliefNet,
+    model_b: PolicyValueBeliefNet,
+    training: TrainingConfig,
+    mcts: MCTSConfig,
+    games: int,
+    *,
+    num_threads: int | None,
+    max_pending_leaves: int,
+    visible_action_history: int,
+    belief_retries: int,
+    max_envs: int,
+    model_a_label: str,
+    model_b_label: str,
+    model_b_search_top_actions: int | None = None,
+    model_b_search_random_actions: int | None = None,
+    continuation_value_scale: float = 1.0,
+) -> dict[str, Any]:
+    """Replay the first different action in paired MCTS games with opposite winners."""
+    if continuation_value_scale not in (0.0, 1.0):
+        raise ValueError("continuation value scale must be 0 or 1")
+    seeds = [training.seed + index // 2 for index in range(games)]
+    if not (0 <= training.seed <= 2**31 - 1) or any(seed >= 2**31 for seed in seeds):
+        raise ValueError("diagnostic map seeds must be in [0, 2**31 - 1]")
+    schedule = [(seed, index % 2) for index, seed in enumerate(seeds)]
+    baselines: dict[str, Any] = {}
+    report: dict[str, Any] = {
+        "baseline": baselines,
+        "diagnostics_valid": False,
+        "positions": [],
+        "simulations": mcts.simulations,
+    }
+    traces: dict[str, dict[int, list[tuple[int, int, str]]]] = {}
+    outcomes: dict[str, dict[tuple[int, int], Mapping[str, Any]]] = {}
+    for label, scale in (("value_1", 1.0), ("value_0", 0.0)):
+        trace: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
+        games_by_side: dict[tuple[int, int], Mapping[str, Any]] = {}
+
+        def record_actions(indices, request, actions) -> None:
+            for row in np.flatnonzero(actions >= 0):
+                trace[int(indices[row])].append((
+                    int(actions[row]), int(request["to_play"][row]), _position_fingerprint(request, row),
+                ))
+
+        def record_game(game) -> None:
+            games_by_side[game["map_seed"], game["model_a_player"]] = game
+
+        baseline = evaluate_matches_pool(
+            model_a, model_b, training, mcts, games,
+            num_threads=num_threads, max_pending_leaves=max_pending_leaves,
+            visible_action_history=visible_action_history, belief_retries=belief_retries,
+            max_envs=max_envs, model_b_uses_mcts=False, leaf_value_scale=scale,
+            map_seeds=seeds, replace_failed_pairs=False, belief_action_mode="root_shield",
+            model_b_search_top_actions=model_b_search_top_actions,
+            model_b_search_random_actions=model_b_search_random_actions,
+            model_a_label=f"{model_a_label} ({label})", model_b_label=model_b_label,
+            action_callback=record_actions, game_callback=record_game,
+        )
+        baselines[label] = baseline
+        if not baseline["valid"]:
+            report["invalid_reason"] = f"{label} did not finish the fixed evaluation schedule"
+            return report
+        if baseline["evaluated_map_seeds"] != seeds or set(games_by_side) != set(schedule):
+            raise RuntimeError(f"{label} evaluation changed the paired map and side schedule")
+        traces[label] = trace
+        outcomes[label] = games_by_side
+
+    positions: list[tuple[_ReplayPosition, dict[str, Any]]] = []
+    prefixes: dict[int, list[int]] = {}
+    paired_games = []
+    excluded_truncated = excluded_draws = 0
+    for index, (seed, player) in enumerate(schedule):
+        zero = outcomes["value_0"][seed, player]
+        one = outcomes["value_1"][seed, player]
+        paired = {
+            "seed": seed, "model_a_player": player,
+            "winner_value_0": None if zero["truncated"] else zero["winner_player"],
+            "winner_value_1": None if one["truncated"] else one["winner_player"],
+        }
+        paired_games.append(paired)
+        if zero["truncated"] or one["truncated"]:
+            excluded_truncated += 1
+            continue
+        if min(zero["winner_player"], one["winner_player"]) < 0:
+            excluded_draws += 1
+            continue
+        if zero["winner_player"] == one["winner_player"]:
+            continue
+
+        zero_steps = traces["value_0"][zero["game_index"]]
+        one_steps = traces["value_1"][one["game_index"]]
+        prefix = []
+        for step_0, step_1 in zip(zero_steps, one_steps):
+            action_0, actor, fingerprint = step_0
+            action_1, actor_1, fingerprint_1 = step_1
+            if (actor, fingerprint) != (actor_1, fingerprint_1):
+                raise RuntimeError(f"paired observations differ before the first different action on seed {seed}")
+            if action_0 != action_1:
+                position = _ReplayPosition(index, seed, player, len(prefix), fingerprint)
+                positions.append((position, {
+                    **paired, "move": len(prefix) + 1, "to_play": actor,
+                    "actor": "apprentice" if actor == player else "opponent",
+                    "action_value_0": action_0, "action_value_1": action_1,
+                    "continuations": {},
+                }))
+                break
+            prefix.append(action_0)
+        else:
+            raise RuntimeError(f"the winner changed without a different action on seed {seed}, side {player}")
+        prefixes[index] = prefix
+
+    new_search = partial(
+        _diagnostic_search, model_a, model_b, training, mcts,
+        num_threads=num_threads, max_pending_leaves=max_pending_leaves,
+        visible_action_history=visible_action_history,
+        belief_retries=_evaluation_belief_retries(belief_retries),
+        model_b_search_top_actions=model_b_search_top_actions,
+        model_b_search_random_actions=model_b_search_random_actions,
+    )
+    summaries = {}
+    batch_pairs = max_envs // 2
+    for policy, scale in (("raw", None), ("mcts", continuation_value_scale)):
+        seed_everything(training.seed)
+        batches = deque(positions[start:start + batch_pairs] for start in range(0, len(positions), batch_pairs))
+        failed_pairs = 0
+        with tqdm(total=len(positions), desc=f"play first divergence ({policy})", unit="pair") as progress:
+            while batches:
+                batch = batches.popleft()
+                branch_positions = [position for position, _ in batch for _ in range(2)]
+                first_actions = [row[key] for _, row in batch for key in ("action_value_0", "action_value_1")]
+                search = new_search(branch_positions)
+                try:
+                    branches = _play_continuations(
+                        search, branch_positions, first_actions, prefixes, training.max_moves,
+                        mcts_value_scale=scale,
+                    )
+                except BeliefRecoveryRequired as error:
+                    if len(batch) > 1:
+                        middle = len(batch) // 2
+                        batches.appendleft(batch[middle:])
+                        batches.appendleft(batch[:middle])
+                        continue
+                    failed_pairs += 1
+                    branches = [{"score_a": None, "failure_reason": str(error)}] * 2
+                finally:
+                    del search
+                for row_index, (_, row) in enumerate(batch):
+                    row["continuations"][policy] = dict(zip(
+                        ("from_value_0_action", "from_value_1_action"), branches[2 * row_index:2 * row_index + 2],
+                    ))
+                progress.update(len(batch))
+
+        scores = [
+            (row["continuations"][policy]["from_value_0_action"]["score_a"],
+             row["continuations"][policy]["from_value_1_action"]["score_a"])
+            for _, row in positions
+        ]
+        summaries[policy] = {
+            **_continuation_pair_summary(scores), "failed_pairs": failed_pairs,
+            "leaf_value_scale": scale,
+        }
+
+    report.update(
+        diagnostics_valid=not any(summary["failed_pairs"] for summary in summaries.values()),
+        paired_games=paired_games,
+        excluded_truncated_pairs=excluded_truncated,
+        excluded_draw_pairs=excluded_draws,
+        changed_winner_pairs=len(positions),
+        opponent_first_divergences=sum(row["actor"] == "opponent" for _, row in positions),
+        continuation_policies={"raw": "both_raw", "mcts": "apprentice_mcts_opponent_raw"},
+        continuations=summaries,
+        positions=[row for _, row in positions],
+    )
     return report

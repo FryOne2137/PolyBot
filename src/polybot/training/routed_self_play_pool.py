@@ -65,6 +65,7 @@ from .value_targets import Transition
 
 
 GameCallback = Callable[[Mapping[str, Any]], None]
+ActionCallback = Callable[[np.ndarray, Mapping[str, np.ndarray], np.ndarray], None]
 DecisionCallback = Callable[
     [np.ndarray, Mapping[str, np.ndarray], Mapping[str, np.ndarray], np.ndarray], None
 ]
@@ -2378,6 +2379,7 @@ def evaluate_matches_pool(
     replace_failed_pairs: bool = True,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
+    action_callback: ActionCallback | None = None,
     decision_callback: DecisionCallback | None = None,
     model_b_search_top_actions: int | None = None,
     model_b_search_random_actions: int | None = None,
@@ -2402,6 +2404,9 @@ def evaluate_matches_pool(
     ``excluded_map_seeds`` reserves maps which must never be used as a
     recovery replacement.  Callers use it to keep an invalid evaluation pair
     from being silently replaced with a map used by any training collection.
+
+    ``action_callback`` observes the public positions and chosen action IDs
+    before each step in fixed-pair evaluation, without extra inference.
     """
     if games < 2 or games % 2:
         raise ValueError("games must be positive and even for paired evaluation")
@@ -2410,6 +2415,8 @@ def evaluate_matches_pool(
     if belief_action_mode not in {"strict", "root_shield"}:
         raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
     raw_only = not (model_a_uses_mcts or model_b_uses_mcts)
+    if action_callback is not None and replace_failed_pairs:
+        raise ValueError("action collection requires fixed pairs")
     if decision_callback is not None and (model_b_uses_mcts or replace_failed_pairs):
         raise ValueError("decision collection requires a raw model B and fixed pairs")
     fixed_map_seeds = None
@@ -2647,6 +2654,8 @@ def evaluate_matches_pool(
                 actions[active_rows] = np.asarray(root["action_id"], dtype=np.int32)[
                     active_rows, action_rows[active_rows]
                 ]
+                if action_callback is not None:
+                    action_callback(indices, request, actions)
                 if decision_callback is not None:
                     decision_callback(
                         indices,

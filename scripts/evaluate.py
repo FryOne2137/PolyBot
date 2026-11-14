@@ -26,7 +26,7 @@ def main() -> None:
         "--mode",
         choices=(
             "mcts", "flat", "mcts-vs-raw", "mcts-diagnostics",
-            "mcts-value-ablation", "mcts-value-diagnostics",
+            "mcts-value-ablation", "mcts-value-diagnostics", "mcts-first-divergence",
         ),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
@@ -39,6 +39,10 @@ def main() -> None:
     parser.add_argument(
         "--play-disagreement-games", action="store_true",
         help="In mcts-value-diagnostics, play both actions on the real map and finish with raw policies",
+    )
+    parser.add_argument(
+        "--continuation-value-scale", type=float, choices=(0.0, 1.0),
+        help="Common MCTS leaf value scale for both continuations in mcts-first-divergence (default: 1)",
     )
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
@@ -79,6 +83,8 @@ def main() -> None:
         parser.error("--positions-per-game must be positive")
     if args.play_disagreement_games and args.mode != "mcts-value-diagnostics":
         parser.error("--play-disagreement-games requires --mode mcts-value-diagnostics")
+    if args.continuation_value_scale is not None and args.mode != "mcts-first-divergence":
+        parser.error("--continuation-value-scale requires --mode mcts-first-divergence")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
@@ -159,6 +165,16 @@ def main() -> None:
             summary = diagnose(
                 model_a, model_b, training, mcts, args.games,
                 positions_per_game=args.positions_per_game, **pool_options,
+            )
+        elif args.mode == "mcts-first-divergence":
+            from polybot.evaluation.mcts_diagnostics import evaluate_mcts_first_divergence
+
+            summary = evaluate_mcts_first_divergence(
+                model_a, model_b, training, mcts, args.games,
+                continuation_value_scale=(
+                    1.0 if args.continuation_value_scale is None else args.continuation_value_scale
+                ),
+                **pool_options,
             )
         elif args.mode == "mcts-value-ablation":
             seeds = [training.seed + index // 2 for index in range(args.games)]

@@ -24,14 +24,17 @@ def main() -> None:
     parser.add_argument("--model-b", type=Path, help="optional MCTS opponent; default is random")
     parser.add_argument(
         "--mode",
-        choices=("mcts", "flat", "mcts-vs-raw", "mcts-diagnostics", "mcts-value-ablation"),
+        choices=(
+            "mcts", "flat", "mcts-vs-raw", "mcts-diagnostics",
+            "mcts-value-ablation", "mcts-value-diagnostics",
+        ),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
     )
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument(
         "--positions-per-game", type=int, default=4,
-        help="Maximum sampled raw-versus-MCTS disagreements per game in mcts-diagnostics",
+        help="Maximum diagnostic positions per game (disagreements in mcts-diagnostics, raw turns in mcts-value-diagnostics)",
     )
     parser.add_argument("--simulations", type=int, default=32)
     parser.add_argument("--particles", type=int, default=2)
@@ -65,9 +68,10 @@ def main() -> None:
         help="Set to a nonzero value only when evaluating the anchored search policy.",
     )
     args = parser.parse_args()
-    if args.mode in {"flat", "mcts-vs-raw", "mcts-diagnostics", "mcts-value-ablation"} and args.model_b is None:
+    diagnostic_modes = {"mcts-diagnostics", "mcts-value-diagnostics"}
+    if args.mode != "mcts" and args.model_b is None:
         parser.error(f"--mode {args.mode} requires --model-b")
-    if args.mode == "mcts-diagnostics" and args.positions_per_game < 1:
+    if args.mode in diagnostic_modes and args.positions_per_game < 1:
         parser.error("--positions-per-game must be positive")
 
     training = training_config_from_args(args)
@@ -134,10 +138,17 @@ def main() -> None:
             model_a_label=args.model_a.stem,
             model_b_label=args.model_b.stem,
         )
-        if args.mode == "mcts-diagnostics":
-            from polybot.evaluation.mcts_diagnostics import evaluate_mcts_diagnostics
+        if args.mode in diagnostic_modes:
+            from polybot.evaluation.mcts_diagnostics import (
+                evaluate_mcts_diagnostics,
+                evaluate_mcts_value_diagnostics,
+            )
 
-            summary = evaluate_mcts_diagnostics(
+            diagnose = (
+                evaluate_mcts_value_diagnostics if args.mode == "mcts-value-diagnostics"
+                else evaluate_mcts_diagnostics
+            )
+            summary = diagnose(
                 model_a, model_b, training, mcts, args.games,
                 positions_per_game=args.positions_per_game, **pool_options,
             )

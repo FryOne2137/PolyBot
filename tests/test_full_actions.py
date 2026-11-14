@@ -196,6 +196,54 @@ def test_mcts_diagnostics_replays_only_disagreements_on_the_same_positions():
     assert report["value_vs_observed_belief_game"]["raw_value"]["count"] == 0
 
 
+def test_mcts_value_diagnostics_reuses_the_same_roots_and_particles(monkeypatch):
+    from polybot.data.full_actions import ExactActionNative
+    from polybot.evaluation.mcts_diagnostics import evaluate_mcts_value_diagnostics
+
+    submitted_worlds = []
+
+    def record_beliefs(pool, state_ids, worlds):
+        pool.native.submit_beliefs(state_ids, worlds)
+        if worlds.ndim == 5:
+            submitted_worlds.append(worlds.copy())
+
+    monkeypatch.setattr(ExactActionNative, "submit_beliefs", record_beliefs, raising=False)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(21)
+        model = tiny_model()
+    seed = 1048957319
+    report = evaluate_mcts_value_diagnostics(
+        model, model, TrainingConfig(device="cpu", seed=seed, max_moves=16),
+        MCTSConfig(simulations=32, particles=4), games=12,
+        positions_per_game=2, num_threads=2, max_pending_leaves=4,
+        visible_action_history=32, belief_retries=4, max_envs=4,
+        model_a_label="apprentice", model_b_label="champion",
+    )
+    assert report["raw"]["valid"] and report["raw"]["self_play_pool_leaf_rows"] == 0
+    assert [(game["map_seed"], game["model_a_player"]) for game in report["raw_games"]] == [
+        (seed + index // 2, index % 2) for index in range(12)
+    ]
+    assert report["diagnostics_valid"]
+    assert report["sampled_positions"] == report["compared_positions"] == 24
+    assert sum(report["changes"].values()) == 24
+    assert len(report["positions"]) == 24 - report["changes"]["neither"]
+    assert len(submitted_worlds) == 24
+    for index in range(0, len(submitted_worlds), 4):
+        np.testing.assert_array_equal(submitted_worlds[index], submitted_worlds[index + 1])
+        np.testing.assert_array_equal(submitted_worlds[index + 2], submitted_worlds[index + 3])
+    for position in report["positions"]:
+        assert position["observed_raw_game_outcome"] is None
+        for mode in ("belief", "true_map"):
+            for scale in (0, 1):
+                choice = position[f"{mode}_value_{scale}"]
+                assert 0 < choice["root_visits"] <= 32
+                assert choice["action_visits"][choice["action_id"]] == choice["chosen_action_visits"]
+        assert (
+            position["belief_value_1"]["action_id"] != position["belief_value_0"]["action_id"]
+            or position["true_map_value_1"]["action_id"] != position["true_map_value_0"]["action_id"]
+        )
+
+
 def test_full_self_play_masked_into_expands_and_checked_step_preserves_actions():
     from PolyEnv import SelfPlayPool
     pool = exact_self_play_pool(SelfPlayPool, num_envs=1, seed=2137, num_threads=1, max_actions=1)

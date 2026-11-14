@@ -193,15 +193,17 @@ def _evaluation_search_with_recovery(
     mcts_mask: np.ndarray | None = None,
     direct_policy: np.ndarray | None = None,
     direct_value: np.ndarray | None = None,
+    on_submitted_beliefs: Callable[[np.ndarray], None] | None = None,
     recovery_cycles: int = _EVALUATION_POSITION_RECOVERY_CYCLES,
 ) -> tuple[Dict[str, np.ndarray], tuple[BeliefRecoveryRequired, ...]]:
     """Retry one held-out position without changing its state, map, or seed."""
     if recovery_cycles < 1:
         raise ValueError("evaluation recovery_cycles must be positive")
-    direct = (
-        {"direct_policy": direct_policy, "direct_value": direct_value}
-        if direct_policy is not None else {}
-    )
+    search_options: dict[str, Any] = {}
+    if direct_policy is not None:
+        search_options.update(direct_policy=direct_policy, direct_value=direct_value)
+    if on_submitted_beliefs is not None:
+        search_options["on_submitted_beliefs"] = on_submitted_beliefs
     failures: list[BeliefRecoveryRequired] = []
     for _ in range(int(recovery_cycles)):
         try:
@@ -212,7 +214,7 @@ def _evaluation_search_with_recovery(
                 belief_temperature=0.0,
                 prior_scale=0.0,
                 mcts_mask=mcts_mask,
-                **direct,
+                **search_options,
             )
             return root, tuple(failures)
         except BeliefRecoveryRequired as error:
@@ -1723,12 +1725,15 @@ class RoutedPoolSearch:
         direct_value: np.ndarray | None = None,
         raw_policy_only: bool = False,
         moves_played: np.ndarray | None = None,
+        on_submitted_beliefs: Callable[[np.ndarray], None] | None = None,
     ) -> Dict[str, np.ndarray]:
         """Run full or selective routed belief-MCTS for one vector decision.
 
         Rows outside ``mcts_mask`` execute the public raw policy. In raw-only
         collection, learned particles are measured for belief supervision and
         the public decision is returned without constructing a search forest.
+        ``on_submitted_beliefs`` exposes the accepted particles to diagnostics
+        so they can rerun the same forest with a different leaf evaluator.
         """
         for model in self.models:
             model.eval()
@@ -2025,6 +2030,8 @@ class RoutedPoolSearch:
                     diagnostics,
                 ) from error
 
+        if on_submitted_beliefs is not None:
+            on_submitted_beliefs(particles)
         return self._search_submitted_roots(
             request, mcts_mask, root_temperature, prior_scale,
             direct_rows, direct_policy, direct_value,
@@ -2346,6 +2353,10 @@ def _next_evaluation_replacement_seed(
             return value, next_cursor
 
 
+def _evaluation_belief_retries(belief_retries: int) -> int:
+    return max(_EVALUATION_MIN_BELIEF_RETRIES, 16 * int(belief_retries))
+
+
 def evaluate_matches_pool(
     model_a: PolicyValueBeliefNet,
     model_b: PolicyValueBeliefNet,
@@ -2399,10 +2410,8 @@ def evaluate_matches_pool(
     if belief_action_mode not in {"strict", "root_shield"}:
         raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
     raw_only = not (model_a_uses_mcts or model_b_uses_mcts)
-    if decision_callback is not None and (
-        not model_a_uses_mcts or model_b_uses_mcts or replace_failed_pairs
-    ):
-        raise ValueError("decision collection requires MCTS on model A only and fixed pairs")
+    if decision_callback is not None and (model_b_uses_mcts or replace_failed_pairs):
+        raise ValueError("decision collection requires a raw model B and fixed pairs")
     fixed_map_seeds = None
     if map_seeds is not None:
         fixed_map_seeds = np.asarray(map_seeds, dtype=np.uint32)
@@ -2430,10 +2439,7 @@ def evaluate_matches_pool(
     # collection: even a rare 0.1% exhausted position would invalidate most
     # long evaluations. Only rejected particles are regenerated, so this high
     # ceiling has negligible cost on normal positions.
-    evaluation_belief_retries = max(
-        _EVALUATION_MIN_BELIEF_RETRIES,
-        16 * int(belief_retries),
-    )
+    evaluation_belief_retries = _evaluation_belief_retries(belief_retries)
     totals: Dict[str, Any] = {
         "games": float(games),
         "model_a_wins": 0.0,
@@ -2469,7 +2475,7 @@ def evaluate_matches_pool(
     chunk_limit = max(2, int(max_envs) - int(max_envs) % 2)
     with tqdm(
         total=games,
-        desc=f"evaluate MCTS {model_a_label} vs {model_b_label}",
+        desc=f"evaluate {'raw' if raw_only else 'MCTS'} {model_a_label} vs {model_b_label}",
         unit="game",
         dynamic_ncols=True,
     ) as progress:
@@ -2526,8 +2532,11 @@ def evaluate_matches_pool(
                     raw_policy, raw_value = search.direct_policy_value(request, np.flatnonzero(active))
                 try:
                     if raw_only:
-                        policy, _ = search.direct_policy_value(request, np.flatnonzero(active))
-                        root = {**request, "policy": policy}
+                        if raw_policy is None:
+                            raw_policy, raw_value = search.direct_policy_value(
+                                request, np.flatnonzero(active)
+                            )
+                        root = {**request, "policy": raw_policy, "root_value": raw_value}
                     else:
                         root, recovery_failures = _evaluation_search_with_recovery(
                             search,

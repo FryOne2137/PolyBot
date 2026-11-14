@@ -49,6 +49,51 @@ def test_belief_samplers_choose_an_enemy_owner_for_hidden_units(temperature):
             assert (particle[hidden_units, 3] == 1 - player).all()
 
 
+@pytest.mark.parametrize(
+    "terrain,settlement", [(1, 0), (2, 1)],
+    ids=["all-hidden-water", "all-hidden-villages"],
+)
+def test_belief_samplers_reserve_a_center_for_a_referenced_city(terrain, settlement):
+    from PolyEnv import GameEnv
+
+    seed = 730184220
+    env = GameEnv(seed=seed)
+    rng = np.random.default_rng(seed)
+    for _ in range(70):
+        action_ids = env.model_request_numpy()["actions"]["action_id"]
+        assert env.step_fast(int(rng.choice(action_ids)))[0]
+    observed = torch.as_tensor(env.model_request_numpy()["map_tokens"], dtype=torch.long)
+    player = env.current_player()
+    visible = observed[:, 0] == 1
+    public = observed[visible]
+    references = set(public[:, 6].tolist()) | set(public[:, 22].tolist())
+    missing = (references - {-1}) - set(public[public[:, 14] == 2, 15].tolist())
+    assert len(missing) == 1
+    city_id = missing.pop()
+
+    model = tiny_model()
+    logits = [torch.full((1, len(observed), maximum + 2), -10.0) for maximum in MAP_FEATURE_MAX]
+    for values in logits:
+        values[..., 0] = 10.0
+    logits[19][..., terrain + 1] = 20.0
+    logits[14][..., settlement + 1] = 20.0
+    scalar, = model.sample_completed_maps_from_belief_logits(
+        observed[None], logits, 1, temperature=0.0, perspective_player=player
+    )
+    batched, = model.sample_completed_map_batch_from_belief_logits(
+        observed[None], logits, temperature=0.0, perspective_players=torch.tensor([player])
+    )
+
+    for particle in (scalar, batched):
+        assert torch.equal(particle[visible], public)
+        center = ~visible & (particle[:, 14] == 2) & (particle[:, 15] == city_id)
+        assert center.sum().item() == 1
+        assert int(particle[center, 16].item()) == 1 - player
+        assert int(particle[center, 19].item()) == 2
+        assert (particle[~visible & ~center, 14] == settlement).all()
+        env.make_belief_env(np.ascontiguousarray(particle, dtype=np.int32), perspective=player)
+
+
 def test_full_vector_packet_survives_capacity_one_and_keeps_old_observations():
     from PolyEnv import VectorGameEnv, GameEnv
     vector = exact_vector_env(VectorGameEnv, num_envs=1, map_size=11, seed=2137, num_threads=1, max_actions=1)

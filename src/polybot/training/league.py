@@ -96,7 +96,7 @@ def _belief_validation_signature(
     """Describe every setting that changes a belief held-out measurement."""
     return {
         "collector": "public_raw_without_belief_recovery",
-        "particle_sampler": "hidden_units_exclude_observer",
+        "particle_sampler": "hidden_units_exclude_observer_reserve_referenced_cities",
         "map_size": int(training.map_size),
         "map_type": str(training.map_type),
         "particles": int(mcts.particles),

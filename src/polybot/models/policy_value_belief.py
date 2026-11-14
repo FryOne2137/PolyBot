@@ -731,9 +731,6 @@ class PolicyValueBeliefNet(nn.Module):
                 player_count=2,
                 perspective_player=perspective_player,
             )
-            self._add_referenced_city_placeholders(
-                completed_cpu, hidden_cpu, player_count=2, perspective_player=perspective_player
-            )
             self._add_missing_player_capitals(
                 completed_cpu, hidden_cpu, player_count=2, perspective_player=perspective_player
             )
@@ -837,8 +834,6 @@ class PolicyValueBeliefNet(nn.Module):
         city_counts = self._batch_constraint_values(known_city_counts, batch, "known_city_counts")
         action_rows = None if action_categorical is None else action_categorical.detach().to(device="cpu")
         action_masks = None if action_mask is None else action_mask.detach().to(device="cpu")
-        # Referenced city IDs must still have a centre. The placement is a
-        # deterministic hypothesis built solely from the submitted observation.
         for row in range(batch):
             apply_public_bridge_constraints(
                 completed_cpu[row],
@@ -851,9 +846,6 @@ class PolicyValueBeliefNet(nn.Module):
                 {field: values[row].to(device="cpu") for field, values in sampled_features.items()},
                 player_count=2,
                 perspective_player=perspectives[row],
-            )
-            self._add_referenced_city_placeholders(
-                completed_cpu[row], hidden_cpu[row], player_count=2, perspective_player=perspectives[row]
             )
             self._add_missing_player_capitals(
                 completed_cpu[row], hidden_cpu[row], player_count=2, perspective_player=perspectives[row]
@@ -904,8 +896,15 @@ class PolicyValueBeliefNet(nn.Module):
         territory/origin pointers because those are relational facts the tile
         decoder cannot identify reliably yet.
         """
+        PolicyValueBeliefNet._add_referenced_city_placeholders(
+            completed, hidden,
+            player_count=player_count,
+            perspective_player=perspective_player,
+            sampled_settlements=sampled[14],
+        )
+        open_settlement_tiles = hidden & (completed[:, 14] == 0)
         city_candidates = torch.nonzero(
-            hidden & (sampled[14] == 2), as_tuple=False
+            open_settlement_tiles & (sampled[14] == 2), as_tuple=False
         ).flatten().tolist()
         # A predicted capital must be considered before ordinary city rows;
         # otherwise the city cap can discard the only capital hypothesis.
@@ -913,7 +912,6 @@ class PolicyValueBeliefNet(nn.Module):
             key=lambda tile: int(sampled[9][tile]) == 1,
             reverse=True,
         )
-        city_rows = completed[:, 14] == 2
         references = torch.cat((completed[:, 6], completed[:, 22]))
         # Settlement IDs are map-wide, not city-centre-only.  A visible
         # village already owns the ID of the city that ``found_city`` will
@@ -930,7 +928,7 @@ class PolicyValueBeliefNet(nn.Module):
         # city runtime identity and therefore retain the valid empty defaults
         # for city fields.
         non_city_settlement_candidates = torch.nonzero(
-            hidden & (sampled[14] > 0) & (sampled[14] != 2),
+            open_settlement_tiles & (sampled[14] > 0) & (sampled[14] != 2),
             as_tuple=False,
         ).flatten().tolist()
         for tile in non_city_settlement_candidates:
@@ -1073,51 +1071,40 @@ class PolicyValueBeliefNet(nn.Module):
         *,
         player_count: int = 2,
         perspective_player: int | None = None,
+        sampled_settlements: torch.Tensor | None = None,
     ) -> None:
         """Create valid hidden city centers for IDs visible only by reference.
 
         A revealed territory or own unit can name a city whose center remains
-        hidden.  The engine correctly requires that ID to have a city-center
-        token, but the observation does not tell us where it is.  Allocate a
-        hidden tile deterministically; this is a hypothesis, not source data.
+        hidden. Reserve a hidden tile before placing sampled settlements. If
+        the prediction offers no land, the public reference justifies turning
+        one hidden tile into land for its center.
         """
         referenced = torch.cat((completed[:, 6], completed[:, 22]))
         referenced = torch.unique(referenced[referenced >= 0])
         if referenced.numel() == 0:
             return
-        existing = completed[completed[:, 14] == 2, 15]
-        existing = set(int(city_id) for city_id in existing.tolist() if city_id >= 0)
-        # Do not replace a sampled village, ruin or lighthouse with a
-        # synthetic centre merely to satisfy a runtime reference.
-        candidates = iter(torch.nonzero(
-            hidden
-            & (completed[:, 14] == 0)
-            & torch.isin(
-                completed[:, TERRAIN_FEATURE],
-                torch.as_tensor(
-                    tuple(LANDISH_TERRAINS),
-                    dtype=completed.dtype,
-                    device=completed.device,
-                ),
-            ),
-            as_tuple=False,
-        ).flatten().tolist())
-        for city_id in referenced.tolist():
-            if int(city_id) in existing:
-                continue
-            try:
-                tile = next(candidates)
-            except StopIteration:
-                # Let the engine reject an impossible hypothesis rather than
-                # alter a visible row to force it through validation.
-                return
+        existing = set(completed[completed[:, 14] == 2, 15].tolist())
+        missing_ids = [city_id for city_id in referenced.tolist() if city_id not in existing]
+        if not missing_ids:
+            return
+        candidates = torch.nonzero(hidden & (completed[:, 14] == 0), as_tuple=False).flatten()
+        terrain = completed[candidates, TERRAIN_FEATURE]
+        land = torch.isin(terrain, completed.new_tensor(tuple(LANDISH_TERRAINS)))
+        priority = land.to(torch.int64) * 2
+        if sampled_settlements is not None:
+            priority += sampled_settlements[candidates] == 0
+        ordered = torch.argsort(priority, descending=True, stable=True)
+        for city_id, tile in zip(missing_ids, candidates[ordered].tolist()):
+            if int(completed[tile, TERRAIN_FEATURE]) not in LANDISH_TERRAINS:
+                completed[tile, TERRAIN_FEATURE] = LAND_TERRAIN
             completed[tile, 9] = 0   # not capital
             completed[tile, 10] = 0  # no workshop
             completed[tile, 11] = 0  # no wall
             completed[tile, 12] = 0  # no parks
             completed[tile, 13] = 1  # city level
             completed[tile, 14] = 2  # SettlementTypeEnum::City
-            completed[tile, 15] = int(city_id)
+            completed[tile, 15] = city_id
             # The owner is genuinely unknown, but it cannot be the
             # perspective: their own city centre would already be known.
             owner = next(
@@ -1125,7 +1112,6 @@ class PolicyValueBeliefNet(nn.Module):
             )
             completed[tile, 16] = owner
             completed[tile, 17] = 0
-            existing.add(int(city_id))
 
     @staticmethod
     def _add_missing_player_capitals(

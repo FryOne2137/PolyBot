@@ -163,6 +163,39 @@ def exact_test_worlds(pool, state_ids):
     return np.ascontiguousarray(worlds)
 
 
+def test_mcts_diagnostics_replays_only_disagreements_on_the_same_positions():
+    from polybot.evaluation.mcts_diagnostics import evaluate_mcts_diagnostics
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(21)
+        model = tiny_model()
+    report = evaluate_mcts_diagnostics(
+        model,
+        model,
+        TrainingConfig(device="cpu", seed=916438271, max_moves=30),
+        MCTSConfig(simulations=8, particles=4),
+        games=4,
+        positions_per_game=2,
+        num_threads=1,
+        max_pending_leaves=4,
+        visible_action_history=32,
+        belief_retries=4,
+        max_envs=4,
+        model_a_label="apprentice",
+        model_b_label="champion",
+    )
+    assert report["diagnostics_valid"]
+    assert 0 < report["compared_positions"] <= 8
+    assert report["belief_mcts_evaluation"]["evaluated_map_seeds"] == [
+        916438271, 916438271, 916438272, 916438272,
+    ]
+    for position in report["positions"]:
+        assert position["raw_action"] != position["belief_action"]
+        assert position["belief_visits"] > 0 and position["true_map_visits"] > 0
+    assert report["terminal_positions"] == 0
+    assert report["value_vs_observed_belief_game"]["raw_value"]["count"] == 0
+
+
 def test_full_self_play_masked_into_expands_and_checked_step_preserves_actions():
     from PolyEnv import SelfPlayPool
     pool = exact_self_play_pool(SelfPlayPool, num_envs=1, seed=2137, num_threads=1, max_actions=1)

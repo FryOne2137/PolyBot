@@ -65,6 +65,9 @@ from .value_targets import Transition
 
 
 GameCallback = Callable[[Mapping[str, Any]], None]
+DecisionCallback = Callable[
+    [np.ndarray, Mapping[str, np.ndarray], Mapping[str, np.ndarray], np.ndarray], None
+]
 
 _EVALUATION_MIN_BELIEF_RETRIES = 64
 _EVALUATION_POSITION_RECOVERY_CYCLES = 2
@@ -188,11 +191,17 @@ def _evaluation_search_with_recovery(
     active: np.ndarray,
     *,
     mcts_mask: np.ndarray | None = None,
+    direct_policy: np.ndarray | None = None,
+    direct_value: np.ndarray | None = None,
     recovery_cycles: int = _EVALUATION_POSITION_RECOVERY_CYCLES,
 ) -> tuple[Dict[str, np.ndarray], tuple[BeliefRecoveryRequired, ...]]:
     """Retry one held-out position without changing its state, map, or seed."""
     if recovery_cycles < 1:
         raise ValueError("evaluation recovery_cycles must be positive")
+    direct = (
+        {"direct_policy": direct_policy, "direct_value": direct_value}
+        if direct_policy is not None else {}
+    )
     failures: list[BeliefRecoveryRequired] = []
     for _ in range(int(recovery_cycles)):
         try:
@@ -203,6 +212,7 @@ def _evaluation_search_with_recovery(
                 belief_temperature=0.0,
                 prior_scale=0.0,
                 mcts_mask=mcts_mask,
+                **direct,
             )
             return root, tuple(failures)
         except BeliefRecoveryRequired as error:
@@ -2007,6 +2017,21 @@ class RoutedPoolSearch:
                     diagnostics,
                 ) from error
 
+        return self._search_submitted_roots(
+            request, mcts_mask, root_temperature, prior_scale,
+            direct_rows, direct_policy, direct_value,
+        )
+
+    def _search_submitted_roots(
+        self,
+        request: Mapping[str, np.ndarray],
+        mcts_mask: np.ndarray,
+        root_temperature: float,
+        prior_scale: float,
+        direct_rows: np.ndarray,
+        direct_policy: np.ndarray | None,
+        direct_value: np.ndarray | None,
+    ) -> Dict[str, np.ndarray]:
         waves = 0
         if mcts_mask.any():
             waves = 1 + int(
@@ -2332,6 +2357,7 @@ def evaluate_matches_pool(
     replace_failed_pairs: bool = True,
     max_envs: int = 128,
     game_callback: GameCallback | None = None,
+    decision_callback: DecisionCallback | None = None,
     model_b_search_top_actions: int | None = None,
     model_b_search_random_actions: int | None = None,
     model_a_label: str = "model A",
@@ -2359,6 +2385,10 @@ def evaluate_matches_pool(
     if belief_action_mode not in {"strict", "root_shield"}:
         raise ValueError("belief_action_mode must be 'strict' or 'root_shield'")
     raw_only = not (model_a_uses_mcts or model_b_uses_mcts)
+    if decision_callback is not None and (
+        not model_a_uses_mcts or model_b_uses_mcts or replace_failed_pairs
+    ):
+        raise ValueError("decision collection requires MCTS on model A only and fixed pairs")
     fixed_map_seeds = None
     if map_seeds is not None:
         fixed_map_seeds = np.asarray(map_seeds, dtype=np.uint32)
@@ -2475,6 +2505,9 @@ def evaluate_matches_pool(
                     ((agent_ids == 0) & bool(model_a_uses_mcts))
                     | ((agent_ids == 1) & bool(model_b_uses_mcts))
                 )
+                raw_policy = raw_value = None
+                if decision_callback is not None:
+                    raw_policy, raw_value = search.direct_policy_value(request, np.flatnonzero(active))
                 try:
                     if raw_only:
                         policy, _ = search.direct_policy_value(request, np.flatnonzero(active))
@@ -2485,6 +2518,10 @@ def evaluate_matches_pool(
                             request,
                             active,
                             mcts_mask=mcts_mask,
+                            **(
+                                {"direct_policy": raw_policy, "direct_value": raw_value}
+                                if decision_callback is not None else {}
+                            ),
                         )
                         evaluation_position_recovery_cycles += len(recovery_failures)
                 except BeliefRecoveryRequired as error:
@@ -2585,6 +2622,13 @@ def evaluate_matches_pool(
                 actions[active_rows] = np.asarray(root["action_id"], dtype=np.int32)[
                     active_rows, action_rows[active_rows]
                 ]
+                if decision_callback is not None:
+                    decision_callback(
+                        indices,
+                        {**request, "policy": raw_policy, "root_value": raw_value},
+                        root,
+                        actions,
+                    )
                 candidate_turns = active & (np.asarray(request["agent_id"]) == 0)
                 candidate_decisions[candidate_turns] += 1
                 totals["model_a_decisions"] += float(candidate_turns.sum())

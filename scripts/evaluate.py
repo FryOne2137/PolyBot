@@ -26,7 +26,7 @@ def main() -> None:
         "--mode",
         choices=("mcts", "flat", "mcts-vs-raw", "mcts-diagnostics", "mcts-value-ablation"),
         default="mcts",
-        help="Evaluate search, raw policy, search gain, or belief/value diagnostics",
+        help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
     )
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument(
@@ -149,26 +149,32 @@ def main() -> None:
                 replace_failed_pairs=False,
                 belief_action_mode="root_shield",
             )
-            with_value = evaluate_matches_pool(
-                model_a, model_b, training, mcts, args.games,
-                **{**pool_options, "model_a_label": f"{args.model_a.stem} (learned value)"},
-            )
-            zero_value = evaluate_matches_pool(
-                model_a, model_b, training, mcts, args.games,
-                zero_leaf_values=True,
-                **{**pool_options, "model_a_label": f"{args.model_a.stem} (zero leaf value)"},
-            )
-            valid = (
-                bool(with_value["valid"] and zero_value["valid"])
-                and with_value.get("evaluated_map_seeds") == zero_value.get("evaluated_map_seeds") == seeds
-            )
-            summary = {
-                "learned_value": with_value,
-                "zero_leaf_value": zero_value,
-                "score_gain_zero_value": (
-                    zero_value["model_a_score"] - with_value["model_a_score"] if valid else None
-                ),
-            }
+            summary = {}
+            for name, scale in (
+                ("learned_value", 1.0),
+                ("quarter_leaf_value", 0.25),
+                ("zero_leaf_value", 0.0),
+            ):
+                result = evaluate_matches_pool(
+                    model_a, model_b, training, mcts, args.games,
+                    leaf_value_scale=scale,
+                    **{**pool_options, "model_a_label": f"{args.model_a.stem} (leaf value x{scale})"},
+                )
+                summary[name] = {**result, "leaf_value_scale": scale}
+
+            baseline = summary["learned_value"]
+            for variant, metric in (
+                ("quarter_leaf_value", "score_gain_quarter_value"),
+                ("zero_leaf_value", "score_gain_zero_value"),
+            ):
+                result = summary[variant]
+                valid = (
+                    baseline["valid"] and result["valid"]
+                    and baseline.get("evaluated_map_seeds") == result.get("evaluated_map_seeds") == seeds
+                )
+                summary[metric] = (
+                    result["model_a_score"] - baseline["model_a_score"] if valid else None
+                )
         elif args.mode == "mcts-vs-raw":
             seeds = [training.seed + index // 2 for index in range(args.games)]
             pool_options.update(

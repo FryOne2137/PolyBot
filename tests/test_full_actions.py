@@ -213,8 +213,13 @@ def test_full_self_play_masked_into_expands_and_checked_step_preserves_actions()
     assert request["action_mask"].sum() == request["total_legal_action_count"][0]
 
 
-@pytest.mark.parametrize("zero_leaf_values", [False, True])
-def test_routed_search_runs_multiple_masked_waves_with_all_actions(monkeypatch, zero_leaf_values):
+@pytest.mark.parametrize(
+    "leaf_value_scale,zero_leaf_values",
+    [(1.0, False), (0.25, False), (0.0, False), (1.0, True)],
+)
+def test_routed_search_runs_multiple_masked_waves_with_all_actions(
+    monkeypatch, leaf_value_scale, zero_leaf_values
+):
     from polybot.training.routed_self_play_pool import RoutedPoolSearch
 
     model = tiny_model()
@@ -226,6 +231,7 @@ def test_routed_search_runs_multiple_masked_waves_with_all_actions(monkeypatch, 
         [model], num_envs=1, num_threads=1, max_pending_leaves=2,
         visible_action_history=2, belief_retries=0, seed=2137,
         zero_leaf_values=zero_leaf_values,
+        leaf_value_scale=leaf_value_scale,
     )
     expand_and_backup = search.pool.expand_and_backup
     backed_up_values = []
@@ -245,7 +251,7 @@ def test_routed_search_runs_multiple_masked_waves_with_all_actions(monkeypatch, 
                          belief_temperature=.15, prior_scale=0)
     assert root["action_mask"].sum() == 14
     assert root["visit_count"].sum() == 2
-    expected_value = 0.0 if zero_leaf_values else np.tanh(0.5)
+    expected_value = 0.0 if zero_leaf_values else leaf_value_scale * np.tanh(0.5)
     np.testing.assert_allclose(np.concatenate(backed_up_values), expected_value)
     search.pool.step_into_checked(root["action_id"][:, 0].copy(), root["state_id"].copy(), request)
     require_complete_actions(request)

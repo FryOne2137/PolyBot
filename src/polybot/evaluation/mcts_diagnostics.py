@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from hashlib import sha256
 from typing import Any, Callable, Mapping, Sequence
@@ -22,6 +22,71 @@ from ..training.routed_self_play_pool import (
     _evaluation_search_with_recovery,
     evaluate_matches_pool,
 )
+
+
+def evaluate_mcts_value_matrix(
+    model_a: PolicyValueBeliefNet,
+    model_b: PolicyValueBeliefNet,
+    training: TrainingConfig,
+    mcts: MCTSConfig,
+    map_seed_groups: Sequence[Sequence[int]],
+    **pool_options: Any,
+) -> dict[str, Any]:
+    """Evaluate both leaf heads independently, preserving the original map groups."""
+    if not map_seed_groups or any(not group for group in map_seed_groups):
+        raise ValueError("provide at least one nonempty map seed group")
+    variants = {}
+    planned_games = 2 * sum(len(group) for group in map_seed_groups)
+    for scale_a, scale_b in ((0, 0), (0, 1), (1, 1)):
+        label = f"{scale_a},{scale_b}"
+        all_games = []
+        groups = []
+        for group in map_seed_groups:
+            seeds = [seed for seed in group for _ in range(2)]
+            games: list[Mapping[str, Any]] = []
+            result = evaluate_matches_pool(
+                model_a, model_b, replace(training, seed=group[0]), mcts, len(seeds),
+                model_a_uses_mcts=True, model_b_uses_mcts=False,
+                leaf_value_scale=float(scale_a), opponent_leaf_value_scale=float(scale_b),
+                map_seeds=seeds, replace_failed_pairs=False, belief_action_mode="root_shield",
+                game_callback=games.append, **{
+                    **pool_options,
+                    "model_a_label": f"{pool_options.get('model_a_label', 'model A')} (value {label})",
+                },
+            )
+            valid = bool(result["valid"])
+            if valid and (
+                result["evaluated_map_seeds"] != seeds
+                or [(game["map_seed"], game["model_a_player"]) for game in games]
+                != [(seed, side) for seed in group for side in (0, 1)]
+            ):
+                raise RuntimeError(f"value ({label}) changed the fixed map and side schedule")
+            rows = [{
+                "map_seed": game["map_seed"], "model_a_player": game["model_a_player"],
+                "score_a": None if game["truncated"] else game["score_a"],
+                "moves": game["moves"], "truncated": bool(game["truncated"]),
+            } for game in games]
+            groups.append({
+                "map_seeds": list(group), "valid": valid,
+                "planned_games": len(seeds), "completed_games": int(result["completed_games"]),
+                "invalid_reason": result.get("invalid_reason"), "games": rows,
+            })
+            all_games.extend(rows)
+        valid = all(group["valid"] for group in groups)
+        scores = [game["score_a"] for game in all_games if not game["truncated"]]
+        variants[label] = {
+            "model_a_leaf_value_scale": scale_a, "opponent_leaf_value_scale": scale_b,
+            "valid": valid, "planned_games": planned_games, "recorded_games": len(all_games),
+            "wins": scores.count(1.0), "losses": scores.count(0.0), "draws": scores.count(0.5),
+            "truncated_games": len(all_games) - len(scores),
+            "score": float(np.mean(scores)) if valid and len(scores) == planned_games else None,
+            "mean_moves": float(np.mean([game["moves"] for game in all_games])) if valid else None,
+            "groups": groups,
+        }
+    return {
+        "simulations": mcts.simulations, "map_seed_groups": [list(group) for group in map_seed_groups],
+        "variants": variants,
+    }
 
 
 def _position_fingerprint(request: Mapping[str, np.ndarray], row: int) -> str:

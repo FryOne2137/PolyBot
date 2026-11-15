@@ -17,6 +17,16 @@ from polybot.training.cli import add_environment_options, print_summary, trainin
 from polybot.training.routed_self_play_pool import evaluate_matches_pool
 
 
+def _map_seed_group(value: str) -> tuple[int, ...]:
+    try:
+        seeds = tuple(int(seed) for seed in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected comma-separated integer map seeds") from error
+    if any(not 1 <= seed <= 2**31 - 1 for seed in seeds):
+        raise argparse.ArgumentTypeError("map seeds must be in [1, 2**31 - 1]")
+    return seeds
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a checkpoint; write no games or metrics files")
     add_environment_options(parser)
@@ -26,12 +36,16 @@ def main() -> None:
         "--mode",
         choices=(
             "mcts", "flat", "mcts-vs-raw", "mcts-diagnostics",
-            "mcts-value-ablation", "mcts-value-diagnostics", "mcts-first-divergence",
+            "mcts-value-ablation", "mcts-value-diagnostics", "mcts-first-divergence", "mcts-value-matrix",
         ),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
     )
-    parser.add_argument("--games", type=int, default=10)
+    parser.add_argument("--games", type=int, default=10, help="Game count outside mcts-value-matrix")
+    parser.add_argument(
+        "--map-seed-group", type=_map_seed_group, action="append", metavar="SEED[,SEED...]",
+        help="In mcts-value-matrix, play both sides per map; repeat for separate evaluation seed resets",
+    )
     parser.add_argument(
         "--positions-per-game", type=int, default=4,
         help="Maximum diagnostic positions per game (disagreements in mcts-diagnostics, raw turns in mcts-value-diagnostics)",
@@ -85,6 +99,14 @@ def main() -> None:
         parser.error("--play-disagreement-games requires --mode mcts-value-diagnostics")
     if args.continuation_value_scale is not None and args.mode != "mcts-first-divergence":
         parser.error("--continuation-value-scale requires --mode mcts-first-divergence")
+    if args.mode == "mcts-value-matrix":
+        if not args.map_seed_group:
+            parser.error("--mode mcts-value-matrix requires --map-seed-group")
+        seeds = [seed for group in args.map_seed_group for seed in group]
+        if len(set(seeds)) != len(seeds):
+            parser.error("each map seed must appear once across --map-seed-group arguments")
+    elif args.map_seed_group is not None:
+        parser.error("--map-seed-group requires --mode mcts-value-matrix")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
@@ -175,6 +197,12 @@ def main() -> None:
                     1.0 if args.continuation_value_scale is None else args.continuation_value_scale
                 ),
                 **pool_options,
+            )
+        elif args.mode == "mcts-value-matrix":
+            from polybot.evaluation.mcts_diagnostics import evaluate_mcts_value_matrix
+
+            summary = evaluate_mcts_value_matrix(
+                model_a, model_b, training, mcts, args.map_seed_group, **pool_options,
             )
         elif args.mode == "mcts-value-ablation":
             seeds = [training.seed + index // 2 for index in range(args.games)]

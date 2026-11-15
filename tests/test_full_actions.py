@@ -224,6 +224,42 @@ def test_mcts_scales_opponent_leaves_independently(candidate_scale):
     np.testing.assert_allclose(search.pool.root_policy()["root_value"], np.tanh(0.5) * np.array([candidate_scale, 0.25]))
 
 
+def test_mcts_value_matrix_preserves_original_schedules_and_separates_truncation(monkeypatch):
+    from polybot.evaluation import mcts_diagnostics
+
+    map_groups = (tuple(range(1287345901, 1287345907)), tuple(range(1387345901, 1387345904)))
+    calls = []
+
+    def evaluate(model_a, model_b, training, mcts, games, **kwargs):
+        group = map_groups[len(calls) % 2]
+        scales = (kwargs["leaf_value_scale"], kwargs["opponent_leaf_value_scale"])
+        calls.append((scales, training.seed, games))
+        assert kwargs["map_seeds"] == [seed for seed in group for _ in range(2)]
+        assert kwargs["model_a_uses_mcts"] is True and kwargs["model_b_uses_mcts"] is False
+        assert kwargs["belief_action_mode"] == "root_shield" and kwargs["replace_failed_pairs"] is False
+        for index, seed in enumerate(kwargs["map_seeds"]):
+            truncated = scales == (0, 1) and training.seed == map_groups[1][0] and index == 0
+            kwargs["game_callback"]({
+                "map_seed": seed, "model_a_player": index % 2, "moves": 100,
+                "score_a": 0.5 if truncated else float(index % 2), "truncated": truncated,
+            })
+        return {"valid": True, "evaluated_map_seeds": kwargs["map_seeds"], "completed_games": games}
+
+    monkeypatch.setattr(mcts_diagnostics, "evaluate_matches_pool", evaluate)
+    report = mcts_diagnostics.evaluate_mcts_value_matrix(
+        None, None, TrainingConfig(device="cpu"), MCTSConfig(simulations=32), map_groups,
+    )
+    assert calls == [
+        (scales, group[0], 2 * len(group))
+        for scales in ((0, 0), (0, 1), (1, 1)) for group in map_groups
+    ]
+    complete = report["variants"]["1,1"]
+    assert (complete["wins"], complete["losses"], complete["draws"], complete["score"]) == (9, 9, 0, 0.5)
+    limited = report["variants"]["0,1"]
+    assert limited["score"] is None and limited["draws"] == 0 and limited["truncated_games"] == 1
+    assert limited["groups"][1]["games"][0]["score_a"] is None
+
+
 def test_branch_value_labels_have_the_successor_players_perspective():
     from polybot.evaluation.mcts_diagnostics import _ReplayPosition
     from polybot.training.mcts_value import _branch_examples

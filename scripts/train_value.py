@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +28,7 @@ from polybot.training.cli import (
     training_run_from_args,
 )
 from polybot.training.flat_experiments import FlatImprovements
-from polybot.training.flat_value import EncodedValuePosition, evaluate_value_head, fit_value_head
+from polybot.training.flat_value import EncodedValuePosition, evaluate_value_head, fit_paired_value_heads, fit_value_head
 
 
 def collect_value_games(
@@ -112,18 +113,33 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
         disagreement_opponent_value_scale=args.opponent_value_scale,
         disagreement_probes_per_position=args.disagreement_probes_per_position,
         branch_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature,
+        difference_loss_weight=args.difference_loss_weight,
     )
     datasets = {}
     collection = {}
-    report: dict[str, Any] = {"collection": collection, "saved_checkpoint": None, "mcts_improved": False}
+    report: dict[str, Any] = {
+        "collection": collection, "pair_datasets": {}, "saved_checkpoints": {}, "mcts_improved": False,
+    }
     for label, seed, games in schedules[:2]:
-        examples, summary = collect_mcts_value_branches(
-            model, opponent, replace(training, seed=seed), mcts, games,
-            positions_per_game=args.positions_per_game, label=f"value {label}",
-            opponent_value_scale=args.opponent_value_scale,
-            disagreement_probes_per_position=args.disagreement_probes_per_position,
-            branch_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature, **pool,
-        )
+        path = run.directory / f"{label}_pairs.jsonl"
+        report["pair_datasets"][label] = str(path)
+        with path.open("w", encoding="utf-8", buffering=1) as stream:
+            stream.write(json.dumps({
+                "schema_version": 1, "split": label, "seed": seed,
+                "branch_order": ["value_0", "value_1"], "config": "config.json",
+            }) + "\n")
+
+            def save_pair(pair) -> None:
+                stream.write(json.dumps(pair, allow_nan=False) + "\n")
+
+            examples, summary = collect_mcts_value_branches(
+                model, opponent, replace(training, seed=seed), mcts, games,
+                positions_per_game=args.positions_per_game, label=f"value {label}",
+                opponent_value_scale=args.opponent_value_scale,
+                disagreement_probes_per_position=args.disagreement_probes_per_position,
+                branch_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature,
+                pair_callback=save_pair, **pool,
+            )
         collection[label] = summary
         run.event("branch_collection", split=label, **{key: value for key, value in summary.items() if key != "evaluation"})
         if not summary["valid"]:
@@ -139,23 +155,28 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
         value_learning_rate=args.learning_rate, value_validation_games=args.selection_games,
         value_capacity=max(len(datasets["train"]), args.batch_size),
     )
-    fit = fit_value_head(
-        model, training, datasets["train"], datasets["selection"], settings,
-        seed=training.seed, validation_source="mcts_branch_selection", keep_best_update=True,
+    heads, fit = fit_paired_value_heads(
+        model, datasets["train"], datasets["selection"], settings,
+        seed=training.seed, difference_weight=args.difference_loss_weight,
     )
     report["fit"] = fit
-    run.log(updates=fit["updates"], selection_rmse_before=fit.get("before", {}).get("rmse"),
-            selection_rmse_after=fit.get("after", {}).get("rmse"))
-    if not fit["kept"]:
-        return {**report, "reason": fit["reason"]}
+    for name, result in fit.items():
+        selected = result["after"] or {}
+        run.log(**{f"{name}_updates": result["updates"], f"{name}_selection_rmse": selected.get("rmse"),
+                    f"{name}_selection_gap_rmse": selected.get("gap_rmse"),
+                    f"{name}_selection_preference_accuracy": selected.get("preference_accuracy")})
+    if len(heads) != 2:
+        return {**report, "reason": "missing_finite_loss_variant"}
 
-    save_model(args.model_out, model, config)
-    report["saved_checkpoint"] = str(args.model_out)
-    run.event("experimental_checkpoint_saved", checkpoint=args.model_out)
+    for name, path in (("mse", args.mse_model_out), ("mse_delta", args.model_out)):
+        model.value_head.load_state_dict(heads[name])
+        save_model(path, model, config)
+        report["saved_checkpoints"][name] = str(path)
+        run.event("experimental_checkpoint_saved", loss=name, checkpoint=path)
     _, seed, games = schedules[2]
     benchmark = evaluate_mcts_value_heads(
         model, opponent, replace(training, seed=seed), mcts, games,
-        opponent_value_scale=args.opponent_value_scale, **pool,
+        opponent_value_scale=args.opponent_value_scale, fitted_heads=heads, **pool,
     )
     improved = benchmark["beats_zero"]
     reason = "mcts_improved" if improved else "mcts_no_demonstrated_improvement"
@@ -197,6 +218,8 @@ def main() -> None:
                         help="Number of sampled raw rollouts per action in mcts-branches mode")
     parser.add_argument("--rollout-temperature", type=float, default=0.5,
                         help="Common raw-policy sampling temperature for both actions in mcts-branches mode")
+    parser.add_argument("--difference-loss-weight", type=float, default=1.0,
+                        help="Weight of the branch difference term in the second mcts-branches variant")
     parser.set_defaults(learning_rate=0.0001, max_moves=1600)
     args = parser.parse_args()
     training = training_config_from_args(args)
@@ -221,6 +244,14 @@ def main() -> None:
         or not np.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0.0
     ):
         parser.error("require positive probe and rollout counts and a finite positive rollout temperature")
+    if args.position_source == "mcts-branches":
+        if args.batch_size < 2 or args.batch_size % 2:
+            parser.error("mcts-branches requires an even batch size of at least two to keep branch pairs together")
+        if not np.isfinite(args.difference_loss_weight) or args.difference_loss_weight <= 0.0:
+            parser.error("--difference-loss-weight must be finite and positive")
+        args.mse_model_out = args.model_out.with_name(f"{args.model_out.stem}-mse{args.model_out.suffix}")
+        if args.mse_model_out.resolve() in {args.model_in.resolve(), args.opponent.resolve(), args.model_out.resolve()}:
+            parser.error("derived MSE output must be separate from the input checkpoints and --model-out")
 
     schedules = (
         ("train", training.seed, args.train_games),

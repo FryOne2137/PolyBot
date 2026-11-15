@@ -31,6 +31,7 @@ class EncodedValuePosition:
     return_target: float
     game_key: tuple[Any, ...]
     phase: str | None = None
+    to_root_sign: int = 1
 
 
 def _turn(example: ValuePosition | EncodedValuePosition) -> int:
@@ -166,6 +167,105 @@ def _metrics_by_phase(predictions, targets, examples):
         mask = phases == phase
         metrics[phase] = value_metrics(predictions[mask], targets[mask])
     return metrics
+
+
+def _paired_value_tensors(examples, device):
+    pairs: dict[tuple[Any, ...], list[EncodedValuePosition]] = {}
+    for example in examples:
+        pairs.setdefault(example.game_key, []).append(example)
+    if any(len(pair) != 2 or _phase(pair[0]) != _phase(pair[1]) for pair in pairs.values()):
+        raise ValueError("value comparison requires exactly two branches in the same phase per position")
+    ordered = list(pairs.values())
+    states = torch.as_tensor(np.stack([[branch.features for branch in pair] for pair in ordered]), device=device)
+    targets = torch.tensor([[branch.return_target for branch in pair] for pair in ordered], device=device)
+    signs = torch.tensor([[branch.to_root_sign for branch in pair] for pair in ordered], device=device)
+    return states, targets, signs, ordered
+
+
+def _value_gap(values: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    root_values = values * signs
+    return root_values[:, 1] - root_values[:, 0]
+
+
+def fit_paired_value_heads(
+    model, replay: Sequence[EncodedValuePosition], selection: Sequence[EncodedValuePosition],
+    settings: FlatImprovements, *, seed: int, difference_weight: float,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, Any]]:
+    """Fit MSE and MSE-plus-gap heads from the same initialization and pair batches."""
+    if not replay or not selection:
+        return {}, {}
+    model.eval()
+    device = next(model.parameters()).device
+    states, targets, signs, pairs = _paired_value_tensors(replay, device)
+    held_states, held_targets, held_signs, held_pairs = _paired_value_tensors(selection, device)
+    held_gaps = _value_gap(held_targets, held_signs)
+    informative = held_gaps != 0
+    held_examples = [branch for pair in held_pairs for branch in pair]
+
+    def measure():
+        with torch.no_grad():
+            predictions = model.value_head(held_states).squeeze(-1).float()
+            gaps = _value_gap(predictions, held_signs)
+            mse = F.mse_loss(predictions, held_targets).item()
+            gap_mse = F.mse_loss(gaps, held_gaps).item()
+            metrics = _metrics_by_phase(
+                predictions.flatten().cpu().numpy(), held_targets.flatten().cpu().numpy(), held_examples,
+            )
+            return {**metrics, "gap_rmse": float(np.sqrt(gap_mse)),
+                    "informative_pairs": int(informative.sum().item()),
+                    "preference_accuracy": (
+                        float(((gaps[informative] * held_gaps[informative]) > 0).float().mean().item())
+                        if informative.any() else None
+                    ), "selection_loss": mse + difference_weight * gap_mse / 4.0}
+
+    start_state = deepcopy(model.value_head.state_dict())
+    groups = {}
+    for index, pair in enumerate(pairs):
+        groups.setdefault(_phase(pair[0]), []).append(index)
+    buckets = list(groups.values())
+    rng = np.random.default_rng(seed ^ 0x43524954)
+    batches = [torch.as_tensor([
+        int(rng.choice(buckets[int(rng.integers(len(buckets)))]))
+        for _ in range(settings.value_batch_size // 2)
+    ], device=device) for _ in range(settings.value_updates)]
+
+    heads = {}
+    reports = {}
+    try:
+        with isolated_rng():
+            before = measure()
+            for name, weight in (("mse", 0.0), ("mse_delta", difference_weight)):
+                model.value_head.load_state_dict(start_state)
+                optimizer = torch.optim.AdamW(
+                    model.value_head.parameters(), lr=settings.value_learning_rate, weight_decay=0.0,
+                )
+                best = None
+                best_step = attempted = 0
+                for step, indices in enumerate(batches, 1):
+                    predictions = model.value_head(states[indices]).squeeze(-1).float()
+                    loss = F.mse_loss(predictions, targets[indices])
+                    if weight:
+                        loss = loss + weight * F.mse_loss(
+                            _value_gap(predictions, signs[indices]) / 2,
+                            _value_gap(targets[indices], signs[indices]) / 2,
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    norm = torch.nn.utils.clip_grad_norm_(model.value_head.parameters(), 1.0)
+                    if not torch.isfinite(norm):
+                        break
+                    optimizer.step()
+                    attempted += 1
+                    measured = measure()
+                    if measured["valid"] and (best is None or measured["selection_loss"] < best["selection_loss"]):
+                        best = measured
+                        best_step = step
+                        heads[name] = deepcopy(model.value_head.state_dict())
+                reports[name] = {"before": before, "after": best, "updates": attempted, "selected_updates": best_step,
+                                 "difference_weight": weight}
+    finally:
+        model.value_head.load_state_dict(start_state)
+    return heads, reports
 
 
 def fit_value_head(

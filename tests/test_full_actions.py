@@ -270,6 +270,7 @@ def test_branch_value_labels_have_the_successor_players_perspective():
     examples = _branch_examples(position, wins, successors, phase="late")
     assert [example.return_target for example in examples] == [1.0, -1.0]
     assert [example.phase for example in examples] == ["late", "late"]
+    assert [example.to_root_sign for example in examples] == [1, -1]
     assert not _branch_examples(position, [{"score_a": None}, wins[1]], successors)
     assert not _branch_examples(position, wins, successors[:1])
 
@@ -280,6 +281,10 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
     model, opponent = tiny_model(), tiny_model()
     with torch.no_grad():
         model.value_head[-2].bias.fill_(0.75)
+    mse = {key: value.clone() for key, value in model.value_head.state_dict().items()}
+    mse["2.bias"].fill_(0.25)
+    delta = {key: value.clone() for key, value in model.value_head.state_dict().items()}
+    delta["2.bias"].fill_(0.5)
     seen = []
 
     def evaluate(candidate, rival, training, mcts, games, **kwargs):
@@ -291,7 +296,7 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
         for index, seed in enumerate(seeds):
             kwargs["game_callback"]({
                 "map_seed": seed, "model_a_player": index % 2,
-                "score_a": float(arm == 0), "truncated": arm == 1 and index == 3,
+                "score_a": (0.5, 1.0, 0.0)[arm], "truncated": arm == 1 and index == 3,
             })
         return {"valid": True, "evaluated_map_seeds": seeds}
 
@@ -299,11 +304,13 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
     report = mcts_value.evaluate_mcts_value_heads(
         model, opponent, TrainingConfig(device="cpu", seed=2137), MCTSConfig(), 4,
         num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4, opponent_value_scale=0.25,
+        fitted_heads={"mse": mse, "mse_delta": delta},
     )
-    assert seen == [(1.0, 0.75), (0.0, 0.75)]
+    assert seen == [(1.0, 0.25), (1.0, 0.5), (0.0, 0.75)]
     assert model.value_head[-2].bias.item() == 0.75
     assert report["compared_map_seeds"] == [2137]
-    assert report["paired_scores"] == {"fitted": 1.0, "zero": 0.0}
+    assert report["paired_scores"] == {"mse": 0.5, "mse_delta": 1.0, "zero": 0.0}
+    assert report["score_deltas_vs_zero"] == {"mse": 0.5, "mse_delta": 1.0}
     assert report["beats_zero"]
 
 
@@ -367,11 +374,12 @@ def test_branch_collection_selects_disagreements_and_averages_paired_repeats(mon
     monkeypatch.setattr(mcts_value, "evaluate_matches_pool", play_games)
     monkeypatch.setattr(mcts_value, "_compare_leaf_scales", compare)
     monkeypatch.setattr(mcts_value, "_play_replayed_continuations", complete_branches)
+    recorded_pairs = []
     examples, report = mcts_value.collect_mcts_value_branches(
         model, model, training, mcts, games=4, positions_per_game=6,
         num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4,
         opponent_value_scale=1.0, disagreement_probes_per_position=2,
-        branch_rollouts=3, rollout_temperature=0.5, label="test",
+        branch_rollouts=3, rollout_temperature=0.5, label="test", pair_callback=recorded_pairs.append,
     )
     assert report["terminal_source_games"] == 3 and report["truncated_source_games"] == 1
     assert report["sampled_roots"] == report["labelled_pairs"] == len(streams) == 15
@@ -380,6 +388,13 @@ def test_branch_collection_selects_disagreements_and_averages_paired_repeats(mon
     assert all(len(history) == 3 for history in streams.values())
     assert sum(example.return_target == 0.0 for example in examples) == 15
     assert sum(abs(example.return_target) == 1.0 for example in examples) == 15
+    assert len(recorded_pairs) == 15
+    for pair in recorded_pairs:
+        assert pair["mean_scores"] == [0.5, 1.0]
+        assert pair["rollouts"][2] == [{"score_a": None}, {"score_a": 0.0}]
+        assert pair["targets"] == [0.0, 1.0]
+        assert [state["to_root_sign"] for state in pair["successors"]] == [-1, 1]
+        assert len(pair["prefix_actions"]) == pair["prefix_length"]
     for phase, counts in report["phases"].items():
         expected = 3 if phase == "opening" else 6
         assert counts["probed_roots"] == 6
@@ -438,6 +453,41 @@ def test_branch_fit_can_benchmark_an_update_with_worse_offline_rmse():
     assert branch["kept"] and not branch["selection_improved"]
     assert branch["after"]["rmse"] > branch["before"]["rmse"]
     assert branch["selected_updates"] > 0
+
+
+def test_paired_value_fit_uses_root_perspective_and_restores_the_starting_head():
+    from polybot.training.flat_experiments import FlatImprovements
+    from polybot.training.flat_value import EncodedValuePosition, _value_gap, fit_paired_value_heads
+
+    values = torch.tensor([[0.8, -0.2], [0.2, -0.8]])
+    signs = torch.tensor([[1, -1], [1, -1]])
+    torch.testing.assert_close(_value_gap(values, signs), torch.tensor([-0.6, 0.6]))
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(21)
+        model = tiny_model()
+    with torch.no_grad():
+        model.value_head[-2].weight.zero_()
+        model.value_head[-2].bias.zero_()
+    model.requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    before = {name: state.clone() for name, state in model.state_dict().items()}
+    features = np.ones(model.config.d_model, dtype=np.float32)
+
+    def pairs(start):
+        return [EncodedValuePosition(features * sign, 0, target, (key,), "opening", sign)
+                for key in range(start, start + 4) for sign, target in ((1, 0.5), (-1, -1.0))]
+
+    heads, reports = fit_paired_value_heads(
+        model, pairs(10), pairs(20), FlatImprovements(value_updates=8, value_batch_size=4),
+        seed=2137, difference_weight=2.0,
+    )
+    assert set(heads) == {"mse", "mse_delta"}
+    assert reports["mse"]["before"] == reports["mse_delta"]["before"]
+    assert reports["mse"]["updates"] == reports["mse_delta"]["updates"] == 8
+    assert reports["mse_delta"]["after"]["informative_pairs"] == 4
+    assert not torch.equal(heads["mse"]["2.weight"], heads["mse_delta"]["2.weight"])
+    assert all(torch.equal(before[name], state) for name, state in model.state_dict().items())
 
 
 def test_mcts_diagnostics_replays_only_disagreements_on_the_same_positions():

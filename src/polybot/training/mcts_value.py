@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,12 +68,11 @@ def _branch_examples(
     if len(successors) != 2 or any(outcome["score_a"] is None for outcome in outcomes):
         return []
     key = (position.seed, position.player, position.prefix_length)
-    return [
-        EncodedValuePosition(
-            features, turn, (2 * outcome["score_a"] - 1) * (1 if actor == position.player else -1), key, phase,
-        )
-        for (features, turn, actor), outcome in zip(successors, outcomes)
-    ]
+    examples = []
+    for (features, turn, actor), outcome in zip(successors, outcomes):
+        sign = 1 if actor == position.player else -1
+        examples.append(EncodedValuePosition(features, turn, (2 * outcome["score_a"] - 1) * sign, key, phase, sign))
+    return examples
 
 
 def collect_mcts_value_branches(
@@ -92,6 +92,7 @@ def collect_mcts_value_branches(
     branch_rollouts: int,
     rollout_temperature: float,
     label: str,
+    pair_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[EncodedValuePosition], dict[str, Any]]:
     seeds = [training.seed + index // 2 for index in range(games)]
     rng = np.random.default_rng(training.seed ^ 0x56414C)
@@ -221,7 +222,7 @@ def collect_mcts_value_branches(
         )
         first_actions = [action for _, actions in chunk for action in actions]
         successors = {}
-        pair_scores: list[list[tuple[float, float]]] = [[] for _ in chunk]
+        rollout_pairs: list[list[list[dict[str, Any]]]] = [[] for _ in chunk]
 
         def record_successors(packet) -> None:
             successors.update(_encode_successors(model, search, packet))
@@ -236,24 +237,36 @@ def collect_mcts_value_branches(
                 after_first_action=record_successors if repeat == 0 else None,
                 raw_rngs=raw_rngs, raw_temperature=rollout_temperature,
             )
-            for index, scores in enumerate(pair_scores):
-                score_0, score_1 = (outcome["score_a"] for outcome in outcomes[2 * index:2 * index + 2])
-                terminal_branches += int(score_0 is not None) + int(score_1 is not None)
-                if score_0 is not None and score_1 is not None:
-                    scores.append((score_0, score_1))
+            for index, repeats in enumerate(rollout_pairs):
+                repeats.append(outcomes[2 * index:2 * index + 2])
 
-        for index, ((probe, _), scores) in enumerate(zip(chunk, pair_scores)):
+        for index, ((probe, actions), repeats) in enumerate(zip(chunk, rollout_pairs)):
+            all_scores = [(pair[0]["score_a"], pair[1]["score_a"]) for pair in repeats]
+            terminal_branches += sum(score is not None for pair in all_scores for score in pair)
+            scores = [pair for pair in all_scores if None not in pair]
             completed_rollout_pairs += len(scores)
             partial_rollout_roots += len(scores) < branch_rollouts
-            if not scores:
-                continue
-            score_0, score_1 = np.mean(scores, axis=0).tolist()
+            means = np.mean(scores, axis=0).tolist() if scores else [None, None]
+            states = [successors.get(row) for row in (2 * index, 2 * index + 1)]
             labelled = _branch_examples(
-                probe.position, [{"score_a": score_0}, {"score_a": score_1}],
-                [successors[row] for row in (2 * index, 2 * index + 1) if row in successors], phase=probe.phase,
+                probe.position, [{"score_a": score} for score in means],
+                [state for state in states if state is not None], phase=probe.phase,
             )
+            if pair_callback is not None:
+                position = probe.position
+                pair_callback({
+                    "map_seed": position.seed, "model_a_player": position.player,
+                    "prefix_length": position.prefix_length, "root_fingerprint": position.fingerprint,
+                    "prefix_actions": prefixes[position.game][:position.prefix_length], "phase": probe.phase,
+                    "action_ids": list(actions), "mean_scores": means, "rollouts": repeats,
+                    "successors": [None if state is None else {
+                        "features": state[0].tolist(), "turn": state[1], "to_play": state[2],
+                        "to_root_sign": 1 if state[2] == position.player else -1,
+                    } for state in states],
+                    "targets": [example.return_target for example in labelled] if labelled else None,
+                })
             if labelled:
-                informative = score_0 != score_1
+                informative = means[0] != means[1]
                 informative_pairs += informative
                 phase_counts[probe.phase]["labelled_pairs"] += 1
                 phase_counts[probe.phase]["pairs_with_different_mean_scores"] += informative
@@ -284,26 +297,33 @@ def evaluate_mcts_value_heads(
     visible_action_history: int,
     max_pending_leaves: int,
     opponent_value_scale: float,
+    fitted_heads: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
 ) -> dict[str, Any]:
     seeds = [training.seed + index // 2 for index in range(games)]
     arms = {}
     outcomes: dict[str, dict[tuple[int, int], float]] = {}
-    for name, scale in (("fitted", 1.0), ("zero", 0.0)):
-        terminal: dict[tuple[int, int], float] = {}
+    original = deepcopy(model.value_head.state_dict())
+    heads = fitted_heads if fitted_heads is not None else {"fitted": original}
+    try:
+        for name, state in (*heads.items(), ("zero", original)):
+            model.value_head.load_state_dict(state)
+            terminal: dict[tuple[int, int], float] = {}
 
-        def record(game) -> None:
-            if not game["truncated"]:
-                terminal[game["map_seed"], game["model_a_player"]] = game["score_a"]
+            def record(game) -> None:
+                if not game["truncated"]:
+                    terminal[game["map_seed"], game["model_a_player"]] = game["score_a"]
 
-        arms[name] = evaluate_matches_pool(
-            model, opponent, training, mcts, games, model_b_uses_mcts=False, map_seeds=seeds,
-            num_threads=num_threads, max_envs=num_envs, max_pending_leaves=max_pending_leaves,
-            visible_action_history=visible_action_history, belief_action_mode="root_shield",
-            replace_failed_pairs=False, leaf_value_scale=scale,
-            opponent_leaf_value_scale=opponent_value_scale, model_a_label=f"value {name}",
-            model_b_label="raw opponent", game_callback=record,
-        )
-        outcomes[name] = terminal
+            arms[name] = evaluate_matches_pool(
+                model, opponent, training, mcts, games, model_b_uses_mcts=False, map_seeds=seeds,
+                num_threads=num_threads, max_envs=num_envs, max_pending_leaves=max_pending_leaves,
+                visible_action_history=visible_action_history, belief_action_mode="root_shield",
+                replace_failed_pairs=False, leaf_value_scale=0.0 if name == "zero" else 1.0,
+                opponent_leaf_value_scale=opponent_value_scale, model_a_label=f"value {name}",
+                model_b_label="raw opponent", game_callback=record,
+            )
+            outcomes[name] = terminal
+    finally:
+        model.value_head.load_state_dict(original)
 
     valid = all(arm["valid"] and arm.get("evaluated_map_seeds") == seeds for arm in arms.values())
     complete = [seed for seed in seeds[::2] if all(
@@ -313,9 +333,10 @@ def evaluate_mcts_value_heads(
         name: float(np.mean([terminal[seed, side] for seed in complete for side in (0, 1)])) if complete else None
         for name, terminal in outcomes.items()
     }
+    deltas = {name: scores[name] - scores["zero"] if complete else None for name in heads}
     return {
         "arms": arms, "valid": bool(complete), "opponent_value_scale": opponent_value_scale,
         "compared_map_seeds": complete, "compared_games_per_arm": 2 * len(complete),
-        "paired_scores": scores,
-        "beats_zero": bool(complete and scores["fitted"] > scores["zero"]),
+        "paired_scores": scores, "score_deltas_vs_zero": deltas,
+        "beats_zero": any(delta is not None and delta > 0 for delta in deltas.values()),
     }

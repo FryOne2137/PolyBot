@@ -267,7 +267,9 @@ def test_branch_value_labels_have_the_successor_players_perspective():
     position = _ReplayPosition(game=1, seed=2137, player=1, prefix_length=3, fingerprint="")
     successors = [(np.zeros(16), 1, 1), (np.zeros(16), 2, 0)]
     wins = [{"score_a": 1.0}, {"score_a": 1.0}]
-    assert [example.return_target for example in _branch_examples(position, wins, successors)] == [1.0, -1.0]
+    examples = _branch_examples(position, wins, successors, phase="late")
+    assert [example.return_target for example in examples] == [1.0, -1.0]
+    assert [example.phase for example in examples] == ["late", "late"]
     assert not _branch_examples(position, [{"score_a": None}, wins[1]], successors)
     assert not _branch_examples(position, wins, successors[:1])
 
@@ -276,7 +278,6 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
     from polybot.training import mcts_value
 
     model, opponent = tiny_model(), tiny_model()
-    original = {key: value.clone() for key, value in model.value_head.state_dict().items()}
     with torch.no_grad():
         model.value_head[-2].bias.fill_(0.75)
     seen = []
@@ -296,15 +297,86 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
 
     monkeypatch.setattr(mcts_value, "evaluate_matches_pool", evaluate)
     report = mcts_value.evaluate_mcts_value_heads(
-        model, opponent, original, TrainingConfig(device="cpu", seed=2137), MCTSConfig(), 4,
+        model, opponent, TrainingConfig(device="cpu", seed=2137), MCTSConfig(), 4,
         num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4, opponent_value_scale=0.25,
     )
-    original_bias = original["2.bias"].item()
-    assert seen == [(1.0, 0.75), (1.0, original_bias), (0.0, original_bias)]
+    assert seen == [(1.0, 0.75), (0.0, 0.75)]
     assert model.value_head[-2].bias.item() == 0.75
     assert report["compared_map_seeds"] == [2137]
-    assert report["paired_scores"] == {"fitted": 1.0, "original": 0.0, "zero": 0.0}
-    assert report["beats_original_and_zero"]
+    assert report["paired_scores"] == {"fitted": 1.0, "zero": 0.0}
+    assert report["beats_zero"]
+
+
+def test_branch_collection_uses_zero_value_and_separate_phase_quotas(monkeypatch):
+    from polybot.training import mcts_value
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    seed = 2137
+    model = tiny_model()
+    training = TrainingConfig(device="cpu", seed=seed, max_moves=24)
+    mcts = MCTSConfig(simulations=32, particles=4)
+    replay = RoutedPoolSearch(
+        training, mcts, [model, model], num_envs=4, num_threads=1,
+        max_pending_leaves=4, visible_action_history=32, belief_retries=0, seed=seed,
+    )
+
+    def play_games(*args, **kwargs):
+        assert kwargs["leaf_value_scale"] == kwargs["opponent_leaf_value_scale"] == 0.0
+        assert kwargs["model_b_uses_mcts"] is False
+        seeds = np.asarray(kwargs["map_seeds"], dtype=np.uint32)
+        assignments = np.array([[0, 1], [1, 0], [0, 1], [1, 0]], dtype=np.int32)
+        request = replay.reset(seeds, assignments)
+        actions = np.zeros(4, dtype=np.int32)
+        for _ in range(12):
+            kwargs["action_callback"](np.arange(4), request, actions)
+            replay.step_public_policy(actions, request["state_id"], request)
+        for index in range(4):
+            kwargs["game_callback"]({"game_index": index, "truncated": index == 3})
+        return {"valid": True, "evaluated_map_seeds": seeds.tolist()}
+
+    def complete_branches(search, request, positions, first_actions, max_moves, *, after_first_action):
+        assert not any(position.game == 3 for position in positions)
+        search.step_public_policy(np.asarray(first_actions, dtype=np.int32), request["state_id"], request)
+        assert request["action_valid"].all()
+        after_first_action(request)
+        return [{"score_a": float(index % 2)} for index in range(len(positions))]
+
+    monkeypatch.setattr(mcts_value, "evaluate_matches_pool", play_games)
+    monkeypatch.setattr(mcts_value, "_play_replayed_continuations", complete_branches)
+    examples, report = mcts_value.collect_mcts_value_branches(
+        model, model, training, mcts, games=4, positions_per_game=6,
+        num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4, label="test",
+    )
+    assert report["terminal_source_games"] == 3 and report["truncated_source_games"] == 1
+    assert report["sampled_roots"] == report["labelled_pairs"] == 18
+    for phase, counts in report["phases"].items():
+        assert counts["sampled_roots"] == counts["labelled_pairs"] == counts["pairs_with_different_outcomes"] == 6
+        indices = {"opening": range(4), "mid": range(4, 8), "late": range(8, 12)}[phase]
+        assert all(example.game_key[2] in indices for example in examples if example.phase == phase)
+        assert sum(example.phase == phase for example in examples) == 12
+
+
+def test_branch_fit_can_benchmark_an_update_with_worse_offline_rmse():
+    from polybot.training.flat_experiments import FlatImprovements
+    from polybot.training.flat_value import EncodedValuePosition, fit_value_head
+
+    model = tiny_model()
+    model.requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    with torch.no_grad():
+        model.value_head[-2].weight.zero_()
+        model.value_head[-2].bias.zero_()
+    training = TrainingConfig(device="cpu")
+    settings = FlatImprovements(value_updates=2, value_batch_size=8, value_fit_backoffs=0)
+    features = np.ones(model.config.d_model, dtype=np.float32)
+    replay = [EncodedValuePosition(features, 0, 1.0, (seed,)) for seed in range(8)]
+    validation = [EncodedValuePosition(features, 0, -1.0, (seed,)) for seed in range(8, 16)]
+    baseline = fit_value_head(model, training, replay, validation, settings, seed=2137)
+    assert not baseline["kept"]
+    branch = fit_value_head(model, training, replay, validation, settings, seed=2137, keep_best_update=True)
+    assert branch["kept"] and not branch["selection_improved"]
+    assert branch["after"]["rmse"] > branch["before"]["rmse"]
+    assert branch["selected_updates"] > 0
 
 
 def test_mcts_diagnostics_replays_only_disagreements_on_the_same_positions():

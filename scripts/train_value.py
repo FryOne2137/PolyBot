@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -106,9 +105,11 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
     pool = dict(
         num_envs=args.num_envs, num_threads=args.num_threads,
         visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
-        opponent_value_scale=args.opponent_value_scale,
     )
-    run.write_config(training=training, model=config, mcts=mcts, schedules=schedules)
+    run.write_config(
+        training=training, model=config, mcts=mcts, schedules=schedules,
+        collection_leaf_value_scales=(0.0, 0.0), benchmark_opponent_value_scale=args.opponent_value_scale,
+    )
     datasets = {}
     collection = {}
     report: dict[str, Any] = {"collection": collection, "saved_checkpoint": None, "mcts_improved": False}
@@ -132,10 +133,9 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
         value_learning_rate=args.learning_rate, value_validation_games=args.selection_games,
         value_capacity=max(len(datasets["train"]), args.batch_size),
     )
-    original_head = deepcopy(model.value_head.state_dict())
     fit = fit_value_head(
         model, training, datasets["train"], datasets["selection"], settings,
-        seed=training.seed, validation_source="mcts_branch_selection",
+        seed=training.seed, validation_source="mcts_branch_selection", keep_best_update=True,
     )
     report["fit"] = fit
     run.log(updates=fit["updates"], selection_rmse_before=fit.get("before", {}).get("rmse"),
@@ -148,9 +148,10 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
     run.event("experimental_checkpoint_saved", checkpoint=args.model_out)
     _, seed, games = schedules[2]
     benchmark = evaluate_mcts_value_heads(
-        model, opponent, original_head, replace(training, seed=seed), mcts, games, **pool,
+        model, opponent, replace(training, seed=seed), mcts, games,
+        opponent_value_scale=args.opponent_value_scale, **pool,
     )
-    improved = benchmark["beats_original_and_zero"]
+    improved = benchmark["beats_zero"]
     reason = "mcts_improved" if improved else "mcts_no_demonstrated_improvement"
     report.update(mcts_benchmark=benchmark, mcts_improved=improved, reason=reason)
     run.log(compared_mcts_games=benchmark["compared_games_per_arm"], **{
@@ -172,7 +173,8 @@ def main() -> None:
     parser.add_argument("--validation-games", type=int, default=48)
     parser.add_argument("--selection-seed", type=int, default=447618319)
     parser.add_argument("--validation-seed", type=int, default=682954103)
-    parser.add_argument("--positions-per-game", type=int, default=64)
+    parser.add_argument("--positions-per-game", type=int, default=64,
+                        help="Total position budget per game, divided across thirds in mcts-branches mode")
     parser.add_argument("--updates", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-envs", type=int, default=8)
@@ -182,7 +184,7 @@ def main() -> None:
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--max-pending-leaves", type=int, default=4)
     parser.add_argument("--opponent-value-scale", type=float, default=0.0,
-                        help="Fixed value scale on opponent leaves in mcts-branches mode")
+                        help="Fixed scale on opponent leaves in both MCTS benchmark arms; collection uses zero")
     parser.set_defaults(learning_rate=0.0001, max_moves=1600)
     args = parser.parse_args()
     training = training_config_from_args(args)

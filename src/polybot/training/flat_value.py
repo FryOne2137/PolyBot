@@ -13,6 +13,9 @@ from torch.nn import functional as F
 from .flat_experiments import FlatImprovements, isolated_rng
 
 
+VALUE_PHASES = ("opening", "mid", "late")
+
+
 @dataclass(frozen=True)
 class ValuePosition:
     observation: Mapping[str, np.ndarray]
@@ -27,12 +30,20 @@ class EncodedValuePosition:
     turn: int
     return_target: float
     game_key: tuple[Any, ...]
+    phase: str | None = None
 
 
 def _turn(example: ValuePosition | EncodedValuePosition) -> int:
     if isinstance(example, EncodedValuePosition):
         return example.turn
     return int(np.asarray(example.observation["state"]).reshape(-1)[0])
+
+
+def _phase(example: ValuePosition | EncodedValuePosition) -> str:
+    if isinstance(example, EncodedValuePosition) and example.phase is not None:
+        return example.phase
+    turn = _turn(example)
+    return VALUE_PHASES[0 if turn < 20 else 1 if turn < 60 else 2]
 
 
 @dataclass
@@ -150,10 +161,9 @@ def _metrics_by_phase(predictions, targets, examples):
     metrics = value_metrics(predictions, targets)
     keys = {getattr(e, "game_key", None) for e in examples} - {None}
     metrics["games"] = len(keys)
-    for phase, lo, hi in (("opening", 0, 20), ("mid", 20, 60), ("late", 60, float("inf"))):
-        mask = np.asarray([
-            lo <= _turn(e) < hi for e in examples
-        ])
+    phases = np.asarray([_phase(example) for example in examples])
+    for phase in VALUE_PHASES:
+        mask = phases == phase
         metrics[phase] = value_metrics(predictions[mask], targets[mask])
     return metrics
 
@@ -161,6 +171,7 @@ def _metrics_by_phase(predictions, targets, examples):
 def fit_value_head(
     model, training, replay: Sequence, validation: Sequence,
     settings: FlatImprovements, *, seed: int, validation_source: str = "explicit",
+    keep_best_update: bool = False,
 ) -> dict[str, Any]:
     """Only the critic head changes; validation never supplies a gradient.
 
@@ -168,6 +179,8 @@ def fit_value_head(
     Only the head changes, so those action trajectories remain applicable.
     A rejected actor must receive its own saved validation, never the rejected
     policy's labels. Validation positions never become training examples.
+    When a later game benchmark will compare the trained head, callers can
+    select the best finite update even if its offline RMSE is worse than before.
     """
     result = {"updates": 0, "kept": False, "train_positions": len(replay),
               "validation_positions": len(validation), "validation_source": validation_source}
@@ -198,8 +211,7 @@ def fit_value_head(
         # original distribution and reports each phase separately.
         groups = {}
         for index, example in enumerate(rows):
-            turn = _turn(example)
-            groups.setdefault(0 if turn < 20 else 1 if turn < 60 else 2, []).append(index)
+            groups.setdefault(_phase(example), []).append(index)
         buckets = list(groups.values())
         # The encoder is frozen. Reuse identical sampled features when trying
         # a smaller head learning rate rather than replaying the expensive net.
@@ -235,14 +247,18 @@ def fit_value_head(
                 optimizer.step()
                 attempted_updates += 1
                 measured = measure()
-                if measured["valid"] and measured["rmse"] < after["rmse"] - 1e-8:
+                if measured["valid"] and (
+                    (keep_best_update and best_step == 0) or measured["rmse"] < after["rmse"] - 1e-8
+                ):
                     after, best_state = measured, deepcopy(model.value_head.state_dict())
                     best_step, selected_lr = step, lr
-            if best_step:
+            if best_step and after["rmse"] < before["rmse"] - 1e-8:
                 break
         kept = best_step > 0
         model.value_head.load_state_dict(best_state)
         result.update(updates=attempted_updates, selected_updates=best_step,
                       attempts=attempts, learning_rate=selected_lr)
+        selection_improved = after["rmse"] < before["rmse"] - 1e-8
+    reason = "validation_improved" if selection_improved else "best_updated_head" if kept else "value_regression"
     return {**result, "before": before, "after": after, "kept": kept,
-            "reason": "validation_improved" if kept else "value_regression"}
+            "selection_improved": selection_improved, "reason": reason}

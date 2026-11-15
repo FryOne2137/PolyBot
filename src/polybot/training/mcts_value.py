@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -20,7 +19,7 @@ from ..evaluation.mcts_diagnostics import (
     _ReplayPosition,
 )
 from ..models.policy_value_belief import PolicyValueBeliefNet
-from .flat_value import EncodedValuePosition
+from .flat_value import EncodedValuePosition, VALUE_PHASES
 from .routed_self_play_pool import RoutedPoolSearch, _slice_rows, evaluate_matches_pool
 
 
@@ -50,6 +49,8 @@ def _branch_examples(
     position: _ReplayPosition,
     outcomes: Sequence[Mapping[str, Any]],
     successors: Sequence[tuple[np.ndarray, int, int]],
+    *,
+    phase: str | None = None,
 ) -> list[EncodedValuePosition]:
     """Use both observed terminal outcomes, expressed in each successor's perspective."""
     if len(successors) != 2 or any(outcome["score_a"] is None for outcome in outcomes):
@@ -57,7 +58,7 @@ def _branch_examples(
     key = (position.seed, position.player, position.prefix_length)
     return [
         EncodedValuePosition(
-            features, turn, (2 * outcome["score_a"] - 1) * (1 if actor == position.player else -1), key,
+            features, turn, (2 * outcome["score_a"] - 1) * (1 if actor == position.player else -1), key, phase,
         )
         for (features, turn, actor), outcome in zip(successors, outcomes)
     ]
@@ -75,14 +76,13 @@ def collect_mcts_value_branches(
     num_threads: int,
     visible_action_history: int,
     max_pending_leaves: int,
-    opponent_value_scale: float,
     label: str,
 ) -> tuple[list[EncodedValuePosition], dict[str, Any]]:
     seeds = [training.seed + index // 2 for index in range(games)]
     rng = np.random.default_rng(training.seed ^ 0x56414C)
     prefixes: dict[int, list[int]] = defaultdict(list)
-    samples: dict[tuple[int, bool], list[tuple[_ReplayPosition, int]]] = defaultdict(list)
-    seen: dict[tuple[int, bool], int] = defaultdict(int)
+    eligible: dict[int, list[tuple[_ReplayPosition, int, bool]]] = defaultdict(list)
+    terminal_source_games: set[int] = set()
 
     def record(indices, request, actions) -> None:
         for row in np.flatnonzero(actions >= 0):
@@ -91,27 +91,23 @@ def collect_mcts_value_branches(
             action = int(actions[row])
             if request["agent_id"][row] == 0 and request["action_mask"][row].sum() > 1:
                 early_end = action == 0 and request["state"][row, 0] < 20
-                key = (game, bool(early_end))
-                reservoir = samples[key]
-                seen[key] += 1
-                index = len(reservoir) if len(reservoir) < positions_per_game else int(rng.integers(seen[key]))
-                if index < positions_per_game:
-                    sample = (_ReplayPosition(
-                        game, int(request["map_seed"][row]), int(request["to_play"][row]),
-                        len(prefix), _position_fingerprint(request, row),
-                    ), action)
-                    if index == len(reservoir):
-                        reservoir.append(sample)
-                    else:
-                        reservoir[index] = sample
+                position = _ReplayPosition(
+                    game, int(request["map_seed"][row]), int(request["to_play"][row]),
+                    len(prefix), _position_fingerprint(request, row),
+                )
+                eligible[game].append((position, action, bool(early_end)))
             prefix.append(action)
+
+    def record_game(game) -> None:
+        if not game["truncated"]:
+            terminal_source_games.add(int(game["game_index"]))
 
     evaluation = evaluate_matches_pool(
         model, opponent, training, mcts, games, model_b_uses_mcts=False, map_seeds=seeds,
         num_threads=num_threads, max_envs=num_envs, max_pending_leaves=max_pending_leaves,
         visible_action_history=visible_action_history, belief_action_mode="root_shield",
-        replace_failed_pairs=False, opponent_leaf_value_scale=opponent_value_scale,
-        model_a_label=label, model_b_label="raw opponent", action_callback=record,
+        replace_failed_pairs=False, leaf_value_scale=0.0, opponent_leaf_value_scale=0.0,
+        model_a_label=label, model_b_label="raw opponent", action_callback=record, game_callback=record_game,
     )
     report: dict[str, Any] = {
         "valid": bool(evaluation["valid"] and evaluation.get("evaluated_map_seeds") == seeds),
@@ -119,19 +115,33 @@ def collect_mcts_value_branches(
         "evaluation": evaluation,
         "labelled_maps": 0,
         "positions": 0,
+        "model_a_leaf_value_scale": 0.0,
+        "opponent_leaf_value_scale": 0.0,
+        "phase_definition": "thirds_of_completed_game_by_action_index",
     }
     if not report["valid"]:
         return [], report
 
-    positions = []
+    positions: list[tuple[_ReplayPosition, int, str]] = []
     early_end_samples = 0
-    for game in range(games):
-        early, other = samples[game, True], samples[game, False]
-        # Reserve half the per-game slots for early end-turn decisions when available.
-        early_count = min(len(early), (positions_per_game + 1) // 2)
-        early_count = min(len(early), max(early_count, positions_per_game - len(other)))
-        positions.extend(early[:early_count] + other[:positions_per_game - early_count])
-        early_end_samples += early_count
+    phase_counts = {phase: {"available_roots": 0, "sampled_roots": 0, "labelled_pairs": 0,
+                            "pairs_with_different_outcomes": 0} for phase in VALUE_PHASES}
+    quota, remainder = divmod(positions_per_game, len(VALUE_PHASES))
+    for game in sorted(terminal_source_games):
+        buckets: dict[str, list[tuple[_ReplayPosition, int, bool]]] = defaultdict(list)
+        for sample in eligible[game]:
+            phase = VALUE_PHASES[len(VALUE_PHASES) * sample[0].prefix_length // len(prefixes[game])]
+            buckets[phase].append(sample)
+        for index, phase in enumerate(VALUE_PHASES):
+            bucket = buckets[phase]
+            limit = quota + int((index - game) % len(VALUE_PHASES) < remainder)
+            count = min(limit, len(bucket))
+            phase_counts[phase]["available_roots"] += len(bucket)
+            phase_counts[phase]["sampled_roots"] += count
+            for sample_index in rng.choice(len(bucket), size=count, replace=False):
+                position, action, early_end = bucket[sample_index]
+                positions.append((position, action, phase))
+                early_end_samples += early_end
     positions.sort(key=lambda sample: (sample[0].game, sample[0].prefix_length))
 
     examples = []
@@ -139,7 +149,7 @@ def collect_mcts_value_branches(
     batch_pairs = num_envs // 2
     for start in tqdm(range(0, len(positions), batch_pairs), desc=f"{label} raw branches", unit="batch"):
         chunk = positions[start:start + batch_pairs]
-        branch_positions = [position for position, _ in chunk for _ in range(2)]
+        branch_positions = [sample[0] for sample in chunk for _ in range(2)]
         search = RoutedPoolSearch(
             training, mcts, (model, opponent), num_envs=len(branch_positions),
             num_threads=num_threads, max_pending_leaves=max_pending_leaves,
@@ -148,7 +158,7 @@ def collect_mcts_value_branches(
         request = _replay_positions(search, branch_positions, prefixes)
         policy, _ = search.direct_policy_value(request, np.arange(0, len(branch_positions), 2))
         first_actions = []
-        for row, (_, chosen) in zip(range(0, len(branch_positions), 2), chunk):
+        for row, (_, chosen, _) in zip(range(0, len(branch_positions), 2), chunk):
             legal = request["action_mask"][row].astype(bool) & (request["action_id"][row] != chosen)
             alternate = np.flatnonzero(legal)
             best_alternate = alternate[policy[row, alternate].argmax()]
@@ -159,17 +169,24 @@ def collect_mcts_value_branches(
             search, request, branch_positions, first_actions, training.max_moves,
             after_first_action=lambda packet: successors.update(_encode_successors(model, search, packet)),
         )
-        for row, (position, _) in zip(range(0, len(branch_positions), 2), chunk):
+        for row, (position, _, phase) in zip(range(0, len(branch_positions), 2), chunk):
             pair = outcomes[row:row + 2]
             terminal_branches += sum(outcome["score_a"] is not None for outcome in pair)
-            labelled = _branch_examples(position, pair, [successors[i] for i in (row, row + 1) if i in successors])
+            labelled = _branch_examples(
+                position, pair, [successors[i] for i in (row, row + 1) if i in successors], phase=phase,
+            )
             if labelled:
-                informative_pairs += pair[0]["score_a"] != pair[1]["score_a"]
+                informative = pair[0]["score_a"] != pair[1]["score_a"]
+                informative_pairs += informative
+                phase_counts[phase]["labelled_pairs"] += 1
+                phase_counts[phase]["pairs_with_different_outcomes"] += informative
                 examples.extend(labelled)
         del request, search
 
     report.update(
         sampled_roots=len(positions), early_end_turn_roots=early_end_samples,
+        phases=phase_counts, terminal_source_games=len(terminal_source_games),
+        truncated_source_games=games - len(terminal_source_games),
         terminal_branches=terminal_branches, truncated_branches=2 * len(positions) - terminal_branches,
         labelled_pairs=len(examples) // 2, pairs_with_different_outcomes=informative_pairs,
         labelled_maps=len({example.game_key[0] for example in examples}), positions=len(examples),
@@ -180,7 +197,6 @@ def collect_mcts_value_branches(
 def evaluate_mcts_value_heads(
     model: PolicyValueBeliefNet,
     opponent: PolicyValueBeliefNet,
-    original_head: Mapping[str, torch.Tensor],
     training: TrainingConfig,
     mcts: MCTSConfig,
     games: int,
@@ -192,30 +208,24 @@ def evaluate_mcts_value_heads(
     opponent_value_scale: float,
 ) -> dict[str, Any]:
     seeds = [training.seed + index // 2 for index in range(games)]
-    fitted_head = deepcopy(model.value_head.state_dict())
     arms = {}
     outcomes: dict[str, dict[tuple[int, int], float]] = {}
-    try:
-        for name in ("fitted", "original", "zero"):
-            if name == "original":
-                model.value_head.load_state_dict(original_head)
-            terminal: dict[tuple[int, int], float] = {}
+    for name, scale in (("fitted", 1.0), ("zero", 0.0)):
+        terminal: dict[tuple[int, int], float] = {}
 
-            def record(game) -> None:
-                if not game["truncated"]:
-                    terminal[game["map_seed"], game["model_a_player"]] = game["score_a"]
+        def record(game) -> None:
+            if not game["truncated"]:
+                terminal[game["map_seed"], game["model_a_player"]] = game["score_a"]
 
-            arms[name] = evaluate_matches_pool(
-                model, opponent, training, mcts, games, model_b_uses_mcts=False, map_seeds=seeds,
-                num_threads=num_threads, max_envs=num_envs, max_pending_leaves=max_pending_leaves,
-                visible_action_history=visible_action_history, belief_action_mode="root_shield",
-                replace_failed_pairs=False, leaf_value_scale=0.0 if name == "zero" else 1.0,
-                opponent_leaf_value_scale=opponent_value_scale, model_a_label=f"value {name}",
-                model_b_label="raw opponent", game_callback=record,
-            )
-            outcomes[name] = terminal
-    finally:
-        model.value_head.load_state_dict(fitted_head)
+        arms[name] = evaluate_matches_pool(
+            model, opponent, training, mcts, games, model_b_uses_mcts=False, map_seeds=seeds,
+            num_threads=num_threads, max_envs=num_envs, max_pending_leaves=max_pending_leaves,
+            visible_action_history=visible_action_history, belief_action_mode="root_shield",
+            replace_failed_pairs=False, leaf_value_scale=scale,
+            opponent_leaf_value_scale=opponent_value_scale, model_a_label=f"value {name}",
+            model_b_label="raw opponent", game_callback=record,
+        )
+        outcomes[name] = terminal
 
     valid = all(arm["valid"] and arm.get("evaluated_map_seeds") == seeds for arm in arms.values())
     complete = [seed for seed in seeds[::2] if all(
@@ -229,5 +239,5 @@ def evaluate_mcts_value_heads(
         "arms": arms, "valid": bool(complete), "opponent_value_scale": opponent_value_scale,
         "compared_map_seeds": complete, "compared_games_per_arm": 2 * len(complete),
         "paired_scores": scores,
-        "beats_original_and_zero": bool(complete and scores["fitted"] > max(scores["original"], scores["zero"])),
+        "beats_zero": bool(complete and scores["fitted"] > scores["zero"]),
     }

@@ -109,6 +109,9 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
     run.write_config(
         training=training, model=config, mcts=mcts, schedules=schedules,
         collection_leaf_value_scales=(0.0, 0.0), benchmark_opponent_value_scale=args.opponent_value_scale,
+        disagreement_opponent_value_scale=args.opponent_value_scale,
+        disagreement_probes_per_position=args.disagreement_probes_per_position,
+        branch_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature,
     )
     datasets = {}
     collection = {}
@@ -116,7 +119,10 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
     for label, seed, games in schedules[:2]:
         examples, summary = collect_mcts_value_branches(
             model, opponent, replace(training, seed=seed), mcts, games,
-            positions_per_game=args.positions_per_game, label=f"value {label}", **pool,
+            positions_per_game=args.positions_per_game, label=f"value {label}",
+            opponent_value_scale=args.opponent_value_scale,
+            disagreement_probes_per_position=args.disagreement_probes_per_position,
+            branch_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature, **pool,
         )
         collection[label] = summary
         run.event("branch_collection", split=label, **{key: value for key, value in summary.items() if key != "evaluation"})
@@ -183,8 +189,14 @@ def main() -> None:
     parser.add_argument("--simulations", type=int, default=32, help="MCTS budget in mcts-branches mode")
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--max-pending-leaves", type=int, default=4)
-    parser.add_argument("--opponent-value-scale", type=float, default=0.0,
-                        help="Fixed scale on opponent leaves in both MCTS benchmark arms; collection uses zero")
+    parser.add_argument("--opponent-value-scale", type=float, default=1.0,
+                        help="Fixed opponent leaf scale for disagreement probes and game benchmarks")
+    parser.add_argument("--disagreement-probes-per-position", type=int, default=8,
+                        help="Maximum probes per desired sample within each phase in mcts-branches mode")
+    parser.add_argument("--branch-rollouts", type=int, default=3,
+                        help="Number of sampled raw rollouts per action in mcts-branches mode")
+    parser.add_argument("--rollout-temperature", type=float, default=0.5,
+                        help="Common raw-policy sampling temperature for both actions in mcts-branches mode")
     parser.set_defaults(learning_rate=0.0001, max_moves=1600)
     args = parser.parse_args()
     training = training_config_from_args(args)
@@ -204,6 +216,11 @@ def main() -> None:
         or not 0.0 <= args.opponent_value_scale <= 1.0
     ):
         parser.error("require positive simulations and particles, 1–8 pending leaves and opponent value scale in [0, 1]")
+    if args.position_source == "mcts-branches" and (
+        args.disagreement_probes_per_position < 1 or args.branch_rollouts < 1
+        or not np.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0.0
+    ):
+        parser.error("require positive probe and rollout counts and a finite positive rollout temperature")
 
     schedules = (
         ("train", training.seed, args.train_games),

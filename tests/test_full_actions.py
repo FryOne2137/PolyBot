@@ -307,7 +307,7 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
     assert report["beats_zero"]
 
 
-def test_branch_collection_uses_zero_value_and_separate_phase_quotas(monkeypatch):
+def test_branch_collection_selects_disagreements_and_averages_paired_repeats(monkeypatch):
     from polybot.training import mcts_value
     from polybot.training.routed_self_play_pool import RoutedPoolSearch
 
@@ -334,26 +334,87 @@ def test_branch_collection_uses_zero_value_and_separate_phase_quotas(monkeypatch
             kwargs["game_callback"]({"game_index": index, "truncated": index == 3})
         return {"valid": True, "evaluated_map_seeds": seeds.tolist()}
 
-    def complete_branches(search, request, positions, first_actions, max_moves, *, after_first_action):
+    def compare(search, request, *, include_true_map):
+        assert not include_true_map and search.opponent_leaf_value_scale == 1.0
+        alternatives = []
+        for row, turn in enumerate(request["state"][:, 0]):
+            legal = request["action_id"][row, request["action_mask"][row].astype(bool)]
+            alternate = 0 if turn == 0 else int(legal[legal != 0][0])
+            alternatives.append({"action_id": alternate})
+        return {"belief_value_0": [{"action_id": 0}] * search.num_envs, "belief_value_1": alternatives}
+
+    streams = {}
+
+    def complete_branches(search, request, positions, first_actions, max_moves, *,
+                          after_first_action, raw_rngs, raw_temperature):
         assert not any(position.game == 3 for position in positions)
+        assert raw_temperature == 0.5
+        outcomes = []
+        for row in range(0, len(positions), 2):
+            assert first_actions[row] == 0 and first_actions[row + 1] != 0
+            first_draw, second_draw = raw_rngs[row].random(), raw_rngs[row + 1].random()
+            assert first_draw == second_draw
+            history = streams.setdefault((positions[row].game, positions[row].prefix_length), [])
+            assert first_draw not in history
+            outcomes.extend({"score_a": score} for score in ((0.0, 1.0), (1.0, 1.0), (None, 0.0))[len(history)])
+            history.append(first_draw)
         search.step_public_policy(np.asarray(first_actions, dtype=np.int32), request["state_id"], request)
         assert request["action_valid"].all()
-        after_first_action(request)
-        return [{"score_a": float(index % 2)} for index in range(len(positions))]
+        if after_first_action is not None:
+            after_first_action(request)
+        return outcomes
 
     monkeypatch.setattr(mcts_value, "evaluate_matches_pool", play_games)
+    monkeypatch.setattr(mcts_value, "_compare_leaf_scales", compare)
     monkeypatch.setattr(mcts_value, "_play_replayed_continuations", complete_branches)
     examples, report = mcts_value.collect_mcts_value_branches(
         model, model, training, mcts, games=4, positions_per_game=6,
-        num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4, label="test",
+        num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4,
+        opponent_value_scale=1.0, disagreement_probes_per_position=2,
+        branch_rollouts=3, rollout_temperature=0.5, label="test",
     )
     assert report["terminal_source_games"] == 3 and report["truncated_source_games"] == 1
-    assert report["sampled_roots"] == report["labelled_pairs"] == 18
+    assert report["sampled_roots"] == report["labelled_pairs"] == len(streams) == 15
+    assert report["completed_rollout_pairs"] == report["truncated_branches"] * 2 == 30
+    assert report["terminal_branches"] == 75
+    assert all(len(history) == 3 for history in streams.values())
+    assert sum(example.return_target == 0.0 for example in examples) == 15
+    assert sum(abs(example.return_target) == 1.0 for example in examples) == 15
     for phase, counts in report["phases"].items():
-        assert counts["sampled_roots"] == counts["labelled_pairs"] == counts["pairs_with_different_outcomes"] == 6
+        expected = 3 if phase == "opening" else 6
+        assert counts["probed_roots"] == 6
+        assert counts["sampled_roots"] == counts["labelled_pairs"] == counts["pairs_with_different_mean_scores"] == expected
         indices = {"opening": range(4), "mid": range(4, 8), "late": range(8, 12)}[phase]
         assert all(example.game_key[2] in indices for example in examples if example.phase == phase)
-        assert sum(example.phase == phase for example in examples) == 12
+        assert sum(example.phase == phase for example in examples) == 2 * expected
+
+
+def test_branch_probe_reuses_particles_without_searching_the_true_map(monkeypatch):
+    from polybot.data.full_actions import ExactActionNative
+    from polybot.evaluation.mcts_diagnostics import _compare_leaf_scales
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    worlds = []
+
+    def submit(pool, state_ids, particles):
+        pool.native.submit_beliefs(state_ids, particles)
+        worlds.append(particles.copy())
+
+    monkeypatch.setattr(ExactActionNative, "submit_beliefs", submit, raising=False)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(21)
+        model = tiny_model()
+    search = RoutedPoolSearch(
+        TrainingConfig(device="cpu"), MCTSConfig(simulations=32, particles=4), [model, model],
+        num_envs=1, num_threads=1, max_pending_leaves=4, visible_action_history=32,
+        belief_retries=4, seed=2137, belief_action_mode="root_shield", opponent_leaf_value_scale=1.0,
+    )
+    request = search.reset(np.array([2137], dtype=np.uint32), np.array([[0, 1]], dtype=np.int32))
+    result = _compare_leaf_scales(search, request, include_true_map=False)
+    assert set(result) == {"belief_value_0", "belief_value_1"}
+    assert all(0 < choices[0]["root_visits"] <= 32 for choices in result.values())
+    assert len(worlds) == 2
+    np.testing.assert_array_equal(worlds[0], worlds[1])
 
 
 def test_branch_fit_can_benchmark_an_update_with_worse_offline_rmse():

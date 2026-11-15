@@ -20,6 +20,7 @@ from ..training.routed_self_play_pool import (
     RoutedPoolSearch,
     _evaluation_belief_retries,
     _evaluation_search_with_recovery,
+    _sample_active_rows,
     evaluate_matches_pool,
 )
 
@@ -172,6 +173,8 @@ def _root_decisions(root: Mapping[str, np.ndarray]) -> list[dict[str, Any]]:
 def _compare_leaf_scales(
     search: RoutedPoolSearch,
     request: Mapping[str, np.ndarray],
+    *,
+    include_true_map: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     worlds: list[np.ndarray] = []
     active = np.ones(search.num_envs, dtype=bool)
@@ -202,6 +205,8 @@ def _compare_leaf_scales(
     search.leaf_value_scale = 0.0
     root = _search_submitted_maps(search, request, worlds[0])
     decisions["belief_value_0"] = _root_decisions(root)
+    if not include_true_map:
+        return decisions
 
     clear_forest()
     truth = _true_map_worlds(search, request)
@@ -302,8 +307,12 @@ def _play_replayed_continuations(
     *,
     mcts_value_scale: float | None = None,
     after_first_action: Callable[[Mapping[str, np.ndarray]], None] | None = None,
+    raw_rngs: Sequence[np.random.Generator] | None = None,
+    raw_temperature: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Force the first move, then use raw policies or MCTS on model A's turns."""
+    if raw_rngs is not None and (mcts_value_scale is not None or len(raw_rngs) != len(positions)):
+        raise ValueError("sampled raw continuations require one generator per branch and no MCTS")
     moves = np.array([position.prefix_length for position in positions], dtype=np.int32)
     terminated = np.zeros(len(positions), dtype=bool)
     winners = np.full(len(positions), -1, dtype=np.int32)
@@ -341,7 +350,14 @@ def _play_replayed_continuations(
             policy, _ = search.direct_policy_value(request, rows)
             action_ids = request["action_id"]
         actions = np.full(len(positions), -1, dtype=np.int32)
-        actions[rows] = action_ids[rows, policy[rows].argmax(axis=1)]
+        if raw_rngs is None:
+            selected = policy[rows].argmax(axis=1)
+        else:
+            selected = _sample_active_rows(
+                {**request, "policy": policy}, request, rows, raw_rngs,
+                temperature=raw_temperature, exploration_rate=0.0,
+            )[rows]
+        actions[rows] = action_ids[rows, selected]
         step(actions, searched=searched)
 
     results = []

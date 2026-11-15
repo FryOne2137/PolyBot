@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,14 +14,23 @@ from tqdm.auto import tqdm
 from ..config import MCTSConfig, TrainingConfig
 from ..data.polyenv_features import native_batch_to_tensors
 from ..evaluation.mcts_diagnostics import (
+    _compare_leaf_scales,
     _play_replayed_continuations,
     _position_fingerprint,
     _replay_positions,
     _ReplayPosition,
 )
 from ..models.policy_value_belief import PolicyValueBeliefNet
+from .belief_recovery import BeliefRecoveryRequired
 from .flat_value import EncodedValuePosition, VALUE_PHASES
-from .routed_self_play_pool import RoutedPoolSearch, _slice_rows, evaluate_matches_pool
+from .routed_self_play_pool import RoutedPoolSearch, _evaluation_belief_retries, _slice_rows, evaluate_matches_pool
+
+
+@dataclass(frozen=True)
+class _BranchProbe:
+    position: _ReplayPosition
+    phase: str
+    turn: int
 
 
 @torch.inference_mode()
@@ -52,7 +62,7 @@ def _branch_examples(
     *,
     phase: str | None = None,
 ) -> list[EncodedValuePosition]:
-    """Use both observed terminal outcomes, expressed in each successor's perspective."""
+    """Convert both mean terminal scores to their successors' perspectives."""
     if len(successors) != 2 or any(outcome["score_a"] is None for outcome in outcomes):
         return []
     key = (position.seed, position.player, position.prefix_length)
@@ -76,12 +86,16 @@ def collect_mcts_value_branches(
     num_threads: int,
     visible_action_history: int,
     max_pending_leaves: int,
+    opponent_value_scale: float,
+    disagreement_probes_per_position: int,
+    branch_rollouts: int,
+    rollout_temperature: float,
     label: str,
 ) -> tuple[list[EncodedValuePosition], dict[str, Any]]:
     seeds = [training.seed + index // 2 for index in range(games)]
     rng = np.random.default_rng(training.seed ^ 0x56414C)
     prefixes: dict[int, list[int]] = defaultdict(list)
-    eligible: dict[int, list[tuple[_ReplayPosition, int, bool]]] = defaultdict(list)
+    eligible: dict[int, list[tuple[_ReplayPosition, int]]] = defaultdict(list)
     terminal_source_games: set[int] = set()
 
     def record(indices, request, actions) -> None:
@@ -90,12 +104,11 @@ def collect_mcts_value_branches(
             prefix = prefixes[game]
             action = int(actions[row])
             if request["agent_id"][row] == 0 and request["action_mask"][row].sum() > 1:
-                early_end = action == 0 and request["state"][row, 0] < 20
                 position = _ReplayPosition(
                     game, int(request["map_seed"][row]), int(request["to_play"][row]),
                     len(prefix), _position_fingerprint(request, row),
                 )
-                eligible[game].append((position, action, bool(early_end)))
+                eligible[game].append((position, int(request["state"][row, 0])))
             prefix.append(action)
 
     def record_game(game) -> None:
@@ -117,78 +130,139 @@ def collect_mcts_value_branches(
         "positions": 0,
         "model_a_leaf_value_scale": 0.0,
         "opponent_leaf_value_scale": 0.0,
+        "disagreement_opponent_leaf_value_scale": opponent_value_scale,
+        "branch_rollouts_per_move": branch_rollouts,
+        "rollout_temperature": rollout_temperature,
         "phase_definition": "thirds_of_completed_game_by_action_index",
     }
     if not report["valid"]:
         return [], report
 
-    positions: list[tuple[_ReplayPosition, int, str]] = []
-    early_end_samples = 0
-    phase_counts = {phase: {"available_roots": 0, "sampled_roots": 0, "labelled_pairs": 0,
-                            "pairs_with_different_outcomes": 0} for phase in VALUE_PHASES}
+    phase_counts = {phase: dict.fromkeys((
+        "available_roots", "probed_roots", "failed_probes", "disagreement_roots", "sampled_roots",
+        "labelled_pairs", "pairs_with_different_mean_scores",
+    ), 0) for phase in VALUE_PHASES}
+    probes: list[_BranchProbe] = []
+    limits: dict[tuple[int, str], int] = {}
     quota, remainder = divmod(positions_per_game, len(VALUE_PHASES))
     for game in sorted(terminal_source_games):
-        buckets: dict[str, list[tuple[_ReplayPosition, int, bool]]] = defaultdict(list)
-        for sample in eligible[game]:
-            phase = VALUE_PHASES[len(VALUE_PHASES) * sample[0].prefix_length // len(prefixes[game])]
-            buckets[phase].append(sample)
+        buckets: dict[str, list[_BranchProbe]] = defaultdict(list)
+        for position, turn in eligible[game]:
+            phase = VALUE_PHASES[len(VALUE_PHASES) * position.prefix_length // len(prefixes[game])]
+            buckets[phase].append(_BranchProbe(position, phase, turn))
         for index, phase in enumerate(VALUE_PHASES):
             bucket = buckets[phase]
             limit = quota + int((index - game) % len(VALUE_PHASES) < remainder)
-            count = min(limit, len(bucket))
+            limits[game, phase] = limit
+            count = min(limit * disagreement_probes_per_position, len(bucket))
             phase_counts[phase]["available_roots"] += len(bucket)
-            phase_counts[phase]["sampled_roots"] += count
-            for sample_index in rng.choice(len(bucket), size=count, replace=False):
-                position, action, early_end = bucket[sample_index]
-                positions.append((position, action, phase))
-                early_end_samples += early_end
-    positions.sort(key=lambda sample: (sample[0].game, sample[0].prefix_length))
+            probes.extend(bucket[row] for row in rng.choice(len(bucket), size=count, replace=False))
+
+    def new_search(positions: Sequence[_ReplayPosition], belief_retries: int = 0) -> RoutedPoolSearch:
+        return RoutedPoolSearch(
+            training, mcts, (model, opponent), num_envs=len(positions),
+            num_threads=num_threads, max_pending_leaves=max_pending_leaves,
+            visible_action_history=visible_action_history, belief_retries=belief_retries,
+            seed=positions[0].seed, belief_action_mode="root_shield", opponent_leaf_value_scale=opponent_value_scale,
+        )
+
+    probes.sort(key=lambda probe: (probe.position.game, probe.position.prefix_length))
+    candidates: dict[tuple[int, str], list[tuple[_BranchProbe, tuple[int, int]]]] = defaultdict(list)
+    batches = deque(probes[start:start + num_envs] for start in range(0, len(probes), num_envs))
+    with tqdm(total=len(probes), desc=f"{label} value disagreements", unit="position") as progress:
+        while batches:
+            batch = batches.popleft()
+            positions = [probe.position for probe in batch]
+            search = new_search(positions, belief_retries=_evaluation_belief_retries(4))
+            request = _replay_positions(search, positions, prefixes)
+            try:
+                comparison = _compare_leaf_scales(search, request, include_true_map=False)
+            except BeliefRecoveryRequired as error:
+                failed = {int(row) for row in error.env_ids if 0 <= row < len(batch)} or set(range(len(batch)))
+                remaining = [probe for row, probe in enumerate(batch) if row not in failed]
+                if remaining:
+                    batches.appendleft(remaining)
+                for row in failed:
+                    phase_counts[batch[row].phase]["failed_probes"] += 1
+                progress.update(len(failed))
+                continue
+            finally:
+                del request, search
+            for row, probe in enumerate(batch):
+                action_0 = comparison["belief_value_0"][row]["action_id"]
+                action_1 = comparison["belief_value_1"][row]["action_id"]
+                phase_counts[probe.phase]["probed_roots"] += 1
+                if action_0 != action_1:
+                    phase_counts[probe.phase]["disagreement_roots"] += 1
+                    candidates[probe.position.game, probe.phase].append((probe, (action_0, action_1)))
+            progress.update(len(batch))
+
+    selected = []
+    early_end_samples = 0
+    for key, bucket in candidates.items():
+        count = min(limits[key], len(bucket))
+        phase_counts[key[1]]["sampled_roots"] += count
+        for row in rng.choice(len(bucket), size=count, replace=False):
+            probe, actions = bucket[row]
+            selected.append((probe, actions))
+            early_end_samples += probe.turn < 20 and 0 in actions
+    selected.sort(key=lambda item: (item[0].position.game, item[0].position.prefix_length))
 
     examples = []
-    terminal_branches = informative_pairs = 0
+    terminal_branches = informative_pairs = completed_rollout_pairs = partial_rollout_roots = 0
     batch_pairs = num_envs // 2
-    for start in tqdm(range(0, len(positions), batch_pairs), desc=f"{label} raw branches", unit="batch"):
-        chunk = positions[start:start + batch_pairs]
-        branch_positions = [sample[0] for sample in chunk for _ in range(2)]
-        search = RoutedPoolSearch(
-            training, mcts, (model, opponent), num_envs=len(branch_positions),
-            num_threads=num_threads, max_pending_leaves=max_pending_leaves,
-            visible_action_history=visible_action_history, belief_retries=0, seed=chunk[0][0].seed,
-        )
-        request = _replay_positions(search, branch_positions, prefixes)
-        policy, _ = search.direct_policy_value(request, np.arange(0, len(branch_positions), 2))
-        first_actions = []
-        for row, (_, chosen, _) in zip(range(0, len(branch_positions), 2), chunk):
-            legal = request["action_mask"][row].astype(bool) & (request["action_id"][row] != chosen)
-            alternate = np.flatnonzero(legal)
-            best_alternate = alternate[policy[row, alternate].argmax()]
-            first_actions.extend((chosen, int(request["action_id"][row, best_alternate])))
-
+    for start in tqdm(range(0, len(selected), batch_pairs), desc=f"{label} raw branches", unit="batch"):
+        chunk = selected[start:start + batch_pairs]
+        branch_positions = [probe.position for probe, _ in chunk for _ in range(2)]
+        search = new_search(branch_positions)
+        first_actions = [action for _, actions in chunk for action in actions]
         successors = {}
-        outcomes = _play_replayed_continuations(
-            search, request, branch_positions, first_actions, training.max_moves,
-            after_first_action=lambda packet: successors.update(_encode_successors(model, search, packet)),
-        )
-        for row, (position, _, phase) in zip(range(0, len(branch_positions), 2), chunk):
-            pair = outcomes[row:row + 2]
-            terminal_branches += sum(outcome["score_a"] is not None for outcome in pair)
+        pair_scores: list[list[tuple[float, float]]] = [[] for _ in chunk]
+
+        def record_successors(packet) -> None:
+            successors.update(_encode_successors(model, search, packet))
+
+        for repeat in range(branch_rollouts):
+            request = _replay_positions(search, branch_positions, prefixes)
+            # Identical per-ply random streams for the two actions at one root.
+            raw_rngs = [np.random.default_rng((training.seed, position.seed, position.player, position.prefix_length, repeat))
+                        for position in branch_positions]
+            outcomes = _play_replayed_continuations(
+                search, request, branch_positions, first_actions, training.max_moves,
+                after_first_action=record_successors if repeat == 0 else None,
+                raw_rngs=raw_rngs, raw_temperature=rollout_temperature,
+            )
+            for index, scores in enumerate(pair_scores):
+                score_0, score_1 = (outcome["score_a"] for outcome in outcomes[2 * index:2 * index + 2])
+                terminal_branches += int(score_0 is not None) + int(score_1 is not None)
+                if score_0 is not None and score_1 is not None:
+                    scores.append((score_0, score_1))
+
+        for index, ((probe, _), scores) in enumerate(zip(chunk, pair_scores)):
+            completed_rollout_pairs += len(scores)
+            partial_rollout_roots += len(scores) < branch_rollouts
+            if not scores:
+                continue
+            score_0, score_1 = np.mean(scores, axis=0).tolist()
             labelled = _branch_examples(
-                position, pair, [successors[i] for i in (row, row + 1) if i in successors], phase=phase,
+                probe.position, [{"score_a": score_0}, {"score_a": score_1}],
+                [successors[row] for row in (2 * index, 2 * index + 1) if row in successors], phase=probe.phase,
             )
             if labelled:
-                informative = pair[0]["score_a"] != pair[1]["score_a"]
+                informative = score_0 != score_1
                 informative_pairs += informative
-                phase_counts[phase]["labelled_pairs"] += 1
-                phase_counts[phase]["pairs_with_different_outcomes"] += informative
+                phase_counts[probe.phase]["labelled_pairs"] += 1
+                phase_counts[probe.phase]["pairs_with_different_mean_scores"] += informative
                 examples.extend(labelled)
         del request, search
 
     report.update(
-        sampled_roots=len(positions), early_end_turn_roots=early_end_samples,
+        sampled_roots=len(selected), early_end_turn_roots=early_end_samples, requested_probes=len(probes),
         phases=phase_counts, terminal_source_games=len(terminal_source_games),
         truncated_source_games=games - len(terminal_source_games),
-        terminal_branches=terminal_branches, truncated_branches=2 * len(positions) - terminal_branches,
-        labelled_pairs=len(examples) // 2, pairs_with_different_outcomes=informative_pairs,
+        terminal_branches=terminal_branches, truncated_branches=2 * len(selected) * branch_rollouts - terminal_branches,
+        completed_rollout_pairs=completed_rollout_pairs, roots_with_incomplete_rollouts=partial_rollout_roots,
+        labelled_pairs=len(examples) // 2, pairs_with_different_mean_scores=informative_pairs,
         labelled_maps=len({example.game_key[0] for example in examples}), positions=len(examples),
     )
     return examples, report

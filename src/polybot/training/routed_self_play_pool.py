@@ -2197,7 +2197,7 @@ def _sample_active_rows(
     root: Mapping[str, np.ndarray],
     request: Mapping[str, np.ndarray],
     active_rows: np.ndarray,
-    rng: np.random.Generator,
+    rng: np.random.Generator | Sequence[np.random.Generator],
     *,
     temperature: float | np.ndarray,
     exploration_rate: float,
@@ -2208,6 +2208,7 @@ def _sample_active_rows(
     features = np.asarray(request["action_features"], dtype=np.int64)
     selected = np.full(policies.shape[0], -1, dtype=np.int64)
     for env in active_rows:
+        row_rng = rng if isinstance(rng, np.random.Generator) else rng[env]
         count = int(mask[env].sum())
         if count <= 0:
             raise RuntimeError(f"live SelfPlayPool root {env} has no legal action")
@@ -2225,7 +2226,8 @@ def _sample_active_rows(
         if row_temperature <= 1e-5:
             row = int(weights.argmax())
         else:
-            sampled = np.power(weights, 1.0 / row_temperature)
+            # Keep at least the maximum weight at one even at low temperature.
+            sampled = np.power(weights / weights.max(), 1.0 / row_temperature)
             sampled_total = float(sampled.sum())
             # Do not divide by an arbitrary epsilon: at low positive
             # temperatures a valid distribution can have a sum below 1e-8,
@@ -2233,9 +2235,9 @@ def _sample_active_rows(
             row = (
                 int(weights.argmax())
                 if not np.isfinite(sampled_total) or sampled_total <= 0.0
-                else int(rng.choice(count, p=sampled / sampled_total))
+                else int(row_rng.choice(count, p=sampled / sampled_total))
             )
-        if exploration_rate > 0.0 and rng.random() < exploration_rate:
+        if exploration_rate > 0.0 and row_rng.random() < exploration_rate:
             action = features[env, :count]
             bias = (
                 ((action[:, 0] == 8) & (action[:, 8] == 14)).astype(np.float64) * 4.0
@@ -2245,7 +2247,7 @@ def _sample_active_rows(
                 - (action[:, 0] == 3).astype(np.float64) * 0.75
             )
             explore = np.exp(np.clip(bias - bias.max(), -20.0, 0.0))
-            row = int(rng.choice(count, p=explore / explore.sum()))
+            row = int(row_rng.choice(count, p=explore / explore.sum()))
         selected[env] = row
     return selected
 

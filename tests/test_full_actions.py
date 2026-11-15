@@ -202,6 +202,75 @@ def test_native_mcts_backup_respects_leaf_player(root_player, turn_changes):
     assert float(root["root_value"][0]) == pytest.approx(expected_value / visits)
 
 
+@pytest.mark.parametrize("candidate_scale", [0.0, 1.0])
+def test_mcts_scales_opponent_leaves_independently(candidate_scale):
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    model = tiny_model()
+    with torch.no_grad():
+        model.value_head[-2].weight.zero_()
+        model.value_head[-2].bias.fill_(0.5)
+    search = RoutedPoolSearch(
+        TrainingConfig(device="cpu"), MCTSConfig(simulations=1, particles=1), [model, model],
+        num_envs=2, num_threads=1, max_pending_leaves=1, visible_action_history=0,
+        belief_retries=0, seed=2137, leaf_value_scale=candidate_scale, opponent_leaf_value_scale=0.25,
+    )
+    request = search.reset(np.full(2, 2137, dtype=np.uint32), np.array([[0, 1], [1, 0]], dtype=np.int32))
+    ids = request["state_id"].copy()
+    search.pool.submit_beliefs(ids, exact_test_worlds(search.pool, ids))
+    leaves = {}
+    count = search.pool.select_leaves_masked_into(leaves, np.ones(2, dtype=np.uint8), max_leaves=2)
+    search._expand_leaves(leaves, count, prior_scale=0.0)
+    np.testing.assert_allclose(search.pool.root_policy()["root_value"], np.tanh(0.5) * np.array([candidate_scale, 0.25]))
+
+
+def test_branch_value_labels_have_the_successor_players_perspective():
+    from polybot.evaluation.mcts_diagnostics import _ReplayPosition
+    from polybot.training.mcts_value import _branch_examples
+
+    position = _ReplayPosition(game=1, seed=2137, player=1, prefix_length=3, fingerprint="")
+    successors = [(np.zeros(16), 1, 1), (np.zeros(16), 2, 0)]
+    wins = [{"score_a": 1.0}, {"score_a": 1.0}]
+    assert [example.return_target for example in _branch_examples(position, wins, successors)] == [1.0, -1.0]
+    assert not _branch_examples(position, [{"score_a": None}, wins[1]], successors)
+    assert not _branch_examples(position, wins, successors[:1])
+
+
+def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatch):
+    from polybot.training import mcts_value
+
+    model, opponent = tiny_model(), tiny_model()
+    original = {key: value.clone() for key, value in model.value_head.state_dict().items()}
+    with torch.no_grad():
+        model.value_head[-2].bias.fill_(0.75)
+    seen = []
+
+    def evaluate(candidate, rival, training, mcts, games, **kwargs):
+        assert candidate is model and rival is opponent and games == 4
+        assert kwargs["opponent_leaf_value_scale"] == 0.25
+        arm = len(seen)
+        seen.append((kwargs["leaf_value_scale"], candidate.value_head[-2].bias.item()))
+        seeds = kwargs["map_seeds"]
+        for index, seed in enumerate(seeds):
+            kwargs["game_callback"]({
+                "map_seed": seed, "model_a_player": index % 2,
+                "score_a": float(arm == 0), "truncated": arm == 1 and index == 3,
+            })
+        return {"valid": True, "evaluated_map_seeds": seeds}
+
+    monkeypatch.setattr(mcts_value, "evaluate_matches_pool", evaluate)
+    report = mcts_value.evaluate_mcts_value_heads(
+        model, opponent, original, TrainingConfig(device="cpu", seed=2137), MCTSConfig(), 4,
+        num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4, opponent_value_scale=0.25,
+    )
+    original_bias = original["2.bias"].item()
+    assert seen == [(1.0, 0.75), (1.0, original_bias), (0.0, original_bias)]
+    assert model.value_head[-2].bias.item() == 0.75
+    assert report["compared_map_seeds"] == [2137]
+    assert report["paired_scores"] == {"fitted": 1.0, "original": 0.0, "zero": 0.0}
+    assert report["beats_original_and_zero"]
+
+
 def test_mcts_diagnostics_replays_only_disagreements_on_the_same_positions():
     from polybot.evaluation.mcts_diagnostics import evaluate_mcts_diagnostics
 

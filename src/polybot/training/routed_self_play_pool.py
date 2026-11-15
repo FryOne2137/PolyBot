@@ -926,6 +926,7 @@ class RoutedPoolSearch:
         search_random_actions_by_agent: Sequence[int] | None = None,
         zero_leaf_values: bool = False,
         leaf_value_scale: float = 1.0,
+        opponent_leaf_value_scale: float | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
@@ -941,11 +942,14 @@ class RoutedPoolSearch:
             raise ValueError("MCTS action candidate counts must not be negative")
         if not 0.0 <= leaf_value_scale <= 1.0:
             raise ValueError("leaf_value_scale must be between zero and one")
+        if opponent_leaf_value_scale is not None and not 0.0 <= opponent_leaf_value_scale <= 1.0:
+            raise ValueError("opponent_leaf_value_scale must be between zero and one")
         Bardur, Imperius, MapType, SelfPlayPool = _pool_types()
         self.training = training
         self.mcts = mcts
         self.models = list(models)
         self.leaf_value_scale = 0.0 if zero_leaf_values else leaf_value_scale
+        self.opponent_leaf_value_scale = opponent_leaf_value_scale
         self.search_top_actions_by_agent = tuple(
             int(value) for value in (
                 search_top_actions_by_agent
@@ -1696,10 +1700,13 @@ class RoutedPoolSearch:
                             local, selected_cpu[local]
                         ].copy()
             logits[rows] = routed_logits.float().cpu().numpy()
-            if self.leaf_value_scale:
+            scale = self.leaf_value_scale
+            if agent != 0 and self.opponent_leaf_value_scale is not None:
+                scale = self.opponent_leaf_value_scale
+            if scale:
                 values[rows] = output.value.float().cpu().numpy()
-        if 0.0 < self.leaf_value_scale < 1.0:
-            values *= self.leaf_value_scale
+                if scale != 1.0:
+                    values[rows] *= scale
         if self._capture_root_candidates and self._root_noise_enabled:
             add_dirichlet_noise_to_root_logits(
                 logits,
@@ -2374,6 +2381,7 @@ def evaluate_matches_pool(
     model_b_uses_mcts: bool = True,
     zero_leaf_values: bool = False,
     leaf_value_scale: float = 1.0,
+    opponent_leaf_value_scale: float | None = None,
     map_seeds: Sequence[int] | None = None,
     excluded_map_seeds: Sequence[int] = (),
     replace_failed_pairs: bool = True,
@@ -2398,7 +2406,8 @@ def evaluate_matches_pool(
     action encoding. Step the chosen actions without sampling belief.
 
     ``leaf_value_scale`` scales neural leaf evaluations for both sides of
-    the search tree. ``zero_leaf_values`` is shorthand for scale zero.
+    the search tree unless ``opponent_leaf_value_scale`` is specified.
+    ``zero_leaf_values`` is shorthand for a default scale of zero.
     Terminal backups are still handled by PolyEnv.
 
     ``excluded_map_seeds`` reserves maps which must never be used as a
@@ -2509,6 +2518,7 @@ def evaluate_matches_pool(
                 search_random_actions_by_agent=(mcts.search_random_actions, model_b_random),
                 zero_leaf_values=zero_leaf_values,
                 leaf_value_scale=leaf_value_scale,
+                opponent_leaf_value_scale=opponent_leaf_value_scale,
             )
             request = search.reset(seeds, assignments)
             done = np.zeros(count, dtype=bool)

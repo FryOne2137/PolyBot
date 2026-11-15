@@ -1,9 +1,10 @@
-"""Fit only a checkpoint's value head on terminal raw-policy games."""
+"""Fit only a checkpoint's value head on terminal game outcomes."""
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from _bootstrap import add_local_source_root
 
 add_local_source_root()
 
-from polybot.config import TrainingConfig
+from polybot.config import MCTSConfig, TrainingConfig
 from polybot.evaluation.matches import evaluate_direct_matches
 from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model, save_model
@@ -98,6 +99,66 @@ def collect_value_games(
     }
 
 
+def fit_mcts_branch_value(args, model, opponent, config, training, schedules, run) -> dict[str, Any]:
+    from polybot.training.mcts_value import collect_mcts_value_branches, evaluate_mcts_value_heads
+
+    mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
+    pool = dict(
+        num_envs=args.num_envs, num_threads=args.num_threads,
+        visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
+        opponent_value_scale=args.opponent_value_scale,
+    )
+    run.write_config(training=training, model=config, mcts=mcts, schedules=schedules)
+    datasets = {}
+    collection = {}
+    report: dict[str, Any] = {"collection": collection, "saved_checkpoint": None, "mcts_improved": False}
+    for label, seed, games in schedules[:2]:
+        examples, summary = collect_mcts_value_branches(
+            model, opponent, replace(training, seed=seed), mcts, games,
+            positions_per_game=args.positions_per_game, label=f"value {label}", **pool,
+        )
+        collection[label] = summary
+        run.event("branch_collection", split=label, **{key: value for key, value in summary.items() if key != "evaluation"})
+        if not summary["valid"]:
+            return {**report, "reason": f"{label}_collection_invalid"}
+        if summary["map_seeds"] != list(range(seed, seed + games // 2)):
+            raise RuntimeError(f"unexpected map schedule in {label} games")
+        if summary["labelled_maps"] < 2:
+            return {**report, "reason": f"{label}_insufficient_terminal_maps"}
+        datasets[label] = examples
+
+    settings = FlatImprovements(
+        value_updates=args.updates, value_batch_size=args.batch_size,
+        value_learning_rate=args.learning_rate, value_validation_games=args.selection_games,
+        value_capacity=max(len(datasets["train"]), args.batch_size),
+    )
+    original_head = deepcopy(model.value_head.state_dict())
+    fit = fit_value_head(
+        model, training, datasets["train"], datasets["selection"], settings,
+        seed=training.seed, validation_source="mcts_branch_selection",
+    )
+    report["fit"] = fit
+    run.log(updates=fit["updates"], selection_rmse_before=fit.get("before", {}).get("rmse"),
+            selection_rmse_after=fit.get("after", {}).get("rmse"))
+    if not fit["kept"]:
+        return {**report, "reason": fit["reason"]}
+
+    save_model(args.model_out, model, config)
+    report["saved_checkpoint"] = str(args.model_out)
+    run.event("experimental_checkpoint_saved", checkpoint=args.model_out)
+    _, seed, games = schedules[2]
+    benchmark = evaluate_mcts_value_heads(
+        model, opponent, original_head, replace(training, seed=seed), mcts, games, **pool,
+    )
+    improved = benchmark["beats_original_and_zero"]
+    reason = "mcts_improved" if improved else "mcts_no_demonstrated_improvement"
+    report.update(mcts_benchmark=benchmark, mcts_improved=improved, reason=reason)
+    run.log(compared_mcts_games=benchmark["compared_games_per_arm"], **{
+        f"mcts_{arm}_score": score for arm, score in benchmark["paired_scores"].items()
+    })
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_environment_options(parser)
@@ -105,6 +166,7 @@ def main() -> None:
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--opponent", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, required=True)
+    parser.add_argument("--position-source", choices=("raw", "mcts-branches"), default="raw")
     parser.add_argument("--train-games", type=int, default=128)
     parser.add_argument("--selection-games", type=int, default=32)
     parser.add_argument("--validation-games", type=int, default=48)
@@ -116,6 +178,11 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--visible-action-history", type=int, default=32)
+    parser.add_argument("--simulations", type=int, default=32, help="MCTS budget in mcts-branches mode")
+    parser.add_argument("--particles", type=int, default=4)
+    parser.add_argument("--max-pending-leaves", type=int, default=4)
+    parser.add_argument("--opponent-value-scale", type=float, default=0.0,
+                        help="Fixed value scale on opponent leaves in mcts-branches mode")
     parser.set_defaults(learning_rate=0.0001, max_moves=1600)
     args = parser.parse_args()
     training = training_config_from_args(args)
@@ -130,6 +197,11 @@ def main() -> None:
         parser.error("require at least two environments, one thread and one move")
     if not 0 <= args.visible_action_history <= 1024:
         parser.error("--visible-action-history must be in [0, 1024]")
+    if args.position_source == "mcts-branches" and (
+        args.simulations < 1 or args.particles < 1 or not 1 <= args.max_pending_leaves <= 8
+        or not 0.0 <= args.opponent_value_scale <= 1.0
+    ):
+        parser.error("require positive simulations and particles, 1–8 pending leaves and opponent value scale in [0, 1]")
 
     schedules = (
         ("train", training.seed, args.train_games),
@@ -154,6 +226,11 @@ def main() -> None:
     model.value_head.requires_grad_(True)
     opponent.requires_grad_(False)
     run = training_run_from_args(args, "value")
+    if args.position_source == "mcts-branches":
+        report = fit_mcts_branch_value(args, model, opponent, config, training, schedules, run)
+        report["run_dir"] = str(run.finish(report, plots=False))
+        print_summary(report)
+        return
     run.write_config(training=training, model=config, schedules=schedules)
     datasets = {}
     collection = {}

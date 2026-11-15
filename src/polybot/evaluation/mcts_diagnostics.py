@@ -222,8 +222,23 @@ def _play_continuations(
     *,
     mcts_value_scale: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Force the first move, then use raw policies or MCTS on model A's turns."""
     request = _replay_positions(search, positions, prefixes)
+    return _play_replayed_continuations(
+        search, request, positions, first_actions, max_moves, mcts_value_scale=mcts_value_scale,
+    )
+
+
+def _play_replayed_continuations(
+    search: RoutedPoolSearch,
+    request: Mapping[str, np.ndarray],
+    positions: Sequence[_ReplayPosition],
+    first_actions: Sequence[int],
+    max_moves: int,
+    *,
+    mcts_value_scale: float | None = None,
+    after_first_action: Callable[[Mapping[str, np.ndarray]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Force the first move, then use raw policies or MCTS on model A's turns."""
     moves = np.array([position.prefix_length for position in positions], dtype=np.int32)
     terminated = np.zeros(len(positions), dtype=bool)
     winners = np.full(len(positions), -1, dtype=np.int32)
@@ -245,6 +260,8 @@ def _play_continuations(
     if mcts_value_scale is not None:
         search.leaf_value_scale = mcts_value_scale
     step(np.asarray(first_actions, dtype=np.int32))
+    if after_first_action is not None:
+        after_first_action(request)
     while True:
         active = ~terminated & (moves < max_moves)
         rows = np.flatnonzero(active)

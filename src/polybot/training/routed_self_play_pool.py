@@ -904,6 +904,62 @@ def shield_root_policy_with_public_actions(
     return RootShieldStats(roots, missing, hallucinated, fallbacks)
 
 
+@torch.inference_mode()
+def routed_public_policy_value(
+    request: Mapping[str, np.ndarray],
+    rows: np.ndarray,
+    *,
+    models: Sequence[PolicyValueBeliefNet],
+    device: torch.device,
+    training: TrainingConfig,
+    num_envs: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Route public policy/value inference and retain the full packet row layout."""
+    rows = np.asarray(rows, dtype=np.int32)
+    action_mask = np.asarray(request["action_mask"], dtype=bool)
+    policies = np.zeros(action_mask.shape, dtype=np.float32)
+    values = np.zeros(num_envs, dtype=np.float32)
+    for model in models:
+        model.eval()
+    if rows.size == 0:
+        return policies, values
+    if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= num_envs):
+        raise ValueError("direct-policy rows must be valid pool indices")
+    agents = np.asarray(request["agent_id"], dtype=np.int32)
+    _validate_agents(agents[rows], len(models), "direct-policy packet")
+    for agent in np.unique(agents[rows]):
+        local = np.flatnonzero(agents[rows] == agent)
+        selected_rows = rows[local]
+        batch = _slice_rows(request, selected_rows)
+        tensors = native_batch_to_tensors(
+            batch, device, training.map_size, training.map_type
+        )
+        output = models[int(agent)](
+            tensors.map_tokens,
+            tensors.global_features,
+            tensors.action_categorical,
+            tensors.action_continuous,
+            tensors.action_mask,
+            tensors.event_features,
+            action_history=tensors.action_history,
+            action_history_mask=tensors.action_history_mask,
+            include_belief=False,
+        )
+        logits = output.policy_logits.masked_fill(~tensors.action_mask, float("-inf"))
+        policy = torch.softmax(logits, dim=-1).float().cpu().numpy()
+        policy *= np.asarray(batch["action_mask"], dtype=np.float32)
+        totals = policy.sum(axis=1, keepdims=True)
+        empty = ~np.isfinite(totals[:, 0]) | (totals[:, 0] <= 0.0)
+        if np.any(empty):
+            legal = np.asarray(batch["action_mask"], dtype=bool)
+            policy[empty] = legal[empty].astype(np.float32)
+            totals = policy.sum(axis=1, keepdims=True)
+        policy /= np.maximum(totals, 1.0e-8)
+        policies[selected_rows] = policy
+        values[selected_rows] = output.value.float().reshape(-1).cpu().numpy()
+    return policies, values
+
+
 class RoutedPoolSearch:
     """Persistent native pool whose neural rows are routed by ``agent_id``."""
 
@@ -1090,62 +1146,15 @@ class RoutedPoolSearch:
         self.pool.reset_into(self.request, seeds=seeds, agent_ids=assignments)
         return self.request
 
-    @torch.inference_mode()
     def direct_policy_value(
         self,
         request: Mapping[str, np.ndarray],
         rows: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run one fog-safe raw policy/value pass, routed by ``agent_id``.
-
-        The returned arrays retain the full pool row layout so callers can
-        safely merge direct decisions with native MCTS roots.  Padded actions
-        are always zeroed and every legal row is renormalised explicitly;
-        this keeps direct execution anchored to PolyEnv's public action list.
-        """
-        rows = np.asarray(rows, dtype=np.int32)
-        action_mask = np.asarray(request["action_mask"], dtype=bool)
-        policies = np.zeros(action_mask.shape, dtype=np.float32)
-        values = np.zeros(self.num_envs, dtype=np.float32)
-        for model in self.models:
-            model.eval()
-        if rows.size == 0:
-            return policies, values
-        if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= self.num_envs):
-            raise ValueError("direct-policy rows must be valid pool indices")
-        agents = np.asarray(request["agent_id"], dtype=np.int32)
-        _validate_agents(agents[rows], len(self.models), "direct-policy packet")
-        for agent in np.unique(agents[rows]):
-            local = np.flatnonzero(agents[rows] == agent)
-            selected_rows = rows[local]
-            batch = _slice_rows(request, selected_rows)
-            tensors = native_batch_to_tensors(
-                batch, self.device, self.training.map_size, self.training.map_type
-            )
-            output = self.models[int(agent)](
-                tensors.map_tokens,
-                tensors.global_features,
-                tensors.action_categorical,
-                tensors.action_continuous,
-                tensors.action_mask,
-                tensors.event_features,
-                action_history=tensors.action_history,
-                action_history_mask=tensors.action_history_mask,
-                include_belief=False,
-            )
-            logits = output.policy_logits.masked_fill(~tensors.action_mask, float("-inf"))
-            policy = torch.softmax(logits, dim=-1).float().cpu().numpy()
-            policy *= np.asarray(batch["action_mask"], dtype=np.float32)
-            totals = policy.sum(axis=1, keepdims=True)
-            empty = ~np.isfinite(totals[:, 0]) | (totals[:, 0] <= 0.0)
-            if np.any(empty):
-                legal = np.asarray(batch["action_mask"], dtype=bool)
-                policy[empty] = legal[empty].astype(np.float32)
-                totals = policy.sum(axis=1, keepdims=True)
-            policy /= np.maximum(totals, 1.0e-8)
-            policies[selected_rows] = policy
-            values[selected_rows] = output.value.float().reshape(-1).cpu().numpy()
-        return policies, values
+        return routed_public_policy_value(
+            request, rows, models=self.models, device=self.device,
+            training=self.training, num_envs=self.num_envs,
+        )
 
     def selective_mcts_mask(
         self,

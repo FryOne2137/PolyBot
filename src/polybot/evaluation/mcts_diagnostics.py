@@ -23,6 +23,7 @@ from ..training.routed_self_play_pool import (
     _sample_active_rows,
     evaluate_matches_pool,
 )
+from .public_rollouts import PublicRolloutPool
 
 
 def evaluate_mcts_value_matrix(
@@ -228,10 +229,10 @@ def _search_true_maps(
 
 
 def _replay_positions(
-    search: RoutedPoolSearch,
+    search: RoutedPoolSearch | PublicRolloutPool,
     positions: Sequence[_ReplayPosition],
     prefixes: Mapping[int, Sequence[int]],
-) -> Mapping[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     request = search.reset(
         np.array([position.seed for position in positions], dtype=np.uint32),
         np.array([(0, 1) if position.player == 0 else (1, 0) for position in positions], dtype=np.int32),
@@ -284,7 +285,7 @@ def _diagnostic_search(
 
 
 def _play_continuations(
-    search: RoutedPoolSearch,
+    search: RoutedPoolSearch | PublicRolloutPool,
     positions: Sequence[_ReplayPosition],
     first_actions: Sequence[int],
     prefixes: Mapping[int, Sequence[int]],
@@ -299,8 +300,8 @@ def _play_continuations(
 
 
 def _play_replayed_continuations(
-    search: RoutedPoolSearch,
-    request: Mapping[str, np.ndarray],
+    search: RoutedPoolSearch | PublicRolloutPool,
+    request: dict[str, np.ndarray],
     positions: Sequence[_ReplayPosition],
     first_actions: Sequence[int],
     max_moves: int,
@@ -313,6 +314,8 @@ def _play_replayed_continuations(
     """Force the first move, then use raw policies or MCTS on model A's turns."""
     if raw_rngs is not None and (mcts_value_scale is not None or len(raw_rngs) != len(positions)):
         raise ValueError("sampled raw continuations require one generator per branch and no MCTS")
+    if mcts_value_scale is not None and isinstance(search, PublicRolloutPool):
+        raise ValueError("MCTS continuations require a search pool")
     moves = np.array([position.prefix_length for position in positions], dtype=np.int32)
     terminated = np.zeros(len(positions), dtype=bool)
     winners = np.full(len(positions), -1, dtype=np.int32)

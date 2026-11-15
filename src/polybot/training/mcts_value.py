@@ -20,6 +20,7 @@ from ..evaluation.mcts_diagnostics import (
     _replay_positions,
     _ReplayPosition,
 )
+from ..evaluation.public_rollouts import PublicRolloutPool
 from ..models.policy_value_belief import PolicyValueBeliefNet
 from .belief_recovery import BeliefRecoveryRequired
 from .flat_value import EncodedValuePosition, VALUE_PHASES
@@ -36,7 +37,7 @@ class _BranchProbe:
 @torch.inference_mode()
 def _encode_successors(
     model: PolicyValueBeliefNet,
-    search: RoutedPoolSearch,
+    search: PublicRolloutPool,
     request: Mapping[str, np.ndarray],
 ) -> dict[int, tuple[np.ndarray, int, int]]:
     rows = np.flatnonzero(~request["terminated"].astype(bool))
@@ -214,7 +215,10 @@ def collect_mcts_value_branches(
     for start in tqdm(range(0, len(selected), batch_pairs), desc=f"{label} raw branches", unit="batch"):
         chunk = selected[start:start + batch_pairs]
         branch_positions = [probe.position for probe, _ in chunk for _ in range(2)]
-        search = new_search(branch_positions)
+        search = PublicRolloutPool(
+            training, (model, opponent), num_envs=len(branch_positions),
+            visible_action_history=visible_action_history,
+        )
         first_actions = [action for _, actions in chunk for action in actions]
         successors = {}
         pair_scores: list[list[tuple[float, float]]] = [[] for _ in chunk]

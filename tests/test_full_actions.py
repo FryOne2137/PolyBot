@@ -543,11 +543,13 @@ def test_mcts_value_diagnostics_reuses_the_same_roots_and_particles(monkeypatch)
         assert continuation_summary[mode]["mean_score_delta_value_1_minus_value_0"] is None
 
 
-def test_raw_continuations_distinguish_a_terminal_win_from_the_move_limit():
+@pytest.mark.parametrize("use_vector", [False, True])
+def test_raw_continuations_distinguish_a_terminal_win_from_the_move_limit(use_vector):
     from PolyEnv import GameEnv
     from polybot.evaluation.mcts_diagnostics import (
         _ReplayPosition, _play_continuations, _position_fingerprint,
     )
+    from polybot.evaluation.public_rollouts import PublicRolloutPool
     from polybot.planning.heuristic_policy import choose_teacher_action
     from polybot.training.routed_self_play_pool import RoutedPoolSearch
 
@@ -579,12 +581,62 @@ def test_raw_continuations_distinguish_a_terminal_win_from_the_move_limit():
     assert winner == int(request["to_play"][0]) == 0
     assert action != 0 and 0 in request["action_id"][0, request["action_mask"][0].astype(bool)]
     position = _ReplayPosition(0, seed, 0, len(prefix), _position_fingerprint(request, 0))
+    if use_vector:
+        search = PublicRolloutPool(
+            search.training, [model, model], num_envs=2, visible_action_history=32,
+        )
 
     win, truncated = _play_continuations(
         search, [position, position], [action, 0], {0: prefix}, max_moves=len(prefix) + 3,
     )
     assert win == {"score_a": 1.0, "winner_player": 0, "truncated": False, "moves_from_position": 1}
     assert truncated == {"score_a": None, "winner_player": None, "truncated": True, "moves_from_position": 3}
+
+
+def test_sampled_value_branches_pass_a_position_rejected_by_snapshot_reconstruction():
+    from polybot.evaluation.mcts_diagnostics import (
+        _ReplayPosition, _play_replayed_continuations, _position_fingerprint, _replay_positions,
+    )
+    from polybot.evaluation.public_rollouts import PublicRolloutPool
+    from polybot.training.routed_self_play_pool import RoutedPoolSearch
+
+    seed = 1834517902
+    training = TrainingConfig(device="cpu", seed=seed, max_moves=267)
+    model = tiny_model()
+    search = RoutedPoolSearch(
+        training, MCTSConfig(), [model, model], num_envs=1, num_threads=1,
+        max_pending_leaves=4, visible_action_history=32, belief_retries=0, seed=seed,
+    )
+    request = search.reset(np.array([seed], dtype=np.uint32), np.array([[1, 0]], dtype=np.int32))
+    rng = np.random.default_rng(seed ^ 1111)
+    prefix = []
+    for _ in range(257):
+        legal = request["action_mask"][0].astype(bool)
+        ids = request["action_id"][0, legal]
+        features = request["action_features"][0, legal]
+        weights = np.exp(
+            1.5 * (features[:, 0] == 1) + 0.5 * (features[:, 0] == 0)
+            + 4 * ((features[:, 0] == 8) & np.isin(features[:, 8], (11, 14)))
+        )
+        action = int(rng.choice(ids, p=weights / weights.sum()))
+        actions = np.array([action], dtype=np.int32)
+        search.step_public_policy(actions, request["state_id"], request)
+        prefix.append(action)
+    action = 4527
+    assert action in request["action_id"][0, request["action_mask"][0].astype(bool)]
+    assert int(request["to_play"][0]) == 1
+    position = _ReplayPosition(0, seed, 1, len(prefix), _position_fingerprint(request, 0))
+    with pytest.raises(ValueError, match="changes the current player's legal action set"):
+        search.step_public_policy(np.array([action], dtype=np.int32), request["state_id"], request)
+
+    raw = PublicRolloutPool(training, [model, model], num_envs=2, visible_action_history=32)
+    for repeat in range(3):
+        request = _replay_positions(raw, [position, position], {0: prefix})
+        outcomes = _play_replayed_continuations(
+            raw, request, [position, position], [action, 0], training.max_moves,
+            raw_rngs=[np.random.default_rng((seed, repeat)) for _ in range(2)], raw_temperature=0.5,
+        )
+        assert all(outcome["moves_from_position"] == 10 for outcome in outcomes)
 
 
 def test_first_divergence_replays_only_opposite_winners_with_shared_mcts(monkeypatch):

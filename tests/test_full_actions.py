@@ -314,6 +314,80 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
     assert report["beats_zero"]
 
 
+def test_mcts_terminal_value_uses_full_pairs_and_all_three_phases(monkeypatch):
+    from polybot.training import mcts_value
+
+    model = tiny_model()
+    attempted = []
+
+    def encode(model, training, device, request, rows):
+        return request["state"][rows].astype(np.float32)
+
+    def play(candidate, opponent, training, mcts, games, **kwargs):
+        assert (kwargs["leaf_value_scale"], kwargs["opponent_leaf_value_scale"]) == (0.0, 1.0)
+        assert not kwargs["model_b_uses_mcts"] and not kwargs["replace_failed_pairs"]
+        schedule = kwargs["map_seeds"]
+        attempted.extend(schedule[::2])
+        indices = np.arange(games)
+        for move in range(12):
+            request = {"agent_id": (indices + move) % 2, "state": np.full((games, 1), move)}
+            kwargs["action_callback"](indices, request, np.zeros(games, dtype=np.int32))
+        for index, seed in enumerate(schedule):
+            kwargs["game_callback"]({
+                "map_seed": seed, "model_a_player": index % 2, "game_index": index,
+                "score_a": float(index % 2), "truncated": seed == 2137 and index == 0,
+            })
+        return {"valid": True, "evaluated_map_seeds": schedule}
+
+    monkeypatch.setattr(mcts_value, "_encode_value_rows", encode)
+    monkeypatch.setattr(mcts_value, "evaluate_matches_pool", play)
+    examples, report = mcts_value.collect_mcts_terminal_value_games(
+        model, model, TrainingConfig(device="cpu", seed=2137), MCTSConfig(simulations=32), 4,
+        positions_per_game=6, num_envs=4, num_threads=1, visible_action_history=32,
+        max_pending_leaves=4, opponent_value_scale=1.0, excluded_map_seeds=(2139, 2140), label="value train",
+    )
+    assert attempted == [2137, 2138, 2141] and report["map_seeds"] == [2138, 2141]
+    assert report["valid"] and report["terminal_games"] == 4 and report["truncated_games"] == 1
+    assert report["wins"] == report["losses"] == 2
+    assert report["phases"] == {"opening": 8, "mid": 8, "late": 8}
+    assert len(examples) == 24
+    for example in examples:
+        seed, side = example.game_key
+        assert seed in (2138, 2141) and example.turn % 2 == side
+        assert example.return_target == (1.0 if side else -1.0)
+        assert example.phase == ("opening", "mid", "late")[example.turn // 4]
+
+
+def test_mcts_terminal_benchmark_compares_all_scales_against_zero(monkeypatch):
+    from polybot.training import mcts_value
+
+    model = tiny_model()
+    seen = []
+
+    def play(candidate, opponent, training, mcts, games, **kwargs):
+        scale = kwargs["leaf_value_scale"]
+        seen.append(scale)
+        assert kwargs["opponent_leaf_value_scale"] == 1.0
+        assert kwargs["map_seeds"] == [2137, 2137, 2138, 2138]
+        for index, seed in enumerate(kwargs["map_seeds"]):
+            kwargs["game_callback"]({
+                "map_seed": seed, "model_a_player": index % 2, "score_a": scale,
+                "truncated": index == 2 and scale == 0.5,
+            })
+        return {"valid": True, "evaluated_map_seeds": kwargs["map_seeds"]}
+
+    monkeypatch.setattr(mcts_value, "evaluate_matches_pool", play)
+    report = mcts_value.evaluate_mcts_value_heads(
+        model, model, TrainingConfig(device="cpu", seed=2137), MCTSConfig(simulations=32), 4,
+        num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4,
+        opponent_value_scale=1.0, value_scales=mcts_value.MCTS_VALUE_SCALES,
+    )
+    assert seen == [0.0, 0.25, 0.5, 1.0] and report["compared_map_seeds"] == [2137]
+    assert report["paired_scores"] == {"0": 0.0, "0.25": 0.25, "0.5": 0.5, "1": 1.0}
+    assert report["score_deltas_vs_zero"] == {"0.25": 0.25, "0.5": 0.5, "1": 1.0}
+    assert report["beats_zero"]
+
+
 def test_branch_collection_selects_disagreements_and_averages_paired_repeats(monkeypatch):
     from polybot.training import mcts_value
     from polybot.training.routed_self_play_pool import RoutedPoolSearch

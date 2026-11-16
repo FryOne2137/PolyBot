@@ -99,6 +99,83 @@ def collect_value_games(
     }
 
 
+def fit_mcts_terminal_value(args, model, opponent, config, training, schedules, run) -> dict[str, Any]:
+    from polybot.training.mcts_value import (
+        MCTS_VALUE_SCALES,
+        collect_mcts_terminal_value_games,
+        evaluate_mcts_value_heads,
+    )
+
+    mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
+    pool = dict(
+        num_envs=args.num_envs, num_threads=args.num_threads,
+        visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
+        opponent_value_scale=args.opponent_value_scale,
+    )
+    run.write_config(
+        training=training, model=config, mcts=mcts, schedules=schedules, loss="mse",
+        collection_leaf_value_scales=(0.0, args.opponent_value_scale), benchmark_leaf_value_scales=MCTS_VALUE_SCALES,
+    )
+    datasets = {}
+    collection = {}
+    report: dict[str, Any] = {"collection": collection, "saved_checkpoint": None, "mcts_improved": False}
+    reserved = {label: set(range(seed, seed + games // 2)) for label, seed, games in schedules}
+    attempted_seeds: set[int] = set()
+    for label, seed, games in schedules[:2]:
+        excluded = attempted_seeds.union(*(maps for split, maps in reserved.items() if split != label))
+        datasets[label], summary = collect_mcts_terminal_value_games(
+            model, opponent, replace(training, seed=seed), mcts, games,
+            positions_per_game=args.positions_per_game, excluded_map_seeds=excluded,
+            label=f"value {label}", **pool,
+        )
+        collection[label] = summary
+        attempted_seeds.update(summary["attempted_map_seeds"])
+        run.event("terminal_collection", split=label, **summary)
+        if not summary["valid"] or summary["labelled_maps"] < 2 or not all(summary["phases"].values()):
+            return {**report, "reason": f"{label}_insufficient_terminal_data"}
+
+    settings = FlatImprovements(
+        value_updates=args.updates, value_batch_size=args.batch_size,
+        value_learning_rate=args.learning_rate, value_validation_games=args.selection_games,
+        value_capacity=max(len(datasets["train"]), args.batch_size), value_fit_backoffs=0,
+    )
+    fit = fit_value_head(
+        model, training, datasets["train"], datasets["selection"], settings, seed=training.seed,
+        validation_source="mcts_terminal_selection", keep_best_update=True,
+    )
+    report["fit"] = fit
+    run.log(
+        updates=fit["updates"], selected_updates=fit.get("selected_updates"),
+        selection_original_rmse=(fit.get("before") or {}).get("rmse"),
+        selection_fitted_rmse=(fit.get("after") or {}).get("rmse"),
+        selection_zero_rmse=(fit.get("after") or {}).get("zero_rmse"),
+    )
+    if not fit["kept"]:
+        return {**report, "reason": fit["reason"]}
+    save_model(args.model_out, model, config)
+    report["saved_checkpoint"] = str(args.model_out)
+    run.event("experimental_checkpoint_saved", loss="mse", checkpoint=args.model_out)
+
+    _, seed, games = schedules[2]
+    benchmark = evaluate_mcts_value_heads(
+        model, opponent, replace(training, seed=seed), mcts, games, value_scales=MCTS_VALUE_SCALES, **pool,
+    )
+    report["mcts_benchmark"] = benchmark
+    report["mcts_improved"] = benchmark["beats_zero"]
+    if benchmark["valid"]:
+        scales = benchmark["leaf_value_scales"]
+        scores = benchmark["paired_scores"]
+        best = max(scales, key=scores.__getitem__)
+        report["best_benchmark_value_scale"] = scales[best]
+        report["reason"] = "mcts_improved" if benchmark["beats_zero"] else "mcts_no_demonstrated_improvement"
+    else:
+        report["reason"] = "mcts_benchmark_invalid"
+    run.log(compared_mcts_games=benchmark["compared_games_per_arm"], **{
+        f"mcts_scale_{scale}_score": score for scale, score in benchmark["paired_scores"].items()
+    })
+    return report
+
+
 def fit_mcts_branch_value(args, model, opponent, config, training, schedules, run) -> dict[str, Any]:
     from polybot.training.mcts_value import collect_mcts_value_branches, evaluate_mcts_value_heads
 
@@ -194,24 +271,24 @@ def main() -> None:
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--opponent", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, required=True)
-    parser.add_argument("--position-source", choices=("raw", "mcts-branches"), default="raw")
+    parser.add_argument("--position-source", choices=("raw", "mcts-branches", "mcts-terminal"), default="raw")
     parser.add_argument("--train-games", type=int, default=128)
     parser.add_argument("--selection-games", type=int, default=32)
     parser.add_argument("--validation-games", type=int, default=48)
     parser.add_argument("--selection-seed", type=int, default=447618319)
     parser.add_argument("--validation-seed", type=int, default=682954103)
     parser.add_argument("--positions-per-game", type=int, default=64,
-                        help="Total position budget per game, divided across thirds in mcts-branches mode")
+                        help="Total position budget per game, divided across thirds in MCTS modes")
     parser.add_argument("--updates", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--visible-action-history", type=int, default=32)
-    parser.add_argument("--simulations", type=int, default=32, help="MCTS budget in mcts-branches mode")
+    parser.add_argument("--simulations", type=int, default=32, help="Search simulations per decision in MCTS modes")
     parser.add_argument("--particles", type=int, default=4)
     parser.add_argument("--max-pending-leaves", type=int, default=4)
     parser.add_argument("--opponent-value-scale", type=float, default=1.0,
-                        help="Fixed opponent leaf scale for disagreement probes and game benchmarks")
+                        help="Fixed opponent leaf scale for terminal collection, disagreement probes and benchmarks")
     parser.add_argument("--disagreement-probes-per-position", type=int, default=8,
                         help="Maximum probes per desired sample within each phase in mcts-branches mode")
     parser.add_argument("--branch-rollouts", type=int, default=3,
@@ -234,11 +311,13 @@ def main() -> None:
         parser.error("require at least two environments, one thread and one move")
     if not 0 <= args.visible_action_history <= 1024:
         parser.error("--visible-action-history must be in [0, 1024]")
-    if args.position_source == "mcts-branches" and (
+    if args.position_source != "raw" and (
         args.simulations < 1 or args.particles < 1 or not 1 <= args.max_pending_leaves <= 8
         or not 0.0 <= args.opponent_value_scale <= 1.0
     ):
         parser.error("require positive simulations and particles, 1–8 pending leaves and opponent value scale in [0, 1]")
+    if args.position_source == "mcts-terminal" and args.positions_per_game < 3:
+        parser.error("mcts-terminal requires at least three positions per game for phase sampling")
     if args.position_source == "mcts-branches" and (
         args.disagreement_probes_per_position < 1 or args.branch_rollouts < 1
         or not np.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0.0
@@ -276,8 +355,9 @@ def main() -> None:
     model.value_head.requires_grad_(True)
     opponent.requires_grad_(False)
     run = training_run_from_args(args, "value")
-    if args.position_source == "mcts-branches":
-        report = fit_mcts_branch_value(args, model, opponent, config, training, schedules, run)
+    if args.position_source != "raw":
+        fit_mcts = fit_mcts_terminal_value if args.position_source == "mcts-terminal" else fit_mcts_branch_value
+        report = fit_mcts(args, model, opponent, config, training, schedules, run)
         report["run_dir"] = str(run.finish(report, plots=False))
         print_summary(report)
         return

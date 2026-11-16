@@ -741,6 +741,62 @@ def test_saved_branch_agreement_keeps_actions_and_separates_ties_from_incomplete
     assert report["raw_by_mcts_preference"]["tie"]["value_1"] == 1
 
 
+def test_paired_branch_agreement_matches_opponent_streams_and_complete_repeats(tmp_path, monkeypatch):
+    import json
+
+    from polybot.evaluation import mcts_diagnostics as diagnostics
+
+    path = tmp_path / "selection_pairs.jsonl"
+    header = {"schema_version": 1, "branch_order": ["value_0", "value_1"]}
+    decisive = {
+        "map_seed": 2137, "model_a_player": 1, "phase": "late", "root_fingerprint": "saved",
+        "prefix_length": 1, "prefix_actions": [0], "action_ids": [10, 20], "mean_scores": [0, 1],
+    }
+    tie = {**decisive, "map_seed": 2138, "mean_scores": [1, 1]}
+    path.write_text("\n".join(map(json.dumps, (header, decisive, tie))), encoding="utf-8")
+
+    def raw_pool(*args, **kwargs):
+        return "raw"
+
+    def mcts_pool(*args, **kwargs):
+        assert (kwargs["leaf_value_scale"], kwargs["opponent_leaf_value_scale"]) == (0, 1)
+        return "mcts"
+
+    draws = {"raw": [], "mcts": []}
+    scores = {"raw": ((1, 0), (0, 1), (0.5, 0.5)), "mcts": ((1, 0), (None, 1), (0.5, 0.5))}
+
+    def play(search, positions, actions, prefixes, max_moves, *, mcts_value_scale,
+             raw_rngs=None, opponent_rngs=None, raw_temperature):
+        assert [position.seed for position in positions] == [2137, 2137]
+        assert actions == decisive["action_ids"] and prefixes == {0: [0]}
+        assert raw_temperature == 0.5
+        assert mcts_value_scale == (None if search == "raw" else 0)
+        assert (raw_rngs is None) == (search == "mcts")
+        if raw_rngs is not None:
+            assert raw_rngs[0].random() == raw_rngs[1].random()
+        a, b = (tuple(rng.random(4)) for rng in opponent_rngs)
+        assert a == b
+        repeat = len(draws[search])
+        draws[search].append(a)
+        return [{"score_a": score} for score in scores[search][repeat]]
+
+    monkeypatch.setattr(diagnostics, "PublicRolloutPool", raw_pool)
+    monkeypatch.setattr(diagnostics, "RoutedPoolSearch", mcts_pool)
+    monkeypatch.setattr(diagnostics, "_play_continuations", play)
+    result = diagnostics.evaluate_saved_branch_agreement(
+        None, None, TrainingConfig(device="cpu"), MCTSConfig(simulations=32), path,
+        max_positions=6, max_envs=4, num_threads=1, max_pending_leaves=4,
+        visible_action_history=32, belief_retries=4, branch_rollouts=3,
+    )
+    assert draws["raw"] == draws["mcts"] and len(set(draws["raw"])) == 3
+    assert result["eligible_pairs"] == result["tested_pairs"] == 1
+    assert result["planned_paired_repeats"] == 3 and result["completed_paired_repeats"] == 2
+    row, = result["positions"]
+    assert row["saved_raw_mean_scores"] == [0, 1]
+    assert row["raw_mean_scores"] == row["mcts_mean_scores"] == [0.75, 0.25]
+    assert result["agreement_when_both_decisive"] == 1
+
+
 def test_first_divergence_replays_only_opposite_winners_with_shared_mcts(monkeypatch):
     from polybot.evaluation import mcts_diagnostics as diagnostics
     from polybot.training.routed_self_play_pool import RoutedPoolSearch

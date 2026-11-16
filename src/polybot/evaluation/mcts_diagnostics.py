@@ -319,10 +319,14 @@ def _play_continuations(
     max_moves: int,
     *,
     mcts_value_scale: float | None = None,
+    raw_rngs: Sequence[np.random.Generator] | None = None,
+    opponent_rngs: Sequence[np.random.Generator] | None = None,
+    raw_temperature: float = 1.0,
 ) -> list[dict[str, Any]]:
     request = _replay_positions(search, positions, prefixes, recover_beliefs=mcts_value_scale is not None)
     return _play_replayed_continuations(
         search, request, positions, first_actions, max_moves, mcts_value_scale=mcts_value_scale,
+        raw_rngs=raw_rngs, opponent_rngs=opponent_rngs, raw_temperature=raw_temperature,
     )
 
 
@@ -336,11 +340,14 @@ def _play_replayed_continuations(
     mcts_value_scale: float | None = None,
     after_first_action: Callable[[Mapping[str, np.ndarray]], None] | None = None,
     raw_rngs: Sequence[np.random.Generator] | None = None,
+    opponent_rngs: Sequence[np.random.Generator] | None = None,
     raw_temperature: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Force the first move, then use raw policies or MCTS on model A's turns."""
     if raw_rngs is not None and (mcts_value_scale is not None or len(raw_rngs) != len(positions)):
         raise ValueError("sampled raw continuations require one generator per branch and no MCTS")
+    if opponent_rngs is not None and len(opponent_rngs) != len(positions):
+        raise ValueError("sampled raw opponents require one generator per branch")
     if mcts_value_scale is not None and isinstance(search, PublicRolloutPool):
         raise ValueError("MCTS continuations require a search pool")
     moves = np.array([position.prefix_length for position in positions], dtype=np.int32)
@@ -381,15 +388,18 @@ def _play_replayed_continuations(
         else:
             policy, _ = search.direct_policy_value(request, rows)
             action_ids = request["action_id"]
-        actions = np.full(len(positions), -1, dtype=np.int32)
-        if raw_rngs is None:
-            selected = policy[rows].argmax(axis=1)
-        else:
-            selected = _sample_active_rows(
-                {**request, "policy": policy}, request, rows, raw_rngs,
+        selected = policy.argmax(axis=1)
+        opponent_rows = rows[request["agent_id"][rows] == 1]
+        raw_rows = rows if opponent_rngs is None else rows[request["agent_id"][rows] == 0]
+        for sampled_rows, rngs in ((raw_rows, raw_rngs), (opponent_rows, opponent_rngs)):
+            if rngs is None or not sampled_rows.size:
+                continue
+            selected[sampled_rows] = _sample_active_rows(
+                {**request, "policy": policy}, request, sampled_rows, rngs,
                 temperature=raw_temperature, exploration_rate=0.0,
-            )[rows]
-        actions[rows] = action_ids[rows, selected]
+            )[sampled_rows]
+        actions = np.full(len(positions), -1, dtype=np.int32)
+        actions[rows] = action_ids[rows, selected[rows]]
         step(actions, searched=searched)
 
     results = []
@@ -432,10 +442,16 @@ def evaluate_saved_branch_agreement(
     max_pending_leaves: int,
     visible_action_history: int,
     belief_retries: int,
+    branch_rollouts: int | None = None,
+    rollout_temperature: float = 0.5,
 ) -> dict[str, Any]:
-    """Compare saved raw rollout means with MCTS (0,1) on the same actions."""
+    """Replay saved actions with MCTS (0,1), optionally rerunning raw with paired RNG."""
     if max_positions < 1 or max_envs < 2:
         raise ValueError("branch agreement requires at least one position and two environment slots")
+    if branch_rollouts is not None and (
+        branch_rollouts < 1 or not np.isfinite(rollout_temperature) or rollout_temperature <= 0
+    ):
+        raise ValueError("paired branch rollouts require a positive count and finite positive temperature")
     with pairs_path.open(encoding="utf-8-sig") as stream:
         header = json.loads(next(stream, "{}"))
         if header.get("schema_version") != 1 or header.get("branch_order") != ["value_0", "value_1"]:
@@ -446,11 +462,12 @@ def evaluate_saved_branch_agreement(
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for index in rng.permutation(len(saved)):
         row = saved[index]
-        if None not in row["mean_scores"]:
+        preference = _better_branch(row["mean_scores"])
+        if preference is not None and (branch_rollouts is None or preference != "tie"):
             buckets[row["phase"]].append(row)
     eligible_pairs = sum(map(len, buckets.values()))
     if not eligible_pairs:
-        raise ValueError("the saved dataset contains no pairs with completed raw rollouts")
+        raise ValueError("the saved dataset contains no eligible raw outcome pairs")
     selected = []
     used_maps = set()
     while len(selected) < min(max_positions, eligible_pairs):
@@ -478,15 +495,22 @@ def evaluate_saved_branch_agreement(
         ))
 
     seed_everything(training.seed)
-    results: dict[int, list[dict[str, Any]]] = {}
-    failures: dict[int, str] = {}
+    methods = ("raw", "mcts") if branch_rollouts is not None else ("mcts",)
+    repeats = branch_rollouts if branch_rollouts is not None else 1
+    results: dict[str, dict[tuple[int, int], list[dict[str, Any]]]] = {method: {} for method in methods}
+    failures: dict[tuple[int, int], str] = {}
     batch_pairs = max_envs // 2
-    batches = deque(positions[start:start + batch_pairs] for start in range(0, len(positions), batch_pairs))
-    with tqdm(total=len(positions), desc="replay saved pairs with MCTS (0,1)", unit="pair") as progress:
-        while batches:
-            batch = batches.popleft()
-            branch_positions = [position for position in batch for _ in range(2)]
-            actions = [action for position in batch for action in selected[position.game]["action_ids"]]
+    position_batches = [positions[start:start + batch_pairs] for start in range(0, len(positions), batch_pairs)]
+
+    def play_batch(batch: Sequence[_ReplayPosition], repeat: int, method: str) -> list[dict[str, Any]]:
+        branch_positions = [position for position in batch for _ in range(2)]
+        actions = [action for position in batch for action in selected[position.game]["action_ids"]]
+        if method == "raw":
+            search = PublicRolloutPool(
+                training, (model_a, model_b), num_envs=len(branch_positions),
+                visible_action_history=visible_action_history,
+            )
+        else:
             search = RoutedPoolSearch(
                 training, mcts, (model_a, model_b), num_envs=len(branch_positions),
                 num_threads=num_threads, max_pending_leaves=max_pending_leaves,
@@ -494,60 +518,117 @@ def evaluate_saved_branch_agreement(
                 seed=batch[0].seed, belief_action_mode="root_shield",
                 leaf_value_scale=0.0, opponent_leaf_value_scale=1.0,
             )
-            try:
-                outcomes = _play_continuations(
-                    search, branch_positions, actions, prefixes, training.max_moves, mcts_value_scale=0.0,
-                )
-            except BeliefRecoveryRequired as error:
-                if len(batch) > 1:
-                    middle = len(batch) // 2
-                    batches.appendleft(batch[middle:])
-                    batches.appendleft(batch[:middle])
-                    continue
-                failures[batch[0].game] = str(error)
-            else:
-                for index, position in enumerate(batch):
-                    results[position.game] = outcomes[2 * index:2 * index + 2]
-            finally:
-                del search
-            progress.update(len(batch))
+        options: dict[str, Any] = {"mcts_value_scale": 0.0 if method == "mcts" else None}
+        if branch_rollouts is not None:
+            # Fresh generators share seeds across forced actions and methods.
+            # Opponent draws advance only on that opponent's own decisions.
+            seeds = [
+                (training.seed, position.seed, position.player, position.prefix_length, repeat)
+                for position in branch_positions
+            ]
+            options.update(
+                opponent_rngs=[np.random.default_rng((*seed, 1)) for seed in seeds],
+                raw_temperature=rollout_temperature,
+            )
+            if method == "raw":
+                options["raw_rngs"] = [np.random.default_rng((*seed, 0)) for seed in seeds]
+        return _play_continuations(search, branch_positions, actions, prefixes, training.max_moves, **options)
+
+    for method in methods:
+        label = "MCTS (0,1)" if method == "mcts" else "raw"
+        with tqdm(total=len(positions) * repeats, desc=f"replay saved pairs with {label}", unit="pair") as progress:
+            for repeat in range(repeats):
+                batches = deque(position_batches)
+                while batches:
+                    batch = batches.popleft()
+                    try:
+                        outcomes = play_batch(batch, repeat, method)
+                    except BeliefRecoveryRequired as error:
+                        if len(batch) > 1:
+                            middle = len(batch) // 2
+                            batches.appendleft(batch[middle:])
+                            batches.appendleft(batch[:middle])
+                            continue
+                        failures[batch[0].game, repeat] = str(error)
+                    else:
+                        for index, position in enumerate(batch):
+                            results[method][position.game, repeat] = outcomes[2 * index:2 * index + 2]
+                    progress.update(len(batch))
 
     labels = ("value_0", "value_1", "tie")
     agreement = {label: dict.fromkeys(labels, 0) for label in labels}
     rows = []
+    completed_repeats = 0
     for position, saved_pair in zip(positions, selected, strict=True):
-        raw_scores = saved_pair["mean_scores"]
+        if branch_rollouts is None:
+            outcomes = results["mcts"].get((position.game, 0))
+            raw_scores = saved_pair["mean_scores"]
+            mcts_scores = [outcome["score_a"] for outcome in outcomes] if outcomes else [None, None]
+            details = {
+                "raw_completed_rollout_pairs": sum(
+                    all(branch["score_a"] is not None for branch in pair) for pair in saved_pair["rollouts"]
+                ),
+                "mcts_rollout": outcomes, "failure_reason": failures.get((position.game, 0)),
+            }
+        else:
+            scores = {
+                method: [
+                    [outcome["score_a"] for outcome in results[method].get((position.game, repeat), ())]
+                    or [None, None]
+                    for repeat in range(repeats)
+                ]
+                for method in methods
+            }
+            common = [repeat for repeat in range(repeats) if all(
+                None not in scores[method][repeat] for method in methods
+            )]
+            completed_repeats += len(common)
+            raw_scores, mcts_scores = (
+                np.mean([scores[method][repeat] for repeat in common], axis=0).tolist() if common else [None, None]
+                for method in methods
+            )
+            details = {
+                "saved_raw_mean_scores": saved_pair["mean_scores"], "rollout_scores": scores,
+                "completed_paired_repeats": len(common),
+                "belief_failures": {
+                    str(repeat + 1): failures[position.game, repeat]
+                    for repeat in range(repeats) if (position.game, repeat) in failures
+                },
+            }
         raw_choice = _better_branch(raw_scores)
-        outcomes = results.get(position.game)
-        mcts_choice = _better_branch([outcome["score_a"] for outcome in outcomes]) if outcomes else None
-        if mcts_choice is not None:
+        mcts_choice = _better_branch(mcts_scores)
+        if raw_choice is not None and mcts_choice is not None:
             agreement[raw_choice][mcts_choice] += 1
         rows.append({
             "map_seed": position.seed, "model_a_player": position.player, "move": position.prefix_length + 1,
             "phase": saved_pair["phase"], "action_ids": saved_pair["action_ids"],
             "raw_mean_scores": raw_scores, "raw_better_branch": raw_choice,
-            "raw_completed_rollout_pairs": sum(
-                all(branch["score_a"] is not None for branch in pair) for pair in saved_pair["rollouts"]
-            ),
-            "mcts_rollout": outcomes, "mcts_better_branch": mcts_choice,
-            "failure_reason": failures.get(position.game),
+            "mcts_mean_scores": mcts_scores, "mcts_better_branch": mcts_choice,
+            **details,
         })
     same = agreement["value_0"]["value_0"] + agreement["value_1"]["value_1"]
     opposite = agreement["value_0"]["value_1"] + agreement["value_1"]["value_0"]
     raw_decisive = sum(sum(agreement[label].values()) for label in ("value_0", "value_1"))
     completed = raw_decisive + sum(agreement["tie"].values())
-    return {
+    report = {
         "pairs_file": str(pairs_path), "simulations": mcts.simulations, "particles": mcts.particles,
-        "leaf_value_scales": [0.0, 1.0], "opponent_policy": "raw", "mcts_rollouts_per_branch": 1,
+        "leaf_value_scales": [0.0, 1.0], "opponent_policy": "raw", "mcts_rollouts_per_branch": repeats,
         "sampling_seed": training.seed, "saved_pairs": len(saved), "eligible_pairs": eligible_pairs,
         "tested_pairs": len(rows), "tested_maps": len(used_maps), "completed_pairs": completed,
-        "incomplete_pairs": len(rows) - completed, "belief_failed_pairs": len(failures),
+        "incomplete_pairs": len(rows) - completed, "belief_failed_pairs": len({game for game, _ in failures}),
         "same_better_branch": same, "opposite_better_branch": opposite,
         "raw_decisive_pairs": raw_decisive, "both_decisive_pairs": same + opposite,
         "agreement_when_raw_decisive": same / raw_decisive if raw_decisive else None,
         "agreement_when_both_decisive": same / (same + opposite) if same + opposite else None,
         "raw_by_mcts_preference": agreement, "positions": rows,
     }
+    if branch_rollouts is not None:
+        report.update(
+            raw_rollouts_per_branch=repeats, raw_rollout_temperature=rollout_temperature,
+            paired_opponent_seeds=True, planned_paired_repeats=len(rows) * repeats,
+            completed_paired_repeats=completed_repeats, belief_failed_repeats=len(failures),
+        )
+    return report
 
 
 def _better_branch(scores: Sequence[float | None]) -> str | None:

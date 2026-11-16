@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from _bootstrap import add_local_source_root
@@ -45,6 +46,14 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=10, help="Game count outside mcts-value-matrix")
     parser.add_argument("--branch-pairs", type=Path, help="Saved train_value.py pair JSONL for mcts-branch-agreement")
     parser.add_argument("--branch-positions", type=int, default=6, help="Maximum saved pairs to replay")
+    parser.add_argument(
+        "--branch-rollouts", type=int,
+        help="Re-run raw and MCTS this many times per action on saved positions that raw distinguished",
+    )
+    parser.add_argument(
+        "--branch-rollout-temperature", type=float,
+        help="Raw action temperature in paired branch rollouts (default: 0.5)",
+    )
     parser.add_argument(
         "--map-seed-group", type=_map_seed_group, action="append", metavar="SEED[,SEED...]",
         help="In mcts-value-matrix, play both sides per map; repeat for separate evaluation seed resets",
@@ -115,8 +124,15 @@ def main() -> None:
             parser.error("--mode mcts-branch-agreement requires an existing --branch-pairs file")
         if args.branch_positions < 1 or args.num_envs < 2:
             parser.error("mcts-branch-agreement requires --branch-positions >= 1 and --num-envs >= 2")
-    elif args.branch_pairs is not None:
-        parser.error("--branch-pairs requires --mode mcts-branch-agreement")
+        if args.branch_rollouts is not None and args.branch_rollouts < 1:
+            parser.error("--branch-rollouts must be positive")
+        if args.branch_rollout_temperature is not None and (
+            args.branch_rollouts is None or not math.isfinite(args.branch_rollout_temperature)
+            or args.branch_rollout_temperature <= 0.0
+        ):
+            parser.error("--branch-rollout-temperature requires --branch-rollouts and a finite positive temperature")
+    elif any(value is not None for value in (args.branch_pairs, args.branch_rollouts, args.branch_rollout_temperature)):
+        parser.error("--branch-pairs and branch rollout options require --mode mcts-branch-agreement")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
@@ -222,6 +238,8 @@ def main() -> None:
                 max_positions=args.branch_positions, max_envs=args.num_envs,
                 num_threads=args.mcts_threads, max_pending_leaves=args.max_pending_leaves,
                 visible_action_history=args.visible_action_history, belief_retries=args.belief_retries,
+                branch_rollouts=args.branch_rollouts,
+                rollout_temperature=0.5 if args.branch_rollout_temperature is None else args.branch_rollout_temperature,
             )
         elif args.mode == "mcts-value-ablation":
             seeds = [training.seed + index // 2 for index in range(args.games)]

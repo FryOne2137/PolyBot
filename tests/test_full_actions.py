@@ -689,6 +689,58 @@ def test_sampled_value_branches_pass_a_position_rejected_by_snapshot_reconstruct
         assert all(outcome["moves_from_position"] == 10 for outcome in outcomes)
 
 
+def test_saved_branch_agreement_keeps_actions_and_separates_ties_from_incomplete(tmp_path, monkeypatch):
+    import json
+
+    from polybot.evaluation import mcts_diagnostics as diagnostics
+
+    pairs = tmp_path / "selection_pairs.jsonl"
+    saved = []
+    for index, raw_scores in enumerate(((1, 0), (0, 1), (1, 0), (1, 1), (0, 1))):
+        saved.append({
+            "map_seed": 2137 + index, "model_a_player": index % 2, "phase": "mid",
+            "root_fingerprint": str(index), "prefix_length": 2, "prefix_actions": [0, index],
+            "action_ids": [100 + index, 200 + index], "mean_scores": raw_scores,
+            "rollouts": [[{"score_a": score} for score in raw_scores]],
+        })
+    header = {"schema_version": 1, "branch_order": ["value_0", "value_1"]}
+    pairs.write_text("\n".join(map(json.dumps, [header, *saved])), encoding="utf-8")
+    mcts_scores = ((1, 0), (1, 0), (1, 1), (0, 1), (None, 1))
+
+    def make_search(training, mcts, models, **kwargs):
+        assert (mcts.simulations, kwargs["leaf_value_scale"], kwargs["opponent_leaf_value_scale"]) == (32, 0, 1)
+        return object()
+
+    def play(search, positions, actions, prefixes, max_moves, *, mcts_value_scale):
+        assert mcts_value_scale == 0
+        results = []
+        for row in range(0, len(positions), 2):
+            position = positions[row]
+            index = position.seed - 2137
+            assert positions[row + 1] == position
+            assert position.player == saved[index]["model_a_player"]
+            assert position.fingerprint == saved[index]["root_fingerprint"]
+            assert prefixes[position.game] == saved[index]["prefix_actions"]
+            assert actions[row:row + 2] == saved[index]["action_ids"]
+            results.extend({"score_a": score} for score in mcts_scores[index])
+        return results
+
+    monkeypatch.setattr(diagnostics, "RoutedPoolSearch", make_search)
+    monkeypatch.setattr(diagnostics, "_play_continuations", play)
+    report = diagnostics.evaluate_saved_branch_agreement(
+        None, None, TrainingConfig(device="cpu"), MCTSConfig(simulations=32), pairs,
+        max_positions=5, max_envs=4, num_threads=1, max_pending_leaves=4,
+        visible_action_history=32, belief_retries=4,
+    )
+    assert report["tested_maps"] == 5
+    assert report["completed_pairs"] == 4 and report["incomplete_pairs"] == 1
+    assert report["same_better_branch"] == report["opposite_better_branch"] == 1
+    assert report["agreement_when_raw_decisive"] == 1 / 3
+    assert report["agreement_when_both_decisive"] == 0.5
+    assert report["raw_by_mcts_preference"]["value_0"]["tie"] == 1
+    assert report["raw_by_mcts_preference"]["tie"]["value_1"] == 1
+
+
 def test_first_divergence_replays_only_opposite_winners_with_shared_mcts(monkeypatch):
     from polybot.evaluation import mcts_diagnostics as diagnostics
     from polybot.training.routed_self_play_pool import RoutedPoolSearch

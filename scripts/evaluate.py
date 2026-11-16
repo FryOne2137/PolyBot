@@ -37,11 +37,14 @@ def main() -> None:
         choices=(
             "mcts", "flat", "mcts-vs-raw", "mcts-diagnostics",
             "mcts-value-ablation", "mcts-value-diagnostics", "mcts-first-divergence", "mcts-value-matrix",
+            "mcts-branch-agreement",
         ),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
     )
     parser.add_argument("--games", type=int, default=10, help="Game count outside mcts-value-matrix")
+    parser.add_argument("--branch-pairs", type=Path, help="Saved train_value.py pair JSONL for mcts-branch-agreement")
+    parser.add_argument("--branch-positions", type=int, default=6, help="Maximum saved pairs to replay")
     parser.add_argument(
         "--map-seed-group", type=_map_seed_group, action="append", metavar="SEED[,SEED...]",
         help="In mcts-value-matrix, play both sides per map; repeat for separate evaluation seed resets",
@@ -107,6 +110,13 @@ def main() -> None:
             parser.error("each map seed must appear once across --map-seed-group arguments")
     elif args.map_seed_group is not None:
         parser.error("--map-seed-group requires --mode mcts-value-matrix")
+    if args.mode == "mcts-branch-agreement":
+        if args.branch_pairs is None or not args.branch_pairs.is_file():
+            parser.error("--mode mcts-branch-agreement requires an existing --branch-pairs file")
+        if args.branch_positions < 1 or args.num_envs < 2:
+            parser.error("mcts-branch-agreement requires --branch-positions >= 1 and --num-envs >= 2")
+    elif args.branch_pairs is not None:
+        parser.error("--branch-pairs requires --mode mcts-branch-agreement")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
@@ -203,6 +213,15 @@ def main() -> None:
 
             summary = evaluate_mcts_value_matrix(
                 model_a, model_b, training, mcts, args.map_seed_group, **pool_options,
+            )
+        elif args.mode == "mcts-branch-agreement":
+            from polybot.evaluation.mcts_diagnostics import evaluate_saved_branch_agreement
+
+            summary = evaluate_saved_branch_agreement(
+                model_a, model_b, training, mcts, args.branch_pairs,
+                max_positions=args.branch_positions, max_envs=args.num_envs,
+                num_threads=args.mcts_threads, max_pending_leaves=args.max_pending_leaves,
+                visible_action_history=args.visible_action_history, belief_retries=args.belief_retries,
             )
         elif args.mode == "mcts-value-ablation":
             seeds = [training.seed + index // 2 for index in range(args.games)]

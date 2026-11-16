@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from functools import partial
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -228,10 +230,32 @@ def _search_true_maps(
     return _search_submitted_maps(search, request, _true_map_worlds(search, request))
 
 
+def _step_replayed_action(
+    search: RoutedPoolSearch | PublicRolloutPool,
+    request: dict[str, np.ndarray],
+    actions: np.ndarray,
+) -> None:
+    try:
+        search.step_public_policy(actions, request["state_id"], request)
+    except ValueError as error:
+        if not isinstance(search, RoutedPoolSearch) or (
+            "completed_map_tokens changes the current player's legal action set" not in str(error)
+        ):
+            raise
+        # A ground-truth snapshot can fail reconstruction even though the
+        # forced action is legal in the live game. Submit accepted beliefs
+        # without searching and keep the already chosen public action.
+        active = actions >= 0
+        _evaluation_search_with_recovery(search, request, active, mcts_mask=np.zeros_like(active))
+        search.pool.step_into_checked(actions, request["state_id"], request)
+
+
 def _replay_positions(
     search: RoutedPoolSearch | PublicRolloutPool,
     positions: Sequence[_ReplayPosition],
     prefixes: Mapping[int, Sequence[int]],
+    *,
+    recover_beliefs: bool = False,
 ) -> dict[str, np.ndarray]:
     request = search.reset(
         np.array([position.seed for position in positions], dtype=np.uint32),
@@ -242,7 +266,10 @@ def _replay_positions(
             prefixes[position.game][move] if move < position.prefix_length else -1
             for position in positions
         ], dtype=np.int32)
-        search.step_public_policy(actions, request["state_id"], request)
+        if recover_beliefs:
+            _step_replayed_action(search, request, actions)
+        else:
+            search.step_public_policy(actions, request["state_id"], request)
         if not np.all(request["action_valid"][actions >= 0]):
             raise RuntimeError("a saved game action was rejected during diagnostic replay")
     for row, position in enumerate(positions):
@@ -293,7 +320,7 @@ def _play_continuations(
     *,
     mcts_value_scale: float | None = None,
 ) -> list[dict[str, Any]]:
-    request = _replay_positions(search, positions, prefixes)
+    request = _replay_positions(search, positions, prefixes, recover_beliefs=mcts_value_scale is not None)
     return _play_replayed_continuations(
         search, request, positions, first_actions, max_moves, mcts_value_scale=mcts_value_scale,
     )
@@ -323,6 +350,8 @@ def _play_replayed_continuations(
     def step(actions: np.ndarray, *, searched: bool = False) -> None:
         if searched:
             search.pool.step_into_checked(actions, request["state_id"], request)
+        elif mcts_value_scale is not None:
+            _step_replayed_action(search, request, actions)
         else:
             search.step_public_policy(actions, request["state_id"], request)
         played = actions >= 0
@@ -388,6 +417,146 @@ def _continuation_pair_summary(
         "same_outcome": sum(delta == 0.0 for delta in deltas),
         "mean_score_delta_value_1_minus_value_0": sum(deltas) / len(deltas) if deltas else None,
     }
+
+
+def evaluate_saved_branch_agreement(
+    model_a: PolicyValueBeliefNet,
+    model_b: PolicyValueBeliefNet,
+    training: TrainingConfig,
+    mcts: MCTSConfig,
+    pairs_path: Path,
+    *,
+    max_positions: int,
+    max_envs: int,
+    num_threads: int | None,
+    max_pending_leaves: int,
+    visible_action_history: int,
+    belief_retries: int,
+) -> dict[str, Any]:
+    """Compare saved raw rollout means with MCTS (0,1) on the same actions."""
+    if max_positions < 1 or max_envs < 2:
+        raise ValueError("branch agreement requires at least one position and two environment slots")
+    with pairs_path.open(encoding="utf-8-sig") as stream:
+        header = json.loads(next(stream, "{}"))
+        if header.get("schema_version") != 1 or header.get("branch_order") != ["value_0", "value_1"]:
+            raise ValueError("expected a version 1 train_value.py branch pair dataset")
+        saved = [json.loads(line) for line in stream if line.strip()]
+
+    rng = np.random.default_rng(training.seed)
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for index in rng.permutation(len(saved)):
+        row = saved[index]
+        if None not in row["mean_scores"]:
+            buckets[row["phase"]].append(row)
+    eligible_pairs = sum(map(len, buckets.values()))
+    if not eligible_pairs:
+        raise ValueError("the saved dataset contains no pairs with completed raw rollouts")
+    selected = []
+    used_maps = set()
+    while len(selected) < min(max_positions, eligible_pairs):
+        for bucket in buckets.values():
+            if not bucket:
+                continue
+            index = next((i for i, row in enumerate(bucket) if row["map_seed"] not in used_maps), 0)
+            row = bucket.pop(index)
+            used_maps.add(row["map_seed"])
+            selected.append(row)
+            if len(selected) == max_positions:
+                break
+
+    prefixes = {index: row["prefix_actions"] for index, row in enumerate(selected)}
+    positions = []
+    for index, row in enumerate(selected):
+        if len(prefixes[index]) != row["prefix_length"] or len(row["action_ids"]) != 2 or (
+            row["action_ids"][0] == row["action_ids"][1] or min(row["action_ids"]) < 0
+        ):
+            raise ValueError(f"invalid saved branch pair on map {row['map_seed']}")
+        if row["prefix_length"] >= training.max_moves:
+            raise ValueError("a selected position is past --max-moves; use the original run's move limit")
+        positions.append(_ReplayPosition(
+            index, row["map_seed"], row["model_a_player"], row["prefix_length"], row["root_fingerprint"],
+        ))
+
+    seed_everything(training.seed)
+    results: dict[int, list[dict[str, Any]]] = {}
+    failures: dict[int, str] = {}
+    batch_pairs = max_envs // 2
+    batches = deque(positions[start:start + batch_pairs] for start in range(0, len(positions), batch_pairs))
+    with tqdm(total=len(positions), desc="replay saved pairs with MCTS (0,1)", unit="pair") as progress:
+        while batches:
+            batch = batches.popleft()
+            branch_positions = [position for position in batch for _ in range(2)]
+            actions = [action for position in batch for action in selected[position.game]["action_ids"]]
+            search = RoutedPoolSearch(
+                training, mcts, (model_a, model_b), num_envs=len(branch_positions),
+                num_threads=num_threads, max_pending_leaves=max_pending_leaves,
+                visible_action_history=visible_action_history, belief_retries=_evaluation_belief_retries(belief_retries),
+                seed=batch[0].seed, belief_action_mode="root_shield",
+                leaf_value_scale=0.0, opponent_leaf_value_scale=1.0,
+            )
+            try:
+                outcomes = _play_continuations(
+                    search, branch_positions, actions, prefixes, training.max_moves, mcts_value_scale=0.0,
+                )
+            except BeliefRecoveryRequired as error:
+                if len(batch) > 1:
+                    middle = len(batch) // 2
+                    batches.appendleft(batch[middle:])
+                    batches.appendleft(batch[:middle])
+                    continue
+                failures[batch[0].game] = str(error)
+            else:
+                for index, position in enumerate(batch):
+                    results[position.game] = outcomes[2 * index:2 * index + 2]
+            finally:
+                del search
+            progress.update(len(batch))
+
+    labels = ("value_0", "value_1", "tie")
+    agreement = {label: dict.fromkeys(labels, 0) for label in labels}
+    rows = []
+    for position, saved_pair in zip(positions, selected, strict=True):
+        raw_scores = saved_pair["mean_scores"]
+        raw_choice = _better_branch(raw_scores)
+        outcomes = results.get(position.game)
+        mcts_choice = _better_branch([outcome["score_a"] for outcome in outcomes]) if outcomes else None
+        if mcts_choice is not None:
+            agreement[raw_choice][mcts_choice] += 1
+        rows.append({
+            "map_seed": position.seed, "model_a_player": position.player, "move": position.prefix_length + 1,
+            "phase": saved_pair["phase"], "action_ids": saved_pair["action_ids"],
+            "raw_mean_scores": raw_scores, "raw_better_branch": raw_choice,
+            "raw_completed_rollout_pairs": sum(
+                all(branch["score_a"] is not None for branch in pair) for pair in saved_pair["rollouts"]
+            ),
+            "mcts_rollout": outcomes, "mcts_better_branch": mcts_choice,
+            "failure_reason": failures.get(position.game),
+        })
+    same = agreement["value_0"]["value_0"] + agreement["value_1"]["value_1"]
+    opposite = agreement["value_0"]["value_1"] + agreement["value_1"]["value_0"]
+    raw_decisive = sum(sum(agreement[label].values()) for label in ("value_0", "value_1"))
+    completed = raw_decisive + sum(agreement["tie"].values())
+    return {
+        "pairs_file": str(pairs_path), "simulations": mcts.simulations, "particles": mcts.particles,
+        "leaf_value_scales": [0.0, 1.0], "opponent_policy": "raw", "mcts_rollouts_per_branch": 1,
+        "sampling_seed": training.seed, "saved_pairs": len(saved), "eligible_pairs": eligible_pairs,
+        "tested_pairs": len(rows), "tested_maps": len(used_maps), "completed_pairs": completed,
+        "incomplete_pairs": len(rows) - completed, "belief_failed_pairs": len(failures),
+        "same_better_branch": same, "opposite_better_branch": opposite,
+        "raw_decisive_pairs": raw_decisive, "both_decisive_pairs": same + opposite,
+        "agreement_when_raw_decisive": same / raw_decisive if raw_decisive else None,
+        "agreement_when_both_decisive": same / (same + opposite) if same + opposite else None,
+        "raw_by_mcts_preference": agreement, "positions": rows,
+    }
+
+
+def _better_branch(scores: Sequence[float | None]) -> str | None:
+    zero, one = scores
+    if zero is None or one is None:
+        return None
+    if zero == one:
+        return "tie"
+    return "value_0" if zero > one else "value_1"
 
 
 def _play_disagreement_pairs(

@@ -178,6 +178,7 @@ def _compare_leaf_scales(
     request: Mapping[str, np.ndarray],
     *,
     include_true_map: bool = True,
+    variants: Sequence[tuple[str, float, PolicyValueBeliefNet]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     worlds: list[np.ndarray] = []
     active = np.ones(search.num_envs, dtype=bool)
@@ -199,27 +200,37 @@ def _compare_leaf_scales(
         if generator_state is not None:
             generator.set_state(generator_state)
 
-    search.leaf_value_scale = 1.0
-    root, _ = _evaluation_search_with_recovery(
-        search, request, active, on_submitted_beliefs=worlds.append,
-    )
-    decisions = {"belief_value_1": _root_decisions(root)}
-    clear_forest()
-    search.leaf_value_scale = 0.0
-    root = _search_submitted_maps(search, request, worlds[0])
-    decisions["belief_value_0"] = _root_decisions(root)
-    if not include_true_map:
-        return decisions
+    model = search.models[0]
+    scale = search.leaf_value_scale
+    if variants is None:
+        variants = (("value_1", 1.0, model), ("value_0", 0.0, model))
+    decisions = {}
+    try:
+        for index, (name, value_scale, candidate) in enumerate(variants):
+            search.models[0] = candidate
+            search.leaf_value_scale = value_scale
+            if index == 0:
+                root, _ = _evaluation_search_with_recovery(
+                    search, request, active, on_submitted_beliefs=worlds.append,
+                )
+            else:
+                clear_forest()
+                root = _search_submitted_maps(search, request, worlds[0])
+            decisions[f"belief_{name}"] = _root_decisions(root)
 
-    clear_forest()
-    truth = _true_map_worlds(search, request)
-    search.leaf_value_scale = 1.0
-    root = _search_submitted_maps(search, request, truth)
-    decisions["true_map_value_1"] = _root_decisions(root)
-    clear_forest()
-    search.leaf_value_scale = 0.0
-    root = _search_submitted_maps(search, request, truth)
-    decisions["true_map_value_0"] = _root_decisions(root)
+        if include_true_map:
+            clear_forest()
+            truth = _true_map_worlds(search, request)
+            for index, (name, value_scale, candidate) in enumerate(variants):
+                if index:
+                    clear_forest()
+                search.models[0] = candidate
+                search.leaf_value_scale = value_scale
+                root = _search_submitted_maps(search, request, truth)
+                decisions[f"true_map_{name}"] = _root_decisions(root)
+    finally:
+        search.models[0] = model
+        search.leaf_value_scale = scale
     return decisions
 
 
@@ -328,6 +339,15 @@ def _play_continuations(
         search, request, positions, first_actions, max_moves, mcts_value_scale=mcts_value_scale,
         raw_rngs=raw_rngs, opponent_rngs=opponent_rngs, raw_temperature=raw_temperature,
     )
+
+
+def _paired_rollout_rngs(
+    seed: int, positions: Sequence[_ReplayPosition], repeat: int, agent: int,
+) -> list[np.random.Generator]:
+    return [
+        np.random.default_rng((seed, position.seed, position.player, position.prefix_length, repeat, agent))
+        for position in positions
+    ]
 
 
 def _play_replayed_continuations(
@@ -522,16 +542,12 @@ def evaluate_saved_branch_agreement(
         if branch_rollouts is not None:
             # Fresh generators share seeds across forced actions and methods.
             # Opponent draws advance only on that opponent's own decisions.
-            seeds = [
-                (training.seed, position.seed, position.player, position.prefix_length, repeat)
-                for position in branch_positions
-            ]
             options.update(
-                opponent_rngs=[np.random.default_rng((*seed, 1)) for seed in seeds],
+                opponent_rngs=_paired_rollout_rngs(training.seed, branch_positions, repeat, 1),
                 raw_temperature=rollout_temperature,
             )
             if method == "raw":
-                options["raw_rngs"] = [np.random.default_rng((*seed, 0)) for seed in seeds]
+                options["raw_rngs"] = _paired_rollout_rngs(training.seed, branch_positions, repeat, 0)
         return _play_continuations(search, branch_positions, actions, prefixes, training.max_moves, **options)
 
     for method in methods:

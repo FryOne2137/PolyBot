@@ -478,7 +478,10 @@ def test_branch_collection_selects_disagreements_and_averages_paired_repeats(mon
         assert sum(example.phase == phase for example in examples) == 2 * expected
 
 
-def test_branch_probe_reuses_particles_without_searching_the_true_map(monkeypatch):
+@pytest.mark.parametrize("compare_heads", [False, True])
+def test_branch_probe_reuses_particles_without_searching_the_true_map(monkeypatch, compare_heads):
+    from copy import deepcopy
+
     from polybot.data.full_actions import ExactActionNative
     from polybot.evaluation.mcts_diagnostics import _compare_leaf_scales
     from polybot.training.routed_self_play_pool import RoutedPoolSearch
@@ -499,11 +502,22 @@ def test_branch_probe_reuses_particles_without_searching_the_true_map(monkeypatc
         belief_retries=4, seed=2137, belief_action_mode="root_shield", opponent_leaf_value_scale=1.0,
     )
     request = search.reset(np.array([2137], dtype=np.uint32), np.array([[0, 1]], dtype=np.int32))
-    result = _compare_leaf_scales(search, request, include_true_map=False)
-    assert set(result) == {"belief_value_0", "belief_value_1"}
+    if compare_heads:
+        old = deepcopy(model)
+        with torch.no_grad():
+            old.value_head[-2].bias.add_(1.0)
+        variants = (("zero", 0.0, model), ("old_quarter", 0.25, old), ("new_quarter", 0.25, model))
+        result = _compare_leaf_scales(search, request, include_true_map=False, variants=variants)
+        assert set(result) == {"belief_zero", "belief_old_quarter", "belief_new_quarter"}
+        assert search.models[0] is model
+        assert search.leaf_value_scale == 1.0
+    else:
+        result = _compare_leaf_scales(search, request, include_true_map=False)
+        assert set(result) == {"belief_value_0", "belief_value_1"}
     assert all(0 < choices[0]["root_visits"] <= 32 for choices in result.values())
-    assert len(worlds) == 2
-    np.testing.assert_array_equal(worlds[0], worlds[1])
+    assert len(worlds) == len(result)
+    for world in worlds[1:]:
+        np.testing.assert_array_equal(worlds[0], world)
 
 
 def test_branch_fit_can_benchmark_an_update_with_worse_offline_rmse():

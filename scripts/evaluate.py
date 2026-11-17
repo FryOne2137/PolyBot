@@ -38,14 +38,15 @@ def main() -> None:
         choices=(
             "mcts", "flat", "mcts-vs-raw", "mcts-diagnostics",
             "mcts-value-ablation", "mcts-value-diagnostics", "mcts-first-divergence", "mcts-value-matrix",
-            "mcts-branch-agreement",
+            "mcts-branch-agreement", "mcts-value-regression",
         ),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
     )
     parser.add_argument("--games", type=int, default=10, help="Game count outside mcts-value-matrix")
     parser.add_argument("--branch-pairs", type=Path, help="Saved train_value.py pair JSONL for mcts-branch-agreement")
-    parser.add_argument("--branch-positions", type=int, default=6, help="Maximum saved pairs to replay")
+    parser.add_argument("--branch-positions", type=int, default=6, help="Maximum saved pairs to replay or games to scan for a first value divergence")
+    parser.add_argument("--old-value-model", type=Path, help="Checkpoint before fitting value, for mcts-value-regression")
     parser.add_argument(
         "--branch-rollouts", type=int,
         help="Re-run raw and MCTS this many times per action on saved positions that raw distinguished",
@@ -119,20 +120,35 @@ def main() -> None:
             parser.error("each map seed must appear once across --map-seed-group arguments")
     elif args.map_seed_group is not None:
         parser.error("--map-seed-group requires --mode mcts-value-matrix")
+    value_regression = args.mode == "mcts-value-regression"
+    if value_regression:
+        if args.old_value_model is None:
+            parser.error("mcts-value-regression requires --old-value-model")
+        if args.games < 2 or args.games % 2 or args.positions_per_game < 3 or args.num_envs < 3:
+            parser.error("mcts-value-regression requires paired games, at least three positions per game and three environments")
+        if args.branch_pairs is not None:
+            parser.error("--branch-pairs requires --mode mcts-branch-agreement")
+    elif args.old_value_model is not None:
+        parser.error("--old-value-model requires --mode mcts-value-regression")
+
     if args.mode == "mcts-branch-agreement":
         if args.branch_pairs is None or not args.branch_pairs.is_file():
             parser.error("--mode mcts-branch-agreement requires an existing --branch-pairs file")
-        if args.branch_positions < 1 or args.num_envs < 2:
-            parser.error("mcts-branch-agreement requires --branch-positions >= 1 and --num-envs >= 2")
+        if args.num_envs < 2:
+            parser.error("mcts-branch-agreement requires --num-envs >= 2")
+    if args.mode == "mcts-branch-agreement" or value_regression:
+        if args.branch_positions < 1:
+            parser.error("--branch-positions must be positive")
         if args.branch_rollouts is not None and args.branch_rollouts < 1:
             parser.error("--branch-rollouts must be positive")
         if args.branch_rollout_temperature is not None and (
-            args.branch_rollouts is None or not math.isfinite(args.branch_rollout_temperature)
+            (args.branch_rollouts is None and not value_regression)
+            or not math.isfinite(args.branch_rollout_temperature)
             or args.branch_rollout_temperature <= 0.0
         ):
-            parser.error("--branch-rollout-temperature requires --branch-rollouts and a finite positive temperature")
+            parser.error("--branch-rollout-temperature must be finite and positive, and requires rollouts")
     elif any(value is not None for value in (args.branch_pairs, args.branch_rollouts, args.branch_rollout_temperature)):
-        parser.error("--branch-pairs and branch rollout options require --mode mcts-branch-agreement")
+        parser.error("branch rollout options require mcts-branch-agreement or mcts-value-regression")
 
     training = training_config_from_args(args)
     device = select_device(training.device)
@@ -229,6 +245,19 @@ def main() -> None:
 
             summary = evaluate_mcts_value_matrix(
                 model_a, model_b, training, mcts, args.map_seed_group, **pool_options,
+            )
+        elif value_regression:
+            from polybot.evaluation.value_regression import evaluate_mcts_value_regression
+
+            old_model, _ = load_model(args.old_value_model, device)
+            summary = evaluate_mcts_value_regression(
+                model_a, old_model, model_b, training, mcts, args.games,
+                positions_per_game=args.positions_per_game, divergence_games=args.branch_positions,
+                branch_rollouts=3 if args.branch_rollouts is None else args.branch_rollouts,
+                rollout_temperature=0.5 if args.branch_rollout_temperature is None else args.branch_rollout_temperature,
+                num_threads=args.mcts_threads, max_envs=args.num_envs,
+                visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
+                belief_retries=args.belief_retries,
             )
         elif args.mode == "mcts-branch-agreement":
             from polybot.evaluation.mcts_diagnostics import evaluate_saved_branch_agreement

@@ -144,18 +144,22 @@ def value_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, Any
     }
 
 
-def evaluate_value_head(model, training, examples: Sequence, *, batch_size: int = 128) -> dict[str, Any]:
+def evaluate_value_head(
+    model, training, examples: Sequence, *, batch_size: int = 128, value_scale: float = 1.0,
+) -> dict[str, Any]:
     """Evaluate one frozen checkpoint; do not reuse collection-time predictions."""
     if not examples:
         return {"valid": False, "count": 0, "games": 0}
+    targets = np.asarray([e.return_target for e in examples], dtype=np.float32)
+    if value_scale == 0.0:
+        return _metrics_by_phase(np.zeros_like(targets), targets, examples)
     model.eval()
     with isolated_rng(), torch.no_grad():
         predictions = torch.cat([
             model.value_head(_states(model, examples[start:start + batch_size], training)).squeeze(-1).float()
             for start in range(0, len(examples), batch_size)
         ]).cpu().numpy()
-    targets = np.asarray([e.return_target for e in examples], dtype=np.float32)
-    return _metrics_by_phase(predictions, targets, examples)
+    return _metrics_by_phase(predictions * value_scale, targets, examples)
 
 
 def _metrics_by_phase(predictions, targets, examples):

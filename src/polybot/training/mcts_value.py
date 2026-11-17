@@ -78,8 +78,11 @@ def collect_mcts_terminal_value_games(
     opponent_value_scale: float,
     excluded_map_seeds: Sequence[int],
     label: str,
+    leaf_value_scale: float = 0.0,
+    replace_incomplete: bool = True,
+    belief_retries: int = 4,
 ) -> tuple[list[EncodedValuePosition], dict[str, Any]]:
-    """Sample apprentice turns from complete paired games with its leaf value disabled."""
+    """Sample apprentice turns from complete paired games."""
     rng = np.random.default_rng(training.seed ^ 0x56414C)
     device = next(model.parameters()).device
     quota, remainder = divmod(positions_per_game, len(VALUE_PHASES))
@@ -89,7 +92,7 @@ def collect_mcts_terminal_value_games(
     invalid_batches = []
     finished_maps: list[int] = []
     excluded = set(excluded_map_seeds)
-    max_attempts = games // 2 + _MAX_EVALUATION_PAIR_REPLACEMENTS
+    max_attempts = games // 2 + (_MAX_EVALUATION_PAIR_REPLACEMENTS if replace_incomplete else 0)
     cursor = training.seed
     truncated_games = 0
     while len(outcomes) < games and len(attempted) < max_attempts:
@@ -120,8 +123,9 @@ def collect_mcts_terminal_value_games(
 
         evaluation = evaluate_matches_pool(
             model, opponent, replace(training, seed=seeds[0]), mcts, len(schedule),
-            model_b_uses_mcts=False, leaf_value_scale=0.0, opponent_leaf_value_scale=opponent_value_scale,
+            model_b_uses_mcts=False, leaf_value_scale=leaf_value_scale, opponent_leaf_value_scale=opponent_value_scale,
             map_seeds=schedule, replace_failed_pairs=False, belief_action_mode="root_shield",
+            belief_retries=belief_retries,
             num_threads=num_threads, max_envs=len(schedule), max_pending_leaves=max_pending_leaves,
             visible_action_history=visible_action_history, model_a_label=f"{label} {len(outcomes)}/{games}",
             model_b_label="raw opponent", action_callback=collect, game_callback=record,

@@ -107,6 +107,11 @@ def fit_mcts_terminal_value(args, model, opponent, config, training, schedules, 
     )
 
     mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
+    turn_starts_only = args.position_source == "mcts-turn-start"
+    benchmark_config = (
+        {"turn_candidates": args.turn_candidates, "turn_max_rollout_actions": args.turn_max_rollout_actions}
+        if turn_starts_only else {"benchmark_leaf_value_scales": MCTS_VALUE_SCALES}
+    )
     pool = dict(
         num_envs=args.num_envs, num_threads=args.num_threads,
         visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
@@ -114,7 +119,8 @@ def fit_mcts_terminal_value(args, model, opponent, config, training, schedules, 
     )
     run.write_config(
         training=training, model=config, mcts=mcts, schedules=schedules, loss="mse",
-        collection_leaf_value_scales=(0.0, args.opponent_value_scale), benchmark_leaf_value_scales=MCTS_VALUE_SCALES,
+        collection_leaf_value_scales=(0.0, args.opponent_value_scale), turn_starts_only=turn_starts_only,
+        **benchmark_config,
     )
     datasets = {}
     collection = {}
@@ -126,7 +132,7 @@ def fit_mcts_terminal_value(args, model, opponent, config, training, schedules, 
         datasets[label], summary = collect_mcts_terminal_value_games(
             model, opponent, replace(training, seed=seed), mcts, games,
             positions_per_game=args.positions_per_game, excluded_map_seeds=excluded,
-            label=f"value {label}", **pool,
+            label=f"value {label}", turn_starts_only=turn_starts_only, **pool,
         )
         collection[label] = summary
         attempted_seeds.update(summary["attempted_map_seeds"])
@@ -141,7 +147,8 @@ def fit_mcts_terminal_value(args, model, opponent, config, training, schedules, 
     )
     fit = fit_value_head(
         model, training, datasets["train"], datasets["selection"], settings, seed=training.seed,
-        validation_source="mcts_terminal_selection", keep_best_update=True,
+        validation_source="mcts_turn_start_selection" if turn_starts_only else "mcts_terminal_selection",
+        keep_best_update=True,
     )
     report["fit"] = fit
     run.log(
@@ -157,6 +164,24 @@ def fit_mcts_terminal_value(args, model, opponent, config, training, schedules, 
     run.event("experimental_checkpoint_saved", loss="mse", checkpoint=args.model_out)
 
     _, seed, games = schedules[2]
+    if turn_starts_only:
+        from polybot.evaluation.turn_reply import evaluate_turn_reply_benchmark
+
+        benchmark = evaluate_turn_reply_benchmark(
+            model, opponent, replace(training, seed=seed), mcts, games,
+            num_envs=args.num_envs, num_threads=args.num_threads,
+            visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
+            candidates=args.turn_candidates, max_rollout_actions=args.turn_max_rollout_actions, belief_retries=4,
+        )
+        report["turn_reply_benchmark"] = benchmark
+        run.log(compared_mcts_games=benchmark["compared_games_per_arm"], turn_reply_score_delta=benchmark["paired_score_delta"])
+        if benchmark["valid"]:
+            report["mcts_improved"] = benchmark["paired_score_delta"] > 0.0
+            report["reason"] = "mcts_improved" if report["mcts_improved"] else "mcts_no_demonstrated_improvement"
+        else:
+            report["reason"] = "mcts_benchmark_invalid"
+        return report
+
     benchmark = evaluate_mcts_value_heads(
         model, opponent, replace(training, seed=seed), mcts, games, value_scales=MCTS_VALUE_SCALES, **pool,
     )
@@ -271,7 +296,7 @@ def main() -> None:
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--opponent", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, required=True)
-    parser.add_argument("--position-source", choices=("raw", "mcts-branches", "mcts-terminal"), default="raw")
+    parser.add_argument("--position-source", choices=("raw", "mcts-branches", "mcts-terminal", "mcts-turn-start"), default="raw")
     parser.add_argument("--train-games", type=int, default=128)
     parser.add_argument("--selection-games", type=int, default=32)
     parser.add_argument("--validation-games", type=int, default=48)
@@ -289,6 +314,10 @@ def main() -> None:
     parser.add_argument("--max-pending-leaves", type=int, default=4)
     parser.add_argument("--opponent-value-scale", type=float, default=1.0,
                         help="Fixed opponent leaf scale for terminal collection, disagreement probes and benchmarks")
+    parser.add_argument("--turn-candidates", type=int, default=3,
+                        help="Number of legal first actions compared by turn-reply search")
+    parser.add_argument("--turn-max-rollout-actions", type=int, default=96,
+                        help="Limit per simulated branch in turn-reply search; incomplete worlds are excluded")
     parser.add_argument("--disagreement-probes-per-position", type=int, default=8,
                         help="Maximum probes per desired sample within each phase in mcts-branches mode")
     parser.add_argument("--branch-rollouts", type=int, default=3,
@@ -316,8 +345,10 @@ def main() -> None:
         or not 0.0 <= args.opponent_value_scale <= 1.0
     ):
         parser.error("require positive simulations and particles, 1–8 pending leaves and opponent value scale in [0, 1]")
-    if args.position_source == "mcts-terminal" and args.positions_per_game < 3:
-        parser.error("mcts-terminal requires at least three positions per game for phase sampling")
+    if args.position_source in {"mcts-terminal", "mcts-turn-start"} and args.positions_per_game < 3:
+        parser.error("terminal MCTS collection requires at least three positions per game for phase sampling")
+    if args.position_source == "mcts-turn-start" and (args.turn_candidates < 2 or args.turn_max_rollout_actions < 1):
+        parser.error("turn-reply search requires at least two candidates and a positive rollout limit")
     if args.position_source == "mcts-branches" and (
         args.disagreement_probes_per_position < 1 or args.branch_rollouts < 1
         or not np.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0.0
@@ -356,7 +387,7 @@ def main() -> None:
     opponent.requires_grad_(False)
     run = training_run_from_args(args, "value")
     if args.position_source != "raw":
-        fit_mcts = fit_mcts_terminal_value if args.position_source == "mcts-terminal" else fit_mcts_branch_value
+        fit_mcts = fit_mcts_branch_value if args.position_source == "mcts-branches" else fit_mcts_terminal_value
         report = fit_mcts(args, model, opponent, config, training, schedules, run)
         report["run_dir"] = str(run.finish(report, plots=False))
         print_summary(report)

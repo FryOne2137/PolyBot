@@ -81,6 +81,7 @@ def collect_mcts_terminal_value_games(
     leaf_value_scale: float = 0.0,
     replace_incomplete: bool = True,
     belief_retries: int = 4,
+    turn_starts_only: bool = False,
 ) -> tuple[list[EncodedValuePosition], dict[str, Any]]:
     """Sample apprentice turns from complete paired games."""
     rng = np.random.default_rng(training.seed ^ 0x56414C)
@@ -107,16 +108,23 @@ def collect_mcts_terminal_value_games(
         schedule = [seed for seed in seeds for _ in range(2)]
         positions: dict[int, list[tuple[int, int, np.ndarray]]] = defaultdict(list)
         moves = np.zeros(len(schedule), dtype=np.int32)
+        previous_agents = np.full(len(schedule), -1, dtype=np.int32)
         records: dict[tuple[int, int], Mapping[str, Any]] = {}
 
         def collect(indices, request, actions) -> None:
-            rows = np.flatnonzero((actions >= 0) & (request["agent_id"] == 0))
+            played = actions >= 0
+            agents = request["agent_id"]
+            eligible = played & (agents == 0)
+            if turn_starts_only:
+                eligible &= previous_agents[indices] != agents
+                previous_agents[indices[played]] = agents[played]
+            rows = np.flatnonzero(eligible)
             if rows.size:
                 features = _encode_value_rows(model, training, device, request, rows)
                 for row, state in zip(rows, features, strict=True):
                     index = int(indices[row])
                     positions[index].append((int(moves[index]), int(request["state"][row, 0]), state))
-            moves[indices[actions >= 0]] += 1
+            moves[indices[played]] += 1
 
         def record(game: Mapping[str, Any]) -> None:
             records[game["map_seed"], game["model_a_player"]] = game
@@ -167,6 +175,7 @@ def collect_mcts_terminal_value_games(
         "draws": sum(game["score_a"] == 0.5 for game in outcomes),
         "losses": sum(game["score_a"] == 0.0 for game in outcomes),
         "labelled_maps": len({example.game_key[0] for example in examples}), "positions": len(examples),
+        "sampling": "turn_starts" if turn_starts_only else "all_decisions",
         "phase_definition": "thirds_of_completed_game_by_action_index",
         "phases": {phase: sum(example.phase == phase for example in examples) for phase in VALUE_PHASES},
     }

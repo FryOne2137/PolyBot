@@ -314,7 +314,8 @@ def test_mcts_value_benchmark_compares_only_complete_common_map_pairs(monkeypatc
     assert report["beats_zero"]
 
 
-def test_mcts_terminal_value_uses_full_pairs_and_all_three_phases(monkeypatch):
+@pytest.mark.parametrize("turn_starts_only", [False, True])
+def test_mcts_terminal_value_uses_full_pairs_and_all_three_phases(monkeypatch, turn_starts_only):
     from polybot.training import mcts_value
 
     model = tiny_model()
@@ -329,8 +330,8 @@ def test_mcts_terminal_value_uses_full_pairs_and_all_three_phases(monkeypatch):
         schedule = kwargs["map_seeds"]
         attempted.extend(schedule[::2])
         indices = np.arange(games)
-        for move in range(12):
-            request = {"agent_id": (indices + move) % 2, "state": np.full((games, 1), move)}
+        for move in range(24):
+            request = {"agent_id": (indices + move // 2) % 2, "state": np.full((games, 1), move)}
             kwargs["action_callback"](indices, request, np.zeros(games, dtype=np.int32))
         for index, seed in enumerate(schedule):
             kwargs["game_callback"]({
@@ -345,6 +346,7 @@ def test_mcts_terminal_value_uses_full_pairs_and_all_three_phases(monkeypatch):
         model, model, TrainingConfig(device="cpu", seed=2137), MCTSConfig(simulations=32), 4,
         positions_per_game=6, num_envs=4, num_threads=1, visible_action_history=32,
         max_pending_leaves=4, opponent_value_scale=1.0, excluded_map_seeds=(2139, 2140), label="value train",
+        turn_starts_only=turn_starts_only,
     )
     assert attempted == [2137, 2138, 2141] and report["map_seeds"] == [2138, 2141]
     assert report["valid"] and report["terminal_games"] == 4 and report["truncated_games"] == 1
@@ -353,9 +355,54 @@ def test_mcts_terminal_value_uses_full_pairs_and_all_three_phases(monkeypatch):
     assert len(examples) == 24
     for example in examples:
         seed, side = example.game_key
-        assert seed in (2138, 2141) and example.turn % 2 == side
+        assert seed in (2138, 2141) and example.turn // 2 % 2 == side
+        if turn_starts_only:
+            assert example.turn % 2 == 0
         assert example.return_target == (1.0 if side else -1.0)
-        assert example.phase == ("opening", "mid", "late")[example.turn // 4]
+        assert example.phase == ("opening", "mid", "late")[example.turn // 8]
+
+
+def test_turn_reply_search_scores_after_opponents_last_action(monkeypatch):
+    from types import SimpleNamespace
+
+    from polybot.planning.turn_reply import TurnReplySearch
+
+    class World:
+        def __init__(self):
+            self.moves = 0
+
+        def clone(self):
+            return World()
+
+        def current_player(self):
+            return (0, 0, 1, 1, 0)[self.moves]
+
+        def step_fast(self, action):
+            self.moves += 1
+            return True, action == 9, 0.0, 1 if action == 9 else -1, None
+
+    model = object()
+    search = TurnReplySearch(model, object(), torch.device("cpu"), candidates=2, particles=1,
+                             visible_action_history=0, max_rollout_actions=4, belief_retries=0,
+                             belief_temperature=0.0)
+
+    def play(worlds, *, opponent):
+        assert all(world.current_player() == int(opponent) for world in worlds)
+        return [0] * len(worlds)
+
+    def evaluate(candidate, worlds):
+        assert candidate is model and all(world.moves == 4 and world.current_player() == 0 for world in worlds)
+        return None, None, SimpleNamespace(value=torch.tensor([0.25]))
+
+    monkeypatch.setattr(search, "policy_actions", play)
+    monkeypatch.setattr(search, "_forward", evaluate)
+    world = World()
+    scores, steps = search._score_branches([world], [0, 9], 0)
+    np.testing.assert_array_equal(scores, [[0.25, -1.0]])
+    assert world.moves == 0 and steps == 5
+    search.max_rollout_actions = 3
+    scores, _ = search._score_branches([world], [0, 9], 0)
+    assert np.isnan(scores[0, 0]) and scores[0, 1] == -1.0
 
 
 def test_mcts_terminal_benchmark_compares_all_scales_against_zero(monkeypatch):

@@ -1,0 +1,172 @@
+# Training a value head for Polytopia
+
+The turn-start experiment trains a **value head on player-visible observations
+at the start of a turn** and uses it to score candidate plays **after the
+opponent's full reply**. Train the head against completed game outcomes while
+keeping policy, belief and the shared encoder fixed. Compare the resulting
+search on paired maps and measure elapsed time for each arm. Run it with
+`train_value.py --position-source mcts-turn-start`. The original
+`mcts-terminal` mode samples positions throughout the game.
+
+The implemented pilot samples the first decision after control passes to the
+apprentice. At the start of each live apprentice turn, the planner compares
+the top legal first actions under the frozen policy. It plays each through the
+remainder of the turn and the opponent's reply in the same accepted belief
+worlds, using greedy policies for both players. It scores the next apprentice
+turn or the exact terminal outcome. The chosen first action is executed in
+the real game. The frozen policy handles subsequent decisions within the turn
+using their current observations. A world contributes to ranking only when
+all candidate branches reach their scoring point. If none qualify, the
+first action comes from the frozen policy. The report compares completed
+map pairs with the native MCTS baseline and records these policy-only turns.
+
+## Why change the positions that value sees?
+
+A player can take several actions before ending a turn. A search budget of
+32 individual action expansions can therefore spend much of its work on one
+side's decisions before seeing a response. For example, a head might favor an
+attack immediately after it captures a city. Scoring after the opponent's turn
+gives the simulator a chance to show the recapture. The number of expansions that
+reach the opponent's first decision is worth measuring in PolyBot. The turn
+structure and branching problem are documented in the Polytopia-inspired
+[Tribes research framework][tribes].
+
+Kevin Zhang's Polytopia project reports a concrete precedent. Its planner
+samples candidate turns from a frozen policy, simulates an opponent reply
+and scores the next player turn using a critic trained on fogged inputs.
+In the author's experiments, this search gained strength over the raw
+policy, with gains varying by checkpoint. The project also used a separate
+full-state critic for PPO training. These results come from the author's
+engineering report and a different engine, policy and compute budget.
+[Project report][zhang] · [Companion repository][zhang-code]
+
+PolyBot's own results motivate the same comparison. The terminal-only
+experiment improved selection RMSE from 0.877 to 0.868 over 16 games. On a
+fresh matched arena, value at 0.25 won 7/24 games against 11/24 with the
+candidate's value disabled. On a second, smaller arena, those counts were
+6/12 and 4/12. In the four replayed first divergences, the two heads chose
+the same move three times. The one position on which they chose different
+moves yielded three wins from either move. These runs leave the source of
+the gameplay difference unresolved.
+
+## The value target
+
+For the two-player zero-sum setting, let `h_i` be player `i`'s observation
+and visible action history, and let `z_i` be that player's terminal result.
+Train `V(h_i)` to predict the expected `z_i` under the frozen policies used
+for continuation. Use +1 for a win, 0 for a terminal draw and -1 for a loss.
+Exclude games cut off by the move limit from terminal supervision. A budget
+of several actions within one turn retains the same player perspective.
+When backing up estimates in a two-player tree, change sign when the
+perspective changes. Terminal outcome regression provides the control used
+in the AlphaZero family. [AlphaZero][alphazero]
+
+The input is the same player-view packet used at inference, including the
+available legal actions and visible history. A sampled hidden map can drive
+simulation. Each decision still uses the observation that the current
+simulated player would receive. The true hidden map may supply supervision
+offline. The deployed value head reads the masked packet, as described in the
+[model architecture](architecture.md#ground-truth-boundary). Public-belief
+methods such as ReBeL and Student of Games additionally condition their
+values on distributions over both players' information states. They give
+a principled direction for future work when one scalar from the current
+observation is insufficient. [ISMCTS][ismcts] · [ReBeL][rebel] · [Student of Games][sog]
+
+## Experimental controls
+
+1. Collect seat-swapped full games with fixed checkpoints. Start with
+   Bardur versus Imperius on 11×11 Lakes and the same frozen opponent in
+   every arm. The current terminal collector can provide full-game outcomes.
+   Record which decisions occur immediately after control passes to the
+   player. Sample across opening, middle and late game and keep a cap per
+   game so longer games do not dominate. Record the behavior policies and
+   map seeds along with each sampled position.
+2. Fit two heads initialized from the same checkpoint. The control samples
+   decisions throughout the game, as in `train_value.py --position-source
+   mcts-terminal`. The proposed head samples the start of the player's
+   turn. Match the number of samples per phase and the update budget.
+   Regress both heads on the same type of terminal label with MSE, and hold
+   out complete maps, including both seat assignments.
+3. On a small set of held-out decisions, simulate plausible plays through
+   the end of the current turn and through the opponent's full reply. Score
+   at the start of the original player's next turn, or use the exact result
+   when a branch terminates sooner. Compare candidates across the same
+   accepted belief samples and pair random streams for replies. Sample
+   candidate plays from the fixed policy using legal observations. Average
+   evidence for each candidate first action across belief worlds before
+   choosing it. A follow-up can replan within the turn as new information
+   arrives. Compare the existing heads at this horizon to estimate how much
+   comes from the search change.
+   [Polytopia search experiment][zhang]
+4. Benchmark the approaches on fresh maps with both seat assignments.
+   Within each search implementation, compare head variants while holding
+   policy, belief, opponent and candidate budget fixed. Include the current
+   `(0,1)` MCTS@32 reference, where 0 disables apprentice leaf value and 1
+   keeps the opponent's leaf value inside the tree. Compare planners at
+   similar total search time per real turn. Report wins, draws, losses, truncations and
+   paired score differences. Use the map as the sampling unit when
+   reporting uncertainty. Select settings on development maps and verify
+   the selected setup once on an independent set.
+
+Two diagnostic measures make the benchmark easier to explain. Report RMSE
+and bias by phase and on positions at the intended search horizon, with a
+constant-zero reference. Also record the score difference between competing
+moves under a shared continuation policy. When both moves repeatedly reach
+the same result, that position provides little evidence about their ranking.
+The existing `mcts-value-regression` mode provides a baseline for these
+checks at the individual-action horizon. [Training entry points](training.md)
+
+## If turn-aligned terminal targets are too noisy
+
+Build a small second dataset from the positions where the proposed search
+actually queries value. For each selected position, continue the same
+simulated state with frozen, observation-conditioned policies and average
+terminal outcomes across matched continuations. Use those averages as
+additional MSE targets alongside the real-game data. Save the state
+provenance, policy versions, number of completed continuations and how the
+hidden worlds were sampled. Start with a small pilot and measure the fraction
+of competing branches with distinguishable returns before collecting more.
+An outcome from the real game cannot label an unrelated hypothetical leaf.
+The current regression diagnostics can replay real positions from the seed
+and action prefix. Simulated-leaf training also needs a verified way to
+restore or continue detached simulated states in PolyEnv.
+
+Another experiment is a separate full-state teacher for offline
+supervision. Condition it on the information needed to evaluate the fixed
+continuation policies and test it against terminal returns on held-out maps
+before distillation. A student that only sees the player view can learn the
+conditional average of teacher targets over plausible worlds. Keep the
+teacher out of deployed search. Baisero and Amato explain why a state-only
+critic can bias policy-gradient estimates for history-dependent policies. Comparisons of
+AlphaZero targets also show that target choice depends on which policy
+collects the games and which policy makes the final decisions. [Asymmetric critics][asymmetric] · [Off-policy AlphaZero targets][off-policy]
+
+## Sources
+
+- Silver et al. (2017), AlphaZero preprint. Terminal targets for learned
+  values and the policy–value split in search. [Paper][alphazero]
+- Pérez-Liébana et al. (2020), *Tribes: A New Turn-Based Strategy Game for AI
+  Research*. Polytopia-like turn structure and planning benchmarks. [Paper][tribes]
+- Zhang (2026), *Building a Superhuman Polytopia Bot Using Self-Play RL*.
+  First-hand account of fitting a fogged critic and evaluating complete
+  opponent replies. [Engineering report][zhang] · [Code repository][zhang-code]
+- Cowling, Powley and Whitehouse (2012), *Information Set Monte Carlo Tree
+  Search*. Search with hidden information. [Paper][ismcts]
+- Brown et al. (2020), ReBeL, and Schmid et al. (2023), Student of Games.
+  Value and search conditioned on public beliefs. [ReBeL][rebel] · [Student of Games][sog]
+- Willemsen, Baier and Kaisers (2022), *Value Targets in Off-Policy
+  AlphaZero*. Comparing targets for different continuation policies.
+  [Paper][off-policy]
+- Baisero and Amato (2022), *Unbiased Asymmetric Reinforcement Learning
+  under Partial Observability*. Limits of full-state critics under
+  partial observability. [Paper][asymmetric]
+
+[alphazero]: https://arxiv.org/abs/1712.01815
+[tribes]: https://gaigresearch.github.io/afm/papers/TribesAIIDE20.pdf
+[zhang]: https://thekevinz.com/blog/polytopia-bot
+[zhang-code]: https://github.com/kevinz917/superhuman-polytopia-bot
+[ismcts]: https://eprints.whiterose.ac.uk/id/eprint/75048/
+[rebel]: https://arxiv.org/abs/2007.13544
+[sog]: https://pmc.ncbi.nlm.nih.gov/articles/PMC10651118/
+[off-policy]: https://research.tue.nl/files/217685150/s00521_021_05928_5.pdf
+[asymmetric]: https://arxiv.org/abs/2105.11674

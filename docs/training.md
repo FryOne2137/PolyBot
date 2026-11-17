@@ -131,6 +131,8 @@ not a repair for poor value or inconsistent beliefs.
 Accepted search positions produce visit-distribution targets. Collection can be
 offline/frozen and selective. Real game moves remain constrained by the engine's
 public legal list. For the model/search boundary see [architecture](architecture.md).
+For head-only value fitting and search through the full opponent reply, see
+[value training](value_training.md).
 
 ## Evaluation and saved games
 

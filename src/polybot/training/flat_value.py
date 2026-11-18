@@ -194,8 +194,11 @@ def _value_gap(values: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
 def fit_paired_value_heads(
     model, replay: Sequence[EncodedValuePosition], selection: Sequence[EncodedValuePosition],
     settings: FlatImprovements, *, seed: int, difference_weight: float,
+    loss_variants: Sequence[str] = ("mse", "mse_delta"), preserve_reference: bool = False,
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, Any]]:
     """Fit MSE and MSE-plus-gap heads from the same initialization and pair batches."""
+    if not loss_variants or set(loss_variants) - {"mse", "mse_delta"}:
+        raise ValueError("paired value losses must select mse and/or mse_delta")
     if not replay or not selection:
         return {}, {}
     model.eval()
@@ -239,11 +242,15 @@ def fit_paired_value_heads(
         with isolated_rng():
             before = measure()
             for name, weight in (("mse", 0.0), ("mse_delta", difference_weight)):
+                if name not in loss_variants:
+                    continue
                 model.value_head.load_state_dict(start_state)
                 optimizer = torch.optim.AdamW(
                     model.value_head.parameters(), lr=settings.value_learning_rate, weight_decay=0.0,
                 )
-                best = None
+                best = before if preserve_reference and before["valid"] else None
+                if best is not None:
+                    heads[name] = deepcopy(start_state)
                 best_step = attempted = 0
                 for step, indices in enumerate(batches, 1):
                     predictions = model.value_head(states[indices]).squeeze(-1).float()
@@ -267,6 +274,8 @@ def fit_paired_value_heads(
                         heads[name] = deepcopy(model.value_head.state_dict())
                 reports[name] = {"before": before, "after": best, "updates": attempted, "selected_updates": best_step,
                                  "difference_weight": weight}
+                if preserve_reference:
+                    reports[name]["kept_update"] = best_step > 0
     finally:
         model.value_head.load_state_dict(start_state)
     return heads, reports

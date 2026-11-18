@@ -171,6 +171,35 @@ Rollout results belong to these continuations. The native leaf packet
 currently exposes the tree and leaf IDs without the traversed action path,
 so these results cannot serve as labels for individual simulated leaves.
 
+## Fit a head from saved disagreement pairs
+
+`train_value.py --position-source saved-mcts-pairs --saved-pairs DIRECTORY`
+loads the real successor observations from that diagnostic. It verifies the
+saved terminal labels against completed paired rollouts, checks the player
+perspective and re-encodes each observation with the frozen input checkpoint.
+The encoded features must agree with the saved features. Input settings for
+map size, map type, tribes and visible history must match the dataset.
+
+The head learns mean terminal results through MSE. An additional MSE term
+compares the difference between both branch values in the original player's
+perspective. Gaps are divided by two before squaring, keeping their scale
+comparable with the individual value targets. The rest of the network is
+frozen. Both branches and every position from a map stay in the same split.
+By default 25% of map seeds are held out for checkpoint selection. The split
+uses `--selection-seed`. The combined held-out loss selects the checkpoint,
+including the initial head as a reference.
+
+The selected head and a zero-value control then play MCTS at
+`--simulations` against the fixed raw opponent. Every new validation map is
+played from both seats. The validation schedule is rejected if it overlaps
+any source map from the saved diagnostic. Only complete map pairs common to
+both arms contribute to their score difference.
+
+`config.json` records the exact pair IDs and map seeds in each split,
+dataset checksums and the loss settings. `summary.json` reports the offline
+RMSE, gap RMSE, preference accuracy, chosen update and paired arena results.
+The selected checkpoint is saved before the arena starts.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

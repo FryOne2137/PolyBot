@@ -1,4 +1,4 @@
-"""Fit only a checkpoint's value head on terminal game outcomes."""
+"""Fit only a checkpoint's value head on game outcomes or saved branch pairs."""
 
 from __future__ import annotations
 
@@ -398,6 +398,95 @@ def fit_mcts_soft_z_value(args, model, opponent, config, training, schedules, ru
     return report
 
 
+def fit_saved_mcts_pairs(args, model, opponent, config, training, schedules, run) -> dict[str, Any]:
+    from polybot.training.mcts_value import evaluate_mcts_value_heads
+    from polybot.training.saved_value_pairs import load_saved_value_pairs, split_value_pairs
+
+    examples, source = load_saved_value_pairs(
+        model, training, args.saved_pairs, history=args.visible_action_history,
+    )
+    _, validation_seed, games = schedules[2]
+    validation_seeds = set(range(validation_seed, validation_seed + games // 2))
+    if validation_seeds.intersection(source["reserved_map_seeds"]):
+        raise ValueError("--validation-seed overlaps the saved dataset's source maps")
+    datasets, split = split_value_pairs(
+        examples, seed=args.selection_seed, selection_fraction=args.pair_selection_fraction,
+    )
+    mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
+    run.write_config(
+        training=training, model=config, mcts=mcts, source=source, split=split,
+        loss="MSE(value, terminal_mean) + weight * MSE(root_value_gap / 2, root_target_gap / 2)",
+        difference_loss_weight=args.difference_loss_weight, validation_map_seeds=sorted(validation_seeds),
+        frozen_parameters="all except value_head", opponent_value_scale=args.opponent_value_scale,
+    )
+    print(
+        f"saved value pairs | loaded={source['labelled_pairs']} | "
+        f"train={split['train']['pairs']} pairs/{len(split['train']['map_seeds'])} maps | "
+        f"selection={split['selection']['pairs']} pairs/{len(split['selection']['map_seeds'])} maps",
+        flush=True,
+    )
+    report: dict[str, Any] = {
+        "source": source, "split": split, "saved_checkpoint": None, "head_updated": False,
+        "mcts_improved": False,
+    }
+    settings = FlatImprovements(
+        value_updates=args.updates, value_batch_size=args.batch_size, value_learning_rate=args.learning_rate,
+        value_capacity=max(len(datasets["train"]), args.batch_size), value_fit_backoffs=0,
+    )
+    heads, fits = fit_paired_value_heads(
+        model, datasets["train"], datasets["selection"], settings,
+        seed=training.seed, difference_weight=args.difference_loss_weight,
+        loss_variants=("mse_delta",), preserve_reference=True,
+    )
+    report["fit"] = fit = fits.get("mse_delta", {})
+    if "mse_delta" not in heads:
+        return {**report, "reason": "no_finite_value_head"}
+    for stage in ("before", "after"):
+        fit[stage].update(
+            games=len({row.game_key[:2] for row in datasets["selection"]}),
+            maps=len(split["selection"]["map_seeds"]), pairs=split["selection"]["pairs"],
+        )
+    report["head_updated"] = fit["kept_update"]
+    run.log(updates=fit["updates"], selected_updates=fit["selected_updates"], **{
+        f"{stage}_{metric}": fit[stage][metric]
+        for stage in ("before", "after")
+        for metric in ("rmse", "gap_rmse", "preference_accuracy", "selection_loss")
+    })
+    print(
+        f"saved value fit | selected_updates={fit['selected_updates']}/{fit['updates']} | "
+        f"selection_loss={fit['before']['selection_loss']:.6f}->{fit['after']['selection_loss']:.6f} | "
+        f"gap_rmse={fit['before']['gap_rmse']:.4f}->{fit['after']['gap_rmse']:.4f}",
+        flush=True,
+    )
+    original = deepcopy(model.value_head.state_dict())
+    try:
+        model.value_head.load_state_dict(heads["mse_delta"])
+        save_model(args.model_out, model, config)
+    finally:
+        model.value_head.load_state_dict(original)
+    report["saved_checkpoint"] = str(args.model_out)
+    report["reason"] = "mcts_benchmark_pending"
+    run.event("saved_pair_value_checkpoint", checkpoint=args.model_out, head_updated=report["head_updated"])
+    run.finish(report, plots=False)
+
+    benchmark = evaluate_mcts_value_heads(
+        model, opponent, replace(training, seed=validation_seed), mcts, games,
+        fitted_heads={"mse_delta": heads["mse_delta"]}, isolate_failed_pairs=True,
+        num_envs=args.num_envs, num_threads=args.num_threads, visible_action_history=args.visible_action_history,
+        max_pending_leaves=args.max_pending_leaves, opponent_value_scale=args.opponent_value_scale,
+    )
+    report["mcts_benchmark"] = benchmark
+    report["mcts_improved"] = benchmark["beats_zero"]
+    report["reason"] = (
+        "mcts_benchmark_invalid" if not benchmark["valid"]
+        else "mcts_improved" if benchmark["beats_zero"] else "mcts_no_demonstrated_improvement"
+    )
+    run.log(compared_mcts_games=benchmark["compared_games_per_arm"], **{
+        f"mcts_{arm}_score": score for arm, score in benchmark["paired_scores"].items()
+    })
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_environment_options(parser)
@@ -406,8 +495,11 @@ def main() -> None:
     parser.add_argument("--opponent", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, required=True)
     parser.add_argument("--position-source", choices=(
-        "raw", "mcts-branches", "mcts-terminal", "mcts-turn-start", "mcts-soft-z",
+        "raw", "mcts-branches", "mcts-terminal", "mcts-turn-start", "mcts-soft-z", "saved-mcts-pairs",
     ), default="raw")
+    parser.add_argument("--saved-pairs", type=Path, help="mcts-value-disagreements output directory")
+    parser.add_argument("--pair-selection-fraction", type=float, default=0.25,
+                        help="Fraction of whole saved maps reserved for head selection")
     parser.add_argument("--train-games", type=int, default=128)
     parser.add_argument("--selection-games", type=int, default=32)
     parser.add_argument("--validation-games", type=int, default=48)
@@ -446,6 +538,7 @@ def main() -> None:
     parser.set_defaults(learning_rate=0.0001, max_moves=1600)
     args = parser.parse_args()
     training = training_config_from_args(args)
+    saved_pairs_mode = args.position_source == "saved-mcts-pairs"
 
     if args.model_out.resolve() in {args.model_in.resolve(), args.opponent.resolve()}:
         parser.error("--model-out must be separate from the input checkpoints")
@@ -481,6 +574,17 @@ def main() -> None:
         args.mse_model_out = args.model_out.with_name(f"{args.model_out.stem}-mse{args.model_out.suffix}")
         if args.mse_model_out.resolve() in {args.model_in.resolve(), args.opponent.resolve(), args.model_out.resolve()}:
             parser.error("derived MSE output must be separate from the input checkpoints and --model-out")
+    if saved_pairs_mode:
+        if args.saved_pairs is None or not args.saved_pairs.is_dir():
+            parser.error("saved-mcts-pairs requires --saved-pairs pointing to the diagnostic directory")
+        if args.batch_size < 2 or args.batch_size % 2:
+            parser.error("saved pair training requires an even batch size of at least two")
+        if not 0 < args.pair_selection_fraction < 1 or args.selection_seed < 0:
+            parser.error("require --pair-selection-fraction in (0, 1) and a non-negative split seed")
+        if not np.isfinite(args.difference_loss_weight) or args.difference_loss_weight <= 0.0:
+            parser.error("--difference-loss-weight must be finite and positive")
+    elif args.saved_pairs is not None:
+        parser.error("--saved-pairs requires --position-source saved-mcts-pairs")
     if args.position_source == "mcts-soft-z":
         if args.teacher_simulations <= args.simulations or args.teacher_simulations < args.turn_candidates:
             parser.error("--teacher-simulations must exceed --simulations and cover all turn candidates")
@@ -499,7 +603,7 @@ def main() -> None:
         ("validation", args.validation_seed, args.validation_games),
     )
     used_seeds: set[int] = set()
-    for label, seed, games in schedules:
+    for label, seed, games in schedules[2:] if saved_pairs_mode else schedules:
         if games < 4 or games % 2:
             parser.error(f"{label} requires at least four games and an even game count")
         if seed < 1 or seed + games // 2 - 1 > 2**31 - 1:
@@ -517,7 +621,10 @@ def main() -> None:
     opponent.requires_grad_(False)
     run = training_run_from_args(args, "value")
     if args.position_source != "raw":
-        fit_mcts = {"mcts-branches": fit_mcts_branch_value, "mcts-soft-z": fit_mcts_soft_z_value}.get(
+        fit_mcts = {
+            "mcts-branches": fit_mcts_branch_value, "mcts-soft-z": fit_mcts_soft_z_value,
+            "saved-mcts-pairs": fit_saved_mcts_pairs,
+        }.get(
             args.position_source, fit_mcts_terminal_value,
         )
         report = fit_mcts(args, model, opponent, config, training, schedules, run)

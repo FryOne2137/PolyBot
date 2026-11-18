@@ -113,12 +113,13 @@ class TurnReplySearch:
                 worlds.append(world)
         return worlds
 
-    def _score_branches(self, worlds, actions, root_player):
+    def _rollout_branches(self, worlds, actions, root_player):
         # All candidates start from clones of the same hypotheses. The live
         # simulator is only used to build the detached worlds.
         branches = [world.clone() for world in worlds for _ in actions]
         scores = np.full(len(branches), np.nan, dtype=np.float64)
         observed_reply = np.zeros(len(branches), dtype=bool)
+        ready = np.zeros(len(branches), dtype=bool)
         for index, branch in enumerate(branches):
             winner = _step_world(branch, int(actions[index % len(actions)]))
             if winner is not None:
@@ -126,21 +127,15 @@ class TurnReplySearch:
 
         simulated_actions = len(branches)
         for depth in range(1, self.max_rollout_actions + 1):
-            candidate_rows, opponent_rows, leaf_rows = [], [], []
-            for index in np.flatnonzero(np.isnan(scores)):
+            candidate_rows, opponent_rows = [], []
+            for index in np.flatnonzero(np.isnan(scores) & ~ready):
                 if branches[index].current_player() != root_player:
                     observed_reply[index] = True
                     opponent_rows.append(index)
                 elif observed_reply[index]:
-                    leaf_rows.append(index)
+                    ready[index] = True
                 else:
                     candidate_rows.append(index)
-            if leaf_rows:
-                _, _, output = self._forward(self.model, [branches[index] for index in leaf_rows])
-                values = output.value.reshape(-1).tolist()
-                if not np.isfinite(values).all():
-                    raise RuntimeError("nonfinite value after opponent reply")
-                scores[leaf_rows] = values
             if depth == self.max_rollout_actions or not (candidate_rows or opponent_rows):
                 break
             for rows, opponent in ((candidate_rows, False), (opponent_rows, True)):
@@ -152,7 +147,17 @@ class TurnReplySearch:
                     if winner is not None:
                         scores[index] = _outcome(winner, root_player)
                 simulated_actions += len(rows)
-        return scores.reshape(len(worlds), len(actions)), simulated_actions
+        return scores.reshape(len(worlds), len(actions)), ready.reshape(len(worlds), len(actions)), branches, simulated_actions
+
+    def _score_branches(self, worlds, actions, root_player):
+        scores, ready, branches, steps = self._rollout_branches(worlds, actions, root_player)
+        if ready.any():
+            _, _, output = self._forward(self.model, [branches[index] for index in np.flatnonzero(ready)])
+            values = output.value.reshape(-1).tolist()
+            if not np.isfinite(values).all():
+                raise RuntimeError("nonfinite value after opponent reply")
+            scores[ready] = values
+        return scores, steps
 
     @torch.inference_mode()
     def decide(self, env) -> TurnReplyDecision:

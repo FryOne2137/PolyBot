@@ -435,6 +435,87 @@ def test_mcts_terminal_benchmark_compares_all_scales_against_zero(monkeypatch):
     assert report["beats_zero"]
 
 
+def test_matched_soft_z_uses_same_inputs_and_backs_up_post_reply_values(monkeypatch):
+    from types import SimpleNamespace
+
+    from polybot.evaluation.mcts_diagnostics import _ReplayPosition
+    from polybot.training import turn_value
+    from polybot.training.flat_value import EncodedValuePosition
+
+    example = EncodedValuePosition(np.array([1.0, 2.0]), 0, -1.0, (2137, 0), "opening")
+    root = turn_value.ValueRoot(example, _ReplayPosition(0, 2137, 0, 0, "public"))
+    missing = turn_value.RepliedBranches(np.array([11, 21]), np.array([0.6, 0.4]),
+                                         np.empty((0, 2)), np.empty((0, 2), dtype=bool), [], 2)
+    branches = turn_value.RepliedBranches(
+        np.array([11, 21]), np.array([0.6, 0.4]),
+        np.array([[1.0, np.nan], [-1.0, np.nan]]), np.array([[False, True], [False, True]]),
+        ["after_reply_one", "after_reply_two"], 3,
+    )
+    monkeypatch.setattr(turn_value, "_replied_positions", lambda *args, **kwargs: iter([(root, missing), (root, branches)]))
+
+    def deep(search, worlds, training, mcts, *, simulations, **kwargs):
+        assert worlds == ["after_reply_one", "after_reply_two"] and simulations == 16
+        return np.array([0.5, 0.9]), np.array([17, 17])
+
+    monkeypatch.setattr(turn_value, "_deep_reply_values", deep)
+    logged = []
+    datasets, stats = turn_value.label_soft_z(
+        SimpleNamespace(candidates=2), [root, root], {0: []}, TrainingConfig(device="cpu"),
+        MCTSConfig(simulations=4), simulations=16, num_threads=1, opponent_value_scale=1.0,
+        record=logged.append, label="test",
+    )
+    terminal, soft_z = datasets["terminal"][0], datasets["soft_z"][0]
+    assert terminal is example and terminal.features is soft_z.features
+    assert terminal.return_target == -1.0 and 0.35 < soft_z.return_target < 0.7
+    assert stats["matched"] == stats["unavailable"] == 1
+    assert logged[0]["soft_z_target"] is None
+    assert logged[1]["action_values"] == [0.0, 0.7]
+    assert sum(logged[1]["root_action_visits"]) == 16
+    assert logged[1]["post_reply_root_visits"] == [[0, 17], [0, 17]]
+
+
+def test_value_move_preference_excludes_reference_ties_and_counts_prediction_ties():
+    from polybot.training.turn_value import _preference_metrics
+
+    report = _preference_metrics([
+        {"terminal_gap": 1.0, "estimated_gaps": {"terminal": 0.5}},
+        {"terminal_gap": -1.0, "estimated_gaps": {"terminal": 0.0}},
+        {"terminal_gap": 0.0, "estimated_gaps": {"terminal": -0.25}},
+    ], "terminal")
+    assert report["informative_pairs"] == 2 and report["reference_ties"] == 1
+    assert report["predicted_ties"] == report["correct_preferences"] == 1
+    assert report["preference_accuracy"] == 0.5
+    assert _preference_metrics([], "terminal")["preference_accuracy"] is None
+
+
+def test_value_benchmark_isolates_invalid_pairs_without_replacing_maps(monkeypatch):
+    from polybot.training import mcts_value
+
+    model = tiny_model()
+    tried = []
+
+    def play(candidate, opponent, training, mcts, games, **kwargs):
+        schedule = kwargs["map_seeds"]
+        tried.append(tuple(schedule))
+        assert not kwargs["replace_failed_pairs"]
+        if kwargs["leaf_value_scale"] == 1.0 and 2137 in schedule:
+            return {"valid": False, "invalid_reason": "recovery failed"}
+        for i, seed in enumerate(schedule):
+            kwargs["game_callback"]({"map_seed": seed, "model_a_player": i % 2, "score_a": 0.5, "truncated": False})
+        return {"valid": True, "evaluated_map_seeds": schedule}
+
+    monkeypatch.setattr(mcts_value, "evaluate_matches_pool", play)
+    report = mcts_value.evaluate_mcts_value_heads(
+        model, model, TrainingConfig(device="cpu", seed=2137), MCTSConfig(simulations=32), 4,
+        num_envs=4, num_threads=1, visible_action_history=32, max_pending_leaves=4, opponent_value_scale=1.0,
+        fitted_heads={"terminal": model.value_head.state_dict(), "soft_z": model.value_head.state_dict()},
+        isolate_failed_pairs=True,
+    )
+    assert report["compared_map_seeds"] == [2138]
+    assert report["paired_map_scores"][0]["scores_by_player"] == dict.fromkeys(("terminal", "soft_z", "zero"), [0.5, 0.5])
+    assert tried.count((2137, 2137)) == tried.count((2138, 2138)) == 2
+
+
 def test_branch_collection_selects_disagreements_and_averages_paired_repeats(monkeypatch):
     from polybot.training import mcts_value
     from polybot.training.routed_self_play_pool import RoutedPoolSearch

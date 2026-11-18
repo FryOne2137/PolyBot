@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -289,6 +290,114 @@ def fit_mcts_branch_value(args, model, opponent, config, training, schedules, ru
     return report
 
 
+def fit_mcts_soft_z_value(args, model, opponent, config, training, schedules, run) -> dict[str, Any]:
+    from polybot.planning.turn_reply import TurnReplySearch
+    from polybot.training.mcts_value import evaluate_mcts_value_heads
+    from polybot.training.turn_value import (
+        collect_value_roots, evaluate_move_preferences, fit_matched_value_heads, label_soft_z,
+    )
+
+    mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
+    pool = dict(
+        num_envs=args.num_envs, num_threads=args.num_threads,
+        visible_action_history=args.visible_action_history, max_pending_leaves=args.max_pending_leaves,
+        opponent_value_scale=args.opponent_value_scale,
+    )
+    search = TurnReplySearch(
+        model, opponent, next(model.parameters()).device, candidates=args.turn_candidates,
+        particles=args.particles, visible_action_history=args.visible_action_history,
+        max_rollout_actions=args.turn_max_rollout_actions, belief_retries=4,
+        belief_temperature=mcts.belief_particle_temperature,
+    )
+    run.write_config(
+        training=training, model=config, mcts=mcts, schedules=schedules, targets=["terminal", "soft_z"],
+        collection_leaf_value_scales=(0.0, args.opponent_value_scale), benchmark_opponent="raw",
+        teacher_simulations_per_post_reply_root=args.teacher_simulations,
+        turn_candidates=args.turn_candidates, turn_max_rollout_actions=args.turn_max_rollout_actions,
+        ranking_games=args.ranking_games, ranking_positions=args.ranking_positions,
+        ranking_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature,
+    )
+    report: dict[str, Any] = {"collection": {}, "saved_checkpoints": {}, "mcts_improved": False}
+    reserved = {name: set(range(seed, seed + games // 2)) for name, seed, games in schedules}
+    attempted: set[int] = set()
+    datasets = {}
+    for name, seed, games in schedules[:2]:
+        split = replace(training, seed=seed)
+        roots, prefixes, info = collect_value_roots(
+            model, opponent, split, mcts, games, label=f"value {name}", positions_per_game=args.positions_per_game,
+            excluded_map_seeds=attempted.union(*(maps for key, maps in reserved.items() if key != name)),
+            **pool,
+        )
+        attempted.update(info["attempted_map_seeds"])
+        report["collection"][name] = info
+        run.event("turn_value_collection", split=name, **info)
+        if not info["valid"]:
+            return {**report, "reason": f"{name}_incomplete_collection"}
+        path = run.directory / f"{name}_matched_targets.jsonl"
+        with path.open("w", encoding="utf-8", buffering=1) as stream:
+            datasets[name], labels = label_soft_z(
+                search, roots, prefixes, split, mcts, simulations=args.teacher_simulations,
+                num_threads=args.num_threads, opponent_value_scale=args.opponent_value_scale,
+                record=lambda row: stream.write(json.dumps(row, allow_nan=False) + "\n"), label=f"value {name}",
+            )
+        info.update(labels=labels, label_file=str(path))
+        run.event("turn_value_matched_labels", split=name, **labels)
+        if labels["maps"] < 2 or not all(labels["phases"].values()):
+            return {**report, "reason": f"{name}_insufficient_matched_labels"}
+
+    settings = FlatImprovements(
+        value_updates=args.updates, value_batch_size=args.batch_size, value_learning_rate=args.learning_rate,
+        value_capacity=max(len(datasets["train"]["terminal"]), args.batch_size), value_fit_backoffs=0,
+    )
+    heads, report["fit"] = fit_matched_value_heads(model, training, datasets, settings, seed=training.seed)
+    if len(heads) != 2:
+        return {**report, "reason": "missing_fitted_value_head"}
+    original = deepcopy(model.value_head.state_dict())
+    try:
+        for name, path in (("terminal", args.terminal_model_out), ("soft_z", args.model_out)):
+            model.value_head.load_state_dict(heads[name])
+            save_model(path, model, config)
+            report["saved_checkpoints"][name] = str(path)
+            run.event("experimental_checkpoint_saved", target=name, checkpoint=path)
+    finally:
+        model.value_head.load_state_dict(original)
+
+    _, seed, games = schedules[2]
+    validation = replace(training, seed=seed)
+    benchmark = evaluate_mcts_value_heads(
+        model, opponent, validation, mcts, games, fitted_heads=heads, isolate_failed_pairs=True, **pool,
+    )
+    scores = benchmark["paired_scores"]
+    benchmark["soft_z_minus_terminal"] = scores["soft_z"] - scores["terminal"] if benchmark["valid"] else None
+    report.update(mcts_benchmark=benchmark, mcts_improved=benchmark["beats_zero"])
+    if not benchmark["valid"]:
+        report["reason"] = "mcts_benchmark_invalid"
+    else:
+        report["reason"] = "mcts_improved" if benchmark["beats_zero"] else "mcts_no_demonstrated_improvement"
+    run.log(compared_mcts_games=benchmark["compared_games_per_arm"], **{
+        f"mcts_{arm}_score": score for arm, score in benchmark["paired_scores"].items()
+    })
+
+    roots, prefixes, info = collect_value_roots(
+        model, opponent, validation, mcts, args.ranking_games, label="ranking reference", raw=True,
+        excluded_map_seeds=attempted, positions_per_game=args.positions_per_game, **pool,
+    )
+    path = run.directory / "ranking_pairs.jsonl"
+    with path.open("w", encoding="utf-8", buffering=1) as stream:
+        rankings = evaluate_move_preferences(
+            search, heads, validation, roots, prefixes, num_envs=args.num_envs, positions=args.ranking_positions,
+            branch_rollouts=args.branch_rollouts, rollout_temperature=args.rollout_temperature,
+            record=lambda row: stream.write(json.dumps(row, allow_nan=False) + "\n"),
+        )
+    report["move_preferences"] = {**rankings, "collection": info, "pair_file": str(path)}
+    run.log(**{
+        f"{arm}_{metric}": measurements[metric]
+        for arm, measurements in rankings["arms"].items()
+        for metric in ("preference_accuracy", "gap_rmse")
+    })
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_environment_options(parser)
@@ -296,7 +405,9 @@ def main() -> None:
     parser.add_argument("--model-in", type=Path, required=True)
     parser.add_argument("--opponent", type=Path, required=True)
     parser.add_argument("--model-out", type=Path, required=True)
-    parser.add_argument("--position-source", choices=("raw", "mcts-branches", "mcts-terminal", "mcts-turn-start"), default="raw")
+    parser.add_argument("--position-source", choices=(
+        "raw", "mcts-branches", "mcts-terminal", "mcts-turn-start", "mcts-soft-z",
+    ), default="raw")
     parser.add_argument("--train-games", type=int, default=128)
     parser.add_argument("--selection-games", type=int, default=32)
     parser.add_argument("--validation-games", type=int, default=48)
@@ -318,12 +429,18 @@ def main() -> None:
                         help="Number of legal first actions compared by turn-reply search")
     parser.add_argument("--turn-max-rollout-actions", type=int, default=96,
                         help="Limit per simulated branch in turn-reply search; incomplete worlds are excluded")
+    parser.add_argument("--teacher-simulations", type=int, default=128,
+                        help="Deeper simulations per post-reply root in mcts-soft-z")
+    parser.add_argument("--ranking-games", type=int, default=8,
+                        help="Number of validation games replayed with raw policies to sample ranking roots")
+    parser.add_argument("--ranking-positions", type=int, default=12,
+                        help="Maximum number of held-out two-action positions for the ranking test")
     parser.add_argument("--disagreement-probes-per-position", type=int, default=8,
                         help="Maximum probes per desired sample within each phase in mcts-branches mode")
     parser.add_argument("--branch-rollouts", type=int, default=3,
-                        help="Number of sampled raw rollouts per action in mcts-branches mode")
+                        help="Number of paired sampled raw rollouts per action for branch targets or ranking")
     parser.add_argument("--rollout-temperature", type=float, default=0.5,
-                        help="Common raw-policy sampling temperature for both actions in mcts-branches mode")
+                        help="Common raw-policy sampling temperature for both actions in branch rollouts")
     parser.add_argument("--difference-loss-weight", type=float, default=1.0,
                         help="Weight of the branch difference term in the second mcts-branches variant")
     parser.set_defaults(learning_rate=0.0001, max_moves=1600)
@@ -345,9 +462,11 @@ def main() -> None:
         or not 0.0 <= args.opponent_value_scale <= 1.0
     ):
         parser.error("require positive simulations and particles, 1–8 pending leaves and opponent value scale in [0, 1]")
-    if args.position_source in {"mcts-terminal", "mcts-turn-start"} and args.positions_per_game < 3:
+    if args.position_source in {"mcts-terminal", "mcts-turn-start", "mcts-soft-z"} and args.positions_per_game < 3:
         parser.error("terminal MCTS collection requires at least three positions per game for phase sampling")
-    if args.position_source == "mcts-turn-start" and (args.turn_candidates < 2 or args.turn_max_rollout_actions < 1):
+    if args.position_source in {"mcts-turn-start", "mcts-soft-z"} and (
+        args.turn_candidates < 2 or args.turn_max_rollout_actions < 1
+    ):
         parser.error("turn-reply search requires at least two candidates and a positive rollout limit")
     if args.position_source == "mcts-branches" and (
         args.disagreement_probes_per_position < 1 or args.branch_rollouts < 1
@@ -362,6 +481,17 @@ def main() -> None:
         args.mse_model_out = args.model_out.with_name(f"{args.model_out.stem}-mse{args.model_out.suffix}")
         if args.mse_model_out.resolve() in {args.model_in.resolve(), args.opponent.resolve(), args.model_out.resolve()}:
             parser.error("derived MSE output must be separate from the input checkpoints and --model-out")
+    if args.position_source == "mcts-soft-z":
+        if args.teacher_simulations <= args.simulations or args.teacher_simulations < args.turn_candidates:
+            parser.error("--teacher-simulations must exceed --simulations and cover all turn candidates")
+        if not 4 <= args.ranking_games <= args.validation_games or args.ranking_games % 2:
+            parser.error("--ranking-games must be even and in [4, --validation-games]")
+        if (args.ranking_positions < 1 or args.branch_rollouts < 1
+                or not np.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0.0):
+            parser.error("ranking requires positive position and rollout counts and a finite positive temperature")
+        args.terminal_model_out = args.model_out.with_name(f"{args.model_out.stem}-terminal{args.model_out.suffix}")
+        if args.terminal_model_out.resolve() in {args.model_in.resolve(), args.opponent.resolve(), args.model_out.resolve()}:
+            parser.error("derived terminal output must be separate from the input checkpoints and --model-out")
 
     schedules = (
         ("train", training.seed, args.train_games),
@@ -387,7 +517,9 @@ def main() -> None:
     opponent.requires_grad_(False)
     run = training_run_from_args(args, "value")
     if args.position_source != "raw":
-        fit_mcts = fit_mcts_branch_value if args.position_source == "mcts-branches" else fit_mcts_terminal_value
+        fit_mcts = {"mcts-branches": fit_mcts_branch_value, "mcts-soft-z": fit_mcts_soft_z_value}.get(
+            args.position_source, fit_mcts_terminal_value,
+        )
         report = fit_mcts(args, model, opponent, config, training, schedules, run)
         report["run_dir"] = str(run.finish(report, plots=False))
         print_summary(report)

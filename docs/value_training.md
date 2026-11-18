@@ -116,6 +116,41 @@ the same result, that position provides little evidence about their ranking.
 The existing `mcts-value-regression` mode provides a baseline for these
 checks at the individual-action horizon. [Training entry points](training.md)
 
+## Matched terminal and soft-Z targets
+
+`train_value.py --position-source mcts-soft-z` collects completed paired
+games with MCTS on the apprentice and a fixed raw opponent. It samples
+apprentice turn starts across all three phases. Both heads start from the
+same checkpoint and use the same frozen inputs, minibatch draws and MSE
+update budget. Checkpoint selection uses separate maps and the corresponding
+validation target for each head.
+
+The soft-Z teacher compares the highest-prior first actions on shared,
+action-equivalent belief particles. Both policies play greedily through the
+rest of the current turn and the opponent's full reply. The teacher runs
+deeper native MCTS from each live successor after the reply and uses exact
+outcomes for terminal branches. Worlds interrupted by the rollout limit are
+excluded for all candidates. The teacher averages each action's scores over
+the remaining worlds, allocates root visits by PUCT over these action
+values, and uses their visit-weighted mean as the soft-Z target. The training
+set includes only positions for which both targets are available.
+[Off-policy AlphaZero targets][off-policy]
+
+The arena compares the two fitted heads and the zero-value control at
+the same search budget (`--simulations 32`), with both player assignments
+on each new map and one fixed raw opponent. The opponent's value inside the
+search tree is held at `--opponent-value-scale`. Match deltas use only maps
+whose two games reached a terminal result in every arm.
+
+A separate ranking diagnostic picks two high-prior legal actions per
+held-out position. It scores both actions after the reply in the same
+belief worlds for every head. The reference runs repeated raw continuations
+on the original map with matching random seeds for the two actions. It
+reports preference accuracy on decisive mean returns and gap RMSE across
+positions with paired terminal continuations. A predicted tie counts as a
+miss when the reference prefers a move. Individual labels and continuations
+are written to JSONL, with both comparisons in `summary.json`.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

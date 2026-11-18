@@ -179,6 +179,8 @@ def _compare_leaf_scales(
     *,
     include_true_map: bool = True,
     variants: Sequence[tuple[str, float, PolicyValueBeliefNet]] | None = None,
+    observe_leaves: Callable | None = None,
+    observe_particles: Callable[[np.ndarray], None] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     worlds: list[np.ndarray] = []
     active = np.ones(search.num_envs, dtype=bool)
@@ -202,6 +204,7 @@ def _compare_leaf_scales(
 
     model = search.models[0]
     scale = search.leaf_value_scale
+    previous_observer = search.leaf_observer if observe_leaves is not None else None
     if variants is None:
         variants = (("value_1", 1.0, model), ("value_0", 0.0, model))
     decisions = {}
@@ -209,6 +212,8 @@ def _compare_leaf_scales(
         for index, (name, value_scale, candidate) in enumerate(variants):
             search.models[0] = candidate
             search.leaf_value_scale = value_scale
+            if observe_leaves is not None:
+                search.leaf_observer = partial(observe_leaves, f"belief_{name}")
             if index == 0:
                 root, _ = _evaluation_search_with_recovery(
                     search, request, active, on_submitted_beliefs=worlds.append,
@@ -226,11 +231,17 @@ def _compare_leaf_scales(
                     clear_forest()
                 search.models[0] = candidate
                 search.leaf_value_scale = value_scale
+                if observe_leaves is not None:
+                    search.leaf_observer = partial(observe_leaves, f"true_map_{name}")
                 root = _search_submitted_maps(search, request, truth)
                 decisions[f"true_map_{name}"] = _root_decisions(root)
     finally:
         search.models[0] = model
         search.leaf_value_scale = scale
+        if observe_leaves is not None:
+            search.leaf_observer = previous_observer
+    if observe_particles is not None:
+        observe_particles(worlds[0])
     return decisions
 
 

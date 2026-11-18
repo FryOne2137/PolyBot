@@ -1043,6 +1043,7 @@ class RoutedPoolSearch:
                 "raw-only evaluation must use evaluate_direct_matches, not SelfPlayPool"
             )
         self.counters = SearchCounters()
+        self.leaf_observer = None
         self._action_generator: torch.Generator | None = None
         if self.device.type in ("cpu", "cuda"):
             self._action_generator = torch.Generator(device=self.device)
@@ -1716,6 +1717,8 @@ class RoutedPoolSearch:
                 values[rows] = output.value.float().cpu().numpy()
                 if scale != 1.0:
                     values[rows] *= scale
+            if self.leaf_observer is not None:
+                self.leaf_observer(batch, rows, output.state, output.value, values[rows], self._capture_root_candidates)
         if self._capture_root_candidates and self._root_noise_enabled:
             add_dirichlet_noise_to_root_logits(
                 logits,

@@ -630,22 +630,57 @@ def test_branch_probe_reuses_particles_without_searching_the_true_map(monkeypatc
         belief_retries=4, seed=2137, belief_action_mode="root_shield", opponent_leaf_value_scale=1.0,
     )
     request = search.reset(np.array([2137], dtype=np.uint32), np.array([[0, 1]], dtype=np.int32))
+    observed = []
+    saved_particles = []
+
+    def capture(arm, packet, rows, encoded, predicted, backed_up, is_root):
+        assert len(rows) == len(encoded) == len(predicted) == len(backed_up)
+        if arm in {"belief_zero", "belief_value_0"}:
+            np.testing.assert_array_equal(backed_up[packet["agent_id"][rows] == 0], 0.0)
+        observed.append((arm, is_root))
+
+    options = {"include_true_map": False, "observe_leaves": capture, "observe_particles": saved_particles.append}
     if compare_heads:
         old = deepcopy(model)
         with torch.no_grad():
             old.value_head[-2].bias.add_(1.0)
         variants = (("zero", 0.0, model), ("old_quarter", 0.25, old), ("new_quarter", 0.25, model))
-        result = _compare_leaf_scales(search, request, include_true_map=False, variants=variants)
+        result = _compare_leaf_scales(search, request, variants=variants, **options)
         assert set(result) == {"belief_zero", "belief_old_quarter", "belief_new_quarter"}
         assert search.models[0] is model
         assert search.leaf_value_scale == 1.0
     else:
-        result = _compare_leaf_scales(search, request, include_true_map=False)
+        result = _compare_leaf_scales(search, request, **options)
         assert set(result) == {"belief_value_0", "belief_value_1"}
     assert all(0 < choices[0]["root_visits"] <= 32 for choices in result.values())
     assert len(worlds) == len(result)
     for world in worlds[1:]:
         np.testing.assert_array_equal(worlds[0], world)
+    assert search.leaf_observer is None and set(name for name, root in observed if root) == set(result)
+    np.testing.assert_array_equal(saved_particles[0], worlds[0])
+
+
+def test_disagreement_labels_use_paired_returns_and_successor_perspective(tmp_path):
+    import json
+
+    from polybot.evaluation.mcts_diagnostics import _ReplayPosition
+    from polybot.evaluation.value_disagreements import Disagreement, _pair_results, _save_supervised_pairs
+
+    pair = Disagreement(1, _ReplayPosition(0, 2137, 0, 8, "root"), (12, 13))
+    results = {1: [
+        {"outcomes": {"zero": {"score_a": 0.0}, "soft_z": {"score_a": 1.0}}},
+        {"outcomes": {"zero": {"score_a": 1.0}, "soft_z": {"score_a": None}}},
+    ]}
+    scores = _pair_results([pair], results, repeats=2)
+    assert scores["fully_measured_pairs"] == 0 and scores["completed_paired_repeats"] == 1
+    assert scores["soft_z_better"] == 1 and scores["map_balanced_score_delta"] == 1.0
+    np.savez_compressed(tmp_path / "pair-001-zero-successor.npz", to_play=0)
+    np.savez_compressed(tmp_path / "pair-001-soft_z-successor.npz", to_play=1)
+    assert _save_supervised_pairs(tmp_path, [pair], scores["positions"]) == 1
+    label = json.loads((tmp_path / "labelled_pairs.jsonl").read_text())
+    assert label["branches"]["zero"]["return_target"] == -1.0
+    assert label["branches"]["soft_z"]["return_target"] == -1.0
+    assert label["branches"]["soft_z"]["to_root_sign"] == -1
 
 
 def test_branch_fit_can_benchmark_an_update_with_worse_offline_rmse():

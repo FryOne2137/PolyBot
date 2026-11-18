@@ -151,6 +151,26 @@ positions with paired terminal continuations. A predicted tie counts as a
 miss when the reference prefers a move. Individual labels and continuations
 are written to JSONL, with both comparisons in `summary.json`.
 
+## Same-particle disagreement dataset
+
+`evaluate.py --mode mcts-value-disagreements` disables and enables the
+same apprentice value head at identical roots with identical accepted
+particles. Roots are sampled from fixed raw games with seat swaps, across
+all three phases. The diagnostic keeps only different first actions. Each
+action gets paired continuations on the original map with the same frozen
+MCTS (0,1) candidate and a sampled raw opponent. The opponent uses matching
+random streams across the two branches.
+
+The output directory stores native leaf packets and shared particles as
+compressed NumPy archives, root action prefixes and visits in
+`pairs.jsonl`, paired terminal results in `rollouts.jsonl`, and per-map
+score changes in `summary.json`. The real nonterminal positions immediately
+after the forced actions are saved separately for supervised use. Their
+labels and perspective signs are in `labelled_pairs.jsonl`.
+Rollout results belong to these continuations. The native leaf packet
+currently exposes the tree and leaf IDs without the traversed action path,
+so these results cannot serve as labels for individual simulated leaves.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

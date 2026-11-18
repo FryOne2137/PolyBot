@@ -29,7 +29,7 @@ def _map_seed_group(value: str) -> tuple[int, ...]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a checkpoint; write no games or metrics files")
+    parser = argparse.ArgumentParser(description="Evaluate a checkpoint or collect diagnostic MCTS positions")
     add_environment_options(parser)
     parser.add_argument("--model-a", type=Path, required=True)
     parser.add_argument("--model-b", type=Path, help="optional MCTS opponent; default is random")
@@ -38,18 +38,19 @@ def main() -> None:
         choices=(
             "mcts", "flat", "mcts-vs-raw", "mcts-diagnostics",
             "mcts-value-ablation", "mcts-value-diagnostics", "mcts-first-divergence", "mcts-value-matrix",
-            "mcts-branch-agreement", "mcts-value-regression",
+            "mcts-branch-agreement", "mcts-value-regression", "mcts-value-disagreements",
         ),
         default="mcts",
         help="Evaluate search, raw policy, search gain, or belief/value diagnostics (leaf scales 1, 0.25, 0)",
     )
     parser.add_argument("--games", type=int, default=10, help="Game count outside mcts-value-matrix")
     parser.add_argument("--branch-pairs", type=Path, help="Saved train_value.py pair JSONL for mcts-branch-agreement")
-    parser.add_argument("--branch-positions", type=int, default=6, help="Maximum saved pairs to replay or games to scan for a first value divergence")
+    parser.add_argument("--branch-positions", type=int, default=6, help="Maximum branch pairs to collect or replay")
+    parser.add_argument("--disagreement-output", type=Path, help="New output directory for mcts-value-disagreements")
     parser.add_argument("--old-value-model", type=Path, help="Checkpoint before fitting value, for mcts-value-regression")
     parser.add_argument(
         "--branch-rollouts", type=int,
-        help="Re-run raw and MCTS this many times per action on saved positions that raw distinguished",
+        help="Number of paired continuations per branch for branch diagnostics",
     )
     parser.add_argument(
         "--branch-rollout-temperature", type=float,
@@ -121,6 +122,17 @@ def main() -> None:
     elif args.map_seed_group is not None:
         parser.error("--map-seed-group requires --mode mcts-value-matrix")
     value_regression = args.mode == "mcts-value-regression"
+    value_disagreements = args.mode == "mcts-value-disagreements"
+    if value_disagreements:
+        if args.disagreement_output is None or args.disagreement_output.exists():
+            parser.error("mcts-value-disagreements requires a new --disagreement-output directory")
+        if (args.games < 2 or args.games % 2 or args.num_envs < 2 or args.positions_per_game < 1
+                or args.simulations < 2 or args.particles < 1 or args.max_moves < 1
+                or not 1 <= args.max_pending_leaves <= 8 or not 0 <= args.visible_action_history <= 1024
+                or args.belief_retries < 0):
+            parser.error("require paired games, positive probe/search budgets, and a valid leaf and history configuration")
+    elif args.disagreement_output is not None:
+        parser.error("--disagreement-output requires --mode mcts-value-disagreements")
     if value_regression:
         if args.old_value_model is None:
             parser.error("mcts-value-regression requires --old-value-model")
@@ -136,21 +148,25 @@ def main() -> None:
             parser.error("--mode mcts-branch-agreement requires an existing --branch-pairs file")
         if args.num_envs < 2:
             parser.error("mcts-branch-agreement requires --num-envs >= 2")
-    if args.mode == "mcts-branch-agreement" or value_regression:
+    if args.mode == "mcts-branch-agreement" or value_regression or value_disagreements:
+        if args.branch_pairs is not None and args.mode != "mcts-branch-agreement":
+            parser.error("--branch-pairs requires --mode mcts-branch-agreement")
         if args.branch_positions < 1:
             parser.error("--branch-positions must be positive")
         if args.branch_rollouts is not None and args.branch_rollouts < 1:
             parser.error("--branch-rollouts must be positive")
         if args.branch_rollout_temperature is not None and (
-            (args.branch_rollouts is None and not value_regression)
+            (args.branch_rollouts is None and not (value_regression or value_disagreements))
             or not math.isfinite(args.branch_rollout_temperature)
             or args.branch_rollout_temperature <= 0.0
         ):
             parser.error("--branch-rollout-temperature must be finite and positive, and requires rollouts")
     elif any(value is not None for value in (args.branch_pairs, args.branch_rollouts, args.branch_rollout_temperature)):
-        parser.error("branch rollout options require mcts-branch-agreement or mcts-value-regression")
+        parser.error("branch rollout options require a branch diagnostic mode")
 
     training = training_config_from_args(args)
+    if value_disagreements and training.seed + args.games // 2 - 1 >= 2**31:
+        parser.error("the full disagreement map schedule must fit in [1, 2**31 - 1]")
     device = select_device(training.device)
     model_a, _ = load_model(args.model_a, device)
     model_b = load_model(args.model_b, device)[0] if args.model_b is not None else None
@@ -245,6 +261,18 @@ def main() -> None:
 
             summary = evaluate_mcts_value_matrix(
                 model_a, model_b, training, mcts, args.map_seed_group, **pool_options,
+            )
+        elif value_disagreements:
+            from polybot.evaluation.value_disagreements import evaluate_value_disagreements
+
+            summary = evaluate_value_disagreements(
+                model_a, model_b, training, mcts, args.games, output=args.disagreement_output,
+                checkpoints={"soft_z": str(args.model_a), "opponent": str(args.model_b)},
+                target=args.branch_positions, samples_per_game=args.positions_per_game,
+                repeats=4 if args.branch_rollouts is None else args.branch_rollouts,
+                temperature=0.5 if args.branch_rollout_temperature is None else args.branch_rollout_temperature,
+                num_envs=args.num_envs, num_threads=args.mcts_threads, max_pending_leaves=args.max_pending_leaves,
+                history=args.visible_action_history, belief_retries=args.belief_retries,
             )
         elif value_regression:
             from polybot.evaluation.value_regression import evaluate_mcts_value_regression

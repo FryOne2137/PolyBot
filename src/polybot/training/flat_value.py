@@ -191,6 +191,24 @@ def _value_gap(values: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
     return root_values[:, 1] - root_values[:, 0]
 
 
+def _paired_metrics(predictions, reference, perspective, examples, difference_weight):
+    gaps = _value_gap(predictions, perspective)
+    reference_gaps = _value_gap(reference, perspective)
+    informative = reference_gaps != 0
+    mse = F.mse_loss(predictions, reference).item()
+    gap_mse = F.mse_loss(gaps, reference_gaps).item()
+    metrics = _metrics_by_phase(
+        predictions.detach().flatten().cpu().numpy(), reference.flatten().cpu().numpy(), examples,
+    )
+    return {
+        **metrics, "value_mse": mse, "gap_mse": gap_mse, "gap_rmse": float(np.sqrt(gap_mse)),
+        "informative_pairs": int(informative.sum().item()),
+        "preference_accuracy": float(((gaps[informative] * reference_gaps[informative]) > 0).float().mean().item())
+        if informative.any() else None,
+        "selection_loss": mse + difference_weight * gap_mse / 4.0,
+    }
+
+
 def fit_paired_value_heads(
     model, replay: Sequence[EncodedValuePosition], selection: Sequence[EncodedValuePosition],
     settings: FlatImprovements, *, seed: int, difference_weight: float,
@@ -214,20 +232,9 @@ def fit_paired_value_heads(
     def measure(features, reference, perspective, examples):
         with torch.no_grad():
             predictions = model.value_head(features).squeeze(-1).float()
-            gaps = _value_gap(predictions, perspective)
-            reference_gaps = _value_gap(reference, perspective)
-            informative = reference_gaps != 0
-            mse = F.mse_loss(predictions, reference).item()
-            gap_mse = F.mse_loss(gaps, reference_gaps).item()
-            metrics = _metrics_by_phase(
-                predictions.flatten().cpu().numpy(), reference.flatten().cpu().numpy(), examples,
+            return _paired_metrics(
+                predictions, reference, perspective, examples, difference_weight,
             )
-            return {**metrics, "value_mse": mse, "gap_mse": gap_mse, "gap_rmse": float(np.sqrt(gap_mse)),
-                    "informative_pairs": int(informative.sum().item()),
-                    "preference_accuracy": (
-                        float(((gaps[informative] * reference_gaps[informative]) > 0).float().mean().item())
-                        if informative.any() else None
-                    ), "selection_loss": mse + difference_weight * gap_mse / 4.0}
 
     start_state = deepcopy(model.value_head.state_dict())
     if full_batch:

@@ -259,6 +259,66 @@ ranking. Gradient diagnostics use the full-batch objective in this mode.
 This check measures whether the head can learn these training rankings.
 Transfer to held-out maps and value calibration remain separate measurements.
 
+## Calibrated ranking fit
+
+`scripts/train_ranked_value.py` fits only `value_head`. Use this after the
+memorization diagnostic shows that the head can learn branch rankings but
+gap-only updates damage absolute calibration. It accepts the same saved
+successor datasets through `--saved-pairs`. Repeat that option to combine
+additional collections. Pair IDs receive separate ranges, while all pairs
+from the same map stay together in the train or selection split. The
+ranking loss uses only pairs whose mean paired terminal returns differ.
+
+The script also collects separate complete games for absolute value MSE.
+By default the learner uses MCTS with zero leaf values, against the frozen
+raw opponent. Sampling covers thirds of each completed game and both
+seats. Truncated games supply no terminal labels. The train calibration
+maps, calibration selection maps, source-pair maps and final arena maps are
+disjoint, including any replacement maps attempted during collection.
+`--calibration-policy raw` switches only this collection policy.
+
+Complete collections are cached under `--calibration-cache` as compressed
+NPZ files with encoded states, terminal targets, map seeds, player IDs and
+phase labels. Their signatures include both checkpoints' fingerprints,
+device and collection settings. Head-only reruns can reuse these data.
+A cache with a currently reserved map is rejected. Incomplete collections
+are reported and stop the run before fitting. They never become cached
+terminal training sets.
+
+The training objective is normalized root-perspective gap MSE plus
+`calibration_weight * terminal_MSE`. Every weight in
+`--calibration-weights`, default `0.01,0.05,0.2,1.0`, starts from the same
+head and uses identical phase-balanced calibration minibatches. Informative
+training pairs form a full batch. Policy, belief and both shared encoders
+remain frozen.
+
+Each update is checked against the original head on held-out maps. Admission
+requires improved preference accuracy (or preservation of perfect accuracy),
+lower gap RMSE, no absolute RMSE regression by default, absolute RMSE at
+least as good as predicting zero, and no increase in absolute bias beyond
+`--calibration-bias-regression`, default `0.02`. The RMSE tolerance defaults
+to zero. Among admitted updates, selection prioritizes ranking accuracy,
+then gap RMSE, absolute RMSE and absolute bias. This is checkpoint selection
+on validation data. Its metrics are not an independent estimate of strength.
+
+If no update qualifies, the run records the rejection reasons and skips
+the arena. Otherwise it saves a separate checkpoint before playing MCTS
+with the selected head, the original head, and zero leaf value against the
+same raw opponent. Arena maps are fresh, each played from both seats. Only
+complete map pairs shared by all three arms enter score differences.
+`beats_zero` denotes a higher observed score for the selected head, without
+claiming statistical significance or automatic champion promotion.
+
+Each `calibration-WEIGHT` directory contains per-update `metrics.jsonl`,
+`metrics.csv` and `summary.json`. The root config records source checksums,
+map splits, checkpoint fingerprints, loss weights and gate settings. The
+root summary separates the original, selected and last attempted metrics,
+records cache paths, and reports arena validity and score differences.
+The number of informative pairs is printed before collection. A small
+number of informative selection pairs remains weak evidence even when
+all offline gates pass. Add independently collected pair directories to
+expand that part of the dataset.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

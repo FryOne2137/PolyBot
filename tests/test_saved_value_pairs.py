@@ -301,3 +301,56 @@ def test_memorization_uses_only_informative_training_pairs(saved_pairs):
     assert report["initial_diagnostics"]["train"]["informative_pairs"] == len(effective_ids)
     assert report["initial_diagnostics"]["train"]["gradients"]["scope"] == "full_batch_split"
     assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())
+
+
+@pytest.mark.parametrize("admit", [False, True])
+def test_calibrated_pipeline_gates_arena_and_reserves_all_maps(saved_pairs, monkeypatch, admit):
+    from copy import deepcopy
+
+    model, training, path = saved_pairs
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("ranked_value", scripts / "train_ranked_value.py")
+    trainer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trainer)
+    original = deepcopy(model.state_dict())
+    arena_calls = []
+
+    def collect(candidate, opponent, configuration, mcts, games, **kwargs):
+        seed = configuration.seed
+        assert games == 4 and {2137, 2138, 2139, 2140, 7000, 7001} <= set(kwargs["excluded_map_seeds"])
+        assert ({6000, 6001} if seed == 5000 else {5000, 5001}) <= set(kwargs["excluded_map_seeds"])
+        rows = [EncodedValuePosition(np.ones(16, dtype=np.float32), 0, 1, (seed + i, 0), "opening")
+                for i in range(2)]
+        return rows, {"valid": True, "labelled_maps": 2, "attempted_map_seeds": [seed, seed + 1], "cache_loaded": False}
+
+    def fit(candidate, *args, **kwargs):
+        state = deepcopy(candidate.value_head.state_dict())
+        state["2.bias"] += 0.1
+        return (state if admit else None), {"selected": {"update": 1} if admit else None}
+
+    def arena(candidate, opponent, configuration, mcts, games, **kwargs):
+        arena_calls.append(True)
+        assert configuration.seed == 7000 and games == 4
+        assert set(kwargs["fitted_heads"]) == {"calibrated", "original"}
+        assert all(torch.equal(value, candidate.state_dict()[key]) for key, value in original.items())
+        return {"valid": True, "beats_zero": True, "paired_scores": {"calibrated": 0.75, "original": 0.5, "zero": 0.5}}
+
+    monkeypatch.setattr(trainer, "cached_terminal_positions", collect)
+    monkeypatch.setattr(trainer, "fit_calibrated_heads", fit)
+    monkeypatch.setattr(trainer, "evaluate_mcts_value_heads", arena)
+    args = SimpleNamespace(
+        saved_pairs=[path], visible_action_history=0, pair_split_seed=81, pair_selection_fraction=0.25,
+        calibration_games=4, calibration_selection_games=4, validation_games=4,
+        calibration_selection_seed=6000, validation_seed=7000, simulations=32, particles=4,
+        num_envs=4, num_threads=1, max_pending_leaves=4, calibration_weights=(0.05,),
+        calibration_policy="mcts-zero", calibration_rmse_regression=0.0, calibration_bias_regression=0.02,
+        calibration_cache=path / "cache", positions_per_game=3, updates=4, batch_size=4, learning_rate=0.0001,
+        model_out=path / "calibrated.pt", log_interval=4,
+    )
+    report = trainer.run_experiment(args, model, model, model.config, replace(training, seed=5000),
+                                     TrainingRun(path / "calibrated-run"))
+    assert bool(arena_calls) is admit and args.model_out.is_file() is admit
+    assert report["head_updated"] is admit and report["benchmark_performed"] is admit
+    if admit:
+        assert report["score_delta_vs_original"] == report["score_delta_vs_zero"] == 0.25

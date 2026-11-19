@@ -1,0 +1,189 @@
+"""Fit informative branch rankings with terminal calibration and a gated MCTS arena."""
+
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+
+from _bootstrap import add_local_source_root
+
+add_local_source_root()
+
+from polybot.config import MCTSConfig
+from polybot.infrastructure.device import select_device
+from polybot.infrastructure.model_io import load_model, save_model
+from polybot.training.calibrated_value import (
+    cached_terminal_positions, fit_calibrated_heads, informative_pairs, load_ranking_sources,
+)
+from polybot.training.cli import (
+    add_environment_options, add_run_options, print_summary, training_config_from_args, training_run_from_args,
+)
+from polybot.training.flat_experiments import FlatImprovements, model_fingerprint
+from polybot.training.mcts_value import evaluate_mcts_value_heads
+from polybot.training.saved_value_pairs import split_value_pairs
+
+
+def run_experiment(args, model, opponent, config, training, run):
+    examples, source = load_ranking_sources(model, training, args.saved_pairs, history=args.visible_action_history)
+    ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
+    ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
+    report = {
+        "ranking_sources": source, "ranking_split": split, "saved_checkpoint": None, "head_updated": False,
+        "benchmark_performed": False, "beats_zero": None, "calibration": {},
+        "informative_pairs": {name: len(rows) // 2 for name, rows in ranking.items()},
+    }
+    schedules = {
+        "train": (training.seed, args.calibration_games),
+        "selection": (args.calibration_selection_seed, args.calibration_selection_games),
+        "arena": (args.validation_seed, args.validation_games),
+    }
+    planned = {name: set(range(seed, seed + games // 2)) for name, (seed, games) in schedules.items()}
+    reserved = set(source["reserved_map_seeds"])
+    for name, maps in planned.items():
+        if maps & reserved:
+            raise ValueError(f"{name} seeds overlap ranking or other calibration/evaluation maps")
+        reserved.update(maps)
+    mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
+    pool = dict(num_envs=args.num_envs, num_threads=args.num_threads, visible_action_history=args.visible_action_history,
+                max_pending_leaves=args.max_pending_leaves, opponent_value_scale=1.0)
+    run.write_config(training=training, model=config, mcts=mcts, ranking_sources=source, ranking_split=split,
+                     checkpoint_fingerprints={"model": model_fingerprint(model), "opponent": model_fingerprint(opponent)},
+                     schedules=schedules, calibration_weights=args.calibration_weights,
+                     calibration_policy=args.calibration_policy, rmse_regression=args.calibration_rmse_regression,
+                     bias_regression=args.calibration_bias_regression, frozen_parameters="all except value_head")
+    counts = report["informative_pairs"]
+    print(f"value ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
+          "split=whole_map", flush=True)
+    if not all(ranking.values()):
+        return {**report, "reason": "insufficient_informative_ranking_pairs"}
+    calibration = {}
+    attempted = set(source["reserved_map_seeds"])
+    for name in ("train", "selection"):
+        seed, games = schedules[name]
+        excluded = attempted | set().union(*(maps for key, maps in planned.items() if key != name))
+        calibration[name], summary = cached_terminal_positions(
+            model, opponent, replace(training, seed=seed), mcts, games,
+            cache_directory=args.calibration_cache, excluded_map_seeds=excluded,
+            positions_per_game=args.positions_per_game, pool=pool, policy=args.calibration_policy,
+        )
+        report["calibration"][name] = summary
+        attempted.update(summary["attempted_map_seeds"])
+        run.event("calibration_collection", split=name, **summary)
+        print(f"value calibration data | split={name} | positions={len(calibration[name])} | "
+              f"maps={summary['labelled_maps']} | cache_loaded={int(summary['cache_loaded'])}", flush=True)
+        if not summary["valid"] or summary["labelled_maps"] < 2 or not calibration[name]:
+            return {**report, "reason": f"{name}_insufficient_calibration_data"}
+    settings = FlatImprovements(
+        value_updates=args.updates, value_batch_size=args.batch_size, value_learning_rate=args.learning_rate,
+        value_capacity=max(args.batch_size, len(calibration["train"])), value_fit_backoffs=0,
+    )
+    state, report["fit"] = fit_calibrated_heads(
+        model, ranking, calibration, training, settings, weights=args.calibration_weights,
+        rmse_regression=args.calibration_rmse_regression, bias_regression=args.calibration_bias_regression,
+        run=run, log_interval=args.log_interval,
+    )
+    if state is None:
+        return {**report, "reason": "no_calibrated_ranking_improvement"}
+    original = deepcopy(model.value_head.state_dict())
+    try:
+        model.value_head.load_state_dict(state)
+        save_model(args.model_out, model, config)
+    finally:
+        model.value_head.load_state_dict(original)
+    report.update(saved_checkpoint=str(args.model_out), head_updated=True, reason="arena_pending")
+    run.finish(report, plots=False)
+    benchmark = evaluate_mcts_value_heads(
+        model, opponent, replace(training, seed=args.validation_seed), mcts, args.validation_games,
+        fitted_heads={"calibrated": state, "original": original}, isolate_failed_pairs=True, **pool,
+    )
+    report.update(mcts_benchmark=benchmark, benchmark_performed=True,
+                  beats_zero=benchmark["beats_zero"] if benchmark["valid"] else None,
+                  reason="arena_complete" if benchmark["valid"] else "arena_invalid")
+    if benchmark["valid"]:
+        scores = benchmark["paired_scores"]
+        report["beats_zero"] = scores["calibrated"] > scores["zero"]
+        report["score_delta_vs_original"] = scores["calibrated"] - scores["original"]
+        report["score_delta_vs_zero"] = scores["calibrated"] - scores["zero"]
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_environment_options(parser)
+    add_run_options(parser)
+    parser.add_argument("--model-in", type=Path, required=True)
+    parser.add_argument("--opponent", type=Path, required=True)
+    parser.add_argument("--model-out", type=Path, required=True)
+    parser.add_argument("--saved-pairs", type=Path, action="append", required=True)
+    parser.add_argument("--calibration-cache", type=Path, required=True)
+    parser.add_argument("--calibration-policy", choices=("mcts-zero", "raw"), default="mcts-zero")
+    parser.add_argument("--calibration-games", type=int, default=24)
+    parser.add_argument("--calibration-selection-games", type=int, default=8)
+    parser.add_argument("--calibration-selection-seed", type=int, default=2038127001)
+    parser.add_argument("--validation-games", type=int, default=16)
+    parser.add_argument("--validation-seed", type=int, default=2108127001)
+    parser.add_argument("--pair-split-seed", type=int, default=1768127001)
+    parser.add_argument("--pair-selection-fraction", type=float, default=0.25)
+    parser.add_argument("--positions-per-game", type=int, default=24)
+    parser.add_argument("--calibration-weights", default="0.01,0.05,0.2,1.0")
+    parser.add_argument("--calibration-rmse-regression", type=float, default=0.0)
+    parser.add_argument("--calibration-bias-regression", type=float, default=0.02)
+    parser.add_argument("--updates", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--simulations", type=int, default=32)
+    parser.add_argument("--particles", type=int, default=4)
+    parser.add_argument("--num-envs", type=int, default=4)
+    parser.add_argument("--num-threads", type=int, default=4)
+    parser.add_argument("--max-pending-leaves", type=int, default=4)
+    parser.add_argument("--visible-action-history", type=int, default=32)
+    parser.add_argument("--log-interval", type=int, default=64)
+    parser.set_defaults(learning_rate=0.0001, seed=1968127001, max_moves=1600)
+    args = parser.parse_args()
+    try:
+        args.calibration_weights = tuple(float(value) for value in args.calibration_weights.split(","))
+    except ValueError:
+        parser.error("--calibration-weights must contain comma-separated numbers")
+    if (not args.calibration_weights or len(set(args.calibration_weights)) != len(args.calibration_weights)
+            or any(not np.isfinite(weight) or weight <= 0 for weight in args.calibration_weights)):
+        parser.error("calibration weights must be unique finite positive values")
+    if not 0 < args.pair_selection_fraction < 1 or args.pair_split_seed < 0:
+        parser.error("require a selection fraction in (0, 1) and non-negative split seed")
+    if args.model_out.resolve() in {args.model_in.resolve(), args.opponent.resolve()}:
+        parser.error("--model-out must differ from both inputs")
+    if len({path.resolve() for path in args.saved_pairs}) != len(args.saved_pairs) or any(not path.is_dir() for path in args.saved_pairs):
+        parser.error("--saved-pairs must identify distinct existing directories")
+    if (args.updates < 1 or args.batch_size < 1 or args.positions_per_game < 3 or args.simulations < 1
+            or args.particles < 1 or args.num_envs < 2 or args.num_threads < 1 or args.log_interval < 1
+            or args.max_moves < 1 or not 1 <= args.max_pending_leaves <= 8
+            or not 0 <= args.visible_action_history <= 1024):
+        parser.error("invalid training, collection, search or history budget")
+    if not np.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        parser.error("--learning-rate must be finite and positive")
+    if any(not np.isfinite(value) or value < 0 for value in (
+        args.calibration_rmse_regression, args.calibration_bias_regression,
+    )):
+        parser.error("calibration regression tolerances must be finite and non-negative")
+    training = training_config_from_args(args)
+    for seed, games in ((training.seed, args.calibration_games),
+                        (args.calibration_selection_seed, args.calibration_selection_games),
+                        (args.validation_seed, args.validation_games)):
+        if games < 4 or games % 2 or seed < 1 or seed + games // 2 > 2**31:
+            parser.error("each collection/arena requires even game counts >= 4 and valid 31-bit map seeds")
+    device = select_device(training.device)
+    model, config = load_model(args.model_in, device)
+    opponent, _ = load_model(args.opponent, device)
+    model.requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    opponent.requires_grad_(False)
+    run = training_run_from_args(args, "value")
+    report = run_experiment(args, model, opponent, config, training, run)
+    report["run_dir"] = str(run.finish(report, plots=False))
+    print_summary(report)
+
+
+if __name__ == "__main__":
+    main()

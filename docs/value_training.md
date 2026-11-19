@@ -319,6 +319,64 @@ number of informative selection pairs remains weak evidence even when
 all offline gates pass. Add independently collected pair directories to
 expand that part of the dataset.
 
+## Collect confirmed new pairs before the calibrated fit
+
+`train_ranked_value.py --collect-decisive-pairs 50 --collected-pairs-dir DIRECTORY`
+adds a resumable collection before head fitting. It first loads the terminal
+calibration data. Add `--require-calibration-cache` to require the existing
+matching cache and fail immediately rather than collect those games again.
+Keep its original input checkpoint, device, seeds, map settings, history,
+game counts, positions per game and pool settings when reusing the cache.
+
+Source maps exclude every map in the old pair datasets, both calibration
+collections including attempted replacements, and the final arena. New
+raw source games play from both seats. Probes cover opening, midgame and
+endgame thirds. MCTS with value zero and one uses the same root particles
+to propose competing actions. Real successor observations and the particles
+are saved; this mode does not collect simulated-leaf training labels.
+
+For each candidate, both forced actions receive paired MCTS(0,1) versus
+sampled-raw continuations. The opponent RNG seed is identical between
+branches for a repeat and distinct across repeats. Only completed pairs
+count. The default schedule checks after 4, 8, 12 and 16 completed paired
+repeats. Uncertain cases receive more repeats. An exact two-sided paired
+sign test ignores tied repeats, using a per-look alpha of `(1-confidence)`
+divided by the number of scheduled looks. The direction must also agree
+with the mean score difference. Four identical nonzero differences do not
+pass the default test. After eight all-tied repeats, the candidate is set
+aside as having no observed difference; this does not establish equivalence.
+The test screens repeatable preferences, not a precise confidence interval
+for the mean gap or a claim of league strength. The look correction is per
+candidate, not across the whole mined dataset. See the [NIST paired sign
+test](https://www.itl.nist.gov/div898/software/dataplot/refman1/auxillar/signtest.htm)
+and [exact binomial test](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.binomtest.html).
+
+At most two confirmed pairs per source map are selected by default. Only
+confirmed pairs with two nonterminal successor packets enter
+`labelled_pairs.jsonl`. All candidates, paired scores, RNG seed tuples and
+uncertainty decisions remain available in `pairs.jsonl`, `rollouts.jsonl`
+and `decisions.json`. Source reservations and a pending-probe queue are
+checkpointed in `collection-state.json`. Reusing the directory resumes
+missing repeats without replaying completed ones. The directory verifies
+checkpoint fingerprints and collection settings; the time allowance can
+change between invocations. A partial trailing journal record from an
+interrupted write is recovered, while earlier corruption is rejected.
+
+The `50` target counts confirmed pairs. `--pair-collection-hours 8` bounds
+collection at the next native batch boundary, so the final in-flight batch
+may extend beyond that limit. Reaching 50 within the time allowance is not
+guaranteed. `--minimum-collected-pairs 20` explicitly allows fitting a
+smaller completed collection after a time or source-game limit. Without
+that option the minimum equals the target. Below the minimum the run saves
+progress and skips fitting. Offline gates and an optional arena follow
+collection and take additional time.
+
+When this collector is enabled, ranking training uses the new confirmed
+dataset. Previously supplied `--saved-pairs` directories remain recorded
+and reserve their maps. New pairs are split by whole map seed and checked
+against every calibration and arena reservation again before fitting.
+The original calibration and head-admission gates still apply.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

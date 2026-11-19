@@ -105,7 +105,7 @@ def _pack_rows(rows):
     }
 
 
-def _compare_probes(search, batch, prefixes, model):
+def _compare_probes(search, batch, prefixes, model, *, capture_leaves=True):
     request = _replay_positions(search, batch, prefixes, recover_beliefs=True)
     if np.any(request["agent_id"] != 0):
         raise RuntimeError("value disagreement probes must start on the apprentice's decision")
@@ -125,20 +125,24 @@ def _compare_probes(search, batch, prefixes, model):
 
     roots = _compare_leaf_scales(
         search, request, include_true_map=False, variants=(("zero", 0.0, model), ("soft_z", 1.0, model)),
-        observe_leaves=capture, observe_particles=lambda worlds: particles.append(worlds),
+        observe_leaves=capture if capture_leaves else None, observe_particles=lambda worlds: particles.append(worlds),
     )
     return roots, leaves, particles[0]
 
 
-def _branches(search, pairs, prefixes, repeat, temperature, output):
+def _branches(search, pairs, prefixes, repeat, temperature, output, *, save_missing_successors=False):
     positions = [pair.position for pair in pairs for _ in ARMS]
     actions = [action for pair in pairs for action in pair.actions]
     request = _replay_positions(search, positions, prefixes, recover_beliefs=True)
 
     def save_successors(packet):
-        if repeat:
+        if repeat and not save_missing_successors:
             return
         live = np.flatnonzero(~packet["terminated"].astype(bool))
+        if save_missing_successors:
+            live = np.array([row for row in live if not (
+                output / f"pair-{pairs[row // 2].pair_id:03d}-{ARMS[row % 2]}-successor.npz"
+            ).is_file()], dtype=np.int32)
         features = _encode_value_rows(search.models[0], search.training, search.device, packet, live) if live.size else []
         for row, encoded in zip(live, features, strict=True):
             pair = pairs[row // 2]

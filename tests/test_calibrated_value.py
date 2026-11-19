@@ -95,11 +95,18 @@ def test_terminal_cache_reuses_labels_and_rejects_reserved_maps(tmp_path, monkey
     restored, loaded = cached_terminal_positions(model, opponent, TrainingConfig(device="cpu"), MCTSConfig(), 4, **options)
     assert len(calls) == 1 and not info["cache_loaded"] and loaded["cache_loaded"]
     np.testing.assert_array_equal(restored[0].features, rows[0].features)
+    _, required = cached_terminal_positions(model, opponent, TrainingConfig(device="cpu"), MCTSConfig(), 4,
+                                            **options, require_existing=True)
+    assert required["cache_loaded"] and len(calls) == 1
     with pytest.raises(ValueError, match="reserved"):
         cached_terminal_positions(model, opponent, TrainingConfig(device="cpu"), MCTSConfig(), 4,
                                    **{**options, "excluded_map_seeds": {100}})
     with torch.no_grad():
         model.value_head[0].bias.add_(0.1)
+    with pytest.raises(FileNotFoundError, match="required calibration cache"):
+        cached_terminal_positions(model, opponent, TrainingConfig(device="cpu"), MCTSConfig(), 4,
+                                  **options, require_existing=True)
+    assert len(calls) == 1
     _, changed = cached_terminal_positions(model, opponent, TrainingConfig(device="cpu"), MCTSConfig(), 4, **options)
     assert len(calls) == 2 and not changed["cache_loaded"]
     assert changed["cache_path"] != info["cache_path"]

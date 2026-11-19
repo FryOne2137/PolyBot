@@ -47,7 +47,7 @@ def informative_pairs(examples):
 
 
 def cached_terminal_positions(model, opponent, training, mcts, games, *, cache_directory,
-                              excluded_map_seeds, positions_per_game, pool, policy):
+                              excluded_map_seeds, positions_per_game, pool, policy, require_existing=False):
     """Cache only labels from complete seat-swapped games with matching weights."""
     identity = {
         "schema": 1, "model": model_fingerprint(model), "opponent": model_fingerprint(opponent),
@@ -74,6 +74,9 @@ def cached_terminal_positions(model, opponent, training, mcts, games, *, cache_d
         if not examples or any(not np.isfinite(row.features).all() or row.return_target not in (-1, 0, 1) for row in examples):
             raise ValueError("terminal cache contains invalid features or outcomes")
         return examples, {**summary, "cache_path": str(path), "cache_loaded": True}
+
+    if require_existing:
+        raise FileNotFoundError(f"required calibration cache is missing: {path}; keep the original checkpoint and collection settings")
 
     examples, summary = collect_mcts_terminal_value_games(
         model, opponent, training, mcts, games, positions_per_game=positions_per_game,

@@ -82,6 +82,39 @@ def test_saved_pairs_reencode_real_successors_and_split_whole_maps(saved_pairs):
     assert all(torch.equal(value, model.state_dict()[key]) for key, value in original.items())
 
 
+def test_saved_pairs_reserve_every_attempted_adaptive_source_map(saved_pairs):
+    model, training, path = saved_pairs
+    config = json.loads((path / "config.json").read_text())
+    config.update(source_games=0, reserved_map_seeds=[2137, 2138, 2139, 2140, 9001])
+    (path / "config.json").write_text(json.dumps(config))
+    _, source = load_saved_value_pairs(model, training, path, history=0)
+    assert source["reserved_map_seeds"] == [2137, 2138, 2139, 2140, 9001]
+
+
+def test_later_paired_repeat_saves_a_missing_successor_without_overwriting_existing_data(saved_pairs, monkeypatch):
+    from polybot.evaluation import value_disagreements as diagnostic
+
+    model, training, path = saved_pairs
+    pool = PublicRolloutPool(training, (model, model), num_envs=2, visible_action_history=0)
+    packet = pool.reset(np.array([2137, 2137], dtype=np.uint32), np.array([[0, 1], [0, 1]], dtype=np.int32))
+    pair = Disagreement(99, _ReplayPosition(0, 2137, 0, 0, "root"), (0, 1))
+    search = SimpleNamespace(models=(model, model), training=training, device=torch.device("cpu"))
+    monkeypatch.setattr(diagnostic, "_replay_positions", lambda *args, **kwargs: packet)
+
+    def continuations(*args, **kwargs):
+        kwargs["after_first_action"](packet)
+        return []
+
+    monkeypatch.setattr(diagnostic, "_play_replayed_continuations", continuations)
+    diagnostic._branches(search, [pair], {0: []}, 1, 0.5, path, save_missing_successors=True)
+    target = path / "pair-099-zero-successor.npz"
+    with np.load(target, allow_pickle=False) as data:
+        assert data["features"].shape == (16,)
+    original = target.read_bytes()
+    diagnostic._branches(search, [pair], {0: []}, 2, 0.5, path, save_missing_successors=True)
+    assert target.read_bytes() == original
+
+
 @pytest.mark.parametrize("corruption", ["target", "encoder", "map_type", "rollout"])
 def test_saved_pairs_reject_incompatible_or_unpaired_labels(saved_pairs, corruption):
     model, training, path = saved_pairs
@@ -354,3 +387,66 @@ def test_calibrated_pipeline_gates_arena_and_reserves_all_maps(saved_pairs, monk
     assert report["head_updated"] is admit and report["benchmark_performed"] is admit
     if admit:
         assert report["score_delta_vs_original"] == report["score_delta_vs_zero"] == 0.25
+
+
+@pytest.mark.parametrize("enough_new_pairs", [False, True])
+def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(saved_pairs, monkeypatch, enough_new_pairs):
+    model, training, path = saved_pairs
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("ranked_collector", scripts / "train_ranked_value.py")
+    trainer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trainer)
+    calls = []
+    new_dir = path / "new-pairs"
+    old_rows, old_source = load_saved_value_pairs(model, training, path, history=0)
+    load_sources = trainer.load_ranking_sources
+
+    def load(candidate, configuration, directories, **kwargs):
+        if directories == [new_dir]:
+            return [replace(row, game_key=(row.game_key[0] + 10000, *row.game_key[1:])) for row in old_rows], {
+                "sources": [], "reserved_map_seeds": [12137, 12138, 12139, 12140],
+            }
+        return load_sources(candidate, configuration, directories, **kwargs)
+
+    def cache(candidate, opponent, configuration, mcts, games, **kwargs):
+        assert kwargs["require_existing"]
+        calls.append("cache")
+        seed = configuration.seed
+        return [EncodedValuePosition(np.ones(16, dtype=np.float32), 0, 1, (seed + i, 0), "opening")
+                for i in range(2)], {"valid": True, "labelled_maps": 2,
+                                    "attempted_map_seeds": [seed, seed + 1, seed + 2], "cache_loaded": True}
+
+    def collect(*args, **kwargs):
+        assert calls == ["cache", "cache"]
+        assert {2137, 2138, 2139, 2140, 5000, 5001, 5002, 6000, 6001, 6002, 7000, 7001} <= kwargs["excluded_map_seeds"]
+        calls.append("collect")
+        return {"confirmed_pairs": 4 if enough_new_pairs else 0, "reached_target": enough_new_pairs}
+
+    def fit(candidate, ranking, calibration, *args, **kwargs):
+        calls.append("fit")
+        assert {row.game_key[0] for rows in ranking.values() for row in rows} == {12137, 12138, 12139, 12140}
+        return None, {"selected": None}
+
+    monkeypatch.setattr(trainer, "load_ranking_sources", load)
+    monkeypatch.setattr(trainer, "cached_terminal_positions", cache)
+    monkeypatch.setattr(trainer, "collect_decisive_value_pairs", collect)
+    monkeypatch.setattr(trainer, "fit_calibrated_heads", fit)
+    args = SimpleNamespace(
+        saved_pairs=[path], visible_action_history=0, pair_split_seed=81, pair_selection_fraction=0.25,
+        calibration_games=4, calibration_selection_games=4, validation_games=4,
+        calibration_selection_seed=6000, validation_seed=7000, simulations=32, particles=4,
+        num_envs=4, num_threads=1, max_pending_leaves=4, calibration_weights=(0.05,),
+        calibration_policy="mcts-zero", calibration_rmse_regression=0.0, calibration_bias_regression=0.02,
+        calibration_cache=path / "cache", positions_per_game=3, updates=4, batch_size=4, learning_rate=0.0001,
+        model_out=path / "new-head.pt", log_interval=4, require_calibration_cache=True,
+        collect_decisive_pairs=4, minimum_collected_pairs=4, collected_pairs_dir=new_dir,
+        pair_source_seed=9000, pair_source_games=8, pair_source_batch_games=4, pair_probes_per_game=3,
+        pair_min_rollouts=4, pair_max_rollouts=16, pair_rollout_step=4,
+        pair_confidence=0.95, pair_rollout_temperature=0.5, pair_max_pairs_per_map=2, pair_collection_hours=8,
+    )
+    report = trainer.run_experiment(args, model, model, model.config, replace(training, seed=5000),
+                                    TrainingRun(path / "collect-run"))
+    assert ("fit" in calls) is enough_new_pairs
+    assert not report["benchmark_performed"]
+    assert report["reason"] == ("no_calibrated_ranking_improvement" if enough_new_pairs else "insufficient_confirmed_new_pairs")

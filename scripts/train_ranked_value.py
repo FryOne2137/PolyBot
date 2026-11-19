@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -23,14 +23,19 @@ from polybot.training.cli import (
     add_environment_options, add_run_options, print_summary, training_config_from_args, training_run_from_args,
 )
 from polybot.training.flat_experiments import FlatImprovements, model_fingerprint
+from polybot.training.decisive_value_pairs import DecisivePairCollection, collect_decisive_value_pairs
 from polybot.training.mcts_value import evaluate_mcts_value_heads
 from polybot.training.saved_value_pairs import split_value_pairs
 
 
 def run_experiment(args, model, opponent, config, training, run):
+    collect_target = getattr(args, "collect_decisive_pairs", 0)
     examples, source = load_ranking_sources(model, training, args.saved_pairs, history=args.visible_action_history)
-    ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
-    ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
+    if collect_target:
+        ranking, split = {"train": [], "selection": []}, {"pending_new_collection": True}
+    else:
+        ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
+        ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
     report = {
         "ranking_sources": source, "ranking_split": split, "saved_checkpoint": None, "head_updated": False,
         "benchmark_performed": False, "beats_zero": None, "calibration": {},
@@ -50,15 +55,19 @@ def run_experiment(args, model, opponent, config, training, run):
     mcts = MCTSConfig(simulations=args.simulations, particles=args.particles)
     pool = dict(num_envs=args.num_envs, num_threads=args.num_threads, visible_action_history=args.visible_action_history,
                 max_pending_leaves=args.max_pending_leaves, opponent_value_scale=1.0)
-    run.write_config(training=training, model=config, mcts=mcts, ranking_sources=source, ranking_split=split,
+    configuration = dict(training=training, model=config, mcts=mcts, ranking_sources=source, ranking_split=split,
                      checkpoint_fingerprints={"model": model_fingerprint(model), "opponent": model_fingerprint(opponent)},
                      schedules=schedules, calibration_weights=args.calibration_weights,
                      calibration_policy=args.calibration_policy, rmse_regression=args.calibration_rmse_regression,
                      bias_regression=args.calibration_bias_regression, frozen_parameters="all except value_head")
-    counts = report["informative_pairs"]
-    print(f"value ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
-          "split=whole_map", flush=True)
-    if not all(ranking.values()):
+    run.write_config(**configuration)
+    if collect_target:
+        print(f"value ranking collection | target={collect_target} | minimum={args.minimum_collected_pairs}", flush=True)
+    else:
+        counts = report["informative_pairs"]
+        print(f"value ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
+              "split=whole_map", flush=True)
+    if not all(ranking.values()) and not collect_target:
         return {**report, "reason": "insufficient_informative_ranking_pairs"}
     calibration = {}
     attempted = set(source["reserved_map_seeds"])
@@ -69,6 +78,7 @@ def run_experiment(args, model, opponent, config, training, run):
             model, opponent, replace(training, seed=seed), mcts, games,
             cache_directory=args.calibration_cache, excluded_map_seeds=excluded,
             positions_per_game=args.positions_per_game, pool=pool, policy=args.calibration_policy,
+            require_existing=getattr(args, "require_calibration_cache", False),
         )
         report["calibration"][name] = summary
         attempted.update(summary["attempted_map_seeds"])
@@ -77,6 +87,33 @@ def run_experiment(args, model, opponent, config, training, run):
               f"maps={summary['labelled_maps']} | cache_loaded={int(summary['cache_loaded'])}", flush=True)
         if not summary["valid"] or summary["labelled_maps"] < 2 or not calibration[name]:
             return {**report, "reason": f"{name}_insufficient_calibration_data"}
+    if collect_target:
+        collection = _collection_settings(args)
+        summary = collect_decisive_value_pairs(
+            model, opponent, training, mcts, output=args.collected_pairs_dir, settings=collection,
+            excluded_map_seeds=attempted | planned["arena"], pool=pool,
+        )
+        report["decisive_collection"] = summary
+        run.event("decisive_pair_collection", **summary)
+        if summary["confirmed_pairs"] < args.minimum_collected_pairs:
+            return {**report, "reason": "insufficient_confirmed_new_pairs"}
+        examples, new_source = load_ranking_sources(model, training, [args.collected_pairs_dir], history=args.visible_action_history)
+        if len(examples) != 2 * summary["confirmed_pairs"]:
+            raise ValueError("confirmed pair count differs from the saved label count")
+        if set(new_source["reserved_map_seeds"]) & (attempted | planned["arena"]):
+            raise ValueError("new ranking source overlaps old source, calibration or arena maps")
+        ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
+        ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
+        report.update(previous_ranking_sources=source, ranking_sources=new_source, ranking_split=split,
+                      informative_pairs={name: len(rows) // 2 for name, rows in ranking.items()})
+        configuration.update(previous_ranking_sources=source, ranking_sources=new_source, ranking_split=split,
+                             decisive_collection=summary, collection_settings=asdict(collection))
+        run.write_config(**configuration)
+        counts = report["informative_pairs"]
+        print(f"confirmed ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
+              f"target_reached={int(summary['reached_target'])}", flush=True)
+        if not all(ranking.values()):
+            return {**report, "reason": "insufficient_informative_ranking_pairs"}
     settings = FlatImprovements(
         value_updates=args.updates, value_batch_size=args.batch_size, value_learning_rate=args.learning_rate,
         value_capacity=max(args.batch_size, len(calibration["train"])), value_fit_backoffs=0,
@@ -111,6 +148,16 @@ def run_experiment(args, model, opponent, config, training, run):
     return report
 
 
+def _collection_settings(args):
+    return DecisivePairCollection(
+        target=args.collect_decisive_pairs, seed=args.pair_source_seed, source_games=args.pair_source_games,
+        source_batch_games=args.pair_source_batch_games, probes_per_game=args.pair_probes_per_game,
+        min_rollouts=args.pair_min_rollouts, max_rollouts=args.pair_max_rollouts, rollout_step=args.pair_rollout_step,
+        confidence=args.pair_confidence, temperature=args.pair_rollout_temperature,
+        max_pairs_per_map=args.pair_max_pairs_per_map, hours=args.pair_collection_hours,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_environment_options(parser)
@@ -120,6 +167,23 @@ def main():
     parser.add_argument("--model-out", type=Path, required=True)
     parser.add_argument("--saved-pairs", type=Path, action="append", required=True)
     parser.add_argument("--calibration-cache", type=Path, required=True)
+    parser.add_argument("--require-calibration-cache", action="store_true",
+                        help="Fail before collection if the matching terminal cache is missing.")
+    parser.add_argument("--collect-decisive-pairs", type=int, default=0)
+    parser.add_argument("--collected-pairs-dir", type=Path)
+    parser.add_argument("--minimum-collected-pairs", type=int,
+                        help="Minimum new confirmed pairs to fit after the time limit; defaults to the target.")
+    parser.add_argument("--pair-source-seed", type=int, default=1838127001)
+    parser.add_argument("--pair-source-games", type=int, default=256)
+    parser.add_argument("--pair-source-batch-games", type=int, default=8)
+    parser.add_argument("--pair-probes-per-game", type=int, default=12)
+    parser.add_argument("--pair-min-rollouts", type=int, default=4)
+    parser.add_argument("--pair-max-rollouts", type=int, default=16)
+    parser.add_argument("--pair-rollout-step", type=int, default=4)
+    parser.add_argument("--pair-confidence", type=float, default=0.95)
+    parser.add_argument("--pair-rollout-temperature", type=float, default=0.5)
+    parser.add_argument("--pair-max-pairs-per-map", type=int, default=2)
+    parser.add_argument("--pair-collection-hours", type=float, default=8.0)
     parser.add_argument("--calibration-policy", choices=("mcts-zero", "raw"), default="mcts-zero")
     parser.add_argument("--calibration-games", type=int, default=24)
     parser.add_argument("--calibration-selection-games", type=int, default=8)
@@ -143,6 +207,19 @@ def main():
     parser.add_argument("--log-interval", type=int, default=64)
     parser.set_defaults(learning_rate=0.0001, seed=1968127001, max_moves=1600)
     args = parser.parse_args()
+    if args.collect_decisive_pairs < 0:
+        parser.error("--collect-decisive-pairs must be non-negative")
+    if args.collect_decisive_pairs:
+        if args.collected_pairs_dir is None or args.collected_pairs_dir.resolve() in {path.resolve() for path in args.saved_pairs}:
+            parser.error("new collection needs --collected-pairs-dir distinct from every --saved-pairs directory")
+        if args.minimum_collected_pairs is None:
+            args.minimum_collected_pairs = args.collect_decisive_pairs
+        if not 2 <= args.minimum_collected_pairs <= args.collect_decisive_pairs:
+            parser.error("require 2 <= --minimum-collected-pairs <= --collect-decisive-pairs")
+        try:
+            _collection_settings(args)
+        except ValueError as error:
+            parser.error(str(error))
     try:
         args.calibration_weights = tuple(float(value) for value in args.calibration_weights.split(","))
     except ValueError:

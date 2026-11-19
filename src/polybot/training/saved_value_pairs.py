@@ -130,6 +130,7 @@ def load_saved_value_pairs(model, training, directory: Path, *, history: int):
     if not examples:
         raise ValueError("the saved dataset contains no labelled successor pairs")
     reserved = set(range(int(source["seed"]), int(source["seed"]) + int(config["source_games"]) // 2))
+    reserved.update(int(seed) for seed in config.get("reserved_map_seeds", ()))
     reserved.update(int(row["map_seed"]) for row in metadata.values())
     return examples, {
         "directory": str(directory), "source_config": config, "pairs": manifest,

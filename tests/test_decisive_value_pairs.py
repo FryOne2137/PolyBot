@@ -107,3 +107,62 @@ def test_journal_rejects_corruption_before_last_record(tmp_path):
     path.write_text('not json\n{"pair_id": 1}\n')
     with pytest.raises(ValueError, match="corrupt"):
         collector._journal(path)
+
+
+@pytest.mark.parametrize("resume_legacy", [False, True])
+def test_pooled_scouts_first_fills_batches_and_reuses_uncertain_legacy_rollouts(tmp_path, monkeypatch, resume_legacy):
+    model = torch.nn.Linear(1, 1)
+    source_calls, played = [], []
+    pool = dict(num_envs=4, num_threads=1, max_pending_leaves=1, visible_action_history=0)
+    training = TrainingConfig(device="cpu")
+
+    def source(model, opponent, training, mcts, games, **kwargs):
+        source_calls.append(training.seed)
+        return [_ReplayPosition(game, training.seed + game // 2, game % 2, 1, f"r-{game}")
+                for game in range(4)], {game: [5, 6, 7] for game in range(4)}, {}
+
+    def compare(search, batch, prefixes, model, **kwargs):
+        return {"belief_zero": [{"action_id": 10} for _ in batch],
+                "belief_soft_z": [{"action_id": 11} for _ in batch]}, {}, np.zeros((len(batch), 2, 1, 1, 24))
+
+    def branches(search, batch, prefixes, repeat, temperature, output, **kwargs):
+        if "repeat_by_pair" in kwargs:
+            assert len(source_calls) >= (1 if resume_legacy else 2)
+            assert len(batch) == 2
+        for pair in batch:
+            index = kwargs.get("repeat_by_pair", {}).get(pair.pair_id, repeat)
+            played.append((pair.pair_id, index))
+            for arm in ("zero", "soft_z"):
+                np.savez_compressed(output / f"pair-{pair.pair_id:03d}-{arm}-successor.npz",
+                                    to_play=np.array(pair.position.player))
+        return [{"score_a": 1.0, "truncated": False} for _ in range(2 * len(batch))]
+
+    monkeypatch.setattr(collector, "_sample_source_positions", source)
+    monkeypatch.setattr(collector, "_compare_probes", compare)
+    monkeypatch.setattr(collector, "_branches", branches)
+    monkeypatch.setattr(collector, "RoutedPoolSearch", lambda *args, **kwargs: SimpleNamespace())
+    settings = collector.DecisivePairCollection(target=4, seed=1000, source_games=4 if resume_legacy else 8,
+                                               source_batch_games=4, mode="confirmed" if resume_legacy else "pooled",
+                                               candidate_pool=8, screening_rollouts=2)
+    options = dict(output=tmp_path, settings=settings, excluded_map_seeds={2000}, pool=pool)
+    if resume_legacy:
+        previous = collector.collect_decisive_value_pairs(model, model, training, MCTSConfig(), **options)
+        assert previous["confirmed_pairs"] == 0 and previous["completed_paired_repeats"] == 32
+        original = {name: (tmp_path / name).read_bytes() for name in ("pairs.jsonl", "rollouts.jsonl", "labelled_pairs.jsonl")}
+        config = json.loads((tmp_path / "config.json").read_text())
+        for name in ("mode", "candidate_pool", "screening_rollouts", "scout_fraction"):
+            config["collector_identity"]["settings"].pop(name)
+        collector._atomic_json(tmp_path / "config.json", config)
+        options["settings"] = replace(settings, mode="pooled")
+    report = collector.collect_decisive_value_pairs(model, model, training, MCTSConfig(), **options)
+    assert report["usable_pairs"] == 4 and report["confirmed_pairs"] == 0 and report["reached_target"]
+    assert report["mean_pairs_per_rollout_batch"] == 2
+    assert len(played) == len(set(played))
+    labels = [json.loads(line) for line in (tmp_path / "weighted_pairs.jsonl").read_text().splitlines()]
+    assert len(labels) == 4 and all(0 < row["gap_weight"] < 1 and row["soft_z_minus_zero"] == 0 for row in labels)
+    if resume_legacy:
+        assert (tmp_path / "legacy-config.json").is_file()
+        assert all((tmp_path / name).read_bytes() == content for name, content in original.items())
+        assert report["imported"]["paired_repeats"] == 32
+    else:
+        assert source_calls == [1000, 1002] and report["completed_paired_repeats"] == 8

@@ -31,15 +31,22 @@ from polybot.training.saved_value_pairs import split_value_pairs
 def run_experiment(args, model, opponent, config, training, run):
     collect_target = getattr(args, "collect_decisive_pairs", 0)
     examples, source = load_ranking_sources(model, training, args.saved_pairs, history=args.visible_action_history)
+    weighted_pairs = (getattr(args, "pair_collection_mode", "confirmed") == "pooled" or any(
+        item.get("source_config", {}).get("label_mode") == "weighted_soft" for item in source["sources"]
+    ))
+    pair_value_weight = getattr(args, "pair_value_loss_weight", None)
+    if pair_value_weight is None:
+        pair_value_weight = 1.0 if weighted_pairs else 0.0
     if collect_target:
         ranking, split = {"train": [], "selection": []}, {"pending_new_collection": True}
     else:
         ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
-        ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
+        if not weighted_pairs:
+            ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
     report = {
         "ranking_sources": source, "ranking_split": split, "saved_checkpoint": None, "head_updated": False,
         "benchmark_performed": False, "beats_zero": None, "calibration": {},
-        "informative_pairs": {name: len(rows) // 2 for name, rows in ranking.items()},
+        "informative_pairs": {name: len(informative_pairs(rows)) // 2 for name, rows in ranking.items()},
     }
     schedules = {
         "train": (training.seed, args.calibration_games),
@@ -59,7 +66,8 @@ def run_experiment(args, model, opponent, config, training, run):
                      checkpoint_fingerprints={"model": model_fingerprint(model), "opponent": model_fingerprint(opponent)},
                      schedules=schedules, calibration_weights=args.calibration_weights,
                      calibration_policy=args.calibration_policy, rmse_regression=args.calibration_rmse_regression,
-                     bias_regression=args.calibration_bias_regression, frozen_parameters="all except value_head")
+                     bias_regression=args.calibration_bias_regression, frozen_parameters="all except value_head",
+                     pair_value_loss_weight=pair_value_weight, balance_pair_maps=weighted_pairs)
     run.write_config(**configuration)
     if collect_target:
         print(f"value ranking collection | target={collect_target} | minimum={args.minimum_collected_pairs}", flush=True)
@@ -95,22 +103,25 @@ def run_experiment(args, model, opponent, config, training, run):
         )
         report["decisive_collection"] = summary
         run.event("decisive_pair_collection", **summary)
-        if summary["confirmed_pairs"] < args.minimum_collected_pairs:
-            return {**report, "reason": "insufficient_confirmed_new_pairs"}
+        collected_count = summary.get("usable_pairs", summary["confirmed_pairs"]) if weighted_pairs else summary["confirmed_pairs"]
+        if collected_count < args.minimum_collected_pairs:
+            return {**report, "reason": "insufficient_usable_new_pairs" if weighted_pairs else "insufficient_confirmed_new_pairs"}
         examples, new_source = load_ranking_sources(model, training, [args.collected_pairs_dir], history=args.visible_action_history)
-        if len(examples) != 2 * summary["confirmed_pairs"]:
+        if len(examples) != 2 * collected_count:
             raise ValueError("confirmed pair count differs from the saved label count")
         if set(new_source["reserved_map_seeds"]) & (attempted | planned["arena"]):
             raise ValueError("new ranking source overlaps old source, calibration or arena maps")
         ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
-        ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
+        if not weighted_pairs:
+            ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
         report.update(previous_ranking_sources=source, ranking_sources=new_source, ranking_split=split,
-                      informative_pairs={name: len(rows) // 2 for name, rows in ranking.items()})
+                      informative_pairs={name: len(informative_pairs(rows)) // 2 for name, rows in ranking.items()},
+                      training_pairs={name: len(rows) // 2 for name, rows in ranking.items()})
         configuration.update(previous_ranking_sources=source, ranking_sources=new_source, ranking_split=split,
                              decisive_collection=summary, collection_settings=asdict(collection))
         run.write_config(**configuration)
-        counts = report["informative_pairs"]
-        print(f"confirmed ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
+        counts = report["training_pairs"]
+        print(f"{'weighted' if weighted_pairs else 'confirmed'} ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
               f"target_reached={int(summary['reached_target'])}", flush=True)
         if not all(ranking.values()):
             return {**report, "reason": "insufficient_informative_ranking_pairs"}
@@ -122,6 +133,7 @@ def run_experiment(args, model, opponent, config, training, run):
         model, ranking, calibration, training, settings, weights=args.calibration_weights,
         rmse_regression=args.calibration_rmse_regression, bias_regression=args.calibration_bias_regression,
         run=run, log_interval=args.log_interval,
+        pair_value_weight=pair_value_weight, balance_pair_maps=weighted_pairs,
     )
     if state is None:
         return {**report, "reason": "no_calibrated_ranking_improvement"}
@@ -155,6 +167,10 @@ def _collection_settings(args):
         min_rollouts=args.pair_min_rollouts, max_rollouts=args.pair_max_rollouts, rollout_step=args.pair_rollout_step,
         confidence=args.pair_confidence, temperature=args.pair_rollout_temperature,
         max_pairs_per_map=args.pair_max_pairs_per_map, hours=args.pair_collection_hours,
+        mode=getattr(args, "pair_collection_mode", "confirmed"),
+        candidate_pool=getattr(args, "pair_candidate_pool", 100),
+        screening_rollouts=getattr(args, "pair_screen_rollouts", 2),
+        scout_fraction=getattr(args, "pair_scout_fraction", 0.2),
     )
 
 
@@ -172,7 +188,13 @@ def main():
     parser.add_argument("--collect-decisive-pairs", type=int, default=0)
     parser.add_argument("--collected-pairs-dir", type=Path)
     parser.add_argument("--minimum-collected-pairs", type=int,
-                        help="Minimum new confirmed pairs to fit after the time limit; defaults to the target.")
+                        help="Minimum labelled pairs to fit after the time limit; defaults to the target.")
+    parser.add_argument("--pair-collection-mode", choices=("confirmed", "pooled"), default="confirmed")
+    parser.add_argument("--pair-candidate-pool", type=int, default=100)
+    parser.add_argument("--pair-screen-rollouts", type=int, default=2)
+    parser.add_argument("--pair-scout-fraction", type=float, default=0.2)
+    parser.add_argument("--pair-value-loss-weight", type=float,
+                        help="MSE weight on saved branch means; pooled mode defaults to 1, legacy to 0.")
     parser.add_argument("--pair-source-seed", type=int, default=1838127001)
     parser.add_argument("--pair-source-games", type=int, default=256)
     parser.add_argument("--pair-source-batch-games", type=int, default=8)
@@ -207,6 +229,8 @@ def main():
     parser.add_argument("--log-interval", type=int, default=64)
     parser.set_defaults(learning_rate=0.0001, seed=1968127001, max_moves=1600)
     args = parser.parse_args()
+    if args.pair_value_loss_weight is not None and (not np.isfinite(args.pair_value_loss_weight) or args.pair_value_loss_weight < 0):
+        parser.error("--pair-value-loss-weight must be finite and non-negative")
     if args.collect_decisive_pairs < 0:
         parser.error("--collect-decisive-pairs must be non-negative")
     if args.collect_decisive_pairs:

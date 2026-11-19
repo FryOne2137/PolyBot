@@ -128,10 +128,18 @@ def calibration_admission(rank, calibration, reference_rank, reference_calibrati
     return failures
 
 
+def paired_training_losses(predictions, targets, signs, gap_weights, value_weights):
+    """Keep confidence outside the denominator so uncertain targets exert less force."""
+    gap_error = (_value_gap(predictions, signs) - _value_gap(targets, signs)) / 2
+    return (torch.mean(gap_weights * gap_error.square()),
+            torch.mean(value_weights[:, None] * (predictions - targets).square()))
+
+
 def fit_calibrated_heads(model, ranking, calibration, training, settings, *, weights,
-                         rmse_regression, bias_regression, run, log_interval):
+                         rmse_regression, bias_regression, run, log_interval,
+                         pair_value_weight=0.0, balance_pair_maps=False):
     device = next(model.parameters()).device
-    rank_states, rank_targets, rank_signs, _ = _paired_value_tensors(ranking["train"], device)
+    rank_states, rank_targets, rank_signs, ordered = _paired_value_tensors(ranking["train"], device)
     held_states, held_targets, held_signs, _ = _paired_value_tensors(ranking["selection"], device)
     point_states = torch.as_tensor(np.stack([row.features for row in calibration["train"]]), device=device)
     point_targets = torch.tensor([row.return_target for row in calibration["train"]], device=device)
@@ -146,6 +154,12 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
         for _ in range(settings.value_updates)
     ]
     original = deepcopy(model.value_head.state_dict())
+    map_counts = Counter(pair[0].game_key[0] for pair in ordered)
+    balance = [len(ordered) / (len(map_counts) * map_counts[pair[0].game_key[0]])
+               if balance_pair_maps else 1.0 for pair in ordered]
+    gap_weights = torch.tensor([getattr(pair[0], "gap_weight", 1.0) * factor for pair, factor in zip(ordered, balance)], device=device)
+    value_weights = torch.tensor([getattr(pair[0], "supervision_weight", 1.0) * factor
+                                  for pair, factor in zip(ordered, balance)], device=device)
     best_state = best_key = None
     selected = None
     reports = {}
@@ -157,10 +171,13 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                                    held_signs, ranking["selection"], 1.0)
             values = model.value_head(held_point_states).reshape(-1).float().cpu().numpy()
             calibrated = _metrics_by_phase(values, held_point_targets, calibration["selection"])
-            train_rank = _paired_metrics(model.value_head(rank_states).squeeze(-1).float(), rank_targets,
-                                         rank_signs, ranking["train"], 1.0)
+            train_predictions = model.value_head(rank_states).squeeze(-1).float()
+            train_rank = _paired_metrics(train_predictions, rank_targets, rank_signs, ranking["train"], 1.0)
+            train_gap, train_pair = paired_training_losses(train_predictions, rank_targets, rank_signs,
+                                                           gap_weights, value_weights)
             point_mse = F.mse_loss(model.value_head(point_states).reshape(-1).float(), point_targets).item()
-        return {"rank": rank, "calibration": calibrated, "train_rank": train_rank, "train_calibration_mse": point_mse}
+        return {"rank": rank, "calibration": calibrated, "train_rank": train_rank, "train_calibration_mse": point_mse,
+                "train_weighted_gap_loss": train_gap.item(), "train_weighted_pair_mse": train_pair.item()}
 
     try:
         with isolated_rng():
@@ -176,10 +193,10 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                     if step:
                         rows = batches[step - 1]
                         predictions = model.value_head(rank_states).squeeze(-1).float()
-                        gap_loss = F.mse_loss(_value_gap(predictions, rank_signs) / 2,
-                                              _value_gap(rank_targets, rank_signs) / 2)
+                        gap_loss, pair_loss = paired_training_losses(predictions, rank_targets, rank_signs,
+                                                                     gap_weights, value_weights)
                         point_loss = F.mse_loss(model.value_head(point_states[rows]).reshape(-1).float(), point_targets[rows])
-                        loss = gap_loss + weight * point_loss
+                        loss = gap_loss + pair_value_weight * pair_loss + weight * point_loss
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         norm = torch.nn.utils.clip_grad_norm_(model.value_head.parameters(), 1.0)
@@ -206,6 +223,8 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                         train_gap_rmse=last["train_rank"]["gap_rmse"],
                         train_preference_accuracy=last["train_rank"]["preference_accuracy"],
                         train_calibration_mse=last["train_calibration_mse"],
+                        train_weighted_gap_loss=last["train_weighted_gap_loss"],
+                        train_weighted_pair_mse=last["train_weighted_pair_mse"], pair_value_loss_weight=pair_value_weight,
                         selection_gap_rmse=last["rank"]["gap_rmse"],
                         selection_preference_accuracy=last["rank"]["preference_accuracy"],
                         selection_value_rmse=last["calibration"]["rmse"], selection_value_bias=last["calibration"]["bias"],

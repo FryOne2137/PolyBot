@@ -377,6 +377,71 @@ and reserve their maps. New pairs are split by whole map seed and checked
 against every calibration and arena reservation again before fitting.
 The original calibration and head-admission gates still apply.
 
+## Pool candidates and retain uncertain mean outcomes
+
+Use `--pair-collection-mode pooled` to change the collection schedule and
+retain soft training targets. `--pair-candidate-pool 100` first scouts a
+larger set of competing actions before starting new continuations. Scouting
+uses at most `--pair-scout-fraction`, default 0.2, of this invocation's
+collection allowance. It can finish sooner when the pool is full or source
+games are exhausted. Existing pending probes are reused.
+
+Screening takes `--pair-screen-rollouts 2` completed paired continuations
+per candidate. Pairs with different numbers of saved attempts can share a
+batch. Each position still receives the opponent RNG seed for its own
+next repeat, duplicated between both branches. This fills the available
+pair slots while resuming old work. Once enough usable pairs are available,
+the remaining budget refines nonzero mean gaps that remain uncertain. It
+does not spend extra repeats on all-tied cases. Refinement priorities
+include gap size, a regularized estimate of its standard error, and the
+number of completed repeats. This is a collection heuristic.
+
+In this mode `--collect-decisive-pairs 50` targets 50 **usable** pairs.
+`confirmed_pairs` separately retains the stricter sign-test classification.
+A pair becomes usable when both nonterminal successor packets exist and
+enough complete paired rollouts have been saved. Truncated or belief-failed
+attempts never supply terminal targets. The selected states keep their
+actual mean terminal outcomes, converted to each successor player's
+perspective. Tied outcomes are useful for point-value MSE and gap equality.
+
+Uncertainty weights are bounded between zero and one. Two fixed pseudo-
+observations from the uniform joint distribution over paired win/draw/loss
+outcomes regularize the moment estimate, preventing zero estimated
+uncertainty from a short constant sample. Point and gap weights use
+`n/(n+2)/(1+SE)` for their respective regularized standard errors. These
+weights are heuristics, not confidence intervals. The loader recomputes
+them from the complete rollout journal before accepting saved labels.
+
+The head now learns weighted gap MSE plus
+`--pair-value-loss-weight * weighted_pair_MSE` plus the existing weighted
+terminal calibration MSE. The pair MSE weight defaults to one for this mode
+and zero for the original confirmed-only mode. Losses average weighted
+errors over a fixed sample count, so normalization does not cancel a low
+confidence weight. Each training map receives equal total pair sampling
+mass before applying the uncertainty weights. Whole-map selection splits,
+the independent calibration guards and the final game arena are retained.
+Offline acceptance metrics remain the unweighted measurements on the
+fixed held-out dataset, reported separately from the weighted train losses.
+
+To reuse a previous confirmed-only night, keep its checkpoint, rollout
+settings and `--collected-pairs-dir`, and add the pooled options. The
+collector permits this explicit scheduling upgrade and verifies the
+original checkpoint fingerprints, device, environment and search settings.
+It saves `legacy-config.json`, `legacy-summary.json` and
+`legacy-decisions.json` before upgrading. The candidate and rollout journals
+and successor observations are reused without repeating recorded attempts.
+`weighted_pairs.jsonl` contains the new targets; the original
+`labelled_pairs.jsonl` remains intact. Switching that directory back to the
+old scheduling mode is rejected.
+
+Keep the old thirty-pair dataset in `--saved-pairs` to reserve its maps; put
+the resumable night directory in `--collected-pairs-dir`. Keep
+`--require-calibration-cache` and the original calibration settings to reuse
+its existing train and selection caches. New logs show `usable/target`,
+`confirmed`, collection phase and `mean_pair_batch`. A minimum of 20 now
+means 20 usable pairs, including reused pairs from the previous invocation.
+The collection limit excludes head fitting and any later arena.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

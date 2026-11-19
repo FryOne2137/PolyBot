@@ -15,7 +15,7 @@ from polybot.evaluation.value_disagreements import Disagreement, _public_row, _s
 from polybot.infrastructure.model_io import load_model
 from polybot.models.policy_value_belief import PolicyValueBeliefNet
 from polybot.training.flat_experiments import FlatImprovements
-from polybot.training.flat_value import EncodedValuePosition, fit_paired_value_heads
+from polybot.training.flat_value import EncodedValuePosition, fit_paired_value_heads, paired_outcome_weights
 from polybot.training.mcts_value import _encode_value_rows
 from polybot.training.run_artifacts import TrainingRun
 from polybot.training.saved_value_pairs import load_saved_value_pairs, split_value_pairs
@@ -91,6 +91,31 @@ def test_saved_pairs_reserve_every_attempted_adaptive_source_map(saved_pairs):
     assert source["reserved_map_seeds"] == [2137, 2138, 2139, 2140, 9001]
 
 
+def test_soft_labels_recompute_uncertainty_and_preserve_terminal_perspective(saved_pairs):
+    model, training, path = saved_pairs
+    original_labels = (path / "labelled_pairs.jsonl").read_bytes()
+    config = json.loads((path / "config.json").read_text())
+    config.update(label_mode="weighted_soft", labels_file="weighted_pairs.jsonl", pair_weighting_version=1)
+    (path / "config.json").write_text(json.dumps(config))
+    labels = [json.loads(line) for line in original_labels.splitlines()]
+    reliability = paired_outcome_weights([[0, 1]] * 4)
+    for label in labels:
+        label.update(reliability)
+    target = path / "weighted_pairs.jsonl"
+    target.write_text("".join(json.dumps(row) + "\n" for row in labels))
+    rows, source = load_saved_value_pairs(model, training, path, history=0)
+    assert source["labelled_pairs"] == 4
+    assert all(row.supervision_weight == reliability["supervision_weight"] and row.gap_weight == reliability["gap_weight"]
+               for row in rows)
+    assert all(row.return_target == 1 for row in rows)
+    assert all(row.to_root_sign == -1 for row in rows[::2])
+    assert (path / "labelled_pairs.jsonl").read_bytes() == original_labels
+    labels[0]["gap_weight"] = 1.0
+    target.write_text("".join(json.dumps(row) + "\n" for row in labels))
+    with pytest.raises(ValueError, match="uncertainty"):
+        load_saved_value_pairs(model, training, path, history=0)
+
+
 def test_later_paired_repeat_saves_a_missing_successor_without_overwriting_existing_data(saved_pairs, monkeypatch):
     from polybot.evaluation import value_disagreements as diagnostic
 
@@ -113,6 +138,32 @@ def test_later_paired_repeat_saves_a_missing_successor_without_overwriting_exist
     original = target.read_bytes()
     diagnostic._branches(search, [pair], {0: []}, 2, 0.5, path, save_missing_successors=True)
     assert target.read_bytes() == original
+
+
+def test_mixed_repeat_batch_keeps_opponent_rngs_paired_per_position(saved_pairs, monkeypatch):
+    from polybot.evaluation import value_disagreements as diagnostic
+
+    model, training, path = saved_pairs
+    pool = PublicRolloutPool(training, (model, model), num_envs=4, visible_action_history=0)
+    packet = pool.reset(np.array([2137, 2137, 2138, 2138], dtype=np.uint32), np.array([[0, 1]] * 4, dtype=np.int32))
+    pairs = [Disagreement(key, _ReplayPosition(key, seed, 0, 0, "root"), (0, 1))
+             for key, seed in ((99, 2137), (100, 2138))]
+    search = SimpleNamespace(models=(model, model), training=training, device=torch.device("cpu"))
+    monkeypatch.setattr(diagnostic, "_replay_positions", lambda *args, **kwargs: packet)
+
+    def continuations(*args, **kwargs):
+        kwargs["after_first_action"](packet)
+        actual = [generator.integers(0, 2**31, size=8) for generator in kwargs["opponent_rngs"]]
+        expected = [np.random.default_rng((training.seed, seed, 0, 0, repeat, 1)).integers(0, 2**31, size=8)
+                    for seed, repeat in ((2137, 3), (2138, 7))]
+        for index in range(4):
+            np.testing.assert_array_equal(actual[index], expected[index // 2])
+        assert not np.array_equal(actual[0], actual[2])
+        return []
+
+    monkeypatch.setattr(diagnostic, "_play_replayed_continuations", continuations)
+    diagnostic._branches(search, pairs, {99: [], 100: []}, 0, 0.5, path,
+                         save_missing_successors=True, repeat_by_pair={99: 3, 100: 7})
 
 
 @pytest.mark.parametrize("corruption", ["target", "encoder", "map_type", "rollout"])
@@ -390,7 +441,8 @@ def test_calibrated_pipeline_gates_arena_and_reserves_all_maps(saved_pairs, monk
 
 
 @pytest.mark.parametrize("enough_new_pairs", [False, True])
-def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(saved_pairs, monkeypatch, enough_new_pairs):
+@pytest.mark.parametrize("mode", ["confirmed", "pooled"])
+def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(saved_pairs, monkeypatch, enough_new_pairs, mode):
     model, training, path = saved_pairs
     scripts = Path(__file__).resolve().parents[1] / "scripts"
     monkeypatch.syspath_prepend(str(scripts))
@@ -404,7 +456,11 @@ def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(
 
     def load(candidate, configuration, directories, **kwargs):
         if directories == [new_dir]:
-            return [replace(row, game_key=(row.game_key[0] + 10000, *row.game_key[1:])) for row in old_rows], {
+            new_rows = [replace(row, game_key=(row.game_key[0] + 10000, *row.game_key[1:])) for row in old_rows]
+            if mode == "pooled":
+                new_rows[:2] = [replace(row, return_target=float(row.to_root_sign), supervision_weight=0.5, gap_weight=0.4)
+                                for row in new_rows[:2]]
+            return new_rows, {
                 "sources": [], "reserved_map_seeds": [12137, 12138, 12139, 12140],
             }
         return load_sources(candidate, configuration, directories, **kwargs)
@@ -421,11 +477,14 @@ def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(
         assert calls == ["cache", "cache"]
         assert {2137, 2138, 2139, 2140, 5000, 5001, 5002, 6000, 6001, 6002, 7000, 7001} <= kwargs["excluded_map_seeds"]
         calls.append("collect")
-        return {"confirmed_pairs": 4 if enough_new_pairs else 0, "reached_target": enough_new_pairs}
+        return {"confirmed_pairs": 0 if mode == "pooled" else 4 if enough_new_pairs else 0,
+                "usable_pairs": 4 if enough_new_pairs else 0, "reached_target": enough_new_pairs}
 
     def fit(candidate, ranking, calibration, *args, **kwargs):
         calls.append("fit")
         assert {row.game_key[0] for rows in ranking.values() for row in rows} == {12137, 12138, 12139, 12140}
+        assert kwargs["pair_value_weight"] == (1.0 if mode == "pooled" else 0.0)
+        assert kwargs["balance_pair_maps"] is (mode == "pooled")
         return None, {"selected": None}
 
     monkeypatch.setattr(trainer, "load_ranking_sources", load)
@@ -444,9 +503,11 @@ def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(
         pair_source_seed=9000, pair_source_games=8, pair_source_batch_games=4, pair_probes_per_game=3,
         pair_min_rollouts=4, pair_max_rollouts=16, pair_rollout_step=4,
         pair_confidence=0.95, pair_rollout_temperature=0.5, pair_max_pairs_per_map=2, pair_collection_hours=8,
+        pair_collection_mode=mode,
     )
     report = trainer.run_experiment(args, model, model, model.config, replace(training, seed=5000),
                                     TrainingRun(path / "collect-run"))
     assert ("fit" in calls) is enough_new_pairs
     assert not report["benchmark_performed"]
-    assert report["reason"] == ("no_calibrated_ranking_improvement" if enough_new_pairs else "insufficient_confirmed_new_pairs")
+    assert report["reason"] == ("no_calibrated_ranking_improvement" if enough_new_pairs else
+                                "insufficient_usable_new_pairs" if mode == "pooled" else "insufficient_confirmed_new_pairs")

@@ -32,6 +32,28 @@ class EncodedValuePosition:
     game_key: tuple[Any, ...]
     phase: str | None = None
     to_root_sign: int = 1
+    supervision_weight: float = 1.0
+    gap_weight: float = 1.0
+
+
+def paired_outcome_weights(scores):
+    """Regularize uncertainty of a paired mean; a small constant sample stays uncertain."""
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.ndim != 2 or scores.shape[1] != 2 or not len(scores) or not np.isin(scores, (0, 0.5, 1)).all():
+        raise ValueError("paired uncertainty requires completed terminal score pairs")
+    count, prior = len(scores), 2.0
+    values = 2 * scores - 1
+    mass = count + prior
+    # A uniform joint prior over the nine possible paired win/draw/loss
+    # outcomes contributes variance even when a short observed sample is constant.
+    gaps = values[:, 1] - values[:, 0]
+    gap_variance = max(0.0, float((np.square(gaps).sum() + prior * 4 / 3) / mass - (gaps.sum() / mass) ** 2))
+    value_variances = np.maximum(0, (np.square(values).sum(axis=0) + prior * 2 / 3) / mass
+                                 - np.square(values.sum(axis=0) / mass))
+    gap_se = float(np.sqrt(gap_variance / mass))
+    value_se = float(np.sqrt(value_variances.mean() / mass))
+    return {"supervision_weight": count / mass / (1 + value_se),
+            "gap_weight": count / mass / (1 + gap_se), "gap_standard_error": gap_se}
 
 
 def _turn(example: ValuePosition | EncodedValuePosition) -> int:

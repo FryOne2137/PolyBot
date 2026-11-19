@@ -7,10 +7,10 @@ from torch import nn
 
 from polybot.config import MCTSConfig, TrainingConfig
 from polybot.training.calibrated_value import (
-    cached_terminal_positions, calibration_admission, fit_calibrated_heads, load_ranking_sources,
+    cached_terminal_positions, calibration_admission, fit_calibrated_heads, load_ranking_sources, paired_training_losses,
 )
 from polybot.training.flat_experiments import FlatImprovements
-from polybot.training.flat_value import EncodedValuePosition
+from polybot.training.flat_value import EncodedValuePosition, paired_outcome_weights
 from polybot.training.run_artifacts import TrainingRun
 
 
@@ -42,14 +42,16 @@ class ValueNet(nn.Module):
         self.value_head.requires_grad_(True)
 
 
-def test_joint_fit_calibrates_and_restores_all_input_weights(tmp_path):
+@pytest.mark.parametrize("weighted", [False, True])
+def test_joint_fit_calibrates_and_restores_all_input_weights(tmp_path, weighted):
     model = ValueNet()
     before = deepcopy(model.state_dict())
 
     def paired(seed):
         return [
             EncodedValuePosition(np.array([sign, 0], dtype=np.float32), 0, -0.5 * sign,
-                                 (seed, 0, pair), "opening")
+                                 (seed, 0, pair), "opening", supervision_weight=0.4 if weighted else 1.0,
+                                 gap_weight=0.3 if weighted else 1.0)
             for pair in range(2) for sign in (1, -1)
         ]
 
@@ -66,6 +68,7 @@ def test_joint_fit_calibrates_and_restores_all_input_weights(tmp_path):
         FlatImprovements(value_updates=12, value_batch_size=4, value_learning_rate=0.05),
         weights=(0.01, 0.5), rmse_regression=0.0, bias_regression=0.1,
         run=TrainingRun(tmp_path), log_interval=12,
+        pair_value_weight=1.0 if weighted else 0.0, balance_pair_maps=weighted,
     )
     assert state is not None and report["selected"]["rank"]["preference_accuracy"] == 1.0
     assert report["selected"]["calibration"]["rmse"] < report["reference"]["calibration"]["rmse"]
@@ -146,3 +149,21 @@ def test_joint_fit_rejects_a_ranking_update_that_breaks_calibration(tmp_path):
     assert state is None and report["selected"] is None
     assert report["variants"]["0.01"]["rejections"]["calibration_rmse_regression"] > 0
     assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())
+
+
+def test_soft_target_uncertainty_keeps_small_constant_samples_uncertain():
+    short = paired_outcome_weights([[1, 1]] * 2)
+    long = paired_outcome_weights([[1, 1]] * 16)
+    variable = paired_outcome_weights([[0, 1], [1, 0]])
+    assert 0 < short["supervision_weight"] < long["supervision_weight"] < 1
+    assert 0 < variable["gap_weight"] < short["gap_weight"] < long["gap_weight"] < 1
+    assert short["gap_standard_error"] > 0
+
+
+def test_uncertain_pair_reduces_its_gradient_without_cancelling_the_weight():
+    predictions = torch.zeros((2, 2), requires_grad=True)
+    targets = torch.tensor([[1.0, -1.0], [1.0, -1.0]])
+    weights = torch.tensor([1.0, 0.1])
+    gap, point = paired_training_losses(predictions, targets, torch.ones_like(targets), weights, weights)
+    (gap + point).backward()
+    torch.testing.assert_close(predictions.grad[1], predictions.grad[0] * 0.1)

@@ -130,7 +130,7 @@ def _compare_probes(search, batch, prefixes, model, *, capture_leaves=True):
     return roots, leaves, particles[0]
 
 
-def _branches(search, pairs, prefixes, repeat, temperature, output, *, save_missing_successors=False):
+def _branches(search, pairs, prefixes, repeat, temperature, output, *, save_missing_successors=False, repeat_by_pair=None):
     positions = [pair.position for pair in pairs for _ in ARMS]
     actions = [action for pair in pairs for action in pair.actions]
     request = _replay_positions(search, positions, prefixes, recover_beliefs=True)
@@ -152,10 +152,14 @@ def _branches(search, pairs, prefixes, repeat, temperature, output, *, save_miss
             np.savez_compressed(output / f"pair-{pair.pair_id:03d}-{arm}-successor.npz",
                                 **_public_row(packet, row), features=encoded)
 
+    opponent_rngs = [generator for pair in pairs for generator in _paired_rollout_rngs(
+        search.training.seed, [pair.position, pair.position],
+        repeat if repeat_by_pair is None else repeat_by_pair[pair.pair_id], 1,
+    )]
     return _play_replayed_continuations(
         search, request, positions, actions, search.training.max_moves, mcts_value_scale=0.0,
         after_first_action=save_successors,
-        opponent_rngs=_paired_rollout_rngs(search.training.seed, positions, repeat, 1),
+        opponent_rngs=opponent_rngs,
         raw_temperature=temperature,
     )
 
@@ -190,10 +194,10 @@ def _pair_results(pairs, results, repeats):
     }
 
 
-def _save_supervised_pairs(output, pairs, score_rows):
+def _save_supervised_pairs(output, pairs, score_rows, *, filename="labelled_pairs.jsonl"):
     """Save labels for the real successors whose outcomes were paired."""
     labelled = 0
-    with (output / "labelled_pairs.jsonl").open("w", encoding="utf-8") as stream:
+    with (output / filename).open("w", encoding="utf-8") as stream:
         for pair, scores in zip(pairs, score_rows, strict=True):
             paths = [output / f"pair-{pair.pair_id:03d}-{arm}-successor.npz" for arm in ARMS]
             if not scores["completed_paired_repeats"] or not all(path.is_file() for path in paths):

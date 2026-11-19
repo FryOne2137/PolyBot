@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from ..data.polyenv_features import VISIBLE_ACTION_HISTORY_FEATURES
-from .flat_value import EncodedValuePosition, VALUE_PHASES
+from .flat_value import EncodedValuePosition, VALUE_PHASES, paired_outcome_weights
 from .mcts_value import _encode_value_rows
 
 
@@ -60,7 +60,11 @@ def load_saved_value_pairs(model, training, directory: Path, *, history: int):
             or tuple(source["player_tribes"]) != tuple(training.player_tribes)
             or config["visible_action_history"] != history):
         raise ValueError("saved pair configuration differs from the current map, tribes or history")
-    paths = ("config.json", "pairs.jsonl", "labelled_pairs.jsonl", "rollouts.jsonl")
+    weighted = config.get("label_mode") == "weighted_soft"
+    labels_file = config.get("labels_file", "labelled_pairs.jsonl")
+    if labels_file not in ("labelled_pairs.jsonl", "weighted_pairs.jsonl") or weighted != (labels_file == "weighted_pairs.jsonl"):
+        raise ValueError("invalid saved pair label file or weighting mode")
+    paths = ("config.json", "pairs.jsonl", labels_file, "rollouts.jsonl")
     metadata = {}
     for row in _records(directory / "pairs.jsonl"):
         pair_id = int(row["pair_id"])
@@ -90,7 +94,7 @@ def load_saved_value_pairs(model, training, directory: Path, *, history: int):
     examples = []
     manifest = []
     seen_pairs = set()
-    for label in _records(directory / "labelled_pairs.jsonl"):
+    for label in _records(directory / labels_file):
         pair_id = int(label["pair_id"])
         if pair_id in seen_pairs or pair_id not in metadata:
             raise ValueError(f"duplicate or unknown labelled pair ID {pair_id}")
@@ -105,6 +109,14 @@ def load_saved_value_pairs(model, training, directory: Path, *, history: int):
         scores = np.mean(rollouts[pair_id], axis=0)
         if len(rollouts[pair_id]) != label["completed_paired_repeats"]:
             raise ValueError(f"terminal rollout count differs from the label in pair {pair_id}")
+        reliability = {"supervision_weight": 1.0, "gap_weight": 1.0}
+        if weighted:
+            if config.get("pair_weighting_version") != 1:
+                raise ValueError("unsupported saved pair weighting version")
+            reliability = paired_outcome_weights(rollouts[pair_id])
+            if any(not np.isclose(label.get(key, np.nan), value, atol=1e-8, rtol=1e-6)
+                   for key, value in reliability.items()):
+                raise ValueError(f"saved uncertainty differs from paired rollouts in pair {pair_id}")
         targets = []
         for index, arm in enumerate(("zero", "soft_z")):
             branch = label["branches"][arm]
@@ -120,12 +132,14 @@ def load_saved_value_pairs(model, training, directory: Path, *, history: int):
             if path.parent != directory or path.suffix != ".npz":
                 raise ValueError(f"invalid saved successor path in pair {pair_id}")
             features, turn = _successor(model, training, path, actor=actor, history=history)
-            examples.append(EncodedValuePosition(features, turn, target, (seed, player, pair_id), phase, sign))
+            examples.append(EncodedValuePosition(features, turn, target, (seed, player, pair_id), phase, sign,
+                                                 reliability["supervision_weight"], reliability["gap_weight"]))
             targets.append(target * sign)
         manifest.append({
             "pair_id": pair_id, "map_seed": seed, "player": player, "phase": phase,
             "completed_paired_repeats": len(rollouts[pair_id]), "root_targets": targets,
             "root_gap": targets[1] - targets[0],
+            **reliability,
         })
     if not examples:
         raise ValueError("the saved dataset contains no labelled successor pairs")

@@ -197,6 +197,7 @@ def fit_paired_value_heads(
     loss_variants: Sequence[str] = ("mse", "mse_delta"), preserve_reference: bool = False,
     update_callback: Callable[[str, int, Mapping[str, Any]], None] | None = None,
     selection_by_variant: bool = False,
+    full_batch: bool = False,
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, Any]]:
     """Fit MSE and MSE-plus-gap heads from the same initialization and pair batches."""
     if not loss_variants or set(loss_variants) - {"mse", "delta", "mse_delta"}:
@@ -229,15 +230,18 @@ def fit_paired_value_heads(
                     ), "selection_loss": mse + difference_weight * gap_mse / 4.0}
 
     start_state = deepcopy(model.value_head.state_dict())
-    groups = {}
-    for index, pair in enumerate(pairs):
-        groups.setdefault(_phase(pair[0]), []).append(index)
-    buckets = list(groups.values())
-    rng = np.random.default_rng(seed ^ 0x43524954)
-    batches = [torch.as_tensor([
-        int(rng.choice(buckets[int(rng.integers(len(buckets)))]))
-        for _ in range(settings.value_batch_size // 2)
-    ], device=device) for _ in range(settings.value_updates)]
+    if full_batch:
+        batches = [torch.arange(len(pairs), device=device)] * settings.value_updates
+    else:
+        groups = {}
+        for index, pair in enumerate(pairs):
+            groups.setdefault(_phase(pair[0]), []).append(index)
+        buckets = list(groups.values())
+        rng = np.random.default_rng(seed ^ 0x43524954)
+        batches = [torch.as_tensor([
+            int(rng.choice(buckets[int(rng.integers(len(buckets)))]))
+            for _ in range(settings.value_batch_size // 2)
+        ], device=device) for _ in range(settings.value_updates)]
 
     heads = {}
     reports = {}
@@ -298,7 +302,7 @@ def fit_paired_value_heads(
                         }
                         update_callback(name, step, last_measurement)
                 reports[name] = {"before": before, "after": best, "updates": attempted, "selected_updates": best_step,
-                                 "difference_weight": weight, "selection_metric": criterion}
+                                 "difference_weight": weight, "selection_metric": criterion, "full_batch": full_batch}
                 if preserve_reference:
                     reports[name]["kept_update"] = best_step > 0
                 if update_callback is not None and name in heads:

@@ -271,3 +271,33 @@ def test_offline_comparison_reuses_saved_data_and_restores_network(saved_pairs):
     }
     assert all("delta_loss_gradient_norm" in row and "to_root_signs" in row for row in pairs)
     assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())
+
+
+def test_memorization_uses_only_informative_training_pairs(saved_pairs):
+    from polybot.training.value_pair_diagnostics import compare_saved_value_losses
+
+    model, training, path = saved_pairs
+    labels = [json.loads(line) for line in (path / "labelled_pairs.jsonl").read_text().splitlines()]
+    labels[0]["branches"]["soft_z"]["return_target"] = -1.0
+    labels[0]["mean_scores"]["soft_z"] = 0.0
+    labels[0]["soft_z_minus_zero"] = 0.0
+    (path / "labelled_pairs.jsonl").write_text("".join(json.dumps(row) + "\n" for row in labels))
+    rollouts = [json.loads(line) for line in (path / "rollouts.jsonl").read_text().splitlines()]
+    for row in rollouts:
+        if row["pair_id"] == 1:
+            row["outcomes"]["soft_z"]["score_a"] = 0.0
+    (path / "rollouts.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rollouts))
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    run = TrainingRun(path / "memorization")
+    report = compare_saved_value_losses(
+        model, training, path, FlatImprovements(value_updates=4, value_batch_size=4),
+        run, history=0, split_seed=81, selection_fraction=0.25, difference_weight=1.0, log_interval=2,
+        memorization_test=True,
+    )
+    effective_ids = set(report["memorization"]["pair_ids"])
+    assert effective_ids == set(report["split"]["train"]["pair_ids"]) - {1}
+    assert not effective_ids & set(report["split"]["selection"]["pair_ids"])
+    assert set(report["loss_comparison"]) == {"delta"}
+    assert report["initial_diagnostics"]["train"]["informative_pairs"] == len(effective_ids)
+    assert report["initial_diagnostics"]["train"]["gradients"]["scope"] == "full_batch_split"
+    assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())

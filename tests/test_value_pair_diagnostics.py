@@ -66,3 +66,24 @@ def test_delta_only_fit_learns_ranking_and_keeps_shared_minibatches():
     assert history["delta"][1][1]["minibatch_loss"] == pytest.approx(0.25)
     assert history["mse_delta"][1][1]["minibatch_loss"] == pytest.approx(0.5)
     assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())
+
+
+def test_memorization_full_batch_visits_every_pair_without_random_sampling(monkeypatch):
+    model = ToyValueNet()
+    examples = [
+        EncodedValuePosition(np.array([sign * (index + 1), 0], dtype=np.float32), 0,
+                             -target * sign, (2137 + index, 0, index), "opening")
+        for index, target in enumerate((0.25, 0.5, 0.75)) for sign in (1, -1)
+    ]
+    def no_sampling(*args, **kwargs):
+        raise AssertionError("full-batch memorization must not sample pairs")
+    monkeypatch.setattr(np.random, "default_rng", no_sampling)
+    trace = []
+    _, reports = fit_paired_value_heads(
+        model, examples, examples, FlatImprovements(value_updates=4, value_batch_size=2, value_learning_rate=0.05),
+        seed=2137, difference_weight=1.0, loss_variants=("delta",), full_batch=True,
+        selection_by_variant=True, update_callback=lambda name, step, row: trace.append(row),
+    )
+    assert reports["delta"]["full_batch"]
+    assert trace[1]["minibatch_loss"] == pytest.approx((0.25**2 + 0.5**2 + 0.75**2) / 3)
+    assert trace[-1]["train"]["preference_accuracy"] == 1.0

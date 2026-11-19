@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--difference-loss-weight", type=float, default=1.0)
     parser.add_argument("--visible-action-history", type=int, default=32)
     parser.add_argument("--log-interval", type=int, default=16)
+    parser.add_argument("--memorization-test", action="store_true",
+                        help="Fit delta only on all informative training pairs in one full batch")
     parser.set_defaults(learning_rate=0.00001, max_moves=1600)
     args = parser.parse_args()
     if not args.model_in.is_file() or not args.saved_pairs.is_dir():
@@ -61,6 +63,7 @@ def main():
         model, training, args.saved_pairs, settings, run, history=args.visible_action_history,
         split_seed=args.selection_seed, selection_fraction=args.pair_selection_fraction,
         difference_weight=args.difference_loss_weight, log_interval=args.log_interval,
+        memorization_test=args.memorization_test,
     )
     report["run_dir"] = str(run.finish(report, plots=False))
     print_summary(report)

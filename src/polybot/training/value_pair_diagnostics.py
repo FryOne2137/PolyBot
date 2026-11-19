@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -15,7 +16,7 @@ LOSSES = ("mse", "delta", "mse_delta")
 METRICS = ("value_mse", "gap_mse", "gap_rmse", "preference_accuracy", "informative_pairs", "bias", "rmse")
 
 
-def inspect_value_pairs(model, examples, *, difference_weight):
+def inspect_value_pairs(model, examples, *, difference_weight, phase_balanced=True):
     """Measure input separation and gradients without accumulating parameter grads."""
     states, targets, signs, pairs = _paired_value_tensors(examples, next(model.parameters()).device)
     parameters = tuple(parameter for parameter in model.value_head.parameters() if parameter.requires_grad)
@@ -35,11 +36,11 @@ def inspect_value_pairs(model, examples, *, difference_weight):
             for value in torch.autograd.grad(loss, parameters, retain_graph=True)
         ])
 
-    # Match the learner's uniform sampling over the phases present in replay.
+    # Match either phase sampling or the explicit full-batch objective.
     phases = [pair[0].phase for pair in pairs]
     present = set(phases)
     weights = torch.tensor(
-        [1.0 / (len(present) * phases.count(phase)) for phase in phases],
+        [1.0 / (len(present) * phases.count(phase)) if phase_balanced else 1.0 / len(pairs) for phase in phases],
         device=states.device, dtype=torch.float32,
     )
     value_loss = (weights * value_errors).sum()
@@ -95,7 +96,8 @@ def inspect_value_pairs(model, examples, *, difference_weight):
         } if len(informative_distances) else None,
         "saturated_value_fraction": float((predictions.detach().abs() >= 0.99).float().mean().item()),
         "gradients": {
-            "scope": "phase_balanced_split", "value_mse": float(value_loss.detach().item()),
+            "scope": "phase_balanced_split" if phase_balanced else "full_batch_split",
+            "value_mse": float(value_loss.detach().item()),
             "normalized_delta_mse": float(gap_loss.detach().item()),
             "value_gradient_norm": value_norm, "delta_gradient_norm": gap_norm,
             "weighted_delta_gradient_norm": difference_weight * gap_norm,
@@ -107,17 +109,40 @@ def inspect_value_pairs(model, examples, *, difference_weight):
 
 
 def compare_saved_value_losses(model, training, directory, settings, run, *, history,
-                               split_seed, selection_fraction, difference_weight, log_interval):
+                               split_seed, selection_fraction, difference_weight, log_interval,
+                               memorization_test=False):
     examples, source = load_saved_value_pairs(model, training, directory, history=history)
     datasets, split = split_value_pairs(examples, seed=split_seed, selection_fraction=selection_fraction)
+    memorization = None
+    losses = LOSSES
+    if memorization_test:
+        pairs = {}
+        for example in datasets["train"]:
+            pairs.setdefault(example.game_key, []).append(example)
+        informative = [
+            pair for pair in pairs.values()
+            if abs(pair[1].return_target * pair[1].to_root_sign - pair[0].return_target * pair[0].to_root_sign) > 1e-8
+        ]
+        if not informative:
+            raise ValueError("the training split contains no informative pairs for the memorization test")
+        datasets["train"] = [example for pair in informative for example in pair]
+        settings = replace(settings, value_batch_size=len(datasets["train"]),
+                           value_capacity=max(settings.value_capacity, len(datasets["train"])))
+        losses = ("delta",)
+        memorization = {
+            "train_pairs": len(informative), "pair_ids": [int(pair[0].game_key[-1]) for pair in informative],
+            "full_batch": True, "first_perfect_training_update": None, "max_training_preference_accuracy": 0.0,
+        }
+        print(f"value memorization | informative_train_pairs={len(informative)} | full_batch=1 | loss=delta", flush=True)
     run.write_config(
         training=training, model=model.config, settings=settings, source=source, split=split,
-        losses={"mse": "value_mse", "delta": "weight * normalized_delta_mse",
-                "mse_delta": "value_mse + weight * normalized_delta_mse"},
+        losses={name: {"mse": "value_mse", "delta": "weight * normalized_delta_mse",
+                       "mse_delta": "value_mse + weight * normalized_delta_mse"}[name] for name in losses},
         difference_weight=difference_weight, initial_weights="shared", minibatch_draws="shared",
         checkpoint_selection="each variant's held-out objective including the initial head",
+        memorization=memorization,
     )
-    children = {name: run.child(name) for name in LOSSES}
+    children = {name: run.child(name) for name in losses}
     diagnostics = {}
     last_diagnostics = {}
     pair_path = run.directory / "pair_diagnostics.jsonl"
@@ -127,7 +152,9 @@ def compare_saved_value_losses(model, training, directory, settings, run, *, his
                 stream.write(json.dumps({"stage": stage, **row}, allow_nan=False) + "\n")
 
         for name, dataset in datasets.items():
-            diagnostics[name], rows = inspect_value_pairs(model, dataset, difference_weight=difference_weight)
+            diagnostics[name], rows = inspect_value_pairs(
+                model, dataset, difference_weight=difference_weight, phase_balanced=not memorization_test,
+            )
             record_pairs(f"initial_{name}", rows)
             stats = diagnostics[name]
             print(
@@ -138,6 +165,13 @@ def compare_saved_value_losses(model, training, directory, settings, run, *, his
             )
 
         def update(name, step, measurements):
+            if memorization is not None:
+                accuracy = measurements["train"]["preference_accuracy"]
+                memorization["max_training_preference_accuracy"] = max(
+                    memorization["max_training_preference_accuracy"], accuracy,
+                )
+                if accuracy == 1.0 and memorization["first_perfect_training_update"] is None:
+                    memorization["first_perfect_training_update"] = step
             metrics = {
                 "update": step, "best_update": measurements["best_update"],
                 "minibatch_loss": measurements["minibatch_loss"], "gradient_norm": measurements["gradient_norm"],
@@ -161,13 +195,15 @@ def compare_saved_value_losses(model, training, directory, settings, run, *, his
             if step == settings.value_updates:
                 last_diagnostics[name], rows = inspect_value_pairs(
                     model, datasets["train"], difference_weight=difference_weight,
+                    phase_balanced=not memorization_test,
                 )
                 record_pairs(f"last_{name}_train", rows)
 
         _, fits = fit_paired_value_heads(
             model, datasets["train"], datasets["selection"], settings, seed=training.seed,
-            difference_weight=difference_weight, loss_variants=LOSSES,
+            difference_weight=difference_weight, loss_variants=losses,
             preserve_reference=True, selection_by_variant=True, update_callback=update,
+            full_batch=memorization_test,
         )
     comparison = {}
     for name, result in fits.items():
@@ -188,5 +224,5 @@ def compare_saved_value_losses(model, training, directory, settings, run, *, his
         "mode": "offline_value_loss_comparison", "benchmark_performed": False,
         "source": source, "split": split, "initial_diagnostics": diagnostics,
         "last_training_diagnostics": last_diagnostics, "pair_diagnostics": str(pair_path),
-        "loss_comparison": comparison,
+        "loss_comparison": comparison, "memorization": memorization,
     }

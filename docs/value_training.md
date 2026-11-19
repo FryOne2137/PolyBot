@@ -250,6 +250,15 @@ measurements before training and after each variant's last update.
 Gap-only fitting diagnoses relative ordering. Its absolute value
 calibration requires a separate check before use in search.
 
+For a memorization check, add `--memorization-test`. It keeps the same
+whole-map split, removes tied-return pairs from training and fits gap loss
+on every remaining training pair in one full batch. Held-out examples never
+enter this batch. The report records the effective pair IDs, highest
+training preference accuracy and first update to reach a perfect training
+ranking. Gradient diagnostics use the full-batch objective in this mode.
+This check measures whether the head can learn these training rankings.
+Transfer to held-out maps and value calibration remain separate measurements.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

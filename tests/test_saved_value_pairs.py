@@ -242,3 +242,32 @@ def test_unchanged_head_skips_arena_unless_requested(saved_pairs, monkeypatch, f
     assert "mcts_improved" not in report
     assert report["beats_zero"] is (True if force_benchmark else None)
     assert report["reason"] == ("mcts_benchmark_complete" if force_benchmark else "no_selection_improvement")
+
+
+def test_offline_comparison_reuses_saved_data_and_restores_network(saved_pairs):
+    from polybot.training.value_pair_diagnostics import compare_saved_value_losses
+
+    model, training, path = saved_pairs
+    model.requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    run = TrainingRun(path / "comparison")
+    report = compare_saved_value_losses(
+        model, training, path, FlatImprovements(value_updates=4, value_batch_size=4),
+        run, history=0, split_seed=81, selection_fraction=0.25, difference_weight=1.0, log_interval=2,
+    )
+    run.finish(report, plots=False)
+    assert report["benchmark_performed"] is False
+    assert set(report["loss_comparison"]) == {"mse", "delta", "mse_delta"}
+    assert not set(report["split"]["train"]["map_seeds"]) & set(report["split"]["selection"]["map_seeds"])
+    for name, result in report["loss_comparison"].items():
+        history = [json.loads(line) for line in Path(result["history"]).read_text().splitlines()]
+        assert [row["update"] for row in history] == [0, 1, 2, 3, 4]
+        assert all("train_gap_mse" in row and "selection_gap_mse" in row for row in history)
+        assert (run.directory / name / "metrics.csv").is_file()
+    pairs = [json.loads(line) for line in Path(report["pair_diagnostics"]).read_text().splitlines()]
+    assert {row["stage"] for row in pairs} == {
+        "initial_train", "initial_selection", "last_mse_train", "last_delta_train", "last_mse_delta_train",
+    }
+    assert all("delta_loss_gradient_norm" in row and "to_root_signs" in row for row in pairs)
+    assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())

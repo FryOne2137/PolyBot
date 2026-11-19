@@ -196,10 +196,11 @@ def fit_paired_value_heads(
     settings: FlatImprovements, *, seed: int, difference_weight: float,
     loss_variants: Sequence[str] = ("mse", "mse_delta"), preserve_reference: bool = False,
     update_callback: Callable[[str, int, Mapping[str, Any]], None] | None = None,
+    selection_by_variant: bool = False,
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, Any]]:
     """Fit MSE and MSE-plus-gap heads from the same initialization and pair batches."""
-    if not loss_variants or set(loss_variants) - {"mse", "mse_delta"}:
-        raise ValueError("paired value losses must select mse and/or mse_delta")
+    if not loss_variants or set(loss_variants) - {"mse", "delta", "mse_delta"}:
+        raise ValueError("paired value losses must select mse, delta and/or mse_delta")
     if not replay or not selection:
         return {}, {}
     model.eval()
@@ -244,9 +245,13 @@ def fit_paired_value_heads(
         with isolated_rng():
             before = measure(held_states, held_targets, held_signs, held_examples)
             train_before = measure(states, targets, signs, replay_examples) if update_callback is not None else None
-            for name, weight in (("mse", 0.0), ("mse_delta", difference_weight)):
+            for name, weight in (("mse", 0.0), ("delta", difference_weight), ("mse_delta", difference_weight)):
                 if name not in loss_variants:
                     continue
+                criterion = (
+                    {"mse": "value_mse", "delta": "gap_mse", "mse_delta": "selection_loss"}[name]
+                    if selection_by_variant else "selection_loss"
+                )
                 model.value_head.load_state_dict(start_state)
                 optimizer = torch.optim.AdamW(
                     model.value_head.parameters(), lr=settings.value_learning_rate, weight_decay=0.0,
@@ -261,15 +266,16 @@ def fit_paired_value_heads(
                         "train": train_before, "selection": before, "minibatch_loss": None, "gradient_norm": None,
                         "learning_rate": settings.value_learning_rate, "best_update": 0,
                         "best_selection_loss": best["selection_loss"] if best is not None else None,
+                        "selection_metric": criterion, "best_objective_loss": best[criterion] if best is not None else None,
                     })
                 for step, indices in enumerate(batches, 1):
                     predictions = model.value_head(states[indices]).squeeze(-1).float()
-                    loss = F.mse_loss(predictions, targets[indices])
-                    if weight:
-                        loss = loss + weight * F.mse_loss(
-                            _value_gap(predictions, signs[indices]) / 2,
-                            _value_gap(targets[indices], signs[indices]) / 2,
-                        )
+                    value_loss = F.mse_loss(predictions, targets[indices])
+                    gap_loss = F.mse_loss(
+                        _value_gap(predictions, signs[indices]) / 2,
+                        _value_gap(targets[indices], signs[indices]) / 2,
+                    )
+                    loss = weight * gap_loss if name == "delta" else value_loss + weight * gap_loss
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     norm = torch.nn.utils.clip_grad_norm_(model.value_head.parameters(), 1.0)
@@ -278,7 +284,7 @@ def fit_paired_value_heads(
                     optimizer.step()
                     attempted += 1
                     measured = measure(held_states, held_targets, held_signs, held_examples)
-                    if measured["valid"] and (best is None or measured["selection_loss"] < best["selection_loss"]):
+                    if measured["valid"] and (best is None or measured[criterion] < best[criterion]):
                         best = measured
                         best_step = step
                         heads[name] = deepcopy(model.value_head.state_dict())
@@ -288,10 +294,11 @@ def fit_paired_value_heads(
                             "minibatch_loss": float(loss.detach().item()), "gradient_norm": float(norm.item()),
                             "learning_rate": settings.value_learning_rate, "best_update": best_step,
                             "best_selection_loss": best["selection_loss"] if best is not None else None,
+                            "selection_metric": criterion, "best_objective_loss": best[criterion] if best is not None else None,
                         }
                         update_callback(name, step, last_measurement)
                 reports[name] = {"before": before, "after": best, "updates": attempted, "selected_updates": best_step,
-                                 "difference_weight": weight}
+                                 "difference_weight": weight, "selection_metric": criterion}
                 if preserve_reference:
                     reports[name]["kept_update"] = best_step > 0
                 if update_callback is not None and name in heads:

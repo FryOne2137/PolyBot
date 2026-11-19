@@ -219,6 +219,37 @@ summary keeps the metrics for the selected head separate from those of the
 last attempted update. The selected checkpoint is saved before the arena
 starts.
 
+## Offline loss and feature diagnostic
+
+`scripts/diagnose_value_pairs.py` reuses the saved successors and the same
+whole-map split to compare MSE, normalized gap MSE, and their weighted sum.
+Every variant starts with identical head weights and uses identical phase
+sampling and minibatch draws. It selects updates with the corresponding
+held-out objective and reports the last attempted update separately from
+the selected one. These three fits run offline. The script restores the
+input network after collecting its measurements.
+
+Before fitting, the diagnostic measures each pair's feature distance,
+root-perspective predictions, target gap, gradient of the normalized gap,
+and gradient of its squared error. It flags an informative pair with
+identical features as an input collision only when both branches have the
+same perspective sign. Opposite signs can produce a nonzero root gap from
+identical own-perspective values.
+
+The aggregate gradients follow the learner's phase-balanced objective.
+Their norms, weighted ratio and cosine help distinguish a weak gap signal
+from conflicting updates. Identical-input collisions, zero sensitivity and
+tanh saturation are recorded separately. An input distance by itself does
+not establish whether the head can learn the ranking.
+
+The root `summary.json` compares training and held-out RMSE, gap RMSE and
+preference accuracy for all losses. Each loss has its own
+`metrics.jsonl`, `metrics.csv` and detailed `summary.json`.
+`pair_diagnostics.jsonl` records individual feature and gradient
+measurements before training and after each variant's last update.
+Gap-only fitting diagnoses relative ordering. Its absolute value
+calibration requires a separate check before use in search.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

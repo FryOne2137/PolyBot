@@ -10,7 +10,7 @@ from polybot.training.calibrated_value import (
     cached_terminal_positions, calibration_admission, fit_calibrated_heads, load_ranking_sources, paired_training_losses,
 )
 from polybot.training.flat_experiments import FlatImprovements
-from polybot.training.flat_value import EncodedValuePosition, paired_outcome_weights
+from polybot.training.flat_value import EncodedValuePosition, paired_outcome_weights, paired_gap_breakdown
 from polybot.training.run_artifacts import TrainingRun
 
 
@@ -167,3 +167,18 @@ def test_uncertain_pair_reduces_its_gradient_without_cancelling_the_weight():
     gap, point = paired_training_losses(predictions, targets, torch.ones_like(targets), weights, weights)
     (gap + point).backward()
     torch.testing.assert_close(predictions.grad[1], predictions.grad[0] * 0.1)
+
+
+def test_gap_breakdown_separates_equal_means_and_respects_player_changes():
+    targets = torch.tensor([[0.4, -0.4], [0.1, 0.1], [0.5, 0.3]])
+    predictions = torch.tensor([[0.1, -0.3], [0.2, 0.4], [0.6, 0.2]])
+    signs = torch.tensor([[1, -1], [1, 1], [1, -1]])
+    groups = paired_gap_breakdown(predictions, targets, signs)
+    assert groups["tied"]["pairs"] == 2 and groups["informative"]["pairs"] == 1
+    assert groups["tied"]["gap_rmse"] == pytest.approx(0.2)
+    assert groups["informative"]["gap_rmse"] == pytest.approx(0, abs=1e-6)
+    assert groups["informative"]["preference_accuracy"] == 1.0
+    assert groups["all"]["gap_rmse"] ** 2 * 3 == pytest.approx(
+        groups["tied"]["gap_rmse"] ** 2 * 2 + groups["informative"]["gap_rmse"] ** 2, abs=1e-7)
+    empty = paired_gap_breakdown(predictions[:2], targets[:2], signs[:2])
+    assert empty["informative"]["pairs"] == 0 and empty["informative"]["gap_rmse"] is None

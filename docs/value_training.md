@@ -442,6 +442,53 @@ its existing train and selection caches. New logs show `usable/target`,
 means 20 usable pairs, including reused pairs from the previous invocation.
 The collection limit excludes head fitting and any later arena.
 
+## Reconstruct an explicitly requested logged update
+
+`scripts/reconstruct_ranked_value.py --source-run DIRECTORY --update 448
+--calibration-weight 1.0 --model-out CHECKPOINT` replays one saved run's
+initial value head through the requested optimizer update. It loads the
+original model paths, training settings, split and collection parameters
+from the run artifacts. Input paths and the calibration-cache directory
+can be overridden, but checkpoint fingerprints and source dataset checksums
+must match. The original run directory and input checkpoints are protected
+against accidental overwrites.
+
+No source games or branch continuations are collected. Both matching
+terminal caches must already exist. The replay uses the same head
+initialization, weighted targets, map balancing and seeded sequence of
+calibration minibatches. Replaying the first 448 updates of the 1.0 arm is
+equivalent to that prefix of the original sweep because every arm started
+with a fresh optimizer and identical minibatches. The requested state is
+captured explicitly, independently of the best update admitted by the
+normal gates.
+
+Before saving or starting games, the script compares the initial and
+requested-update metrics against their original `metrics.jsonl` records.
+The default absolute and relative tolerance is `0.0001`. A mismatch is
+reported with the recorded and replayed values and skips the checkpoint
+and arena. Different GPU kernels or software versions can affect numeric
+reproduction; passing these checks is a metric-level verification rather
+than proof of bitwise identity with an unsaved GPU checkpoint.
+
+`gap_diagnostics` separates all, tied-target and informative-target gap
+errors for training and held-out pairs, for the original head, requested
+head and zero control. Tied means equal **mean returns of both branches**,
+including both winning or both losing. It does not mean a drawn game or
+proven action equivalence. Both predictions and targets use the original
+player's perspective. `gap_pairs.jsonl` records each pair's target gap and
+the three predicted gaps, map, phase, group and supervision weights.
+
+After verification the requested checkpoint is saved as **diagnostic**,
+with any original gate failures listed in the summary. This does not
+change training admission or league promotion. MCTS then compares the
+requested head, original head and zero against the same frozen raw
+opponent on fresh seat-swapped map pairs. Original source, calibration,
+replacement and even planned original arena seeds are reserved. A
+24-game arena means 12 maps from both seats per arm, 72 games across the
+three arms. Only complete map pairs common to all arms contribute to score
+differences. The diagnostic checkpoint and offline report are saved before
+these games so an arena interruption does not discard the recovered head.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

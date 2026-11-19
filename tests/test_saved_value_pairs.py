@@ -511,3 +511,131 @@ def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(
     assert not report["benchmark_performed"]
     assert report["reason"] == ("no_calibrated_ranking_improvement" if enough_new_pairs else
                                 "insufficient_usable_new_pairs" if mode == "pooled" else "insufficient_confirmed_new_pairs")
+
+
+@pytest.fixture
+def replayable_value_run(saved_pairs, monkeypatch):
+    from copy import deepcopy
+    from polybot.infrastructure.model_io import save_model
+    from polybot.training.calibrated_value import cached_terminal_positions, fit_calibrated_heads, load_ranking_sources
+    from polybot.config import MCTSConfig
+    from polybot.training.flat_experiments import model_fingerprint
+
+    model, training, path = saved_pairs
+    opponent = deepcopy(model)
+    training = replace(training, seed=5000, batch_size=4, learning_rate=0.02)
+    dataset = json.loads((path / "config.json").read_text())
+    dataset.update(label_mode="weighted_soft", labels_file="weighted_pairs.jsonl", pair_weighting_version=1)
+    (path / "config.json").write_text(json.dumps(dataset))
+    labels = [json.loads(line) for line in (path / "labelled_pairs.jsonl").read_text().splitlines()]
+    for row in labels:
+        row.update(paired_outcome_weights([[0, 1]] * 4))
+    (path / "weighted_pairs.jsonl").write_text("".join(json.dumps(row) + "\n" for row in labels))
+    save_model(path / "input.pt", model, model.config)
+    save_model(path / "opponent.pt", opponent, opponent.config)
+    rows, source = load_ranking_sources(model, training, [path], history=0)
+    ranking, split = split_value_pairs(rows, seed=81, selection_fraction=0.25)
+    pool = dict(num_envs=4, num_threads=1, visible_action_history=0, max_pending_leaves=1, opponent_value_scale=1.0)
+    mcts = MCTSConfig(simulations=32, particles=4)
+    calls = []
+
+    def collect(candidate, opponent, configuration, *args, **kwargs):
+        calls.append(configuration.seed)
+        rows = [EncodedValuePosition(feature.features.copy(), 0, float(1 if i % 2 else -1),
+                                     (configuration.seed + i, i), "opening") for i, feature in enumerate(ranking["train"][:2])]
+        return rows, {"valid": True, "labelled_maps": 2, "positions": 2,
+                      "map_seeds": [configuration.seed, configuration.seed + 1],
+                      "attempted_map_seeds": [configuration.seed, configuration.seed + 1, configuration.seed + 2]}
+
+    monkeypatch.setattr("polybot.training.calibrated_value.collect_mcts_terminal_value_games", collect)
+    calibration, cache = {}, {}
+    for name, seed in (("train", 5000), ("selection", 6000)):
+        calibration[name], cache[name] = cached_terminal_positions(model, opponent, replace(training, seed=seed), mcts, 4,
+            cache_directory=path / "cache", excluded_map_seeds={7000, 7001}, positions_per_game=3, pool=pool, policy="mcts-zero")
+    arguments = dict(model_in=str(path / "input.pt"), opponent=str(path / "opponent.pt"),
+                     updates=12, batch_size=4, learning_rate=0.02, calibration_cache=str(path / "cache"),
+                     num_envs=4, num_threads=1, visible_action_history=0, max_pending_leaves=1, positions_per_game=3)
+    run = TrainingRun(path / "source-run", arguments=arguments)
+    run.write_config(training=training, mcts=mcts, ranking_sources=source, ranking_split=split,
+                     checkpoint_fingerprints={"model": model_fingerprint(model), "opponent": model_fingerprint(opponent)},
+                     calibration_weights=(0.01, 0.05, 0.2, 1.0), schedules={"train": (5000, 4), "selection": (6000, 4), "arena": (7000, 4)},
+                     calibration_policy="mcts-zero", rmse_regression=0.0, bias_regression=0.02,
+                     pair_value_loss_weight=1.0, balance_pair_maps=True)
+    model.requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    captured = {}
+
+    def snapshot(weight, step, metrics, state):
+        if weight == 1.0 and step == 7:
+            captured.update(state=deepcopy(state), metrics=deepcopy(metrics))
+
+    _, report = fit_calibrated_heads(model, ranking, calibration, training,
+        FlatImprovements(value_updates=12, value_batch_size=4, value_learning_rate=0.02),
+        weights=(0.01, 0.05, 0.2, 1.0), rmse_regression=0.0, bias_regression=0.02,
+        run=run, log_interval=12, pair_value_weight=1.0, balance_pair_maps=True, update_callback=snapshot)
+    run.finish({"calibration": cache, "fit": report}, plots=False)
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("value_reconstructor", scripts / "reconstruct_ranked_value.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return model, opponent, path, module, captured, calls
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_reconstructs_exact_requested_step_from_full_sweep_and_gates_arena(replayable_value_run, monkeypatch, mismatch):
+    from copy import deepcopy
+
+    model, opponent, path, module, captured, calls = replayable_value_run
+    original = deepcopy(model.state_dict())
+    if mismatch:
+        history = path / "source-run/calibration-1.0/metrics.jsonl"
+        rows = [json.loads(line) for line in history.read_text().splitlines()]
+        for row in rows:
+            if row["update"] == 7:
+                row["selection_gap_rmse"] += 1
+        history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    arena_calls = []
+
+    def arena(candidate, rival, training, mcts, games, **kwargs):
+        arena_calls.append(True)
+        assert training.seed == 8000 and games == 4 and mcts.simulations == 32
+        assert set(kwargs["fitted_heads"]) == {"original", "reconstructed"}
+        assert all(torch.equal(value, kwargs["fitted_heads"]["reconstructed"][key]) for key, value in captured["state"].items())
+        assert all(torch.equal(value, candidate.state_dict()[key]) for key, value in original.items())
+        return {"valid": True, "paired_scores": {"reconstructed": 0.75, "original": 0.25, "zero": 0.5}}
+
+    monkeypatch.setattr(module, "evaluate_mcts_value_heads", arena)
+    args = SimpleNamespace(update=7, calibration_weight=1.0, device="cpu", calibration_cache=None,
+                           reproduction_tolerance=1e-7, validation_seed=8000, validation_games=4,
+                           log_interval=7, model_out=path / "reconstructed.pt")
+    report = module.reconstruct(args, model, opponent, model.config, module.read_source(path / "source-run"),
+                                TrainingRun(path / "replay"))
+    assert report["reconstruction_matches"] is not mismatch
+    assert bool(arena_calls) is not mismatch and args.model_out.is_file() is not mismatch
+    assert calls == [5000, 6000]
+    assert all(torch.equal(value, model.state_dict()[key]) for key, value in original.items())
+    if not mismatch:
+        restored, _ = load_model(args.model_out, "cpu")
+        assert all(torch.equal(value, restored.value_head.state_dict()[key]) for key, value in captured["state"].items())
+        assert report["score_delta_vs_original"] == 0.5 and report["score_delta_vs_zero"] == 0.25
+        assert (path / "replay/gap_pairs.jsonl").is_file() and report["diagnostic_only"]
+    else:
+        assert report["reason"] == "reconstruction_mismatch"
+
+
+@pytest.mark.parametrize("corruption", ["dataset", "arena", "weights"])
+def test_reconstruction_rejects_modified_data_and_calibration_replacement_maps(replayable_value_run, corruption):
+    model, opponent, path, module, _, _ = replayable_value_run
+    if corruption == "dataset":
+        with (path / "pairs.jsonl").open("a") as stream:
+            stream.write(" ")
+    if corruption == "weights":
+        with torch.no_grad():
+            model.value_head[-2].bias.add_(0.1)
+    args = SimpleNamespace(update=7, calibration_weight=1.0, device="cpu", calibration_cache=None,
+                           reproduction_tolerance=1e-7, validation_seed=5002 if corruption == "arena" else 8000,
+                           validation_games=4, log_interval=7, model_out=path / "reconstructed.pt")
+    with pytest.raises(ValueError, match={"dataset": "dataset changed", "arena": "overlap", "weights": "initial weights"}[corruption]):
+        module.reconstruct(args, model, opponent, model.config, module.read_source(path / "source-run"), TrainingRun(path / "replay"))
+    assert not args.model_out.is_file()

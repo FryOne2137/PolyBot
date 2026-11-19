@@ -213,6 +213,25 @@ def _value_gap(values: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
     return root_values[:, 1] - root_values[:, 0]
 
 
+def paired_gap_breakdown(predictions, targets, signs):
+    """Separate equal-mean and nonzero-mean targets, always in the root perspective."""
+    predicted = _value_gap(predictions, signs).detach().float().cpu().numpy()
+    reference = _value_gap(targets, signs).detach().float().cpu().numpy()
+    result = {}
+    for name, mask in (("all", np.ones(len(reference), dtype=bool)),
+                       ("tied", reference == 0), ("informative", reference != 0)):
+        count = int(mask.sum())
+        if not count:
+            result[name] = {"pairs": 0, "gap_rmse": None, "gap_mae": None, "preference_accuracy": None}
+            continue
+        error = predicted[mask] - reference[mask]
+        result[name] = {"pairs": count, "gap_rmse": float(np.sqrt(np.square(error).mean())),
+                        "gap_mae": float(np.abs(error).mean()), "gap_bias": float(error.mean()),
+                        "preference_accuracy": float(np.mean(predicted[mask] * reference[mask] > 0))
+                        if name == "informative" else None}
+    return result
+
+
 def _paired_metrics(predictions, reference, perspective, examples, difference_weight):
     gaps = _value_gap(predictions, perspective)
     reference_gaps = _value_gap(reference, perspective)

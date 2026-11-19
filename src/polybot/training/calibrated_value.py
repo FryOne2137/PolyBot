@@ -137,7 +137,7 @@ def paired_training_losses(predictions, targets, signs, gap_weights, value_weigh
 
 def fit_calibrated_heads(model, ranking, calibration, training, settings, *, weights,
                          rmse_regression, bias_regression, run, log_interval,
-                         pair_value_weight=0.0, balance_pair_maps=False):
+                         pair_value_weight=0.0, balance_pair_maps=False, update_callback=None):
     device = next(model.parameters()).device
     rank_states, rank_targets, rank_signs, ordered = _paired_value_tensors(ranking["train"], device)
     held_states, held_targets, held_signs, _ = _paired_value_tensors(ranking["selection"], device)
@@ -205,6 +205,8 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                             break
                         optimizer.step()
                         last = measure()
+                    if update_callback is not None:
+                        update_callback(weight, step, last, model.value_head.state_dict())
                     failures = calibration_admission(
                         last["rank"], last["calibration"], reference["rank"], reference["calibration"],
                         rmse_regression=rmse_regression, bias_regression=bias_regression,

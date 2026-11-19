@@ -186,19 +186,38 @@ perspective. Gaps are divided by two before squaring, keeping their scale
 comparable with the individual value targets. The rest of the network is
 frozen. Both branches and every position from a map stay in the same split.
 By default 25% of map seeds are held out for checkpoint selection. The split
-uses `--selection-seed`. The combined held-out loss selects the checkpoint,
-including the initial head as a reference.
+uses `--selection-seed` to break ties between map groups. It prioritizes
+coverage of all available phases and pairs with different terminal returns
+in both splits, then balances their counts. This assignment uses only
+dataset metadata. The report lists any categories that cannot be covered
+with the requested number of maps. The combined held-out loss selects the
+checkpoint, including the initial head as a reference.
 
-The selected head and a zero-value control then play MCTS at
+When a head update improves the selection loss, the selected head and a
+zero-value control then play MCTS at
 `--simulations` against the fixed raw opponent. Every new validation map is
 played from both seats. The validation schedule is rejected if it overlaps
 any source map from the saved diagnostic. Only complete map pairs common to
 both arms contribute to their score difference.
+If the initial head remains best, the default run finishes after fitting.
+`--benchmark-unchanged-head` explicitly runs the arena in that case.
 
 `config.json` records the exact pair IDs and map seeds in each split,
 dataset checksums and the loss settings. `summary.json` reports the offline
 RMSE, gap RMSE, preference accuracy, chosen update and paired arena results.
-The selected checkpoint is saved before the arena starts.
+It reports `head_updated`, `benchmark_performed` and `beats_zero`
+separately. A missing arena result leaves `beats_zero` null. A positive
+point-score difference against zero is recorded without claiming training
+improved upon the original checkpoint.
+
+`metrics.jsonl` and `metrics.csv` contain full-training-set and
+held-out value MSE, gap MSE, combined loss, RMSE and preference accuracy
+before training and after every update. They also record minibatch loss,
+gradient norm, learning rate and the best update so far. Console output
+prints losses every `--fit-log-interval` updates, defaulting to 16. The
+summary keeps the metrics for the selected head separate from those of the
+last attempted update. The selected checkpoint is saved before the arena
+starts.
 
 ## If turn-aligned terminal targets are too noisy
 

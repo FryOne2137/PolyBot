@@ -113,13 +113,21 @@ def test_saved_pair_fit_keeps_reference_if_updates_hurt_selection(saved_pairs):
     features = np.ones(16, dtype=np.float32)
     replay = [EncodedValuePosition(features, 0, 1, (1, pair), "opening") for pair in range(2) for _ in range(2)]
     selection = [EncodedValuePosition(features, 0, -1, (2, pair), "opening") for pair in range(2) for _ in range(2)]
+    history = []
     heads, report = fit_paired_value_heads(
         model, replay, selection, FlatImprovements(value_updates=4, value_batch_size=4, value_learning_rate=0.01),
         seed=2137, difference_weight=1.0, loss_variants=("mse_delta",), preserve_reference=True,
+        update_callback=lambda name, step, metrics: history.append((name, step, metrics)),
     )
     assert set(heads) == {"mse_delta"}
     assert not report["mse_delta"]["kept_update"] and report["mse_delta"]["selected_updates"] == 0
     assert report["mse_delta"]["updates"] == 4
+    assert [step for _, step, _ in history] == [0, 1, 2, 3, 4]
+    assert history[-1][2]["train"]["selection_loss"] < history[0][2]["train"]["selection_loss"]
+    assert history[-1][2]["selection"]["selection_loss"] > history[0][2]["selection"]["selection_loss"]
+    assert report["mse_delta"]["train_after"] == report["mse_delta"]["train_before"]
+    assert report["mse_delta"]["last_update"] == history[-1][2]
+    assert history[-1][2]["gradient_norm"] > 0 and history[-1][2]["best_update"] == 0
     assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())
     assert all(torch.equal(value, heads["mse_delta"][key.removeprefix("value_head.")])
                for key, value in before.items() if key.startswith("value_head."))
@@ -158,6 +166,7 @@ def test_saved_pair_trainer_freezes_weights_and_uses_new_paired_maps(saved_pairs
         saved_pairs=path, visible_action_history=0, selection_seed=81, pair_selection_fraction=0.25,
         simulations=32, particles=4, difference_loss_weight=1.0, updates=4, batch_size=4, learning_rate=1e-5,
         model_out=path / "new.pt", num_envs=4, num_threads=1, max_pending_leaves=4, opponent_value_scale=1.0,
+        benchmark_unchanged_head=True, fit_log_interval=2,
     )
     run = TrainingRun(path / "run")
     schedules = (("train", 1000, 4), ("selection", 3000, 4), ("validation", 5000, 4))
@@ -166,7 +175,70 @@ def test_saved_pair_trainer_freezes_weights_and_uses_new_paired_maps(saved_pairs
     fitted, _ = load_model(args.model_out, torch.device("cpu"))
     assert all(torch.equal(value, fitted.state_dict()[key]) for key, value in before.items()
                if not key.startswith("value_head."))
-    assert report["reason"] == "mcts_no_demonstrated_improvement"
+    assert report["reason"] == "mcts_benchmark_complete"
+    assert report["benchmark_performed"] and report["beats_zero"] is False
+    history = [json.loads(line) for line in (run.directory / "metrics.jsonl").read_text().splitlines()]
+    updates = [row for row in history if "value_update" in row]
+    assert [row["value_update"] for row in updates] == [0, 1, 2, 3, 4]
+    assert all("train_loss" in row and "selection_loss" in row for row in updates)
     with pytest.raises(ValueError, match="overlaps"):
         trainer.fit_saved_mcts_pairs(args, model, model, model.config, training,
                                      (*schedules[:2], ("validation", 2137, 4)), run)
+
+
+def test_saved_pair_split_preserves_phase_and_decisive_coverage_when_possible():
+    features = np.ones(16, dtype=np.float32)
+    specifications = {
+        1: [("opening", 0), ("mid", 0), ("late", 1)],
+        2: [("opening", 1)], 3: [("mid", 0)], 4: [("late", 0)],
+    }
+    examples = [
+        EncodedValuePosition(features, 0, target, (seed, 0, pair_id), phase)
+        for seed, pairs in specifications.items() for pair_id, (phase, gap) in enumerate(pairs)
+        for target in (0, gap)
+    ]
+    datasets, report = split_value_pairs(examples, seed=81, selection_fraction=0.25)
+    assert report["selection"]["map_seeds"] == [1]
+    assert report["missing_categories"] == 0
+    for split in ("train", "selection"):
+        assert all(report[split]["phase_pairs"].values())
+        assert report[split]["informative_pairs"] == 1 and not report[split]["coverage_gaps"]
+    assert len(datasets["selection"]) == len(datasets["train"]) == 6
+
+
+@pytest.mark.parametrize("force_benchmark", [False, True])
+def test_unchanged_head_skips_arena_unless_requested(saved_pairs, monkeypatch, force_benchmark):
+    from copy import deepcopy
+
+    model, training, path = saved_pairs
+    trainer = _trainer(monkeypatch)
+    calls = []
+
+    def fit(candidate, replay, selection, settings, **kwargs):
+        metrics = {"rmse": 1.0, "gap_rmse": 0.5, "preference_accuracy": 0.0, "selection_loss": 1.0}
+        return {"mse_delta": deepcopy(candidate.value_head.state_dict())}, {
+            "mse_delta": {"before": metrics.copy(), "after": metrics.copy(), "kept_update": False,
+                          "updates": 4, "selected_updates": 0},
+        }
+
+    def arena(*args, **kwargs):
+        calls.append(True)
+        return {"valid": True, "beats_zero": True, "compared_games_per_arm": 4,
+                "paired_scores": {"mse_delta": 0.75, "zero": 0.5}}
+
+    monkeypatch.setattr(trainer, "fit_paired_value_heads", fit)
+    monkeypatch.setattr("polybot.training.mcts_value.evaluate_mcts_value_heads", arena)
+    args = SimpleNamespace(
+        saved_pairs=path, visible_action_history=0, selection_seed=81, pair_selection_fraction=0.25,
+        simulations=32, particles=4, difference_loss_weight=1.0, updates=4, batch_size=4, learning_rate=1e-5,
+        model_out=path / "new.pt", num_envs=4, num_threads=1, max_pending_leaves=4, opponent_value_scale=1.0,
+        benchmark_unchanged_head=force_benchmark, fit_log_interval=2,
+    )
+    run = TrainingRun(path / "run")
+    report = trainer.fit_saved_mcts_pairs(args, model, model, model.config, training,
+                                        (("train", 1000, 4), ("selection", 3000, 4), ("validation", 5000, 4)), run)
+    assert bool(calls) is force_benchmark and report["benchmark_performed"] is force_benchmark
+    assert not report["head_updated"] and Path(report["saved_checkpoint"]).is_file()
+    assert "mcts_improved" not in report
+    assert report["beats_zero"] is (True if force_benchmark else None)
+    assert report["reason"] == ("mcts_benchmark_complete" if force_benchmark else "no_selection_improvement")

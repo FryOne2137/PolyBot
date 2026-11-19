@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -195,6 +195,7 @@ def fit_paired_value_heads(
     model, replay: Sequence[EncodedValuePosition], selection: Sequence[EncodedValuePosition],
     settings: FlatImprovements, *, seed: int, difference_weight: float,
     loss_variants: Sequence[str] = ("mse", "mse_delta"), preserve_reference: bool = False,
+    update_callback: Callable[[str, int, Mapping[str, Any]], None] | None = None,
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, Any]]:
     """Fit MSE and MSE-plus-gap heads from the same initialization and pair batches."""
     if not loss_variants or set(loss_variants) - {"mse", "mse_delta"}:
@@ -205,23 +206,24 @@ def fit_paired_value_heads(
     device = next(model.parameters()).device
     states, targets, signs, pairs = _paired_value_tensors(replay, device)
     held_states, held_targets, held_signs, held_pairs = _paired_value_tensors(selection, device)
-    held_gaps = _value_gap(held_targets, held_signs)
-    informative = held_gaps != 0
+    replay_examples = [branch for pair in pairs for branch in pair]
     held_examples = [branch for pair in held_pairs for branch in pair]
 
-    def measure():
+    def measure(features, reference, perspective, examples):
         with torch.no_grad():
-            predictions = model.value_head(held_states).squeeze(-1).float()
-            gaps = _value_gap(predictions, held_signs)
-            mse = F.mse_loss(predictions, held_targets).item()
-            gap_mse = F.mse_loss(gaps, held_gaps).item()
+            predictions = model.value_head(features).squeeze(-1).float()
+            gaps = _value_gap(predictions, perspective)
+            reference_gaps = _value_gap(reference, perspective)
+            informative = reference_gaps != 0
+            mse = F.mse_loss(predictions, reference).item()
+            gap_mse = F.mse_loss(gaps, reference_gaps).item()
             metrics = _metrics_by_phase(
-                predictions.flatten().cpu().numpy(), held_targets.flatten().cpu().numpy(), held_examples,
+                predictions.flatten().cpu().numpy(), reference.flatten().cpu().numpy(), examples,
             )
-            return {**metrics, "gap_rmse": float(np.sqrt(gap_mse)),
+            return {**metrics, "value_mse": mse, "gap_mse": gap_mse, "gap_rmse": float(np.sqrt(gap_mse)),
                     "informative_pairs": int(informative.sum().item()),
                     "preference_accuracy": (
-                        float(((gaps[informative] * held_gaps[informative]) > 0).float().mean().item())
+                        float(((gaps[informative] * reference_gaps[informative]) > 0).float().mean().item())
                         if informative.any() else None
                     ), "selection_loss": mse + difference_weight * gap_mse / 4.0}
 
@@ -240,7 +242,8 @@ def fit_paired_value_heads(
     reports = {}
     try:
         with isolated_rng():
-            before = measure()
+            before = measure(held_states, held_targets, held_signs, held_examples)
+            train_before = measure(states, targets, signs, replay_examples) if update_callback is not None else None
             for name, weight in (("mse", 0.0), ("mse_delta", difference_weight)):
                 if name not in loss_variants:
                     continue
@@ -252,6 +255,13 @@ def fit_paired_value_heads(
                 if best is not None:
                     heads[name] = deepcopy(start_state)
                 best_step = attempted = 0
+                last_measurement = None
+                if update_callback is not None:
+                    update_callback(name, 0, {
+                        "train": train_before, "selection": before, "minibatch_loss": None, "gradient_norm": None,
+                        "learning_rate": settings.value_learning_rate, "best_update": 0,
+                        "best_selection_loss": best["selection_loss"] if best is not None else None,
+                    })
                 for step, indices in enumerate(batches, 1):
                     predictions = model.value_head(states[indices]).squeeze(-1).float()
                     loss = F.mse_loss(predictions, targets[indices])
@@ -267,15 +277,29 @@ def fit_paired_value_heads(
                         break
                     optimizer.step()
                     attempted += 1
-                    measured = measure()
+                    measured = measure(held_states, held_targets, held_signs, held_examples)
                     if measured["valid"] and (best is None or measured["selection_loss"] < best["selection_loss"]):
                         best = measured
                         best_step = step
                         heads[name] = deepcopy(model.value_head.state_dict())
+                    if update_callback is not None:
+                        last_measurement = {
+                            "train": measure(states, targets, signs, replay_examples), "selection": measured,
+                            "minibatch_loss": float(loss.detach().item()), "gradient_norm": float(norm.item()),
+                            "learning_rate": settings.value_learning_rate, "best_update": best_step,
+                            "best_selection_loss": best["selection_loss"] if best is not None else None,
+                        }
+                        update_callback(name, step, last_measurement)
                 reports[name] = {"before": before, "after": best, "updates": attempted, "selected_updates": best_step,
                                  "difference_weight": weight}
                 if preserve_reference:
                     reports[name]["kept_update"] = best_step > 0
+                if update_callback is not None and name in heads:
+                    model.value_head.load_state_dict(heads[name])
+                    reports[name].update(
+                        train_before=train_before, train_after=measure(states, targets, signs, replay_examples),
+                        last_update=last_measurement,
+                    )
     finally:
         model.value_head.load_state_dict(start_state)
     return heads, reports

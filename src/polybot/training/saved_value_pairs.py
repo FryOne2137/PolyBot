@@ -6,6 +6,7 @@ import json
 import math
 from collections import defaultdict
 from hashlib import sha256
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -140,29 +141,67 @@ def load_saved_value_pairs(model, training, directory: Path, *, history: int):
 
 def split_value_pairs(examples, *, seed: int, selection_fraction: float):
     """Assign each map, both seats and all its pairs to a single split."""
+    pairs = defaultdict(list)
+    for row in examples:
+        pairs[row.game_key].append(row)
+    if any(len(pair) != 2 or pair[0].phase != pair[1].phase for pair in pairs.values()):
+        raise ValueError("saved value split requires two branches in the same phase")
     maps = sorted({int(example.game_key[0]) for example in examples})
     if len(maps) < 2 or not 0 < selection_fraction < 1:
         raise ValueError("saved pair fitting needs at least two maps and a selection fraction in (0, 1)")
-    shuffled = np.random.default_rng(seed).permutation(maps)
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(maps)
     selection_count = min(len(maps) - 1, max(1, math.ceil(len(maps) * selection_fraction)))
-    selection_maps = set(shuffled[:selection_count].tolist())
+    counts = np.zeros((len(maps), len(VALUE_PHASES) + 2), dtype=np.int32)
+    indexes = {int(value): index for index, value in enumerate(shuffled)}
+    for pair in pairs.values():
+        index = indexes[int(pair[0].game_key[0])]
+        counts[index, VALUE_PHASES.index(pair[0].phase)] += 1
+        gap = pair[1].return_target * pair[1].to_root_sign - pair[0].return_target * pair[0].to_root_sign
+        counts[index, -2] += int(abs(gap) > 1e-8)
+        counts[index, -1] += 1
+    total = counts.sum(axis=0)
+    active = total > 0
+    candidates = (
+        combinations(range(len(maps)), selection_count)
+        if math.comb(len(maps), selection_count) <= 4096
+        else (rng.choice(len(maps), size=selection_count, replace=False) for _ in range(4096))
+    )
+    best_score, best_rows = None, None
+    for rows in candidates:
+        selected = counts[list(rows)].sum(axis=0)
+        remaining = total - selected
+        # Coverage uses phase and informative-pair counts. Model predictions
+        # never enter the split decision.
+        missing = np.count_nonzero(active[:-1] & ((selected[:-1] == 0) | (remaining[:-1] == 0)))
+        deviation = float(np.abs(selected[active] / total[active] - selection_count / len(maps)).sum())
+        score = (int(missing), deviation)
+        if best_score is None or score < best_score:
+            best_score, best_rows = score, list(rows)
+    selection_maps = set(shuffled[best_rows].tolist())
     datasets = {
         "train": [row for row in examples if row.game_key[0] not in selection_maps],
         "selection": [row for row in examples if row.game_key[0] in selection_maps],
     }
-    report = {"seed": seed, "unit": "whole_map_seed", "selection_fraction": selection_fraction}
+    report = {
+        "seed": seed, "unit": "whole_map_seed", "selection_fraction": selection_fraction,
+        "method": "phase_and_informative_pair_coverage", "missing_categories": best_score[0],
+    }
     for name, rows in datasets.items():
         pairs = defaultdict(list)
         for row in rows:
             pairs[row.game_key].append(row)
         if any(len(pair) != 2 for pair in pairs.values()):
             raise ValueError("saved value split lost a branch of a paired position")
+        phases = {phase: sum(pair[0].phase == phase for pair in pairs.values()) for phase in VALUE_PHASES}
+        informative = sum(abs(
+            pair[1].return_target * pair[1].to_root_sign - pair[0].return_target * pair[0].to_root_sign
+        ) > 1e-8 for pair in pairs.values())
         report[name] = {
             "map_seeds": sorted({int(row.game_key[0]) for row in rows}), "pairs": len(pairs),
             "pair_ids": [int(key[-1]) for key in pairs], "positions": len(rows),
-            "informative_pairs": sum(abs(
-                pair[1].return_target * pair[1].to_root_sign
-                - pair[0].return_target * pair[0].to_root_sign
-            ) > 1e-8 for pair in pairs.values()),
+            "informative_pairs": informative, "phase_pairs": phases,
+            "coverage_gaps": [phase for phase, count in phases.items() if count == 0]
+            + (["informative_pairs"] if informative == 0 else []),
         }
     return datasets, report

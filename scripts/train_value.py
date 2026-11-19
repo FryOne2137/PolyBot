@@ -418,6 +418,7 @@ def fit_saved_mcts_pairs(args, model, opponent, config, training, schedules, run
         loss="MSE(value, terminal_mean) + weight * MSE(root_value_gap / 2, root_target_gap / 2)",
         difference_loss_weight=args.difference_loss_weight, validation_map_seeds=sorted(validation_seeds),
         frozen_parameters="all except value_head", opponent_value_scale=args.opponent_value_scale,
+        benchmark_unchanged_head=args.benchmark_unchanged_head,
     )
     print(
         f"saved value pairs | loaded={source['labelled_pairs']} | "
@@ -425,18 +426,46 @@ def fit_saved_mcts_pairs(args, model, opponent, config, training, schedules, run
         f"selection={split['selection']['pairs']} pairs/{len(split['selection']['map_seeds'])} maps",
         flush=True,
     )
+    for name in ("train", "selection"):
+        print(
+            f"saved value coverage | split={name} | phases={split[name]['phase_pairs']} | "
+            f"informative={split[name]['informative_pairs']} | gaps={split[name]['coverage_gaps']}",
+            flush=True,
+        )
     report: dict[str, Any] = {
         "source": source, "split": split, "saved_checkpoint": None, "head_updated": False,
-        "mcts_improved": False,
+        "benchmark_performed": False, "beats_zero": None, "fit_history": str(run.directory / "metrics.jsonl"),
     }
     settings = FlatImprovements(
         value_updates=args.updates, value_batch_size=args.batch_size, value_learning_rate=args.learning_rate,
         value_capacity=max(len(datasets["train"]), args.batch_size), value_fit_backoffs=0,
     )
+
+    def log_update(name, step, measurements):
+        metrics = {
+            "value_update": step, "best_value_update": measurements["best_update"],
+            "learning_rate": measurements["learning_rate"], "minibatch_loss": measurements["minibatch_loss"],
+            "gradient_norm": measurements["gradient_norm"], "best_selection_loss": measurements["best_selection_loss"],
+        }
+        for split_name in ("train", "selection"):
+            metrics.update({
+                f"{split_name}_{metric}": measurements[split_name][metric]
+                for metric in ("value_mse", "gap_mse", "rmse", "gap_rmse", "preference_accuracy")
+            })
+            metrics[f"{split_name}_loss"] = measurements[split_name]["selection_loss"]
+        run.log(**metrics)
+        if step == 0 or step % args.fit_log_interval == 0 or step == args.updates:
+            print(
+                f"saved value learning | update={step}/{args.updates} | "
+                f"train_loss={metrics['train_loss']:.6f} | selection_loss={metrics['selection_loss']:.6f} | "
+                f"best_update={measurements['best_update']}",
+                flush=True,
+            )
+
     heads, fits = fit_paired_value_heads(
         model, datasets["train"], datasets["selection"], settings,
         seed=training.seed, difference_weight=args.difference_loss_weight,
-        loss_variants=("mse_delta",), preserve_reference=True,
+        loss_variants=("mse_delta",), preserve_reference=True, update_callback=log_update,
     )
     report["fit"] = fit = fits.get("mse_delta", {})
     if "mse_delta" not in heads:
@@ -465,8 +494,13 @@ def fit_saved_mcts_pairs(args, model, opponent, config, training, schedules, run
     finally:
         model.value_head.load_state_dict(original)
     report["saved_checkpoint"] = str(args.model_out)
-    report["reason"] = "mcts_benchmark_pending"
     run.event("saved_pair_value_checkpoint", checkpoint=args.model_out, head_updated=report["head_updated"])
+    if not report["head_updated"] and not args.benchmark_unchanged_head:
+        report["reason"] = "no_selection_improvement"
+        run.event("mcts_benchmark_skipped", reason="unchanged_value_head")
+        print("saved value benchmark | skipped=unchanged_value_head | use --benchmark-unchanged-head to evaluate", flush=True)
+        return report
+    report["reason"] = "mcts_benchmark_pending"
     run.finish(report, plots=False)
 
     benchmark = evaluate_mcts_value_heads(
@@ -476,10 +510,11 @@ def fit_saved_mcts_pairs(args, model, opponent, config, training, schedules, run
         max_pending_leaves=args.max_pending_leaves, opponent_value_scale=args.opponent_value_scale,
     )
     report["mcts_benchmark"] = benchmark
-    report["mcts_improved"] = benchmark["beats_zero"]
+    report["benchmark_performed"] = True
+    report["beats_zero"] = benchmark["beats_zero"] if benchmark["valid"] else None
     report["reason"] = (
         "mcts_benchmark_invalid" if not benchmark["valid"]
-        else "mcts_improved" if benchmark["beats_zero"] else "mcts_no_demonstrated_improvement"
+        else "mcts_benchmark_complete"
     )
     run.log(compared_mcts_games=benchmark["compared_games_per_arm"], **{
         f"mcts_{arm}_score": score for arm, score in benchmark["paired_scores"].items()
@@ -500,6 +535,10 @@ def main() -> None:
     parser.add_argument("--saved-pairs", type=Path, help="mcts-value-disagreements output directory")
     parser.add_argument("--pair-selection-fraction", type=float, default=0.25,
                         help="Fraction of whole saved maps reserved for head selection")
+    parser.add_argument("--benchmark-unchanged-head", action="store_true",
+                        help="Also run the saved-pair MCTS benchmark when no head update improves selection")
+    parser.add_argument("--fit-log-interval", type=int, default=16,
+                        help="Print saved-pair fit losses every N updates; all updates are saved to metrics")
     parser.add_argument("--train-games", type=int, default=128)
     parser.add_argument("--selection-games", type=int, default=32)
     parser.add_argument("--validation-games", type=int, default=48)
@@ -583,8 +622,12 @@ def main() -> None:
             parser.error("require --pair-selection-fraction in (0, 1) and a non-negative split seed")
         if not np.isfinite(args.difference_loss_weight) or args.difference_loss_weight <= 0.0:
             parser.error("--difference-loss-weight must be finite and positive")
+        if args.fit_log_interval < 1:
+            parser.error("--fit-log-interval must be positive")
     elif args.saved_pairs is not None:
         parser.error("--saved-pairs requires --position-source saved-mcts-pairs")
+    if args.benchmark_unchanged_head and not saved_pairs_mode:
+        parser.error("--benchmark-unchanged-head requires --position-source saved-mcts-pairs")
     if args.position_source == "mcts-soft-z":
         if args.teacher_simulations <= args.simulations or args.teacher_simulations < args.turn_candidates:
             parser.error("--teacher-simulations must exceed --simulations and cover all turn candidates")

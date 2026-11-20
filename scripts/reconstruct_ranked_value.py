@@ -99,19 +99,14 @@ def gap_audit(model, ranking, heads, path):
     return report
 
 
-def reconstruct(args, model, opponent, model_config, source, run):
+def load_source_data(source, model, opponent, *, device, calibration_cache=None, reserved_extra_seeds=()):
+    """Read the pinned observations and caches without collecting or fitting."""
     configuration, previous = source["config"], source["args"]
     if model_fingerprint(model) != configuration["checkpoint_fingerprints"]["model"]:
         raise ValueError("input checkpoint differs from the original run's initial weights")
     if model_fingerprint(opponent) != configuration["checkpoint_fingerprints"]["opponent"]:
         raise ValueError("opponent checkpoint differs from the original run")
-    if args.update > previous["updates"] or args.calibration_weight not in configuration["calibration_weights"]:
-        raise ValueError("requested weight or update was not present in the source run")
-    recorded = {step: _recorded_row(source["directory"], args.calibration_weight, step) for step in (0, args.update)}
-    model.eval().requires_grad_(False)
-    model.value_head.requires_grad_(True)
-    opponent.eval().requires_grad_(False)
-    training = replace(TrainingConfig(**configuration["training"]), device=args.device)
+    training = replace(TrainingConfig(**configuration["training"]), device=device)
     mcts = MCTSConfig(**configuration["mcts"])
     saved_sources = configuration["ranking_sources"]["sources"]
     examples, current_source = load_ranking_sources(model, training, [Path(row["directory"]) for row in saved_sources],
@@ -131,7 +126,7 @@ def reconstruct(args, model, opponent, model_config, source, run):
     reserved = set(current_source["reserved_map_seeds"])
     for seed, games in configuration["schedules"].values():
         reserved.update(range(seed, seed + games // 2))
-    arena_maps = set(range(args.validation_seed, args.validation_seed + args.validation_games // 2))
+    arena_maps = set(reserved_extra_seeds)
     if reserved & arena_maps:
         raise ValueError("fresh arena maps overlap original source, calibration or arena reservations")
     calibration, cache_reports = {}, {}
@@ -140,7 +135,7 @@ def reconstruct(args, model, opponent, model_config, source, run):
         own_schedule = set(range(seed, seed + games // 2))
         calibration[name], summary = cached_terminal_positions(
             model, opponent, replace(training, seed=seed), mcts, games,
-            cache_directory=args.calibration_cache or Path(previous["calibration_cache"]),
+            cache_directory=calibration_cache or Path(previous["calibration_cache"]),
             excluded_map_seeds=(reserved - own_schedule) | arena_maps,
             positions_per_game=previous["positions_per_game"], pool=pool,
             policy=configuration["calibration_policy"], require_existing=True,
@@ -152,6 +147,24 @@ def reconstruct(args, model, opponent, model_config, source, run):
         reserved.update(summary["attempted_map_seeds"])
         cache_reports[name] = {**summary, "sha256": sha256(Path(summary["cache_path"]).read_bytes()).hexdigest()}
         print(f"reconstruction cache | split={name} | positions={len(calibration[name])} | cache_loaded=1", flush=True)
+    return dict(training=training, mcts=mcts, ranking=ranking, calibration=calibration, pool=pool,
+                reserved_map_seeds=sorted(reserved), cache_reports=cache_reports, weighted=weighted)
+
+
+def reconstruct(args, model, opponent, model_config, source, run):
+    configuration, previous = source["config"], source["args"]
+    if args.update > previous["updates"] or args.calibration_weight not in configuration["calibration_weights"]:
+        raise ValueError("requested weight or update was not present in the source run")
+    recorded = {step: _recorded_row(source["directory"], args.calibration_weight, step) for step in (0, args.update)}
+    model.eval().requires_grad_(False)
+    model.value_head.requires_grad_(True)
+    opponent.eval().requires_grad_(False)
+    arena_maps = set(range(args.validation_seed, args.validation_seed + args.validation_games // 2))
+    data = load_source_data(source, model, opponent, device=args.device, calibration_cache=args.calibration_cache,
+                            reserved_extra_seeds=arena_maps)
+    training, mcts, ranking, calibration, pool, weighted = (data[key] for key in
+        ("training", "mcts", "ranking", "calibration", "pool", "weighted"))
+    cache_reports = data["cache_reports"]
     settings = FlatImprovements(value_updates=args.update, value_batch_size=previous["batch_size"],
                                 value_learning_rate=previous["learning_rate"], value_fit_backoffs=0,
                                 value_capacity=max(previous["batch_size"], len(calibration["train"])))

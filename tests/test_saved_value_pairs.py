@@ -639,3 +639,86 @@ def test_reconstruction_rejects_modified_data_and_calibration_replacement_maps(r
     with pytest.raises(ValueError, match={"dataset": "dataset changed", "arena": "overlap", "weights": "initial weights"}[corruption]):
         module.reconstruct(args, model, opponent, model.config, module.read_source(path / "source-run"), TrainingRun(path / "replay"))
     assert not args.model_out.is_file()
+
+
+@pytest.fixture
+def audited_value_run(replayable_value_run, monkeypatch):
+    model, opponent, path, reconstruction, captured, calls = replayable_value_run
+    monkeypatch.setattr(reconstruction, "evaluate_mcts_value_heads", lambda *args, **kwargs: {
+        "valid": True, "paired_scores": {"reconstructed": 0.5, "original": 0.25, "zero": 0.5}})
+    args = SimpleNamespace(update=7, calibration_weight=1.0, device="cpu", calibration_cache=None,
+                           reproduction_tolerance=1e-7, validation_seed=8000, validation_games=4,
+                           log_interval=7, model_out=path / "reconstructed.pt")
+    run = TrainingRun(path / "audit-run")
+    report = reconstruction.reconstruct(args, model, opponent, model.config,
+                                        reconstruction.read_source(path / "source-run"), run)
+    run.finish(report, plots=False)
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    spec = importlib.util.spec_from_file_location("value_scaler", scripts / "calibrate_value_scale.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    candidate, _ = load_model(args.model_out, "cpu")
+    return model, candidate, opponent, path, module, calls
+
+
+@pytest.mark.parametrize("selected_scale", [0.0, 0.25])
+def test_scale_analysis_uses_training_maps_only_and_tests_one_frozen_scale(audited_value_run, monkeypatch, selected_scale):
+    from polybot.training.flat_experiments import model_fingerprint
+
+    original, candidate, opponent, path, module, calls = audited_value_run
+    before = model_fingerprint(candidate)
+    source, audit = module.read_source(path / "source-run"), module.read_source(path / "audit-run")
+    cv_function = module.cross_validate_scale
+
+    def cv(pairs, calibration, **kwargs):
+        assert set(pairs["map_seeds"]) == set(source["config"]["ranking_split"]["train"]["map_seeds"])
+        assert not set(pairs["map_seeds"]) & set(source["config"]["ranking_split"]["selection"]["map_seeds"])
+        assert set(calibration["map_seeds"]) == {5000, 5001}
+        result = cv_function(pairs, calibration, **kwargs)
+        result["selection"] = {"scale": selected_scale, "method": "fixture", "reason": "test arena routing"}
+        return result
+
+    arena_calls = []
+
+    def arena(model, opponent, training, mcts, games, **kwargs):
+        arena_calls.append(True)
+        assert model_fingerprint(model) == before
+        assert kwargs["value_scales"] == (0.0, selected_scale) and kwargs["opponent_value_scale"] == 1
+        assert training.seed == 9000 and mcts.simulations == 32 and games == 4
+        return {"valid": True, "paired_scores": {"0": 0.5, "0.25": 0.75}}
+
+    monkeypatch.setattr(module, "cross_validate_scale", cv)
+    monkeypatch.setattr(module, "evaluate_mcts_value_heads", arena)
+    args = SimpleNamespace(device="cpu", calibration_cache=None, verification_tolerance=1e-6,
+                           folds=2, fold_seed=91, calibration_weights=(0, 0.2), maximum_scale=1,
+                           top_errors=2, validation_seed=9000, validation_games=4,
+                           model_in=path / "reconstructed.pt", offline_only=False)
+    run = TrainingRun(path / "scale-run")
+    report = module.run_analysis(args, original, candidate, opponent, source, audit, run)
+    assert bool(arena_calls) is (selected_scale > 0)
+    assert model_fingerprint(candidate) == before and calls == [5000, 6000]
+    assert not report["model_updated"]
+    assert (run.directory / "gap_errors.jsonl").is_file()
+    settings = json.loads((run.directory / "value_scale.json").read_text())
+    assert settings["leaf_value_scale"] == selected_scale
+    if selected_scale:
+        assert report["score_delta_vs_zero"] == 0.25
+    else:
+        assert report["reason"] == "zero_selected" and not report["benchmark_performed"]
+
+
+@pytest.mark.parametrize("corruption", ["head", "network", "arena"])
+def test_scale_analysis_rejects_changed_checkpoint_and_old_test_maps(audited_value_run, corruption):
+    original, candidate, opponent, path, module, _ = audited_value_run
+    if corruption in ("head", "network"):
+        parameter = (candidate.value_head[-2].bias if corruption == "head" else candidate.global_encoder[0].bias)
+        with torch.no_grad():
+            parameter.add_(0.1)
+    args = SimpleNamespace(device="cpu", calibration_cache=None, verification_tolerance=1e-6,
+                           folds=2, fold_seed=91, calibration_weights=(0, 0.2), maximum_scale=1,
+                           top_errors=2, validation_seed=8000 if corruption == "arena" else 9000,
+                           validation_games=4, model_in=path / "reconstructed.pt", offline_only=False)
+    expected = {"head": "checkpoint metrics", "network": "frozen network", "arena": "previous audit"}
+    with pytest.raises(ValueError, match=expected[corruption]):
+        module.run_analysis(args, original, candidate, opponent, module.read_source(path / "source-run"),
+                            module.read_source(path / "audit-run"), TrainingRun(path / "scale-run"))

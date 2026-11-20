@@ -489,6 +489,62 @@ three arms. Only complete map pairs common to all arms contribute to score
 differences. The diagnostic checkpoint and offline report are saved before
 these games so an arena interruption does not discard the recovered head.
 
+## Attenuate the audited head using training maps only
+
+`scripts/calibrate_value_scale.py --source-run TRAIN_RUN --audit-run AUDIT_RUN`
+loads the verified checkpoint from the reconstruction audit and the original
+frozen-encoder caches. It checks the source dataset hashes and cache hashes,
+requires the checkpoint's non-value weights to equal the original network,
+and compares its held-out metrics with the audit. It collects no games for
+training and does not change any neural-network weights.
+
+The script fits a nonnegative multiplier in `[0, --maximum-scale]`, with
+the maximum limited to one. This is attenuation of the leaf value used by
+MCTS. Positive scaling preserves the head's pairwise ordering; it changes
+how strongly the values guide search relative to its priors. It should not
+be interpreted as a newly trained or automatically calibrated probability
+predictor. Scaled and unscaled outcome errors are both reported.
+
+Candidate fitting objectives include gap-only MSE and joint gap plus pair
+point MSE with each `--calibration-weights` terminal-MSE weight. The pair
+point weight comes from the original run. Each objective has a closed-form
+bounded scalar solution using map-balanced, uncertainty-weighted pairs and
+map-balanced terminal labels. Weights stay outside fixed-count means.
+
+`--folds 4` partitions **only the original training maps**, separately for
+pairs and terminal calibration. All positions from a map stay in one fold,
+and each training map is held out once. The original selection pairs and
+selection calibration games do not fit scales or select objectives. The
+common cross-validation criterion minimizes map-balanced, uncertainty-
+weighted gap MSE, subject to the scaled terminal RMSE beating or matching
+zero. Each candidate is judged with this same criterion, rather than its
+own fitting loss. The report lists the scale range and standard deviation,
+per-fold winning objectives, and pooled out-of-fold errors. If no method
+improves upon the zero gap control, selection returns zero. Otherwise the
+chosen objective is fitted once on all original training maps. The
+original selection sets then evaluate this fixed choice without retuning.
+
+This cross-validation checks **scalar calibration of a fixed head**. That
+head was previously trained on these training maps. It is not an unbiased
+cross-validation estimate of the original head training algorithm or of
+playing strength. New game maps remain the independent measurement.
+
+`gap_errors.jsonl` ranks each split's pairs by unscaled squared gap error.
+The summary lists the largest errors and regressions relative to the
+original head, including the fractions of total squared error contributed
+by the worst pair and worst three pairs. Equal observed mean outcomes are
+reported separately from nonzero gaps and do not establish equivalence.
+
+`value_scale.json` saves the selected multiplier, checkpoint fingerprint,
+objective and planned arena map seeds before any games start. The value
+checkpoint remains unchanged. For a nonzero selection, MCTS compares only
+that scale with zero against the original frozen raw opponent on new
+seat-swapped map pairs, with the same opponent-tree value scale. Source,
+calibration, original arena and reconstruction-audit arena maps are
+reserved. A zero selection skips the redundant arena. `--offline-only`
+runs all analysis without any game evaluation. With 24 games per arm, a
+nonzero selection plans 48 games on 12 fresh maps.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

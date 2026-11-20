@@ -854,6 +854,87 @@ audit does not establish its effect on playing strength or alter the existing
 training objective. Full measurements are retained in `summary.json`, with
 config, source hashes and CSV/JSONL scalar metrics.
 
+## Train policy-consistent values with the native model router
+
+`scripts/train_routed_value.py` is the replacement experiment after the
+routing audit. It changes neither architecture nor policy, belief, encoder,
+flat training defaults or MCTS routing. It optimizes only `value_head`.
+Its input `--source-run` is a historical **legacy** ranked-value run: the
+script verifies its initial checkpoints, pair hashes, whole-map split and
+both required terminal caches before collecting anything. Those caches must
+come from fixed MCTS@32 `(0,1)` against the greedy raw opponent. A missing
+cache fails immediately. `--model-out` must be a new, distinct path.
+
+Fresh successor pairs go into a distinct resumable `--pairs-dir`. The source
+games now use the same frozen MCTS `(0,1)` policy as the calibration games;
+both forced-action branches continue with that policy and a greedy raw
+opponent. In this experiment `temperature=0` disables opponent sampling.
+This removes the previous mix of greedy-opponent calibration and
+sampled-opponent branch targets. Old journals keep their original policy
+identity and cannot be silently resumed with changed labels. Historical
+sampled-raw pairs are reservations and a preflight control, not new training
+labels. The collection retains phase coverage, swapped seats, uncertainty
+weights, incomplete-rollout exclusions, bounded time/retries and whole-map
+splits. Its source-game, candidate and time budgets bound collection; the
+requested number of pairs or informative labels is not guaranteed.
+
+The default screen gives each usable candidate at least four complete
+paired repeats; subsequent repeats use the existing bounded refinement
+schedule. All usable weighted pairs, including equal observed means, remain
+in the dataset. Equal sample means are not proof that the moves are equally
+good. Fitting requires at least 24 nonzero-mean training pairs and 12
+selection pairs by default. Insufficient evidence is reported explicitly,
+without an expensive arena or a misleading accepted checkpoint.
+
+For each saved branch, native `agent_id` selects the apprentice head or the
+frozen opponent. Opponent states use that network's own encoder. Both scores
+are converted to the original player's perspective for the difference loss.
+The loss is the confidence/map-weighted branch MSE plus difference loss and
+phase-sampled terminal-cache MSE. The cache coefficients default to
+`0.01,0.05,0.2,1.0`. Opponent values are detached constants. Only branches
+actually assigned to the apprentice can update it; cache and pair selection
+positions never supply training gradients. No gradient projection, guard
+fallback or encoder unfreezing is enabled by this experiment.
+
+All variants start from the same source head and use identical cached
+minibatch draws. Existing strict ranking and calibration admission remains:
+ranking accuracy and difference error must improve under the routed
+objective without violating calibration RMSE, zero-baseline or bias checks.
+Reports and CSV/JSONL histories separate apprentice-only, mixed and
+opponent-only ranking errors. Diagnostic `last-head.pt` snapshots record the
+update, routed metrics and initial network fingerprint. These are diagnostic
+artifacts, not automatically deployed models. Legacy reconstruction scripts
+explicitly reject the new routed objective rather than replaying another
+loss under the same name.
+
+An offline-admitted head is saved as `diagnostic-candidate.pt` and evaluated
+against both the original head and apprentice `value=0`. All three MCTS@32
+arms keep opponent value scale one, use the same fresh maps with swapped
+seats, and share the original policy/encoder/belief. The validation seed is
+drawn afresh on each invocation unless specified; its resolved value is
+recorded in `args.json`. Planned and replacement source/calibration maps and
+historical arena reservations are excluded from collection/evaluation as
+appropriate. An interrupted collection can resume from the same pair
+directory; `--collect-pairs 0` skips collection for an existing compatible
+dataset, but still performs the arena if a candidate is admitted.
+
+`--model-out` is written only after the **entire planned arena** completes
+and shows evidence against both controls. Each map's two seats form one
+observation. Admission requires a positive mean score delta and a one-sided
+paired sign-test p-value at most 0.025 against each control (two comparisons),
+with at least 16 complete maps by default. Missing maps, tied results and
+small tests do not establish improvement. Failed candidates remain in the
+run directory with their metrics; the requested output is left unwritten.
+`ready_for_mcts` records this experimental gameplay decision, not a league
+promotion or a new belief-calibration marker.
+
+This experiment still trains on **real successor observations**, not on
+simulated particles' leaf observations. It fixes objective routing and
+reference-policy consistency, but does not establish that the frozen
+encoder represents every useful value feature or eliminate all possible
+gradient conflicts. A retained model must demonstrate its effect in the
+fresh gameplay comparison; lower offline RMSE alone is insufficient.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

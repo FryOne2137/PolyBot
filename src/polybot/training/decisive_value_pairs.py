@@ -41,18 +41,19 @@ class DecisivePairCollection:
     candidate_pool: int = 100
     screening_rollouts: int = 2
     scout_fraction: float = 0.2
+    source_policy: str = "raw"
 
     def __post_init__(self):
         if (self.target < 1 or self.seed < 1 or self.source_games < 2 or self.source_games % 2
                 or self.source_batch_games < 2 or self.source_batch_games % 2 or self.probes_per_game < 1
                 or self.min_rollouts < 2 or self.max_rollouts < self.min_rollouts or self.max_rollouts > 128
                 or self.rollout_step < 1 or (self.max_rollouts - self.min_rollouts) % self.rollout_step
-                or not 0 < self.confidence < 1 or not np.isfinite(self.temperature) or self.temperature <= 0
+                or not 0 < self.confidence < 1 or not np.isfinite(self.temperature) or self.temperature < 0
                 or self.max_pairs_per_map < 1 or self.max_candidates_per_map < self.max_pairs_per_map
                 or not np.isfinite(self.hours) or self.hours <= 0
                 or self.mode not in ("confirmed", "pooled") or self.candidate_pool < 2
                 or self.screening_rollouts < 2 or self.screening_rollouts > self.max_rollouts
-                or not 0 < self.scout_fraction < 1):
+                or not 0 < self.scout_fraction < 1 or self.source_policy not in ("raw", "mcts-zero")):
             raise ValueError("invalid decisive-pair collection budget or uncertainty settings")
 
 
@@ -213,8 +214,9 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             "schema_version": 1, "collector_identity": identity, "training": asdict(training),
             "mcts": asdict(mcts), "visible_action_history": pool["visible_action_history"],
             "source_games": 0, "reserved_map_seeds": [], "label_filter": "scheduled_paired_sign_test",
-            "continuation": "fixed_mcts_0_1_vs_sampled_raw", "opponent_temperature": settings.temperature,
-            "phase_definition": "thirds_of_completed_raw_source_game_by_action_index",
+            "continuation": "fixed_mcts_0_1_vs_sampled_raw" if settings.temperature else "fixed_mcts_0_1_vs_greedy_raw",
+            "source_policy": settings.source_policy, "opponent_temperature": settings.temperature,
+            "phase_definition": "thirds_of_completed_source_game_by_action_index",
         }
         _atomic_json(state_path, state)
         _atomic_json(config_path, config)
@@ -446,6 +448,8 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             model, opponent, replace(training, seed=cursor), mcts, games,
             num_envs=pool["num_envs"], num_threads=pool["num_threads"],
             history=pool["visible_action_history"], samples_per_game=settings.probes_per_game,
+            **(dict(source_policy=settings.source_policy, max_pending_leaves=pool["max_pending_leaves"])
+               if settings.source_policy != "raw" else {}),
         )
         state["pending_probes"] = [{
             "position": asdict(position), "prefix": source_prefixes[position.game],

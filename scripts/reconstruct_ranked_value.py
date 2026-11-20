@@ -102,6 +102,8 @@ def gap_audit(model, ranking, heads, path):
 def load_source_data(source, model, opponent, *, device, calibration_cache=None, reserved_extra_seeds=()):
     """Read the pinned observations and caches without collecting or fitting."""
     configuration, previous = source["config"], source["args"]
+    if configuration.get("value_routing", "legacy") != "legacy":
+        raise ValueError("legacy reconstruction cannot replay a routed-value objective; use its native routing report")
     if model_fingerprint(model) != configuration["checkpoint_fingerprints"]["model"]:
         raise ValueError("input checkpoint differs from the original run's initial weights")
     if model_fingerprint(opponent) != configuration["checkpoint_fingerprints"]["opponent"]:

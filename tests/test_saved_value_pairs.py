@@ -1138,3 +1138,137 @@ def test_routing_audit_reads_last_head_and_cache_without_updates_or_games(replay
         assert counts["role_metadata_disagreements"] == 0
     rows = [json.loads(line) for line in (run.directory / "routing_pairs.jsonl").read_text().splitlines()]
     assert len(rows) == 8 and all(len(row["branches"]) == 2 for row in rows)
+
+
+def _routed_trainer(monkeypatch):
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("routed_trainer", scripts / "train_routed_value.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fresh_routed_pairs(path, output, model, opponent, seed=10000):
+    """Mock a new collection using the native packets from the integration fixture."""
+    from shutil import copyfile
+    from polybot.training.flat_experiments import model_fingerprint
+
+    output.mkdir(exist_ok=True)
+    for name in ("config.json", "pairs.jsonl", "rollouts.jsonl", "weighted_pairs.jsonl"):
+        copyfile(path / name, output / name)
+    for filename in path.glob("pair-*-successor.npz"):
+        copyfile(filename, output / filename.name)
+    config = json.loads((output / "config.json").read_text())
+    config["training"]["seed"] = seed
+    config.update(source_policy="mcts-zero", continuation="fixed_mcts_0_1_vs_greedy_raw",
+        opponent_temperature=0, reserved_map_seeds=list(range(seed, seed + 4)),
+        collector_identity={"model": model_fingerprint(model), "opponent": model_fingerprint(opponent)})
+    (output / "config.json").write_text(json.dumps(config))
+    for filename in ("pairs.jsonl", "weighted_pairs.jsonl"):
+        records = [json.loads(line) for line in (output / filename).read_text().splitlines()]
+        for row in records:
+            row["map_seed"] = seed + row["pair_id"] - 1
+        (output / filename).write_text("".join(json.dumps(row) + "\n" for row in records))
+
+
+def _routed_options(path, **overrides):
+    values = dict(source_run=path / "source-run", pairs_dir=path / "fresh-pairs", model_out=path / "routed.pt",
+        device="cpu", calibration_cache=path / "cache", collect_pairs=4, minimum_pairs=4,
+        candidate_pool=4, source_games=4, probes_per_game=3, rollouts=4, max_rollouts=8,
+        collection_hours=1, pair_source_seed=10000, split_seed=81,
+        minimum_informative_train=1, minimum_informative_selection=1,
+        validation_seed=9000, validation_games=16, minimum_arena_maps=2,
+        updates=4, batch_size=4, learning_rate=0.01, calibration_weights=(0.2,), log_interval=4)
+    return SimpleNamespace(**{**values, **overrides})
+
+
+@pytest.mark.parametrize("gameplay_passes", [False, True])
+def test_routed_pipeline_keeps_models_frozen_reuses_cache_and_requires_paired_arena(
+        replayable_value_run, monkeypatch, gameplay_passes):
+    from copy import deepcopy
+    from polybot.training.flat_experiments import model_fingerprint
+    import train_ranked_value as trainer
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _routed_trainer(monkeypatch)
+    source = module.read_source(path / "source-run")
+    before = model_fingerprint(model), model_fingerprint(opponent)
+    observed = []
+
+    def collect(candidate, rival, training, mcts, *, output, settings, excluded_map_seeds, pool):
+        assert settings.source_policy == "mcts-zero" and settings.temperature == 0
+        assert settings.screening_rollouts == 4
+        assert {2137, 2138, 2139, 2140, 5000, 5001, 5002, 6000, 6001, 6002, 7000, 7001, 9000} <= excluded_map_seeds
+        _fresh_routed_pairs(path, output, candidate, rival)
+        observed.append("collect")
+        return {"usable_pairs": 4, "confirmed_pairs": 4, "reached_target": True}
+
+    def fit(candidate, ranking, calibration, training, settings, **kwargs):
+        assert not any(parameter.requires_grad for name, parameter in candidate.named_parameters()
+                       if not name.startswith("value_head."))
+        assert not any(parameter.requires_grad for parameter in opponent.parameters())
+        assert {key[0] for key in kwargs["routing_lookup"]} == {10000, 10001, 10002, 10003}
+        assert all(branch["agent_source"] == "saved" for pair in kwargs["routing_lookup"].values() for branch in pair)
+        state = deepcopy(candidate.value_head.state_dict())
+        state["2.bias"] += 0.1
+        observed.append("fit")
+        return state, {"selected": {"update": 4}}
+
+    def arena(candidate, rival, training, mcts, games, **kwargs):
+        assert training.seed == 9000 and games == 16 and kwargs["opponent_value_scale"] == 1
+        assert (model_fingerprint(model), model_fingerprint(opponent)) == before
+        observed.append("arena")
+        return {"valid": True, "beats_zero": True,
+            "paired_scores": {"calibrated": 1.0, "original": 0.0 if gameplay_passes else 1.0, "zero": 0.0},
+            "paired_map_scores": [{"map_seed": seed, "scores_by_player": {
+                "calibrated": [1, 1], "original": [0, 0] if gameplay_passes else [1, 1], "zero": [0, 0]}}
+                for seed in range(9000, 9008)]}
+
+    monkeypatch.setattr(trainer, "collect_decisive_value_pairs", collect)
+    monkeypatch.setattr(trainer, "fit_calibrated_heads", fit)
+    monkeypatch.setattr(trainer, "evaluate_mcts_value_heads", arena)
+    args = _routed_options(path)
+    run = TrainingRun(path / "routed-run")
+    report = module.run_training(args, model, opponent, source, run)
+    assert observed == ["collect", "fit", "arena"] and calls == [5000, 6000]
+    assert report["input_weights_unchanged"] and report["ready_for_mcts"] is gameplay_passes
+    assert args.model_out.is_file() is gameplay_passes
+    assert Path(report["diagnostic_checkpoint"]).is_file()
+    assert report["routing_counts"]["selection"]["saved_agent_branches"] == 2
+    assert report["old_cache_reused"]
+    assert (model_fingerprint(model), model_fingerprint(opponent)) == before
+    candidate, _ = load_model(Path(report["diagnostic_checkpoint"]), torch.device("cpu"))
+    assert all(torch.equal(value, candidate.state_dict()[name]) for name, value in model.state_dict().items()
+               if not name.startswith("value_head."))
+
+
+def test_routed_pipeline_stops_on_insufficient_evidence_without_recollecting_cached_games(
+        replayable_value_run, monkeypatch):
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _routed_trainer(monkeypatch)
+    _fresh_routed_pairs(path, path / "fresh-pairs", model, opponent)
+    args = _routed_options(path, collect_pairs=0, minimum_informative_selection=2)
+    report = module.run_training(args, model, opponent, module.read_source(path / "source-run"),
+                                 TrainingRun(path / "insufficient-run"))
+    assert report["reason"] == "insufficient_ranking_evidence" and not report["benchmark_performed"]
+    assert report["informative_pairs"] == {"train": 3, "selection": 1}
+    assert not args.model_out.is_file() and calls == [5000, 6000]
+
+
+def test_routed_pipeline_rejects_legacy_stochastic_labels_and_reused_arena_maps(
+        replayable_value_run, monkeypatch):
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _routed_trainer(monkeypatch)
+    directory = path / "fresh-pairs"
+    _fresh_routed_pairs(path, directory, model, opponent)
+    config = json.loads((directory / "config.json").read_text())
+    config["continuation"] = "fixed_mcts_0_1_vs_sampled_raw"
+    (directory / "config.json").write_text(json.dumps(config))
+    args = _routed_options(path, collect_pairs=0)
+    with pytest.raises(ValueError, match="same frozen MCTS"):
+        module.run_training(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "wrong-policy"))
+    args.validation_seed = 7000
+    with pytest.raises(ValueError, match="historical"):
+        module.run_training(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "reused-arena"))
+    assert calls == [5000, 6000]

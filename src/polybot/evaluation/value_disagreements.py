@@ -37,7 +37,9 @@ class Disagreement:
 
 
 def _sample_source_positions(model, opponent, training, mcts, games, *, num_envs, num_threads,
-                             history, samples_per_game):
+                             history, samples_per_game, source_policy="raw", max_pending_leaves=4):
+    if source_policy not in ("raw", "mcts-zero"):
+        raise ValueError("unknown value source policy")
     prefixes = defaultdict(list)
     candidates = defaultdict(list)
     games_played = set()
@@ -61,12 +63,15 @@ def _sample_source_positions(model, opponent, training, mcts, games, *, num_envs
 
     report = evaluate_matches_pool(
         model, opponent, training, mcts, games, max_envs=num_envs, num_threads=num_threads,
-        visible_action_history=history, model_a_uses_mcts=False, model_b_uses_mcts=False,
-        map_seeds=schedule, replace_failed_pairs=False, model_a_label="disagreement source raw",
+        visible_action_history=history, model_a_uses_mcts=source_policy == "mcts-zero", model_b_uses_mcts=False,
+        **(dict(leaf_value_scale=0.0, opponent_leaf_value_scale=1.0,
+                max_pending_leaves=max_pending_leaves, belief_action_mode="root_shield")
+           if source_policy == "mcts-zero" else {}),
+        map_seeds=schedule, replace_failed_pairs=False, model_a_label=f"disagreement source {source_policy}",
         model_b_label="raw opponent", action_callback=action_callback, game_callback=game_callback,
     )
     if not report["valid"] or report["evaluated_map_seeds"] != schedule:
-        raise RuntimeError("raw disagreement source did not play the fixed schedule")
+        raise RuntimeError("disagreement source did not play the fixed schedule")
 
     sampled = []
     # Visit one probe per source game before taking another from the same game.
@@ -159,7 +164,7 @@ def _branches(search, pairs, prefixes, repeat, temperature, output, *, save_miss
     return _play_replayed_continuations(
         search, request, positions, actions, search.training.max_moves, mcts_value_scale=0.0,
         after_first_action=save_successors,
-        opponent_rngs=opponent_rngs,
+        opponent_rngs=opponent_rngs if temperature else None,
         raw_temperature=temperature,
     )
 

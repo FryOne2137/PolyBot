@@ -15,10 +15,11 @@ import torch
 from torch.nn import functional as F
 
 from .flat_experiments import isolated_rng, model_fingerprint
-from .flat_value import EncodedValuePosition, VALUE_PHASES, _metrics_by_phase, _paired_metrics, _paired_value_tensors, _value_gap
+from .flat_value import EncodedValuePosition, VALUE_PHASES, _metrics_by_phase, _paired_metrics, _paired_value_tensors, _value_gap, paired_gap_breakdown
 from .mcts_value import collect_mcts_terminal_value_games
 from .saved_value_pairs import load_saved_value_pairs
 from .value_gradient_guard import guarded_adamw_step, projected_value_gradients
+from .value_routing import pair_routing_tensors, routed_pair_predictions
 
 
 def load_ranking_sources(model, training, directories, *, history):
@@ -158,10 +159,20 @@ def calibration_batch_indices(examples, *, seed, batch_size, updates, device):
 
 def fit_calibrated_heads(model, ranking, calibration, training, settings, *, weights,
                          rmse_regression, bias_regression, run, log_interval,
-                         pair_value_weight=0.0, balance_pair_maps=False, update_callback=None, gradient_guard=None):
+                         pair_value_weight=0.0, balance_pair_maps=False, update_callback=None, gradient_guard=None,
+                         routing_lookup=None):
     device = next(model.parameters()).device
     rank_states, rank_targets, rank_signs, ordered = _paired_value_tensors(ranking["train"], device)
-    held_states, held_targets, held_signs, _ = _paired_value_tensors(ranking["selection"], device)
+    held_states, held_targets, held_signs, held_ordered = _paired_value_tensors(ranking["selection"], device)
+    routing = {"train": None, "selection": None} if routing_lookup is None else {
+        name: pair_routing_tensors(routing_lookup, pairs, device)
+        for name, pairs in (("train", ordered), ("selection", held_ordered))
+    }
+    if routing_lookup is not None and not routing["train"][0].any():
+        raise ValueError("no saved training branch is routed to the apprentice")
+
+    def predict(states, split):
+        return routed_pair_predictions(model.value_head, states, routing[split])
     point_states = torch.as_tensor(np.stack([row.features for row in calibration["train"]]), device=device)
     point_targets = torch.tensor([row.return_target for row in calibration["train"]], device=device)
     held_point_states = torch.as_tensor(np.stack([row.features for row in calibration["selection"]]), device=device)
@@ -177,17 +188,30 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
 
     def measure():
         with torch.no_grad():
-            rank = _paired_metrics(model.value_head(held_states).squeeze(-1).float(), held_targets,
+            held_predictions = predict(held_states, "selection")
+            rank = _paired_metrics(held_predictions, held_targets,
                                    held_signs, ranking["selection"], 1.0)
             values = model.value_head(held_point_states).reshape(-1).float().cpu().numpy()
             calibrated = _metrics_by_phase(values, held_point_targets, calibration["selection"])
-            train_predictions = model.value_head(rank_states).squeeze(-1).float()
+            train_predictions = predict(rank_states, "train")
             train_rank = _paired_metrics(train_predictions, rank_targets, rank_signs, ranking["train"], 1.0)
             train_gap, train_pair = paired_training_losses(train_predictions, rank_targets, rank_signs,
                                                            gap_weights, value_weights)
             point_mse = F.mse_loss(model.value_head(point_states).reshape(-1).float(), point_targets).item()
-        return {"rank": rank, "calibration": calibrated, "train_rank": train_rank, "train_calibration_mse": point_mse,
-                "train_weighted_gap_loss": train_gap.item(), "train_weighted_pair_mse": train_pair.item()}
+            groups = {}
+            if routing_lookup is not None:
+                for name, predictions, targets, signs in (("train", train_predictions, rank_targets, rank_signs),
+                                                          ("selection", held_predictions, held_targets, held_signs)):
+                    own, _ = routing[name]
+                    groups[name] = {group: paired_gap_breakdown(predictions[mask], targets[mask], signs[mask])
+                        for group, mask in (("both_apprentice", own.sum(dim=1) == 2),
+                                            ("mixed_models", own.sum(dim=1) == 1),
+                                            ("both_opponent", own.sum(dim=1) == 0))}
+        result = {"rank": rank, "calibration": calibrated, "train_rank": train_rank, "train_calibration_mse": point_mse,
+                  "train_weighted_gap_loss": train_gap.item(), "train_weighted_pair_mse": train_pair.item()}
+        if routing_lookup is not None:
+            result["routing_groups"] = groups
+        return result
 
     try:
         with isolated_rng():
@@ -207,7 +231,7 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                     applied = step > 0
                     if step:
                         rows = batches[step - 1]
-                        predictions = model.value_head(rank_states).squeeze(-1).float()
+                        predictions = predict(rank_states, "train")
                         gap_loss, pair_loss = paired_training_losses(predictions, rank_targets, rank_signs,
                                                                      gap_weights, value_weights)
                         point_loss = F.mse_loss(model.value_head(point_states[rows]).reshape(-1).float(), point_targets[rows])
@@ -227,7 +251,7 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                                 pair_weight=pair_value_weight, cache_weight=weight)
 
                             def current_training_gap():
-                                return paired_training_losses(model.value_head(rank_states).squeeze(-1).float(),
+                                return paired_training_losses(predict(rank_states, "train"),
                                     rank_targets, rank_signs, gap_weights, value_weights)[0]
 
                             def current_training_calibration():
@@ -268,6 +292,13 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                         if best_key is None or key < best_key:
                             best_key, best_state = key, deepcopy(model.value_head.state_dict())
                             selected = {"calibration_weight": weight, "update": step, **last}
+                    routing_metrics = {}
+                    if routing_lookup is not None:
+                        for split_name, groups in last["routing_groups"].items():
+                            for group, metrics in groups.items():
+                                routing_metrics[f"{split_name}_{group}_gap_rmse"] = metrics["all"]["gap_rmse"]
+                                routing_metrics[f"{split_name}_{group}_preference_accuracy"] = metrics["informative"]["preference_accuracy"]
+                        child.event("routing_quality", update=step, groups=last["routing_groups"])
                     child.log(
                         update=step, calibration_weight=weight, admitted=not failures,
                         train_gap_rmse=last["train_rank"]["gap_rmse"],
@@ -285,6 +316,7 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                         optimizer_moment_resets=moment_resets, fallback_calibration_rejections=calibration_rejections,
                         adamw_gap_ascent_trials=gap_ascent_trials if gradient_guard is not None else None,
                         adamw_measured_trials=direction_trials if gradient_guard is not None else None,
+                        **routing_metrics,
                     )
                     if step == 0 or step % log_interval == 0 or step == settings.value_updates:
                         print(f"calibrated value | weight={weight:g} | update={step}/{settings.value_updates} | "

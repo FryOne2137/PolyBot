@@ -133,6 +133,12 @@ offline/frozen and selective. Real game moves remain constrained by the engine's
 public legal list. For the model/search boundary see [architecture](architecture.md).
 For head-only value fitting and search through the full opponent reply, see
 [value training](value_training.md).
+The newer `scripts/train_routed_value.py` experiment keeps native model routing
+in its pair loss, collects fresh pairs under the calibration policy, and writes
+the requested checkpoint only after a complete paired arena beats both the
+original head and zero-value control. See the
+[routed-value workflow](value_training.md#train-policy-consistent-values-with-the-native-model-router)
+for cache requirements, evidence limits and diagnostic artifacts.
 
 ## Evaluation and saved games
 

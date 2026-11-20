@@ -660,6 +660,67 @@ cosines rather than NaN. Missing caches or incompatible historical records
 stop the diagnostic instead of launching collection or another memorization
 training run.
 
+## Projected cache gradients with a transactional AdamW guard
+
+`scripts/compare_value_projection.py --source-run TRAIN_RUN` compares
+ordinary summed losses with cache-gradient projection plus an actual-step
+guard. It uses the pinned original pairs, split, checkpoint and required
+terminal caches. It collects no games. Both variants start from the same
+original head, use fresh AdamW optimizers and the same phase-balanced
+minibatch draws, source learning rate and batch size. Gap, branch-MSE and
+cache coefficients are identical in both arms. The default cache weight is
+one; the branch weight is restored from the source run.
+
+For weighted training gap gradient `g` and weighted cache gradient `c`, the
+protected arm replaces `c` by `c - dot(g,c)/dot(g,g) * g` when their dot
+product is negative. Otherwise it retains the cache gradient. A zero gap
+gradient leaves the cache gradient unchanged. The branch-MSE gradient is
+not projected. This is an asymmetric use of the projection idea from
+[Gradient Surgery for Multi-Task Learning][pcgrad], prioritizing the gap,
+rather than the full randomized symmetric PCGrad algorithm. Projection is
+calculated in float64 on CPU and converted back to the parameter dtype and
+device. Gradient clipping to a norm of one follows assembly.
+
+Projection alone does not control AdamW's preconditioned update or stored
+momentum. Before each proposed protected update, the guard snapshots the
+head and the complete optimizer state. It accepts the actual step only if
+the **full weighted training-pair gap** is finite and does not increase
+beyond `1e-10 + 1e-6 * abs(gap_before)`. Selection data never participate in
+this decision. Every rejected trial restores parameters, buffers, Adam
+moments, step counters, parameter groups and prior gradients before retrying
+the same gradient with a smaller LR.
+
+The defaults allow six halvings after the original attempt, with a minimum
+LR of `1e-7`. Accepted retries keep their reduced LR for subsequent proposed
+updates. Exhausting all trials restores the entire pre-update state,
+including its LR, and skips that update. Sixteen consecutively skipped
+updates stop the protected arm with `guard_stalled`. Nonfinite trial
+parameters or optimizer tensors are rejected, and exceptions during the
+acceptance measurement restore the snapshot before propagating.
+
+`--updates 512` is a budget of **proposed** updates per arm. Backtracking
+costs extra forward passes, while skips reduce the applied-update count.
+The reports therefore record elapsed time, proposed and applied steps,
+skipped steps, rejected trials and projected steps. Applied steps and
+held-out model admission are distinct: passing the training guard does not
+establish calibration, generalization or better gameplay.
+
+The ordinary-sum control runs first and reproduces the original history at
+update zero and `--control-update 448`; a mismatch stops comparison before
+the protected arm. Both arms use the original held-out calibration admission
+rules and ranking-based checkpoint selection. Each arm saves diagnostic
+`last-head.pt`, `best-gap-head.pt` and, when admitted, `admitted-head.pt`
+snapshots bound to the original network fingerprint. A full `candidate.pt`
+is written only if a head is admitted; it may come from either arm and is
+not automatically promoted. Independent games remain necessary.
+
+Per-update CSV/JSONL histories remain in each arm's `calibration-1.0`
+directory. Its `events.jsonl` records every protected proposal and every
+trial LR, gap measurement and rejection reason. The root `summary.json`
+contains the full comparison; `gap_pairs.jsonl` separates the original,
+zero, last, best-gap and admitted heads on training and selection pairs.
+Input model weights and input files remain unchanged.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search
@@ -687,6 +748,10 @@ collects the games and which policy makes the final decisions. [Asymmetric criti
 
 ## Sources
 
+- Yu et al. (2020), *Gradient Surgery for Multi-Task Learning*. Gradient
+  projection for conflicting task objectives. The asymmetric projection
+  and transactional training-gap guard above are a separate experimental
+  adaptation, without a claim of improved MCTS strength. [Paper][pcgrad]
 - Silver et al. (2017), AlphaZero preprint. Terminal targets for learned
   values and the policy–value split in search. [Paper][alphazero]
 - Pérez-Liébana et al. (2020), *Tribes: A New Turn-Based Strategy Game for AI
@@ -706,6 +771,7 @@ collects the games and which policy makes the final decisions. [Asymmetric criti
   partial observability. [Paper][asymmetric]
 
 [alphazero]: https://arxiv.org/abs/1712.01815
+[pcgrad]: https://arxiv.org/abs/2001.06782
 [tribes]: https://gaigresearch.github.io/afm/papers/TribesAIIDE20.pdf
 [zhang]: https://thekevinz.com/blog/polytopia-bot
 [zhang-code]: https://github.com/kevinz917/superhuman-polytopia-bot

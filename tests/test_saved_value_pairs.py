@@ -900,3 +900,85 @@ def test_gradient_diagnostic_rejects_incompatible_provenance_and_never_collects(
     with pytest.raises((ValueError, FileNotFoundError)):
         module.run_diagnostics(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "grad-run"))
     assert calls == [5000, 6000]
+
+
+def _projection_comparison(monkeypatch):
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("projection_comparison", scripts / "compare_value_projection.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_projection_comparison_reproduces_sum_and_uses_same_training_draws(replayable_value_run, monkeypatch):
+    from polybot.training.flat_experiments import model_fingerprint
+    from polybot.training.value_gradient_guard import GapGuardConfig
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _projection_comparison(monkeypatch)
+    source = module.read_source(path / "source-run")
+    before = model_fingerprint(model)
+    fitter = module.fit_calibrated_heads
+    draws = {}
+
+    def fit(candidate, ranking, calibration, training, settings, **kwargs):
+        mode = "sum" if kwargs["gradient_guard"] is None else "projected_guarded"
+        assert model_fingerprint(candidate) == before
+        assert kwargs["weights"] == (1.0,) and kwargs["pair_value_weight"] == 1
+        observed = []
+
+        def observe(head, inputs):
+            states = inputs[0]
+            if states.ndim == 2 and len(states) == settings.value_batch_size:
+                observed.append(states.detach().cpu().clone())
+
+        hook = candidate.value_head.register_forward_pre_hook(observe)
+        try:
+            result = fitter(candidate, ranking, calibration, training, settings, **kwargs)
+        finally:
+            hook.remove()
+        draws[mode] = observed
+        return result
+
+    monkeypatch.setattr(module, "fit_calibrated_heads", fit)
+    args = SimpleNamespace(device="cpu", calibration_cache=None, calibration_weight=1.0,
+        updates=12, control_update=7, reproduction_tolerance=1e-6, log_interval=12,
+        guard=GapGuardConfig(), model_out=None)
+    run = TrainingRun(path / "projection-run")
+    report = module.run_experiment(args, model, opponent, source, run)
+    assert report["control_matches"] and calls == [5000, 6000]
+    assert model_fingerprint(model) == before and report["new_games_collected"] == 0
+    assert not report["benchmark_performed"] and set(report["variants"]) == {"sum", "projected_guarded"}
+    assert len(draws["sum"]) == len(draws["projected_guarded"]) == 12
+    assert all(torch.equal(a, b) for a, b in zip(draws["sum"], draws["projected_guarded"], strict=True))
+    protected = report["variants"]["projected_guarded"]
+    assert protected["applied_steps"] + protected["rejected_steps"] == 12
+    assert (run.directory / "gap_pairs.jsonl").is_file()
+    events = [json.loads(line) for line in
+              (run.directory / "projected_guarded/calibration-1.0/events.jsonl").read_text().splitlines()]
+    assert len(events) == 12
+    for event in events:
+        assert event["gap_after"] <= event["gap_before"] + event["gap_tolerance"]
+        assert event["phase"] == "guarded_update"
+
+
+def test_projection_comparison_rejects_control_mismatch_before_protected_fit(replayable_value_run, monkeypatch):
+    from polybot.training.value_gradient_guard import GapGuardConfig
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _projection_comparison(monkeypatch)
+    history = path / "source-run/calibration-1.0/metrics.jsonl"
+    rows = [json.loads(line) for line in history.read_text().splitlines()]
+    for row in rows:
+        if row["update"] == 7:
+            row["selection_gap_rmse"] += 1
+    history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    args = SimpleNamespace(device="cpu", calibration_cache=None, calibration_weight=1.0,
+        updates=12, control_update=7, reproduction_tolerance=1e-6, log_interval=12,
+        guard=GapGuardConfig(), model_out=None)
+    run = TrainingRun(path / "projection-run")
+    report = module.run_experiment(args, model, opponent, module.read_source(path / "source-run"), run)
+    assert report["reason"] == "control_reproduction_mismatch" and not report["control_matches"]
+    assert not (run.directory / "projected_guarded").exists() and report["saved_checkpoint"] is None
+    assert calls == [5000, 6000]

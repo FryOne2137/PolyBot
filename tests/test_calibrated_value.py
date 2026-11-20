@@ -12,6 +12,7 @@ from polybot.training.calibrated_value import (
 from polybot.training.flat_experiments import FlatImprovements
 from polybot.training.flat_value import EncodedValuePosition, paired_outcome_weights, paired_gap_breakdown
 from polybot.training.run_artifacts import TrainingRun
+from polybot.training.value_gradient_guard import GapGuardConfig
 
 
 def test_calibration_gate_rejects_a_better_ranking_with_bad_absolute_values():
@@ -182,3 +183,35 @@ def test_gap_breakdown_separates_equal_means_and_respects_player_changes():
         groups["tied"]["gap_rmse"] ** 2 * 2 + groups["informative"]["gap_rmse"] ** 2, abs=1e-7)
     empty = paired_gap_breakdown(predictions[:2], targets[:2], signs[:2])
     assert empty["informative"]["pairs"] == 0 and empty["informative"]["gap_rmse"] is None
+
+
+def test_projected_fit_checks_full_training_gap_on_each_applied_step(tmp_path):
+    model = ValueNet()
+    before = deepcopy(model.state_dict())
+
+    def pairs(seed):
+        return [EncodedValuePosition(np.array([sign, 0], dtype=np.float32), 0, -float(sign),
+                                     (seed, 0, 0), "opening") for sign in (1, -1)]
+
+    def points(seed):
+        return [EncodedValuePosition(np.array([sign, 0], dtype=np.float32), 0, float(sign),
+                                     (seed, 0), "opening") for sign in (1, -1)]
+
+    trace = []
+    _, report = fit_calibrated_heads(
+        model, {"train": pairs(100), "selection": pairs(200)},
+        {"train": points(300), "selection": points(400)}, TrainingConfig(device="cpu"),
+        FlatImprovements(value_updates=12, value_batch_size=4, value_learning_rate=0.05),
+        weights=(1.0,), pair_value_weight=1.0, rmse_regression=0, bias_regression=0.02,
+        run=TrainingRun(tmp_path), log_interval=12, gradient_guard=GapGuardConfig(),
+        update_callback=lambda weight, step, metrics, state: trace.append(deepcopy(metrics)),
+    )
+    counts = report["variants"]["1.0"]
+    assert counts["applied_steps"] > 0 and counts["projected_steps"] > 0
+    assert counts["applied_steps"] + counts["rejected_steps"] == 12
+    for row in trace[1:]:
+        status = row["optimisation"]
+        assert status["cache_gap_dot_after"] >= -1e-10
+        assert status["gap_after"] <= status["gap_before"] + status["gap_tolerance"]
+    assert trace[-1]["train_weighted_gap_loss"] < trace[0]["train_weighted_gap_loss"]
+    assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())

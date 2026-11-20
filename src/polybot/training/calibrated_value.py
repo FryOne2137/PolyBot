@@ -18,6 +18,7 @@ from .flat_experiments import isolated_rng, model_fingerprint
 from .flat_value import EncodedValuePosition, VALUE_PHASES, _metrics_by_phase, _paired_metrics, _paired_value_tensors, _value_gap
 from .mcts_value import collect_mcts_terminal_value_games
 from .saved_value_pairs import load_saved_value_pairs
+from .value_gradient_guard import guarded_adamw_step, projected_value_gradients
 
 
 def load_ranking_sources(model, training, directories, *, history):
@@ -157,7 +158,7 @@ def calibration_batch_indices(examples, *, seed, batch_size, updates, device):
 
 def fit_calibrated_heads(model, ranking, calibration, training, settings, *, weights,
                          rmse_regression, bias_regression, run, log_interval,
-                         pair_value_weight=0.0, balance_pair_maps=False, update_callback=None):
+                         pair_value_weight=0.0, balance_pair_maps=False, update_callback=None, gradient_guard=None):
     device = next(model.parameters()).device
     rank_states, rank_targets, rank_signs, ordered = _paired_value_tensors(ranking["train"], device)
     held_states, held_targets, held_signs, _ = _paired_value_tensors(ranking["selection"], device)
@@ -197,23 +198,50 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                 optimizer = torch.optim.AdamW(model.value_head.parameters(), lr=settings.value_learning_rate, weight_decay=0.0)
                 rejections = Counter()
                 accepted = 0
+                applied_steps = rejected_steps = rejected_trials = projected_steps = consecutive_rejections = 0
+                stop_reason = "completed"
                 last = reference
                 for step in range(settings.value_updates + 1):
+                    status = None
+                    applied = step > 0
                     if step:
                         rows = batches[step - 1]
                         predictions = model.value_head(rank_states).squeeze(-1).float()
                         gap_loss, pair_loss = paired_training_losses(predictions, rank_targets, rank_signs,
                                                                      gap_weights, value_weights)
                         point_loss = F.mse_loss(model.value_head(point_states[rows]).reshape(-1).float(), point_targets[rows])
-                        loss = gap_loss + pair_value_weight * pair_loss + weight * point_loss
                         optimizer.zero_grad(set_to_none=True)
-                        loss.backward()
-                        norm = torch.nn.utils.clip_grad_norm_(model.value_head.parameters(), 1.0)
-                        if not torch.isfinite(norm):
-                            rejections["nonfinite_gradient"] += 1
-                            break
-                        optimizer.step()
+                        if gradient_guard is None:
+                            loss = gap_loss + pair_value_weight * pair_loss + weight * point_loss
+                            loss.backward()
+                            norm = torch.nn.utils.clip_grad_norm_(model.value_head.parameters(), 1.0)
+                            if not torch.isfinite(norm):
+                                rejections["nonfinite_gradient"] += 1
+                                stop_reason = "nonfinite_gradient"
+                                break
+                            optimizer.step()
+                        else:
+                            gradients, geometry = projected_value_gradients(
+                                gap_loss, pair_loss, point_loss, tuple(model.value_head.parameters()),
+                                pair_weight=pair_value_weight, cache_weight=weight)
+
+                            def current_training_gap():
+                                return paired_training_losses(model.value_head(rank_states).squeeze(-1).float(),
+                                    rank_targets, rank_signs, gap_weights, value_weights)[0]
+
+                            status = guarded_adamw_step(model.value_head, optimizer, gradients,
+                                                       current_training_gap, gradient_guard)
+                            status.update(geometry)
+                            applied = status["applied"]
+                            rejected_trials += status["rejected_trials"]
+                            projected_steps += int(geometry["cache_projected"])
+                            consecutive_rejections = 0 if applied else consecutive_rejections + 1
+                            child.event("guarded_update", update=step, **status)
+                        applied_steps += int(applied)
+                        rejected_steps += int(not applied)
                         last = measure()
+                        if status is not None:
+                            last["optimisation"] = status
                     if update_callback is not None:
                         update_callback(weight, step, last, model.value_head.state_dict())
                     failures = calibration_admission(
@@ -222,7 +250,7 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                     )
                     if step:
                         rejections.update(failures)
-                    if step and not failures:
+                    if applied and not failures:
                         accepted += 1
                         key = (-last["rank"]["preference_accuracy"], last["rank"]["gap_rmse"],
                                last["calibration"]["rmse"], abs(last["calibration"]["bias"]))
@@ -239,6 +267,9 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                         selection_gap_rmse=last["rank"]["gap_rmse"],
                         selection_preference_accuracy=last["rank"]["preference_accuracy"],
                         selection_value_rmse=last["calibration"]["rmse"], selection_value_bias=last["calibration"]["bias"],
+                        optimisation_applied=applied, optimisation_applied_steps=applied_steps,
+                        optimisation_rejected_steps=rejected_steps, optimisation_rejected_trials=rejected_trials,
+                        optimisation_projected_steps=projected_steps, learning_rate=optimizer.param_groups[0]["lr"],
                     )
                     if step == 0 or step % log_interval == 0 or step == settings.value_updates:
                         print(f"calibrated value | weight={weight:g} | update={step}/{settings.value_updates} | "
@@ -247,7 +278,12 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                               f"value_rmse={last['calibration']['rmse']:.4f} | "
                               f"bias={last['calibration']['bias']:+.4f} | "
                               f"admitted={int(not failures)} | reasons={','.join(failures) or 'passed'}", flush=True)
-                reports[str(weight)] = {"admitted_updates": accepted, "rejections": dict(rejections), "last": last}
+                    if gradient_guard is not None and consecutive_rejections >= gradient_guard.rejection_patience:
+                        stop_reason = "guard_stalled"
+                        break
+                reports[str(weight)] = {"admitted_updates": accepted, "rejections": dict(rejections), "last": last,
+                    "applied_steps": applied_steps, "rejected_steps": rejected_steps, "rejected_trials": rejected_trials,
+                    "projected_steps": projected_steps, "stop_reason": stop_reason}
                 child.finish(reports[str(weight)], plots=False)
     finally:
         model.value_head.load_state_dict(original)

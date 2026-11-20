@@ -199,6 +199,7 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                 rejections = Counter()
                 accepted = 0
                 applied_steps = rejected_steps = rejected_trials = projected_steps = consecutive_rejections = 0
+                fallback_proposals = fallback_steps = moment_resets = calibration_rejections = gap_ascent_trials = direction_trials = 0
                 stop_reason = "completed"
                 last = reference
                 for step in range(settings.value_updates + 1):
@@ -229,12 +230,22 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                                 return paired_training_losses(model.value_head(rank_states).squeeze(-1).float(),
                                     rank_targets, rank_signs, gap_weights, value_weights)[0]
 
+                            def current_training_calibration():
+                                return F.mse_loss(model.value_head(point_states).reshape(-1).float(), point_targets)
+
                             status = guarded_adamw_step(model.value_head, optimizer, gradients,
-                                                       current_training_gap, gradient_guard)
+                                current_training_gap, gradient_guard, calibration_loss=current_training_calibration)
                             status.update(geometry)
                             applied = status["applied"]
                             rejected_trials += status["rejected_trials"]
                             projected_steps += int(geometry["cache_projected"])
+                            fallback_proposals += int(status["fallback_attempted"])
+                            fallback_steps += int(status["fallback_applied"])
+                            moment_resets += int(status["optimizer_moments_reset"])
+                            calibration_rejections += sum("fallback_calibration_regression" in trial["rejection_reasons"]
+                                                          for trial in status["attempts"])
+                            gap_ascent_trials += sum(trial["direction_is_gap_ascent"] is True for trial in status["attempts"])
+                            direction_trials += sum(trial["gap_dot_parameter_delta"] is not None for trial in status["attempts"])
                             consecutive_rejections = 0 if applied else consecutive_rejections + 1
                             child.event("guarded_update", update=step, **status)
                         applied_steps += int(applied)
@@ -270,6 +281,10 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                         optimisation_applied=applied, optimisation_applied_steps=applied_steps,
                         optimisation_rejected_steps=rejected_steps, optimisation_rejected_trials=rejected_trials,
                         optimisation_projected_steps=projected_steps, learning_rate=optimizer.param_groups[0]["lr"],
+                        fallback_proposals=fallback_proposals, fallback_applied_steps=fallback_steps,
+                        optimizer_moment_resets=moment_resets, fallback_calibration_rejections=calibration_rejections,
+                        adamw_gap_ascent_trials=gap_ascent_trials if gradient_guard is not None else None,
+                        adamw_measured_trials=direction_trials if gradient_guard is not None else None,
                     )
                     if step == 0 or step % log_interval == 0 or step == settings.value_updates:
                         print(f"calibrated value | weight={weight:g} | update={step}/{settings.value_updates} | "
@@ -283,7 +298,11 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
                         break
                 reports[str(weight)] = {"admitted_updates": accepted, "rejections": dict(rejections), "last": last,
                     "applied_steps": applied_steps, "rejected_steps": rejected_steps, "rejected_trials": rejected_trials,
-                    "projected_steps": projected_steps, "stop_reason": stop_reason}
+                    "projected_steps": projected_steps, "stop_reason": stop_reason,
+                    "fallback_proposals": fallback_proposals, "fallback_applied_steps": fallback_steps,
+                    "optimizer_moment_resets": moment_resets, "fallback_calibration_rejections": calibration_rejections,
+                    "adamw_gap_ascent_trials": gap_ascent_trials if gradient_guard is not None else None,
+                    "adamw_measured_trials": direction_trials if gradient_guard is not None else None}
                 child.finish(reports[str(weight)], plots=False)
     finally:
         model.value_head.load_state_dict(original)

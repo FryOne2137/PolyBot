@@ -982,3 +982,49 @@ def test_projection_comparison_rejects_control_mismatch_before_protected_fit(rep
     assert report["reason"] == "control_reproduction_mismatch" and not report["control_matches"]
     assert not (run.directory / "projected_guarded").exists() and report["saved_checkpoint"] is None
     assert calls == [5000, 6000]
+
+
+@pytest.mark.parametrize("corrupt_reference", [False, True])
+def test_fallback_comparison_verifies_projection_reference_and_training_calibration(replayable_value_run, monkeypatch, corrupt_reference):
+    from polybot.training.flat_experiments import model_fingerprint
+    from polybot.training.value_gradient_guard import GapGuardConfig
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _projection_comparison(monkeypatch)
+    args = SimpleNamespace(device="cpu", calibration_cache=None, calibration_weight=1.0,
+        updates=12, control_update=7, reproduction_tolerance=1e-6, log_interval=12,
+        guard=GapGuardConfig(), model_out=None)
+    source = module.read_source(path / "source-run")
+    original = model_fingerprint(model)
+    reference = TrainingRun(path / "projection-reference")
+    first = module.run_experiment(args, model, opponent, source, reference)
+    reference.finish(first, plots=False)
+    if corrupt_reference:
+        target = reference.directory / "projected_guarded/last-head.pt"
+        data = torch.load(target, weights_only=True)
+        key = next(iter(data["value_head"]))
+        data["value_head"][key].add_(1)
+        torch.save(data, target)
+    args.compare_fallback = True
+    args.projection_reference_run = reference.directory
+    args.fallback_calibration_relative_regression = 0.0
+    run = TrainingRun(path / "fallback-comparison")
+    report = module.run_experiment(args, model, opponent, source, run)
+    assert report["projection_reference_matches"] is not corrupt_reference
+    assert model_fingerprint(model) == original and calls == [5000, 6000]
+    assert report["new_games_collected"] == 0 and not report["benchmark_performed"]
+    if corrupt_reference:
+        assert report["reason"] == "projection_reference_mismatch"
+        assert not (run.directory / "projected_gap_fallback").exists()
+        return
+    assert set(report["variants"]) == {"sum", "projected_guarded", "projected_gap_fallback"}
+    assert report["variants"]["projected_guarded"]["applied_steps"] == first["variants"]["projected_guarded"]["applied_steps"]
+    events = [json.loads(line) for line in
+              (run.directory / "projected_gap_fallback/calibration-1.0/events.jsonl").read_text().splitlines()]
+    for event in events:
+        for trial in event["attempts"]:
+            assert "gap_dot_parameter_delta" in trial and "gap_step_cosine" in trial
+            if trial["optimizer_mode"] == "gap_fallback" and trial["accepted"]:
+                assert trial["calibration_after"] <= trial["fallback_calibration_limit"]
+                assert trial["gap_after"] < trial["gap_before"] - event["gap_tolerance"]
+        assert event["optimizer_moments_reset"] == event["fallback_applied"]

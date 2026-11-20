@@ -721,6 +721,74 @@ contains the full comparison; `gap_pairs.jsonl` separates the original,
 zero, last, best-gap and admitted heads on training and selection pairs.
 Input model weights and input files remain unchanged.
 
+## Actual AdamW directions and a fresh-moment gap fallback
+
+The protected update now records the **actual parameter displacement** for
+each trial. `gap_dot_parameter_delta = dot(gap_gradient, theta_after -
+theta_before)` is positive for a first-order gap-ascent step and negative
+for descent. `gap_step_cosine` records the corresponding angle; a zero
+gradient or zero displacement has no defined cosine. This differs from
+the sign convention of `gap_dot_combined`, which describes a gradient that
+would be *subtracted* by SGD. These are measured directions rather than a
+deduction from the LR or raw projected gradient.
+
+Add `--compare-fallback` to compare three arms: the ordinary source control,
+the existing `projected_guarded` method, and `projected_gap_fallback`. All
+start from identical source weights and use the same cached observations,
+split and minibatch stream. `--projection-reference-run PREVIOUS_RUN`
+additionally requires the existing projection to reproduce that run's
+counts, final metrics and saved head before the fallback arm starts. Source
+configs, guard settings, checkpoint fingerprints and cache hashes must
+match. The original five-field guard schema is supported. A mismatch stops
+the comparison rather than attributing a changed baseline to the fallback.
+
+In the fallback arm, normal projection/backtracking runs first, unchanged.
+If every trial is rejected, the code restores the pre-proposal weights and
+full optimizer state, then retries **only the weighted gap gradient** with
+fresh AdamW moments. The existing LR, betas, epsilon and other parameter-group
+settings are retained. Each fallback backoff starts afresh from that same
+snapshot, with fresh moments again, so rejected trials cannot accumulate
+momentum. An accepted fallback retains its new optimizer state; this reset
+is explicit and counted. The external applied-step count remains cumulative
+even though AdamW's internal per-parameter counter restarts at one.
+
+A fallback must lower the full training gap by more than its numerical
+tolerance. A zero-motion or zero-gradient attempt cannot count as a reset
+or successful update. It must also keep the **uniform full training-cache
+MSE** below:
+
+```
+cache_before * (1 + fallback_calibration_relative_regression)
+    + 1e-10 + relative_tolerance * abs(cache_before)
+```
+
+`--fallback-calibration-relative-regression 0` is the default: only
+numerical tolerance is allowed. This bound is relative to the state before
+the current proposal, not a held-out score. It governs fallback trials;
+normal projected trials retain the previous gap-only acceptance rule.
+Consequently it prevents an additional local calibration regression from
+the fallback, but does not guarantee that calibration never regresses
+throughout the whole run. Original held-out calibration and ranking
+admission rules remain unchanged for every arm, and selection data never
+guide update acceptance or LR retries.
+
+If all fallback trials fail, original weights, gradients, moments, counters
+and LR are restored. Exceptions and nonfinite updates receive the same
+rollback. The rejection-patience limit still bounds a stalled run. A strict
+calibration constraint can reject every fallback when its objectives
+conflict; this is reported, not silently bypassed.
+
+`events.jsonl` distinguishes projected and `gap_fallback` trials, with
+directions, before/after gap and calibration, LR, limits and all rejection
+reasons. CSV and summaries separately count fallback proposals, accepted
+fallback steps, retained moment resets, calibration rejections and measured
+AdamW ascent trials. Diagnostic head snapshots and the original candidate
+admission rules are preserved. Missing caches do not launch new games.
+The ordinary sum control does not measure trial directions: its direction
+counts are undefined (`null`), rather than reporting unmeasured ascent as
+zero. Protected arms report the number of measured displacements alongside
+their ascent counts.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

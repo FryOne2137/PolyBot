@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -23,6 +24,35 @@ from polybot.training.flat_experiments import FlatImprovements, model_fingerprin
 from polybot.training.value_gradient_guard import GapGuardConfig
 
 
+def projection_reference(directory, source, data, settings, variant, state, tolerance):
+    previous = read_source(directory)
+    config, summary = previous["config"], previous["summary"]
+    if (config["source_config"] != source["config"] or not summary.get("control_matches")
+            or config["checkpoint_fingerprint"] != source["config"]["checkpoint_fingerprints"]["model"]):
+        raise ValueError("projection reference uses another source run or an unverified control")
+    if any(asdict(settings).get(key) != value for key, value in config["guard"].items()):
+        raise ValueError("projection reference has different guard settings")
+    if any(row["sha256"] != config["calibration"][name]["sha256"] for name, row in data["cache_reports"].items()):
+        raise ValueError("projection reference used different cache files")
+    prior = summary["variants"]["projected_guarded"]
+    counts = {key: prior[key] == variant[key] for key in
+              ("applied_steps", "rejected_steps", "rejected_trials", "projected_steps", "attempted_steps", "stop_reason")}
+    metrics = {
+        "train_gap": (prior["last"]["train_rank"]["gap_rmse"], variant["last"]["train_rank"]["gap_rmse"]),
+        "selection_gap": (prior["last"]["rank"]["gap_rmse"], variant["last"]["rank"]["gap_rmse"]),
+        "value_rmse": (prior["last"]["calibration"]["rmse"], variant["last"]["calibration"]["rmse"]),
+        "value_bias": (prior["last"]["calibration"]["bias"], variant["last"]["calibration"]["bias"]),
+    }
+    metric_checks = {key: bool(np.isclose(a, b, atol=tolerance, rtol=tolerance)) for key, (a, b) in metrics.items()}
+    saved = torch.load(directory / "projected_guarded/last-head.pt", map_location="cpu", weights_only=True)
+    head_matches = (saved["input_checkpoint_fingerprint"] == config["checkpoint_fingerprint"]
+                    and saved["value_head"].keys() == state.keys()
+                    and all(torch.allclose(value.cpu(), saved["value_head"][key], atol=tolerance, rtol=tolerance)
+                            for key, value in state.items()))
+    return {"matches": all(counts.values()) and all(metric_checks.values()) and head_matches,
+            "counts": counts, "metrics": metric_checks, "head_matches": head_matches, "run_dir": str(directory)}
+
+
 def run_experiment(args, model, opponent, source, run):
     configuration, previous = source["config"], source["args"]
     if (args.calibration_weight not in configuration["calibration_weights"]
@@ -39,18 +69,25 @@ def run_experiment(args, model, opponent, source, run):
     settings = FlatImprovements(value_updates=args.updates, value_batch_size=previous["batch_size"],
         value_learning_rate=previous["learning_rate"], value_fit_backoffs=0,
         value_capacity=max(previous["batch_size"], len(data["calibration"]["train"])))
+    modes = [("sum", None), ("projected_guarded", args.guard)]
+    if getattr(args, "compare_fallback", False):
+        modes.append(("projected_gap_fallback", replace(args.guard, fallback_gap_only=True,
+            fallback_calibration_relative_regression=getattr(args, "fallback_calibration_relative_regression", 0.0))))
     run.write_config(source_run=str(source["directory"]), source_config=configuration,
         calibration=data["cache_reports"], checkpoint_fingerprint=fingerprint, guard=args.guard,
+        modes={mode: guard for mode, guard in modes},
+        projection_reference_run=getattr(args, "projection_reference_run", None),
         gap_weight=1, branch_mse_weight=configuration.get("pair_value_loss_weight", 0),
         cache_weight=args.calibration_weight, settings=settings,
         seed=data["training"].seed, control_update=args.control_update, diagnostic_only=True,
         guard_scope="full weighted training gap; no selection samples used for updates or retries")
     report = {"diagnostic_only": True, "new_games_collected": 0, "benchmark_performed": False,
-              "control_matches": False, "variants": {}, "selected": None, "saved_checkpoint": None}
+              "control_matches": False, "projection_reference_matches": None,
+              "variants": {}, "selected": None, "saved_checkpoint": None}
     heads = {"original": initial, "zero": None}
     winner = winner_state = None
     try:
-        for mode, guard in (("sum", None), ("projected_guarded", args.guard)):
+        for mode, guard in modes:
             model.value_head.load_state_dict(initial)
             child = run.child(mode)
             child.write_config(mode=mode, guard=guard, settings=settings, source_config=configuration)
@@ -84,7 +121,15 @@ def run_experiment(args, model, opponent, source, run):
             variant = {"before": fitted["reference"], "last": counts["last"], "selected": fitted["selected"],
                        "attempted_steps": last_step, "elapsed_seconds": perf_counter() - start,
                        **{key: counts[key] for key in ("applied_steps", "rejected_steps", "rejected_trials",
-                                                      "projected_steps", "stop_reason", "rejections")}}
+                            "projected_steps", "stop_reason", "rejections", "fallback_proposals", "fallback_applied_steps",
+                            "optimizer_moment_resets", "fallback_calibration_rejections", "adamw_gap_ascent_trials", "adamw_measured_trials")}}
+            if mode == "projected_guarded" and getattr(args, "projection_reference_run", None) is not None:
+                verified = projection_reference(args.projection_reference_run, source, data, args.guard,
+                                                 variant, last_state, args.reproduction_tolerance)
+                report["projection_reference"] = verified
+                report["projection_reference_matches"] = verified["matches"]
+                if not verified["matches"]:
+                    return {**report, "reason": "projection_reference_mismatch"}
             heads[f"{mode}-last"] = last_state
             torch.save({"value_head": last_state, "update": last_step, "mode": mode,
                         "input_checkpoint_fingerprint": fingerprint, "diagnostic_only": True},
@@ -111,7 +156,8 @@ def run_experiment(args, model, opponent, source, run):
             print(f"value projection comparison | mode={mode} | applied={variant['applied_steps']}/{last_step} | "
                   f"rejected_trials={variant['rejected_trials']} | train_gap={last['train_rank']['gap_rmse']:.4f} | "
                   f"selection_gap={last['rank']['gap_rmse']:.4f} | rank={last['rank']['preference_accuracy']} | "
-                  f"value_rmse={last['calibration']['rmse']:.4f} | stop={variant['stop_reason']}", flush=True)
+                  f"value_rmse={last['calibration']['rmse']:.4f} | fallback={variant['fallback_applied_steps']}/"
+                  f"{variant['fallback_proposals']} | stop={variant['stop_reason']}", flush=True)
             run.log(mode_index=len(report["variants"]), applied_steps=variant["applied_steps"],
                     rejected_steps=variant["rejected_steps"], rejected_trials=variant["rejected_trials"],
                     elapsed_seconds=variant["elapsed_seconds"], selection_gap_rmse=last["rank"]["gap_rmse"],
@@ -144,6 +190,10 @@ def main():
     parser.add_argument("--guard-backoff-factor", type=float, default=0.5)
     parser.add_argument("--minimum-learning-rate", type=float, default=1e-7)
     parser.add_argument("--guard-rejection-patience", type=int, default=16)
+    parser.add_argument("--compare-fallback", action="store_true")
+    parser.add_argument("--projection-reference-run", type=Path)
+    parser.add_argument("--fallback-calibration-relative-regression", type=float, default=0.0,
+                        help="Allowed per-fallback relative increase of full training-cache MSE; default zero")
     parser.set_defaults(project=Path("runs/flat-11x11/logs"), name="flat-004-projected-value-offline")
     args = parser.parse_args()
     try:
@@ -153,14 +203,16 @@ def main():
         parser.error(str(error))
     if (args.updates < 1 or not 1 <= args.control_update <= args.updates or args.log_interval < 1
             or not np.isfinite(args.calibration_weight) or args.calibration_weight < 0
+            or not np.isfinite(args.fallback_calibration_relative_regression) or args.fallback_calibration_relative_regression < 0
             or not np.isfinite(args.reproduction_tolerance) or args.reproduction_tolerance <= 0):
         parser.error("invalid coefficient, update budget or reproduction tolerance")
     source = read_source(args.source_run)
     model_path, opponent_path = (Path(source["args"][key]) for key in ("model_in", "opponent"))
     if args.minimum_learning_rate > source["args"]["learning_rate"]:
         parser.error("minimum learning rate exceeds the source run's initial learning rate")
-    if (args.project / "value" / args.name).resolve() == args.source_run.resolve():
-        parser.error("comparison logs must not overwrite the source run")
+    inputs = {path.resolve() for path in (args.source_run, args.projection_reference_run) if path is not None}
+    if (args.project / "value" / args.name).resolve() in inputs:
+        parser.error("comparison logs must not overwrite an input run")
     if args.model_out is not None and (args.model_out.exists() or args.model_out.resolve() in
                                      {model_path.resolve(), opponent_path.resolve()}):
         parser.error("--model-out must be a new checkpoint path")
@@ -170,11 +222,12 @@ def main():
     run = training_run_from_args(args, "value")
     report = run_experiment(args, model, opponent, source, run)
     report["run_dir"] = str(run.finish(report, plots=False))
-    console = {key: report[key] for key in ("reason", "control_matches", "new_games_collected",
+    console = {key: report[key] for key in ("reason", "control_matches", "projection_reference_matches", "new_games_collected",
                                           "benchmark_performed", "saved_checkpoint", "run_dir")}
     console["variants"] = {mode: {
         **{key: row[key] for key in ("attempted_steps", "applied_steps", "rejected_steps", "rejected_trials",
-                                    "projected_steps", "stop_reason", "elapsed_seconds")},
+                "projected_steps", "stop_reason", "elapsed_seconds", "fallback_proposals", "fallback_applied_steps",
+                "optimizer_moment_resets", "fallback_calibration_rejections", "adamw_gap_ascent_trials", "adamw_measured_trials")},
         "last_train_gap_rmse": row["last"]["train_rank"]["gap_rmse"],
         "last_selection_gap_rmse": row["last"]["rank"]["gap_rmse"],
         "last_preference_accuracy": row["last"]["rank"]["preference_accuracy"],
@@ -185,7 +238,7 @@ def main():
     if report["selected"]:
         console["selected"] = {key: report["selected"][key] for key in ("mode", "update")}
     print_summary(console)
-    if not report["control_matches"]:
+    if not report["control_matches"] or report["projection_reference_matches"] is False:
         raise SystemExit(2)
 
 

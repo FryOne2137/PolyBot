@@ -109,3 +109,86 @@ def test_nonfinite_gradient_is_rejected_without_advancing_optimizer():
     assert not report["applied"] and report["rejected_trials"] == 2
     assert head.weight.item() == 1 and head.weight.grad is None
     assert_tree_equal(optimizer.state_dict(), state)
+
+
+def warm_optimizer(head):
+    optimizer = torch.optim.AdamW(head.parameters(), lr=0.1, weight_decay=0)
+    head.weight.grad = -torch.ones_like(head.weight)
+    optimizer.step()
+    with torch.no_grad():
+        head.weight.fill_(1)
+    return optimizer
+
+
+def test_actual_adamw_direction_and_fresh_gap_fallback_are_measured():
+    head = head_at(1)
+    optimizer = warm_optimizer(head)
+    report = guarded_adamw_step(head, optimizer, [-torch.ones_like(head.weight)],
+        lambda: head.weight.square().sum(), GapGuardConfig(backoffs=1, fallback_gap_only=True),
+        calibration_loss=lambda: head.weight.square().sum())
+    assert report["fallback_applied"] and report["optimizer_moments_reset"]
+    assert report["rejected_trials"] == 2 and len(report["attempts"]) == 3
+    for trial in report["attempts"][:2]:
+        assert trial["direction_is_gap_ascent"] and trial["gap_dot_parameter_delta"] > 0
+        assert trial["gap_step_cosine"] == pytest.approx(1)
+    fallback = report["attempts"][-1]
+    assert fallback["optimizer_mode"] == "gap_fallback"
+    assert fallback["gap_step_cosine"] == pytest.approx(-1)
+    assert fallback["calibration_after"] < fallback["calibration_before"]
+    assert optimizer.state[head.weight]["step"].item() == 1
+    assert optimizer.state[head.weight]["exp_avg"].item() > 0
+    reference = head_at(1)
+    fresh = torch.optim.AdamW(reference.parameters(), lr=0.1, weight_decay=0)
+    reference.weight.square().sum().backward()
+    torch.nn.utils.clip_grad_norm_(reference.parameters(), 1)
+    fresh.step()
+    assert_tree_equal(head.state_dict(), reference.state_dict())
+    assert_tree_equal(optimizer.state_dict(), fresh.state_dict())
+
+
+def test_fallback_that_hurts_training_calibration_restores_original_warm_moments():
+    head = head_at(1)
+    optimizer = warm_optimizer(head)
+    weights, state = deepcopy(head.state_dict()), deepcopy(optimizer.state_dict())
+    report = guarded_adamw_step(head, optimizer, [-torch.ones_like(head.weight)],
+        lambda: head.weight.square().sum(), GapGuardConfig(backoffs=1, fallback_gap_only=True),
+        calibration_loss=lambda: (head.weight - 2).square().sum())
+    assert report["fallback_attempted"] and not report["fallback_applied"]
+    assert not report["applied"] and not report["optimizer_moments_reset"]
+    fallback = [row for row in report["attempts"] if row["optimizer_mode"] == "gap_fallback"]
+    assert len(fallback) == 2
+    assert all(row["gap_after"] < row["gap_before"] for row in fallback)
+    assert all("fallback_calibration_regression" in row["rejection_reasons"] for row in fallback)
+    assert_tree_equal(head.state_dict(), weights)
+    assert_tree_equal(optimizer.state_dict(), state)
+
+
+def test_exception_after_resetting_moments_restores_the_original_optimizer():
+    head = head_at(1)
+    optimizer = warm_optimizer(head)
+    weights, state = deepcopy(head.state_dict()), deepcopy(optimizer.state_dict())
+
+    def calibration():
+        if head.weight.item() < 1:
+            raise RuntimeError("fallback calibration failed")
+        return head.weight.square().sum()
+
+    with pytest.raises(RuntimeError, match="fallback calibration failed"):
+        guarded_adamw_step(head, optimizer, [-torch.ones_like(head.weight)],
+            lambda: head.weight.square().sum(), GapGuardConfig(backoffs=1, fallback_gap_only=True),
+            calibration_loss=calibration)
+    assert_tree_equal(head.state_dict(), weights)
+    assert_tree_equal(optimizer.state_dict(), state)
+
+
+def test_zero_gap_fallback_cannot_reset_moments_without_an_improvement():
+    head = head_at(0)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=0.1, weight_decay=0)
+    state = deepcopy(optimizer.state_dict())
+    report = guarded_adamw_step(head, optimizer, [torch.ones_like(head.weight)],
+        lambda: head.weight.square().sum(), GapGuardConfig(backoffs=1, fallback_gap_only=True),
+        calibration_loss=lambda: head.weight.square().sum())
+    assert not report["applied"] and not report["optimizer_moments_reset"]
+    assert any("fallback_no_gap_improvement" in row["rejection_reasons"] for row in report["attempts"])
+    assert_tree_equal(optimizer.state_dict(), state)
+    assert head.weight.item() == 0

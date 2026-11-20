@@ -822,3 +822,81 @@ def test_pair_mse_sweep_missing_cache_never_collects_games(replayable_value_run,
     with pytest.raises(FileNotFoundError, match="required calibration cache"):
         module.run_experiment(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "sweep"))
     assert calls == [5000, 6000]
+
+
+def _gradient_diagnostic(monkeypatch):
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("gradient_diagnostic", scripts / "diagnose_value_gradients.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_memorization_result(path, model):
+    directory = path / "historical-memory"
+    (directory / "delta").mkdir(parents=True)
+    metadata = {"full_batch": True, "train_pairs": 2, "pair_ids": [1, 2],
+                "max_training_preference_accuracy": 1.0, "first_perfect_training_update": 1}
+    (directory / "args.json").write_text(json.dumps({"arguments": {
+        "memorization_test": True, "model_in": str(path / "input.pt")}}))
+    (directory / "config.json").write_text(json.dumps({"model": asdict(model.config),
+        "source": {"source_sha256": {"pairs.jsonl": "historical-other-dataset"}}}))
+    (directory / "summary.json").write_text(json.dumps({"memorization": metadata, "loss_comparison": {"delta": {
+        "updates": 2, "train_before": {"gap_rmse": 1.0}, "train_last": {"gap_rmse": 0.1},
+        "selection_last": {"preference_accuracy": 0.5, "rmse": 1.4}}}}))
+    (directory / "delta/metrics.jsonl").write_text("".join(json.dumps({
+        "update": update, "train_preference_accuracy": value}) + "\n"
+        for update, value in ((0, 0.5), (1, 1.0), (2, 1.0))))
+    return directory
+
+
+def test_gradient_diagnostic_reuses_historical_memory_and_audited_head_without_games(audited_value_run, monkeypatch):
+    from polybot.training.flat_experiments import model_fingerprint
+
+    original, _, opponent, path, _, calls = audited_value_run
+    module = _gradient_diagnostic(monkeypatch)
+    source = module.read_source(path / "source-run")
+    args = SimpleNamespace(device="cpu", calibration_cache=None,
+        memorization_run=_write_memorization_result(path, original), audit_run=path / "audit-run",
+        batches=4, probe_batches=2, calibration_weight=1.0, verification_tolerance=1e-6)
+    fingerprint = model_fingerprint(original)
+    run = TrainingRun(path / "gradient-run")
+    report = module.run_diagnostics(args, original, opponent, source, run)
+    assert report["weights_unchanged"] and model_fingerprint(original) == fingerprint
+    assert calls == [5000, 6000] and report["new_games_collected"] == 0
+    assert report["memorization"]["history_verified"] and not report["memorization"]["same_pair_dataset"]
+    assert report["memorization"]["first_perfect_training_update"] == 1
+    assert set(report["stages"]) == {"initial", "audited-7"}
+    assert not list(run.directory.rglob("*.pt"))
+    probes = [json.loads(line) for line in (run.directory / "adamw_probes.jsonl").read_text().splitlines()]
+    initial = next(row for row in probes if row["stage"] == "initial" and row["mode"] == "full" and row["batch"] == 1)
+    history = [json.loads(line) for line in (path / "source-run/calibration-1.0/metrics.jsonl").read_text().splitlines()]
+    recorded = next(row for row in history if row["update"] == 1)
+    assert initial["after"]["selection_gap_rmse"] == pytest.approx(recorded["selection_gap_rmse"], abs=1e-6)
+    assert initial["after"]["cache_selection_rmse"] == pytest.approx(recorded["selection_value_rmse"], abs=1e-6)
+    assert initial["after"]["train_gap_rmse"] == pytest.approx(recorded["train_gap_rmse"], abs=1e-6)
+    assert len(probes) == 16
+
+
+@pytest.mark.parametrize("corruption", ["history", "checkpoint", "cache"])
+def test_gradient_diagnostic_rejects_incompatible_provenance_and_never_collects(replayable_value_run, monkeypatch, corruption):
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _gradient_diagnostic(monkeypatch)
+    memory = _write_memorization_result(path, model)
+    if corruption == "history":
+        target = memory / "summary.json"
+        value = json.loads(target.read_text())
+        value["memorization"]["first_perfect_training_update"] = 2
+        target.write_text(json.dumps(value))
+    if corruption == "checkpoint":
+        target = memory / "args.json"
+        value = json.loads(target.read_text())
+        value["arguments"]["model_in"] = str(path / "different.pt")
+        target.write_text(json.dumps(value))
+    args = SimpleNamespace(device="cpu", calibration_cache=path / "missing" if corruption == "cache" else None,
+        memorization_run=memory, audit_run=None, batches=4, probe_batches=2,
+        calibration_weight=1.0, verification_tolerance=1e-6)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        module.run_diagnostics(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "grad-run"))
+    assert calls == [5000, 6000]

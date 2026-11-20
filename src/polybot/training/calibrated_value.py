@@ -135,6 +135,26 @@ def paired_training_losses(predictions, targets, signs, gap_weights, value_weigh
             torch.mean(value_weights[:, None] * (predictions - targets).square()))
 
 
+def paired_training_weights(ordered, device, *, balance_pair_maps):
+    map_counts = Counter(pair[0].game_key[0] for pair in ordered)
+    balance = [len(ordered) / (len(map_counts) * map_counts[pair[0].game_key[0]])
+               if balance_pair_maps else 1.0 for pair in ordered]
+    gap_weights = torch.tensor([getattr(pair[0], "gap_weight", 1.0) * factor
+                                for pair, factor in zip(ordered, balance)], device=device)
+    value_weights = torch.tensor([getattr(pair[0], "supervision_weight", 1.0) * factor
+                                  for pair, factor in zip(ordered, balance)], device=device)
+    return gap_weights, value_weights
+
+
+def calibration_batch_indices(examples, *, seed, batch_size, updates, device):
+    """The same phase sampler serves training and read-only gradient probes."""
+    phase_rows = [[i for i, row in enumerate(examples) if row.phase == phase] for phase in VALUE_PHASES]
+    phase_rows = [rows for rows in phase_rows if rows]
+    rng = np.random.default_rng(seed ^ 0x43414C49)
+    return [torch.tensor([int(rng.choice(phase_rows[int(rng.integers(len(phase_rows)))]))
+                          for _ in range(batch_size)], device=device) for _ in range(updates)]
+
+
 def fit_calibrated_heads(model, ranking, calibration, training, settings, *, weights,
                          rmse_regression, bias_regression, run, log_interval,
                          pair_value_weight=0.0, balance_pair_maps=False, update_callback=None):
@@ -145,21 +165,10 @@ def fit_calibrated_heads(model, ranking, calibration, training, settings, *, wei
     point_targets = torch.tensor([row.return_target for row in calibration["train"]], device=device)
     held_point_states = torch.as_tensor(np.stack([row.features for row in calibration["selection"]]), device=device)
     held_point_targets = np.array([row.return_target for row in calibration["selection"]], dtype=np.float32)
-    phase_rows = [[i for i, row in enumerate(calibration["train"]) if row.phase == phase] for phase in VALUE_PHASES]
-    phase_rows = [rows for rows in phase_rows if rows]
-    rng = np.random.default_rng(training.seed ^ 0x43414C49)
-    batches = [
-        torch.tensor([int(rng.choice(phase_rows[int(rng.integers(len(phase_rows)))]))
-                      for _ in range(settings.value_batch_size)], device=device)
-        for _ in range(settings.value_updates)
-    ]
+    batches = calibration_batch_indices(calibration["train"], seed=training.seed,
+        batch_size=settings.value_batch_size, updates=settings.value_updates, device=device)
     original = deepcopy(model.value_head.state_dict())
-    map_counts = Counter(pair[0].game_key[0] for pair in ordered)
-    balance = [len(ordered) / (len(map_counts) * map_counts[pair[0].game_key[0]])
-               if balance_pair_maps else 1.0 for pair in ordered]
-    gap_weights = torch.tensor([getattr(pair[0], "gap_weight", 1.0) * factor for pair, factor in zip(ordered, balance)], device=device)
-    value_weights = torch.tensor([getattr(pair[0], "supervision_weight", 1.0) * factor
-                                  for pair, factor in zip(ordered, balance)], device=device)
+    gap_weights, value_weights = paired_training_weights(ordered, device, balance_pair_maps=balance_pair_maps)
     best_state = best_key = None
     selected = None
     reports = {}

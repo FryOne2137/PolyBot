@@ -603,6 +603,63 @@ are development measurements: this experiment neither establishes a gain
 over zero-value MCTS nor promotes a league champion. An independent paired
 game benchmark remains necessary.
 
+## Cache-versus-gap gradient diagnostic
+
+`scripts/diagnose_value_gradients.py --source-run TRAIN_RUN
+--memorization-run MEMORY_RUN --audit-run AUDIT_RUN` loads the same pinned
+pairs and required terminal caches without collecting games or fitting a
+new checkpoint. It measures the source run's initial head and, optionally,
+the previously audited reconstructed head. The latter must have unchanged
+non-value weights, matching audit metrics and matching calibration-cache
+hashes.
+
+The diagnostic computes the exact weighted, map-balanced gap and branch-MSE
+gradients used in training. Terminal-cache gradients are measured both for
+the **expected phase-balanced sampler** and for 32 actual minibatches from
+the original sampler and seed. Uniform-cache MSE and its gradient norm are
+reported separately: uniform positions and uniform phases need not produce
+the same gradient. Only training maps supply gradients. Selection maps are
+read solely for outcome measurements.
+
+The report includes raw and weighted gradient norms, cache/gap norm ratios,
+pairwise cosines, the fraction of sampled cache gradients opposing the gap,
+and the projection of the combined gradient onto the gap gradient. A
+negative `gap_cache_cosine` denotes opposing directions. A negative
+`gap_dot_combined` predicts ascent of the training gap under an infinitesimal
+SGD step. Neither alone proves that an AdamW update damages ranking.
+
+For the first eight sampled batches, four isolated one-step probes compare
+gap only, weighted cache only, gap plus cache, and the original full loss.
+They use the original learning rate, a fresh AdamW with zero weight decay,
+and the trainer's gradient-norm clip of one. Each starts from the same head
+and is restored immediately. The report measures actual changes in training
+gap loss, ranking, uniform and phase-balanced cache errors, and selection
+errors. At the initial head, the first full-loss probe reproduces the first
+training update. At update 448, these are fresh-optimizer probes, **not a
+reconstruction of the next original update**: its optimizer moments were
+not saved. With two heads and eight batches, there are 64 isolated probes.
+Parameters and pre-existing gradients are restored; no trained model is
+written.
+
+The existing memorization run is read rather than repeated. Its recorded
+checkpoint path and architecture must match, and its reported maximum
+training accuracy and first perfect update must agree with the saved
+per-update history. Its source dataset hashes are compared with the current
+sources, and any difference is made explicit. The old test did not record
+a parameter fingerprint, so this is historical evidence, not independent
+verification of its original weights. In the recorded five-pair experiment,
+training ranking first reached 100% at update 29; this does not establish
+learnability of a different dataset or generalization to other maps.
+
+`summary.json` stores the complete measurements and historical evidence;
+`gradient_batches.jsonl` records sampled indices and gradient geometry;
+`adamw_probes.jsonl` records every restored update and its measured changes.
+Config, fingerprints, hashes and scalar CSV/JSONL metrics are retained for
+reproducibility. Zero gradient norms produce explicit undefined ratios or
+cosines rather than NaN. Missing caches or incompatible historical records
+stop the diagnostic instead of launching collection or another memorization
+training run.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

@@ -1028,3 +1028,113 @@ def test_fallback_comparison_verifies_projection_reference_and_training_calibrat
                 assert trial["calibration_after"] <= trial["fallback_calibration_limit"]
                 assert trial["gap_after"] < trial["gap_before"] - event["gap_tolerance"]
         assert event["optimizer_moments_reset"] == event["fallback_applied"]
+
+
+def test_routing_loader_uses_saved_roles_and_the_opponents_encoder(saved_pairs):
+    from polybot.data.polyenv_features import native_batch_to_tensors
+    from polybot.training.calibrated_value import load_ranking_sources
+    from polybot.training.saved_value_pairs import load_successor_packet
+    from polybot.training.value_routing_audit import load_routing_inputs
+
+    model, training, path = saved_pairs
+    examples, sources = load_ranking_sources(model, training, [path, path], history=0)
+    ranking, _ = split_value_pairs(examples, seed=81, selection_fraction=0.25)
+    opponent = PolicyValueBeliefNet(model.config).eval()
+    first = path / "pair-001-zero-successor.npz"
+    packet, old_features, agent = load_successor_packet(training, first, actor=1, history=0)
+    assert agent == 1
+    features = _encode_value_rows(opponent, training, torch.device("cpu"), packet, np.array([0]))[0]
+    difference = torch.tensor(features - old_features)
+    opponent.value_head = torch.nn.Sequential(torch.nn.Linear(16, 1, bias=False), torch.nn.Tanh())
+    with torch.no_grad():
+        opponent.value_head[0].weight.copy_((0.1 * difference / difference.norm()).unsqueeze(0))
+    opponent.requires_grad_(False)
+    lookup = load_routing_inputs(model, opponent, training, ranking, sources["sources"], history=0, require_agent_id=True)
+    assert len(lookup) == 8  # Repeated source pair IDs have distinct global offsets.
+    record = lookup[(2137, 0, 1)][0]
+    assert record["turn_changed"] and record["agent_id"] == 1 and record["agent_source"] == "saved"
+    assert record["opponent_feature_l2_difference"] > 0.01
+    tensors = native_batch_to_tensors(packet, torch.device("cpu"), training.map_size, training.map_type)
+    with torch.no_grad():
+        expected = opponent(tensors.map_tokens, tensors.global_features, tensors.action_categorical,
+            tensors.action_continuous, tensors.action_mask, tensors.event_features,
+            action_history=tensors.action_history, action_history_mask=tensors.action_history_mask, include_belief=False).value.item()
+        wrong = opponent.value_head(torch.tensor(old_features).unsqueeze(0)).item()
+    assert record["opponent_value"] == pytest.approx(expected, abs=1e-6)
+    assert abs(expected - wrong) > 0.001
+    assert record["successor_sha256"] and all(parameter.grad is None for parameter in opponent.parameters())
+
+
+def test_routing_loader_marks_missing_agent_metadata_instead_of_silently_verifying_it(saved_pairs):
+    from polybot.training.calibrated_value import load_ranking_sources
+    from polybot.training.value_routing_audit import load_routing_inputs
+
+    model, training, path = saved_pairs
+    target = path / "pair-001-zero-successor.npz"
+    with np.load(target, allow_pickle=False) as archive:
+        packet = {key: archive[key].copy() for key in archive.files if key != "agent_id"}
+    np.savez_compressed(target, **packet)
+    examples, sources = load_ranking_sources(model, training, [path], history=0)
+    ranking, _ = split_value_pairs(examples, seed=81, selection_fraction=0.25)
+    with pytest.raises(ValueError, match="no saved agent_id"):
+        load_routing_inputs(model, model, training, ranking, sources["sources"], history=0, require_agent_id=True)
+    result = load_routing_inputs(model, model, training, ranking, sources["sources"], history=0)
+    assert result[(2137, 0, 1)][0]["agent_source"] == "inferred_from_root_player"
+
+
+def test_routing_loader_uses_actual_saved_agent_and_reports_root_role_disagreement(saved_pairs):
+    from polybot.training.calibrated_value import load_ranking_sources
+    from polybot.training.value_routing_audit import load_routing_inputs
+
+    model, training, path = saved_pairs
+    target = path / "pair-001-zero-successor.npz"
+    with np.load(target, allow_pickle=False) as archive:
+        packet = {key: archive[key].copy() for key in archive.files}
+    packet["agent_id"] = np.array(0, dtype=np.int32)
+    np.savez_compressed(target, **packet)
+    examples, sources = load_ranking_sources(model, training, [path], history=0)
+    ranking, _ = split_value_pairs(examples, seed=81, selection_fraction=0.25)
+    result = load_routing_inputs(model, model, training, ranking, sources["sources"], history=0, require_agent_id=True)
+    branch = result[(2137, 0, 1)][0]
+    assert branch["turn_changed"] and branch["root_role_disagrees_with_agent"]
+    assert branch["agent_id"] == 0 and branch["opponent_value"] is None
+
+
+def _routing_audit(monkeypatch):
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("routing_audit", scripts / "audit_value_routing.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_routing_audit_reads_last_head_and_cache_without_updates_or_games(replayable_value_run, monkeypatch):
+    from polybot.training.flat_experiments import model_fingerprint
+    from polybot.training.value_gradient_guard import GapGuardConfig
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    comparison = _projection_comparison(monkeypatch)
+    source = comparison.read_source(path / "source-run")
+    args = SimpleNamespace(device="cpu", calibration_cache=None, calibration_weight=1.0,
+        updates=12, control_update=7, reproduction_tolerance=1e-6, log_interval=12,
+        guard=GapGuardConfig(), model_out=None)
+    head_run = TrainingRun(path / "head-run")
+    head_run.finish(comparison.run_experiment(args, model, opponent, source, head_run), plots=False)
+    module = _routing_audit(monkeypatch)
+    settings = SimpleNamespace(device="cpu", calibration_cache=None, head_run=head_run.directory,
+        head_mode="projected_guarded", require_agent_id=True, batches=4, calibration_weight=1.0,
+        apprentice_value_scale=1.0, opponent_value_scale=1.0, verification_tolerance=1e-6)
+    before = model_fingerprint(model), model_fingerprint(opponent)
+    run = TrainingRun(path / "routing-audit")
+    report = module.run_audit(settings, model, opponent, source, run)
+    assert report["weights_unchanged"] and not report["model_updated"] and report["new_games_collected"] == 0
+    assert calls == [5000, 6000] and not list(run.directory.rglob("*.pt"))
+    assert before == (model_fingerprint(model), model_fingerprint(opponent))
+    assert set(report["stages"]) == {"initial", "projected_guarded-last"}
+    for stage in report["stages"].values():
+        counts = stage["splits"]["train"]["counts"]
+        assert counts["pairs"] == 3 and counts["saved_agent_branches"] == 6
+        assert counts["role_metadata_disagreements"] == 0
+    rows = [json.loads(line) for line in (run.directory / "routing_pairs.jsonl").read_text().splitlines()]
+    assert len(rows) == 8 and all(len(row["branches"]) == 2 for row in rows)

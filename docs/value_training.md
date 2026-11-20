@@ -789,6 +789,71 @@ counts are undefined (`null`), rather than reporting unmeasured ascent as
 zero. Protected arms report the number of measured displacements alongside
 their ascent counts.
 
+## Audit saved successor routing before changing training
+
+`scripts/audit_value_routing.py --source-run TRAIN_RUN --head-run HEAD_RUN`
+audits the saved successor pairs with no game collection, search or optimizer
+steps. It compares the original head and the selected mode's saved
+`last-head.pt` from the verified offline comparison. Source configs,
+checkpoint fingerprints, cache hashes and recorded head metrics must match.
+Both networks and all input files remain unchanged.
+
+The audit counts physical changes from the root player separately from
+model assignments: neither branch changes player, one does, or both do;
+and both branches use apprentice, mixed networks, or both use opponent.
+Saved native `agent_id` is authoritative for model routing. Any discrepancy
+with the root-player convention is reported rather than overwritten.
+`--require-agent-id` rejects old packets without that field. Without this
+flag, missing assignments are inferred from root/player identity and
+explicitly counted as inferred, not verified native routing.
+
+Each opponent-routed state is encoded from its saved public packet using
+the **opponent's own encoder and head**, including its observation, legal
+actions and visible history. It is not evaluated using apprentice features
+fed into the opponent head. The original apprentice-feature verification
+is retained. Every successor NPZ receives a hash in the audit provenance.
+Source-local pair IDs retain their recorded global offsets when several
+collections are combined.
+
+The prediction comparison includes:
+
+- `legacy`: the unscaled apprentice head on both branches, as in the
+  existing paired fitting objective;
+- `routed`: apprentice on agent zero, frozen opponent on agent one, with
+  independently recorded leaf scales (default one for each);
+- `routed_zero_apprentice`: the `(0, opponent_scale)` control.
+
+All branch scores and terminal targets are compared in the same root-player
+perspective. Original actors, assigned models, turn changes, values, gaps,
+preference changes and packet hashes are written to `routing_pairs.jsonl`.
+
+Gradient comparisons use **training pairs and training cache only**. The
+legacy and routed losses retain the same confidence weights, map balancing,
+normalization and loss coefficients. Frozen opponent values are detached;
+only apprentice-routed predictions pass gradients to its head. The expected
+phase-balanced cache gradient and the same 32 sampled minibatches are
+compared against both gap and branch-MSE gradients. Reports separate all
+pairs, apprentice-only, mixed and opponent-only groups. Group contributions
+retain the original full-pair denominator and weights, without renormalizing
+small groups. Changed scalar scores and changed gradient flow are separate
+measurements: routing can change the gradient even when both networks
+currently predict identical values.
+
+`no_apprentice_route` denotes no gradient path to this head at the saved
+successors, including a zero apprentice leaf scale. `zero_aggregate_gradient`
+instead denotes a zero weighted group gradient, which can result from
+cancellation despite individual paths. Undefined cosines and ratios are
+reported as null; neither status is evidence that a conflict was solved.
+Selection positions provide prediction errors and rankings only.
+
+This audits neural values at **real saved post-action observations**, not
+the complete MCTS action Q-values or the observations of detached simulated
+leaves. An opponent-only pair can still lead to apprentice decisions deeper
+in search. A routing mismatch is a methodological finding to quantify; this
+audit does not establish its effect on playing strength or alter the existing
+training objective. Full measurements are retained in `summary.json`, with
+config, source hashes and CSV/JSONL scalar metrics.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

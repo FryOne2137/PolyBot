@@ -20,7 +20,8 @@ def _records(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
 
 
-def _successor(model, training, path, *, actor, history):
+def load_successor_packet(training, path, *, actor, history):
+    """Read the same public successor packet used by training, plus optional routing metadata."""
     with np.load(path, allow_pickle=False) as archive:
         packet = {name: archive[name] for name in (
             "map_tokens", "state", "own_techs", "own_tribe", "initial_player_count",
@@ -28,6 +29,7 @@ def _successor(model, training, path, *, actor, history):
             "visible_action_history_mask", "action_id", "action_features", "to_play",
         )}
         saved_features = archive["features"].copy()
+        agent = int(archive["agent_id"].item()) if "agent_id" in archive else None
     if (packet["map_tokens"].shape != (training.map_size ** 2, 24)
             or packet["state"].ndim != 1 or len(packet["state"]) < 4
             or int(packet["state"][1]) != actor or int(packet["to_play"]) != actor
@@ -41,13 +43,18 @@ def _successor(model, training, path, *, actor, history):
         raise ValueError(f"saved successor has no complete legal-action packet in {path.name}")
     batch = {name: np.expand_dims(value, 0) for name, value in packet.items()}
     batch["action_mask"] = np.ones((1, count), dtype=np.uint8)
+    return batch, saved_features, agent
+
+
+def _successor(model, training, path, *, actor, history):
+    batch, saved_features, _ = load_successor_packet(training, path, actor=actor, history=history)
     encoded = _encode_value_rows(
         model, training, next(model.parameters()).device, batch, np.array([0], dtype=np.int32),
     )[0]
     if (not np.isfinite(encoded).all() or saved_features.shape != encoded.shape
             or not np.allclose(saved_features, encoded, atol=2e-4, rtol=2e-4)):
         raise ValueError(f"saved features differ from the input checkpoint's frozen encoder in {path.name}")
-    return encoded, int(packet["state"][0])
+    return encoded, int(batch["state"][0, 0])
 
 
 def load_saved_value_pairs(model, training, directory: Path, *, history: int):

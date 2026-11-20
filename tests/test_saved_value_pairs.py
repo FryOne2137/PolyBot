@@ -722,3 +722,103 @@ def test_scale_analysis_rejects_changed_checkpoint_and_old_test_maps(audited_val
     with pytest.raises(ValueError, match=expected[corruption]):
         module.run_analysis(args, original, candidate, opponent, module.read_source(path / "source-run"),
                             module.read_source(path / "audit-run"), TrainingRun(path / "scale-run"))
+
+
+def _pair_mse_sweeper(monkeypatch):
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location("pair_mse_sweeper", scripts / "compare_pair_mse.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sweep_args():
+    return SimpleNamespace(device="cpu", calibration_cache=None, pair_mse_weights=(0.0, 0.1, 1.0),
+                           calibration_weight=1.0, updates=12, control_update=7, reproduction_tolerance=1e-6,
+                           log_interval=12, model_out=None)
+
+
+def test_pair_mse_sweep_reuses_data_and_initial_weights_with_identical_minibatches(replayable_value_run, monkeypatch):
+    from polybot.training.flat_experiments import model_fingerprint
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _pair_mse_sweeper(monkeypatch)
+    source = module.read_source(path / "source-run")
+    fingerprint = model_fingerprint(model)
+    fit = module.fit_calibrated_heads
+    batches, execution = {}, []
+
+    def compare(candidate, ranking, calibration, training, settings, **kwargs):
+        weight = kwargs["pair_value_weight"]
+        execution.append(weight)
+        assert model_fingerprint(candidate) == fingerprint
+        assert kwargs["weights"] == (1.0,) and kwargs["balance_pair_maps"]
+        assert {row.game_key[0] for row in ranking["train"]} == set(source["config"]["ranking_split"]["train"]["map_seeds"])
+        assert {row.game_key[0] for row in calibration["train"]} == {5000, 5001}
+        observed = []
+
+        def observe(head, inputs):
+            states = inputs[0]
+            if states.ndim == 2 and len(states) == settings.value_batch_size:
+                observed.append(states.detach().cpu().clone())
+
+        handle = candidate.value_head.register_forward_pre_hook(observe)
+        try:
+            result = fit(candidate, ranking, calibration, training, settings, **kwargs)
+        finally:
+            handle.remove()
+        batches[weight] = observed
+        return result
+
+    monkeypatch.setattr(module, "fit_calibrated_heads", compare)
+    run = TrainingRun(path / "sweep")
+    report = module.run_experiment(_sweep_args(), model, opponent, source, run)
+    assert execution == [1.0, 0.0, 0.1] and report["control_matches"]
+    assert calls == [5000, 6000] and report["new_games_collected"] == 0 and not report["benchmark_performed"]
+    assert model_fingerprint(model) == fingerprint and len(batches[1.0]) == 12
+    for weight in (0.0, 0.1):
+        assert len(batches[weight]) == len(batches[1.0])
+        assert all(torch.equal(a, b) for a, b in zip(batches[weight], batches[1.0], strict=True))
+    assert report["fixed_loss_weights"] == {"gap": 1, "terminal_cache_mse": 1}
+    assert set(report["variants"]) == {"0.0", "0.1", "1.0"}
+    assert set(report["gap_diagnostics"]) == {"train", "selection"}
+    for weight, variant in report["variants"].items():
+        assert variant["attempted_updates"] == 12
+        assert variant["best_gap"]["rank"]["gap_rmse"] <= variant["last"]["rank"]["gap_rmse"]
+        assert (run.directory / f"pair-mse-{weight}" / "best-gap-head.pt").is_file()
+        assert (run.directory / f"pair-mse-{weight}" / "calibration-1.0" / "metrics.csv").is_file()
+        groups = report["gap_diagnostics"]["selection"][f"pair-{weight}-last"]
+        assert groups["tied"]["pairs"] + groups["informative"]["pairs"] == groups["all"]["pairs"]
+    assert (run.directory / "gap_pairs.jsonl").is_file()
+    if report["saved_checkpoint"]:
+        saved, _ = load_model(Path(report["saved_checkpoint"]), "cpu")
+        assert all(torch.equal(value, saved.state_dict()[key]) for key, value in model.state_dict().items()
+                   if not key.startswith("value_head."))
+
+
+def test_pair_mse_sweep_stops_before_other_variants_if_control_does_not_reproduce(replayable_value_run, monkeypatch):
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _pair_mse_sweeper(monkeypatch)
+    history = path / "source-run/calibration-1.0/metrics.jsonl"
+    rows = [json.loads(line) for line in history.read_text().splitlines()]
+    for row in rows:
+        if row["update"] == 7:
+            row["selection_gap_rmse"] += 1
+    history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    run = TrainingRun(path / "sweep")
+    report = module.run_experiment(_sweep_args(), model, opponent, module.read_source(path / "source-run"), run)
+    assert report["reason"] == "control_reproduction_mismatch" and not report["control_matches"]
+    assert not report["variants"] and report["saved_checkpoint"] is None
+    assert not (run.directory / "pair-mse-0.0").exists() and not (run.directory / "candidate.pt").exists()
+    assert calls == [5000, 6000]
+
+
+def test_pair_mse_sweep_missing_cache_never_collects_games(replayable_value_run, monkeypatch):
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _pair_mse_sweeper(monkeypatch)
+    args = _sweep_args()
+    args.calibration_cache = path / "missing-cache"
+    with pytest.raises(FileNotFoundError, match="required calibration cache"):
+        module.run_experiment(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "sweep"))
+    assert calls == [5000, 6000]

@@ -545,6 +545,64 @@ reserved. A zero selection skips the redundant arena. `--offline-only`
 runs all analysis without any game evaluation. With 24 games per arm, a
 nonzero selection plans 48 games on 12 fresh maps.
 
+## Offline comparison of branch-MSE weights
+
+`scripts/compare_pair_mse.py --source-run TRAIN_RUN` reuses the original
+saved pairs, whole-map split and terminal calibration caches. This is a
+head-only training experiment, with no game collection or MCTS arena. A
+missing cache is an error; source checkpoint fingerprints, source dataset
+hashes and the original split must match. Run it on the same device as the
+original collection, because device is part of the cache identity.
+
+The objective is:
+
+```
+normalized_root_gap_MSE + pair_mse_weight * branch_MSE
+                        + calibration_weight * terminal_cache_MSE
+```
+
+The gap coefficient is always one. `--pair-mse-weights 0,0.01,0.05,0.1,1.0`
+changes only the branch-MSE coefficient. `--calibration-weight 1.0` stays
+fixed across variants, so pair weight zero still trains on terminal-cache
+outcomes. Confidence weights and map balancing follow the source run, with
+fixed-count normalization. Both branch predictions and their targets are
+converted to the same root-player perspective when calculating the gap.
+
+Every variant starts from the **original source run's initial checkpoint**,
+not the head reconstructed at update 448. Each gets a fresh AdamW and the
+same phase-sampled calibration minibatches, learning rate, batch size and
+seed. The original training and selection maps retain their roles; selection
+positions supply no gradients. The default budget is 512 updates per weight.
+
+The source run's branch-MSE weight must be included. It runs first, and its
+metrics at update zero and `--control-update 448` are compared with the
+source history. Failure stops the sweep before the remaining weights and
+prevents saving a proposed candidate. The control step must exist in the
+original history and fit inside the new update budget. This makes it
+possible to attribute differences to the branch-MSE coefficient, rather
+than a different initialization, dataset or optimizer schedule.
+
+Each `pair-mse-WEIGHT/calibration-1.0` directory contains the complete
+per-update JSONL and CSV curves, including training and selection ranking,
+train branch/gap losses, selection value RMSE and bias. The parent summary
+separates the final attempted update, the best held-out gap (including
+update zero), and the best update admitted by the original calibration
+gate. A best-gap checkpoint that breaks calibration remains explicitly
+diagnostic. Small head-only snapshots are stored next to each variant's
+summary. `gap_pairs.jsonl` and `gap_diagnostics` in the root summary compare
+the original head, zero, each last update and each selected update, with
+equal-mean and informative pairs separated.
+
+If a variant passes the original common admission rules, the best admitted
+candidate is saved as `candidate.pt` in the new run directory, or at a new
+`--model-out` path. Otherwise no full-network candidate is saved. Admission
+prioritizes ranking accuracy, gap RMSE, value RMSE and absolute bias; it does
+not compare the variants' differently weighted training objectives. The
+original network and checkpoints remain unchanged. Reused selection metrics
+are development measurements: this experiment neither establishes a gain
+over zero-value MCTS nor promotes a league champion. An independent paired
+game benchmark remains necessary.
+
 ## If turn-aligned terminal targets are too noisy
 
 Build a small second dataset from the positions where the proposed search

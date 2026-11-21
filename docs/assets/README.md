@@ -22,3 +22,11 @@ python scripts/check_docs.py
 The figures use repository-owned shapes and text, not game artwork. Different
 renderer versions may change antialiasing; source structure and legibility are
 the validation criteria.
+
+## Gameplay preview
+
+[self-play-demo.webp](self-play-demo.webp) is the animated README preview of a
+gameplay replay in the PolyEnv viewer. It preserves the full two-minute recording
+at 8 frames per second, with the outer margins cropped and the local file path
+hidden. It loops automatically and is maintained separately from the generated
+architecture figures.

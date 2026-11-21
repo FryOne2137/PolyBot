@@ -21,6 +21,7 @@ from .flat_experiments import model_fingerprint
 from .flat_value import paired_outcome_weights
 from .routed_self_play_pool import RoutedPoolSearch, _evaluation_belief_retries
 from .run_artifacts import _jsonable
+from .value_pair_sampling import adaptive_rollout_batch, proposal_pairs
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,7 @@ def _append(path, records):
 
 
 def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, settings,
-                                 excluded_map_seeds, pool, resume_rollouts_only=False):
+                                 excluded_map_seeds, pool, resume_rollouts_only=False, adaptive_sampling=None):
     """Collect up to target confirmed pairs, saving every probe and paired repeat."""
     started = time.monotonic()
     deadline = started + settings.hours * 3600
@@ -225,6 +226,15 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
     if set(state["reserved_map_seeds"]) & excluded:
         raise ValueError("saved decisive-pair source maps overlap currently reserved maps")
     config["collector_identity"] = identity
+    if adaptive_sampling is not None:
+        if settings.mode != "pooled":
+            raise ValueError("adaptive sampling requires pooled labels")
+        if state.get("zero_recheck_reserved", 0) > adaptive_sampling.zero_budget:
+            raise ValueError("zero recheck budget cannot be smaller than its already reserved budget")
+        if any(target > min(adaptive_sampling.zero_max_rollouts, settings.max_rollouts)
+               for target in state.get("zero_recheck_targets", {}).values()):
+            raise ValueError("zero recheck limit cannot invalidate previously reserved repeats")
+        config["sampling_policy"] = {"version": 1, **asdict(adaptive_sampling)}
     if settings.mode == "pooled":
         config.update(label_mode="weighted_soft", labels_file="weighted_pairs.jsonl", pair_weighting_version=1)
     metadata = _journal(output / "pairs.jsonl")
@@ -245,6 +255,31 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
         raise ValueError("rollouts-only resume needs existing pooled candidate pairs")
     prefixes = {row["pair_id"]: row["action_prefix"] for row in metadata}
     known = {(row["map_seed"], row["player"], row["move"] - 1) for row in metadata}
+    known_pairs = {(row["map_seed"], row["player"], row["move"] - 1,
+                    *sorted(row["choices"][arm]["action_id"] for arm in ARMS)) for row in metadata}
+    pairs_by_root = Counter((row["map_seed"], row["player"], row["move"] - 1) for row in metadata)
+    if adaptive_sampling is not None and not resume_rollouts_only:
+        queued = set(state.get("adaptive_saved_roots", []))
+        # Reuse a bounded, map-interleaved set of saved public roots before
+        # spending time on new source games. Stored particles and pairs stay intact.
+        roots = sorted(metadata, key=lambda row: (pairs_by_root[row["map_seed"], row["player"], row["move"] - 1],
+                                                 row["map_seed"], row["pair_id"]))
+        by_map = {}
+        for row in roots:
+            by_map.setdefault(row["map_seed"], []).append(row)
+        ordered_roots = [rows[index] for index in range(max(map(len, by_map.values()), default=0))
+                         for rows in by_map.values() if index < len(rows)]
+        for row in ordered_roots:
+            root = (row["map_seed"], row["player"], row["move"] - 1)
+            key = ":".join(map(str, root))
+            if len(queued) >= adaptive_sampling.saved_root_probes:
+                break
+            if key in queued or pairs_by_root[root] >= adaptive_sampling.pairs_per_root:
+                continue
+            state["pending_probes"].append({"position": asdict(_ReplayPosition(
+                row["pair_id"], *root, row["root_fingerprint"])), "prefix": row["action_prefix"], "phase": row["phase"]})
+            queued.add(key)
+        state["adaptive_saved_roots"] = sorted(queued)
     candidates_by_map = Counter(row["map_seed"] for row in metadata)
     imported = {"candidates": len(positions), "paired_repeats": len(rollout_rows),
                 "completed_paired_repeats": sum(len(completed_score_pairs(rows)) for rows in results.values())}
@@ -300,6 +335,9 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             "failed_source_batches": state.get("failed_source_batches", 0),
             "failed_source_maps": state.get("failed_source_maps", 0),
             "source_evaluation_games": state.get("source_evaluation_games", 0),
+            "sampling_policy": None if adaptive_sampling is None else asdict(adaptive_sampling),
+            "zero_recheck_reserved": state.get("zero_recheck_reserved", 0),
+            "zero_recheck_attempts": sum(state.get("zero_recheck_attempts", {}).values()),
             "compared_probes": state["compared_probes"], "failed_probes": state["failed_probes"],
             "attempted_paired_repeats": sum(len(rows) for rows in results.values()),
             "completed_paired_repeats": sum(row["completed_paired_repeats"] for row in decisions.values()),
@@ -338,11 +376,21 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             if not scouting:
                 state["pooled_scout_complete"] = True
             phase, batch = _pooled_rollout_batch(positions, results, decisions, settings, pool["num_envs"] // 2)
+            if adaptive_sampling is not None:
+                phase, batch = adaptive_rollout_batch(positions, results, decisions, settings,
+                    pool["num_envs"] // 2, adaptive_sampling, state, (phase, batch))
+                available_source &= len(positions) < settings.candidate_pool
+                count = state.get("adaptive_rollout_batches", 0)
+                scouting = bool(available_source and (not batch or
+                    count - state.get("adaptive_last_source", -adaptive_sampling.source_interval) >= adaptive_sampling.source_interval))
+                if scouting:
+                    state["adaptive_last_source"] = count
             # Fill the batch while data are still being screened. Never drain
             # one candidate through sixteen repeats before looking for others.
             refill = (not summary["reached_target"] and available_source
                       and (phase != "screening" or len(batch) < pool["num_envs"] // 2))
-            scouting = scouting or refill
+            if adaptive_sampling is None:
+                scouting = scouting or refill
             active = [] if scouting else batch
             state["pooled_phase"] = "scouting" if scouting else phase
             if not scouting and not active:
@@ -358,6 +406,22 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             jobs = deque([batch])
             while jobs and time.monotonic() < deadline:
                 batch = jobs.popleft()
+                if adaptive_sampling is not None:
+                    if phase == "zero_recheck":
+                        batch = [pair for pair in batch if state.get("zero_recheck_attempts", {}).get(str(pair.pair_id), 0)
+                                 < state["zero_recheck_allocations"][str(pair.pair_id)]]
+                        if not batch:
+                            continue
+                    state["adaptive_rollout_batches"] = state.get("adaptive_rollout_batches", 0) + 1
+                    if phase == "zero_recheck":
+                        attempts = state.setdefault("zero_recheck_attempts", {})
+                        for pair in batch:
+                            key = str(pair.pair_id)
+                            attempts[key] = attempts.get(key, 0) + 1
+                        # Persist the spent budget before running a potentially
+                        # interrupted native call. Its repeat index is unchanged
+                        # until the terminal journal entry is committed.
+                        checkpoint("zero_recheck_reserved")
                 repeats = {pair.pair_id: len(results[pair.pair_id]) for pair in batch}
                 state["rollout_batches"] = state.get("rollout_batches", 0) + 1
                 state["rollout_pair_slots"] = state.get("rollout_pair_slots", 0) + len(batch)
@@ -396,7 +460,8 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             batch = [replace(_ReplayPosition(**row["position"]), game=index) for index, row in enumerate(pending)]
             batch_prefixes = {index: row["prefix"] for index, row in enumerate(pending)}
             keep = [index for index, position in enumerate(batch) if (
-                (position.seed, position.player, position.prefix_length) not in known
+                ((position.seed, position.player, position.prefix_length) not in known if adaptive_sampling is None else
+                 pairs_by_root[position.seed, position.player, position.prefix_length] < adaptive_sampling.pairs_per_root)
                 and candidates_by_map[position.seed] < settings.max_candidates_per_map
                 and (settings.mode == "pooled" or sum(row["map_seed"] == position.seed and row["status"] == "confirmed"
                         for row in decisions.values()) < settings.max_pairs_per_map
@@ -406,27 +471,43 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
                 if keep:
                     batch = [batch[index] for index in keep]
                     before = len(positions)
-                    roots, _, particles = _compare_probes(make_search(batch), batch, batch_prefixes, model, capture_leaves=False)
+                    roots, _, particles = _compare_probes(make_search(batch), batch, batch_prefixes, model, capture_leaves=False,
+                        **(dict(action_types=adaptive_sampling.action_types) if adaptive_sampling is not None else {}))
                     state["compared_probes"] += len(batch)
                     for index, position in enumerate(batch):
                         choices = {arm: roots[f"belief_{arm}"][index] for arm in ARMS}
-                        actions = tuple(choices[arm]["action_id"] for arm in ARMS)
-                        if actions[0] == actions[1] or candidates_by_map[position.seed] >= settings.max_candidates_per_map:
-                            continue
-                        key = max(positions, default=0) + 1
-                        phase = pending[position.game]["phase"]
-                        particle_file = f"pair-{key:03d}-particles.npz"
-                        np.savez_compressed(output / particle_file, particles=particles[index])
-                        row = {"pair_id": key, "map_seed": position.seed, "player": position.player,
-                               "move": position.prefix_length + 1, "root_fingerprint": position.fingerprint,
-                               "action_prefix": batch_prefixes[position.game][:position.prefix_length],
-                               "choices": choices, "phase": phase, "particle_file": particle_file}
-                        _append(output / "pairs.jsonl", [row])
-                        positions[key] = Disagreement(key, replace(position, game=key), actions)
-                        prefixes[key] = row["action_prefix"]
-                        results[key] = []
-                        candidates_by_map[position.seed] += 1
-                        known.add((position.seed, position.player, position.prefix_length))
+                        alternatives = roots.get("public_action_candidates", [[] for _ in batch])[index]
+                        offered = proposal_pairs(choices, alternatives, adaptive=adaptive_sampling is not None)
+                        root = (position.seed, position.player, position.prefix_length)
+                        if adaptive_sampling is not None and pairs_by_root[root]:
+                            # The original MCTS pair is already preserved. Use
+                            # the remaining root slot for public-action diversity.
+                            offered.sort(key=lambda item: item[1] != "public_action_diversity")
+                        for selected, origin in offered:
+                            actions = tuple(selected[arm]["action_id"] for arm in ARMS)
+                            pair_identity = (*root, *sorted(actions))
+                            if (pair_identity in known_pairs or candidates_by_map[position.seed] >= settings.max_candidates_per_map
+                                    or (adaptive_sampling is not None and (pairs_by_root[root] >= adaptive_sampling.pairs_per_root
+                                                                         or len(positions) >= settings.candidate_pool))):
+                                continue
+                            key = max(positions, default=0) + 1
+                            pair_phase = pending[position.game]["phase"]
+                            particle_file = f"pair-{key:03d}-particles.npz"
+                            np.savez_compressed(output / particle_file, particles=particles[index])
+                            row = {"pair_id": key, "map_seed": position.seed, "player": position.player,
+                                   "move": position.prefix_length + 1, "root_fingerprint": position.fingerprint,
+                                   "action_prefix": batch_prefixes[position.game][:position.prefix_length],
+                                   "choices": selected, "phase": pair_phase, "particle_file": particle_file}
+                            if adaptive_sampling is not None:
+                                row["proposal_source"] = origin
+                            _append(output / "pairs.jsonl", [row])
+                            positions[key] = Disagreement(key, replace(position, game=key), actions)
+                            prefixes[key] = row["action_prefix"]
+                            results[key] = []
+                            candidates_by_map[position.seed] += 1
+                            pairs_by_root[root] += 1
+                            known.add(root)
+                            known_pairs.add(pair_identity)
                     if settings.mode == "pooled" and len(positions) > before:
                         print(f"pooled value scouting | candidates={len(positions)}/{settings.candidate_pool} | "
                               f"probes={state['compared_probes']} | elapsed={(time.monotonic() - started) / 3600:.2f}h", flush=True)

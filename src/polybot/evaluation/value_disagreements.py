@@ -151,7 +151,7 @@ def _pack_rows(rows):
     }
 
 
-def _compare_probes(search, batch, prefixes, model, *, capture_leaves=True):
+def _compare_probes(search, batch, prefixes, model, *, capture_leaves=True, action_types=0):
     request = _replay_positions(search, batch, prefixes, recover_beliefs=True)
     if np.any(request["agent_id"] != 0):
         raise RuntimeError("value disagreement probes must start on the apprentice's decision")
@@ -173,6 +173,36 @@ def _compare_probes(search, batch, prefixes, model, *, capture_leaves=True):
         search, request, include_true_map=False, variants=(("zero", 0.0, model), ("soft_z", 1.0, model)),
         observe_leaves=capture if capture_leaves else None, observe_particles=lambda worlds: particles.append(worlds),
     )
+    if action_types:
+        policy, _ = search.direct_policy_value(request, np.arange(len(batch), dtype=np.int32))
+        alternatives = []
+        for row in range(len(batch)):
+            legal = np.flatnonzero(request["action_mask"][row])
+            order = sorted(legal, key=lambda index: (-policy[row, index], int(request["action_id"][row, index])))
+            seen, chosen = set(), []
+            for index in order:
+                kind = int(request["action_features"][row, index, 0])
+                subtype = int(request["action_features"][row, index, 8]) if kind == 8 else None
+                family = (kind, subtype)
+                if family in seen:
+                    continue
+                seen.add(family)
+                chosen.append({"action_id": int(request["action_id"][row, index]), "action_type": kind,
+                               "action_subtype": subtype, "raw_probability": float(policy[row, index]),
+                               "proposal_source": "public_action_type"})
+                if len(chosen) >= action_types:
+                    break
+            for arm in ARMS:
+                action_id = roots[f"belief_{arm}"][row]["action_id"]
+                if all(item["action_id"] != action_id for item in chosen):
+                    index = next((index for index in legal if request["action_id"][row, index] == action_id), None)
+                    if index is not None:
+                        chosen.append({"action_id": int(action_id), "action_type": int(request["action_features"][row, index, 0]),
+                                       "action_subtype": int(request["action_features"][row, index, 8])
+                                           if request["action_features"][row, index, 0] == 8 else None,
+                                       "raw_probability": float(policy[row, index]), "proposal_source": "mcts"})
+            alternatives.append(chosen)
+        roots["public_action_candidates"] = alternatives
     return roots, leaves, particles[0]
 
 

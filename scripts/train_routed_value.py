@@ -20,6 +20,7 @@ from polybot.infrastructure.device import select_device
 from polybot.infrastructure.model_io import load_model
 from polybot.training.cli import add_run_options, print_summary, training_run_from_args
 from polybot.training.flat_experiments import model_fingerprint
+from polybot.training.value_pair_sampling import AdaptivePairSampling
 
 
 def training_options(args, source):
@@ -43,6 +44,11 @@ def training_options(args, source):
         routed_value=True, pair_source_policy="mcts-zero", pair_rollout_temperature=0.0,
         pair_collection_mode="pooled", collect_decisive_pairs=args.collect_pairs,
         resume_rollouts_only=getattr(args, "resume_rollouts_only", False),
+        diagnostic_fit=getattr(args, "diagnostic_fit", False), minimum_training_pairs=args.minimum_pairs,
+        persistent_split_path=args.pairs_dir / "value-split.json" if getattr(args, "diagnostic_fit", False) else None,
+        adaptive_sampling=AdaptivePairSampling(
+            zero_budget=args.zero_recheck_budget, zero_max_rollouts=args.zero_recheck_rollouts,
+            zero_fraction=args.zero_recheck_fraction) if getattr(args, "adaptive_collection", False) else None,
         minimum_collected_pairs=min(args.collect_pairs, args.minimum_pairs) if args.collect_pairs else 0,
         collected_pairs_dir=args.pairs_dir, pair_source_seed=args.pair_source_seed,
         pair_source_games=args.source_games, pair_source_batch_games=previous["num_envs"] - previous["num_envs"] % 2,
@@ -84,11 +90,24 @@ def run_training(args, model, opponent, source, run):
     training = replace(data["training"], learning_rate=args.learning_rate, batch_size=args.batch_size)
     fingerprints = model_fingerprint(model), model_fingerprint(opponent)
     model.value_head.requires_grad_(True)
+    initial_fit = None
+    labels = args.pairs_dir / "weighted_pairs.jsonl"
+    if options.diagnostic_fit and args.collect_pairs and labels.is_file() and labels.stat().st_size:
+        initial_options = SimpleNamespace(**{**vars(options), "saved_pairs": [args.pairs_dir],
+            "collect_decisive_pairs": 0, "diagnostic_only": True})
+        print("value diagnostic fit | stage=saved_pairs | collection_has_not_started", flush=True)
+        initial_run = run.child("saved-pairs-fit")
+        initial_fit = run_experiment(initial_options, model, opponent, model.config, training, initial_run)
+        initial_run.finish(initial_fit, plots=False)
+        run.finish({"phase": "collection_pending", "initial_diagnostic_fit": initial_fit,
+                    "ready_for_mcts": False, "saved_checkpoint": None}, plots=False)
     report = run_experiment(options, model, opponent, model.config, training, run)
     report["input_weights_unchanged"] = fingerprints == (model_fingerprint(model), model_fingerprint(opponent))
     report["source_run"] = str(source["directory"])
     report["pinned_cache"] = data["cache_reports"]
     report["old_cache_reused"] = True
+    if initial_fit is not None:
+        report["initial_diagnostic_fit"] = initial_fit
     if not report["input_weights_unchanged"]:
         raise RuntimeError("value experiment changed an input network in memory")
     return report
@@ -106,6 +125,13 @@ def main():
                         help="Fresh pooled successor pairs; zero reuses --pairs-dir without games until the arena.")
     parser.add_argument("--resume-rollouts-only", action="store_true",
                         help="Label existing candidates without source games or new probes; keeps the collection identity.")
+    parser.add_argument("--diagnostic-fit", action="store_true",
+                        help="Fit saved data before collection and below evidence thresholds; acceptance gates remain unchanged.")
+    parser.add_argument("--adaptive-collection", action="store_true",
+                        help="Recheck uncertain zero gaps within a persistent budget and propose diverse public actions.")
+    parser.add_argument("--zero-recheck-budget", type=int, default=24)
+    parser.add_argument("--zero-recheck-rollouts", type=int, default=8)
+    parser.add_argument("--zero-recheck-fraction", type=float, default=0.25)
     parser.add_argument("--minimum-pairs", type=int, default=64)
     parser.add_argument("--candidate-pool", type=int, default=256)
     parser.add_argument("--source-games", type=int, default=192)
@@ -134,6 +160,9 @@ def main():
         args.calibration_weights = tuple(float(item) for item in args.calibration_weights.split(","))
         source = read_source(args.source_run)
         training_options(args, source)
+        if args.adaptive_collection:
+            AdaptivePairSampling(zero_budget=args.zero_recheck_budget, zero_max_rollouts=args.zero_recheck_rollouts,
+                                 zero_fraction=args.zero_recheck_fraction)
         if args.resume_rollouts_only and (args.collect_pairs == 0 or not (args.pairs_dir / "pairs.jsonl").is_file()):
             raise ValueError("--resume-rollouts-only needs an existing collection and positive --collect-pairs")
         if (args.collect_pairs < 0 or args.minimum_pairs < 2 or args.candidate_pool < 2
@@ -162,7 +191,8 @@ def main():
     run = training_run_from_args(args, "value")
     report = run_training(args, model, opponent, source, run)
     report["run_dir"] = str(run.finish(report, plots=False))
-    print_summary({key: report.get(key) for key in ("run_dir", "reason", "collected_pair_counts", "informative_pairs", "routing_counts",
+    print_summary({key: report.get(key) for key in ("run_dir", "reason", "diagnostic_fit", "optimisation_updates",
+        "acceptance_data_failures", "collected_pair_counts", "informative_pairs", "routing_counts",
         "ready_for_mcts", "saved_checkpoint", "diagnostic_checkpoint", "input_weights_unchanged",
         "gameplay_admission", "score_delta_vs_original", "score_delta_vs_zero")})
 

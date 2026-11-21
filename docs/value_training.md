@@ -946,6 +946,65 @@ until the whole-map split is actually computed; an early collection exit
 must not present unmeasured split counts as zero. `confirmed=0` is the
 separate sign-test result, not a count of all usable or nonzero-mean pairs.
 
+### Fit existing data while collecting better pairs
+
+Pass `--diagnostic-fit --adaptive-collection` to use the saved data immediately
+and improve subsequent collection. This is compatible with the existing pair
+directory, including its pending candidates and terminal-rollout journal.
+Policy, belief, encoder, opponent and the fixed continuation policy remain
+unchanged.
+
+`--diagnostic-fit` performs a head-only fit on existing labelled pairs **before**
+starting new games, then fits the updated dataset after collection. Branch MSE,
+the routed difference loss, terminal-cache loss and their strict admission
+checks are unchanged. Diagnostic fitting may run below the minimum pair and
+informative-pair counts. It writes metrics and `last-head.pt` snapshots, but
+cannot enter the arena or write `--model-out` while those counts are unmet.
+An offline-admitted state is still only a diagnostic candidate until all
+existing data, calibration, ranking and paired-gameplay gates pass. The
+pre-collection fit is always diagnostic, even if sufficient data already
+exist. Its model weights are restored before collection so the teacher and
+cache identities remain fixed. Zero nonzero-mean labels can still supply
+absolute-value MSE targets; they cannot establish ranking accuracy.
+
+Exact label journals and the labelled public successor NPZs are copied into
+each fit's `datasets/` directory. Later continuations update the live dataset without
+changing the earlier diagnostic targets. `value-split.json` in the pair
+directory keeps map roles fixed across changing labels and new alternatives.
+New maps get deterministic roles; old selection maps never move into training.
+Missing map coverage still prevents a fit rather than mixing the splits.
+
+Adaptive sampling periodically revisits zero observed mean differences.
+`--zero-recheck-fraction 0.25` schedules a recheck opportunity every fourth
+rollout batch when eligible pairs exist. `--zero-recheck-budget 24` reserves
+at most 24 extra **paired attempts** across resumes, including failed native
+attempts; it does not reset each night. `--zero-recheck-rollouts 8` caps each
+selected zero pair at eight completed repeats, including its original screen.
+Reserved blocks can finish if a nonzero difference appears. Subsequent normal
+refinement of an informative pair still follows the original maximum-repeat
+budget. These checks reduce uncertainty without forcing all observed ties
+through sixteen repeats or treating a four-repeat zero as proven equivalence.
+
+The adaptive collector also replays a bounded, map-interleaved selection of
+saved roots and proposes alternatives from their **public legal actions**.
+It retains the original MCTS-zero versus MCTS-value pair, then considers the
+highest-policy representative of different action classes and tile-action
+subtypes. Alternatives are legal even when both MCTS variants choose the same
+move. At most two unordered action pairs per root are retained, with the
+existing per-map and candidate-pool caps. Previously saved pairs, particles,
+successors and repeat numbers are preserved. New pairs record
+`proposal_source`; the legacy arm name `soft_z` is a schema slot and can now
+hold a public-action alternative. Its targets still come from the same fixed
+MCTS `(0,1)` continuations, not from its proposal score.
+
+Source/probe work is interleaved with rollout batches instead of restarting a
+long scouting-only phase. The adaptive sampling policy and persistent attempt
+counters are recorded separately from the unchanged checkpoint/continuation
+identity. Do not pass `--resume-rollouts-only` when new alternatives or maps
+are wanted; that flag intentionally suppresses new probes and source games.
+No proposal strategy guarantees informative outcomes or a stronger value
+head. Acceptance remains based on the original independent comparisons.
+
 `--model-out` is written only after the **entire planned arena** completes
 and shows evidence against both controls. Each map's two seats form one
 observation. Admission requires a positive mean score delta and a one-sided

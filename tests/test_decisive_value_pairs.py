@@ -245,3 +245,63 @@ def test_rollouts_only_resume_reuses_existing_candidates_without_new_source_game
     assert report["completed_paired_repeats"] == 4 and len(played) == len(set(played)) == 4
     assert report["reserved_map_seeds"] == [1000, 1001] and report["source_games"] == 4
     assert before == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
+def test_adaptive_resume_reuses_old_roots_and_rollouts_and_adds_diverse_pairs(tmp_path, monkeypatch):
+    import hashlib
+    from polybot.training.value_pair_sampling import AdaptivePairSampling
+
+    model = torch.nn.Linear(1, 1)
+    settings = collector.DecisivePairCollection(target=2, seed=1000, source_games=4, source_batch_games=4,
+        mode="pooled", candidate_pool=8, min_rollouts=4, max_rollouts=8, screening_rollouts=4)
+    pool = dict(num_envs=4, num_threads=1, max_pending_leaves=1, visible_action_history=0)
+    stage, played = ["legacy"], []
+
+    def source(*args, **kwargs):
+        return [_ReplayPosition(game, 1000 + game // 2, game % 2, 1, f"root-{game}") for game in (0, 2)], {
+            0: [1, 2], 2: [1, 2]}, {}
+
+    def compare(search, batch, *args, **kwargs):
+        result = {"belief_zero": [{"action_id": 10} for _ in batch],
+                  "belief_soft_z": [{"action_id": 11 if stage[0] == "legacy" else 13} for _ in batch]}
+        if kwargs.get("action_types"):
+            result["public_action_candidates"] = [[{"action_id": action, "action_type": kind,
+                "raw_probability": 0.5} for action, kind in ((10, 0), (11, 0), (12, 1))] for _ in batch]
+        return result, {}, np.zeros((len(batch), 2, 1, 1, 24))
+
+    def branches(search, batch, prefixes, repeat, temperature, output, **kwargs):
+        outcomes = []
+        for pair in batch:
+            index = kwargs["repeat_by_pair"][pair.pair_id]
+            played.append((pair.pair_id, index))
+            for arm in ("zero", "soft_z"):
+                path = output / f"pair-{pair.pair_id:03d}-{arm}-successor.npz"
+                if not path.exists():
+                    np.savez_compressed(path, to_play=pair.position.player)
+            left = 1 if stage[0] == "legacy" or pair.pair_id == 2 else 0
+            outcomes.extend([{"score_a": left, "truncated": False}, {"score_a": 1, "truncated": False}])
+        return outcomes
+
+    monkeypatch.setattr(collector, "_sample_source_positions", source)
+    monkeypatch.setattr(collector, "_compare_probes", compare)
+    monkeypatch.setattr(collector, "_branches", branches)
+    monkeypatch.setattr(collector, "RoutedPoolSearch", lambda *args, **kwargs: SimpleNamespace())
+    options = dict(output=tmp_path, settings=settings, excluded_map_seeds={2000}, pool=pool)
+    first = collector.collect_decisive_value_pairs(model, model, TrainingConfig(device="cpu"), MCTSConfig(), **options)
+    assert first["usable_pairs"] == 2 and first["usable_informative_pairs"] == 0
+    old_metadata, old_rollouts = (tmp_path / "pairs.jsonl").read_bytes(), (tmp_path / "rollouts.jsonl").read_bytes()
+    paths = [*tmp_path.glob("*-particles.npz"), *tmp_path.glob("*-successor.npz")]
+    hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    stage[0] = "adaptive"
+    monkeypatch.setattr(collector, "_sample_source_positions", lambda *args, **kwargs: pytest.fail("source budget already spent"))
+    report = collector.collect_decisive_value_pairs(model, model, TrainingConfig(device="cpu"), MCTSConfig(),
+        **options, adaptive_sampling=AdaptivePairSampling(zero_budget=4, zero_fraction=1, source_interval=1, saved_root_probes=2))
+    assert report["candidates"] == 4 and report["usable_pairs"] == 4
+    assert report["zero_recheck_attempts"] == report["zero_recheck_reserved"] == 4
+    assert report["usable_informative_pairs"] == 3
+    assert (tmp_path / "pairs.jsonl").read_bytes().startswith(old_metadata)
+    assert (tmp_path / "rollouts.jsonl").read_bytes().startswith(old_rollouts)
+    assert hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    assert len(played) == len(set(played))
+    added = [json.loads(line) for line in (tmp_path / "pairs.jsonl").read_text().splitlines()][2:]
+    assert all(row["proposal_source"] == "public_action_diversity" and row["choices"]["soft_z"]["action_id"] == 12 for row in added)

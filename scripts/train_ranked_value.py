@@ -30,15 +30,30 @@ from polybot.training.saved_value_pairs import split_value_pairs
 from polybot.training.value_routing_audit import load_routing_inputs, routing_counts
 from polybot.training.flat_value import _paired_value_tensors
 from polybot.training.value_routing import paired_value_admission
+from polybot.training.value_pair_split import persistent_pair_split, snapshot_pair_dataset
 
 
 def run_experiment(args, model, opponent, config, training, run):
     routed = getattr(args, "routed_value", False)
+    diagnostic = routed and getattr(args, "diagnostic_fit", False)
+
+    def split_pairs(rows):
+        if diagnostic and len({row.game_key[0] for row in rows}) < 2:
+            return {"train": rows, "selection": []}, {"unit": "whole_map_seed", "reason": "insufficient_labelled_maps"}
+        path = getattr(args, "persistent_split_path", None)
+        if routed and path is not None:
+            return persistent_pair_split(rows, seed=args.pair_split_seed,
+                                         selection_fraction=args.pair_selection_fraction, path=path)
+        return split_value_pairs(rows, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
     if routed and (args.calibration_policy != "mcts-zero" or args.pair_rollout_temperature != 0
                    or getattr(args, "pair_source_policy", "raw") != "mcts-zero"):
         raise ValueError("routed value requires fixed MCTS (0,1) sources and greedy raw opponents for all labels")
     collect_target = getattr(args, "collect_decisive_pairs", 0)
-    examples, source = load_ranking_sources(model, training, args.saved_pairs, history=args.visible_action_history)
+    source_paths = args.saved_pairs
+    if diagnostic and not collect_target:
+        source_paths = [snapshot_pair_dataset(path, run.directory / "datasets" / f"saved-{index}")
+                        for index, path in enumerate(source_paths)]
+    examples, source = load_ranking_sources(model, training, source_paths, history=args.visible_action_history)
     weighted_pairs = (getattr(args, "pair_collection_mode", "confirmed") == "pooled" or any(
         item.get("source_config", {}).get("label_mode") == "weighted_soft" for item in source["sources"]
     ))
@@ -48,7 +63,7 @@ def run_experiment(args, model, opponent, config, training, run):
     if collect_target:
         ranking, split = {"train": [], "selection": []}, {"pending_new_collection": True}
     else:
-        ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
+        ranking, split = split_pairs(examples)
         if not weighted_pairs:
             ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
     report = {
@@ -79,7 +94,8 @@ def run_experiment(args, model, opponent, config, training, run):
                      bias_regression=args.calibration_bias_regression, frozen_parameters="all except value_head",
                      pair_value_loss_weight=pair_value_weight, balance_pair_maps=weighted_pairs)
     if routed:
-        configuration.update(value_routing="native_agent_id", label_policy="fixed_mcts_0_1_vs_greedy_raw")
+        configuration.update(value_routing="native_agent_id", label_policy="fixed_mcts_0_1_vs_greedy_raw",
+                             diagnostic_fit=diagnostic)
         report.update(value_routing="native_agent_id", ready_for_mcts=False)
     run.write_config(**configuration)
     if collect_target:
@@ -89,7 +105,7 @@ def run_experiment(args, model, opponent, config, training, run):
         print(f"value ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
               "split=whole_map", flush=True)
     if not all(ranking.values()) and not collect_target:
-        return {**report, "reason": "insufficient_informative_ranking_pairs"}
+        return {**report, "reason": split.get("reason", "insufficient_informative_ranking_pairs")}
     calibration = {}
     attempted = set(source["reserved_map_seeds"]) | extra_reserved
     for name in ("train", "selection"):
@@ -114,6 +130,7 @@ def run_experiment(args, model, opponent, config, training, run):
             model, opponent, training, mcts, output=args.collected_pairs_dir, settings=collection,
             excluded_map_seeds=attempted | planned["arena"], pool=pool,
             **(dict(resume_rollouts_only=True) if getattr(args, "resume_rollouts_only", False) else {}),
+            **(dict(adaptive_sampling=args.adaptive_sampling) if getattr(args, "adaptive_sampling", None) is not None else {}),
         )
         report["decisive_collection"] = summary
         run.event("decisive_pair_collection", **summary)
@@ -125,14 +142,15 @@ def run_experiment(args, model, opponent, config, training, run):
             "required_pairs": args.minimum_collected_pairs,
             "missing_pairs": max(0, args.minimum_collected_pairs - collected_count),
         }
-        if collected_count < args.minimum_collected_pairs:
+        if collected_count == 0 or (collected_count < args.minimum_collected_pairs and not diagnostic):
             return {**report, "reason": "insufficient_usable_new_pairs" if weighted_pairs else "insufficient_confirmed_new_pairs"}
-        examples, new_source = load_ranking_sources(model, training, [args.collected_pairs_dir], history=args.visible_action_history)
+        pair_directory = snapshot_pair_dataset(args.collected_pairs_dir, run.directory / "datasets" / "collected") if diagnostic else args.collected_pairs_dir
+        examples, new_source = load_ranking_sources(model, training, [pair_directory], history=args.visible_action_history)
         if len(examples) != 2 * collected_count:
             raise ValueError("confirmed pair count differs from the saved label count")
         if set(new_source["reserved_map_seeds"]) & (attempted | planned["arena"]):
             raise ValueError("new ranking source overlaps old source, calibration or arena maps")
-        ranking, split = split_value_pairs(examples, seed=args.pair_split_seed, selection_fraction=args.pair_selection_fraction)
+        ranking, split = split_pairs(examples)
         if not weighted_pairs:
             ranking = {name: informative_pairs(rows) for name, rows in ranking.items()}
         report.update(previous_ranking_sources=source, ranking_sources=new_source, ranking_split=split,
@@ -145,7 +163,7 @@ def run_experiment(args, model, opponent, config, training, run):
         print(f"{'weighted' if weighted_pairs else 'confirmed'} ranking data | train_pairs={counts['train']} | selection_pairs={counts['selection']} | "
               f"target_reached={int(summary['reached_target'])}", flush=True)
         if not all(ranking.values()):
-            return {**report, "reason": "insufficient_informative_ranking_pairs"}
+            return {**report, "reason": split.get("reason", "insufficient_informative_ranking_pairs")}
     routing_lookup = None
     if routed:
         ranking_source = report["ranking_sources"]
@@ -158,8 +176,16 @@ def run_experiment(args, model, opponent, config, training, run):
                     or identity.get("opponent") != model_fingerprint(opponent)):
                 raise ValueError("routed training pairs must come from the same frozen MCTS (0,1) reference; collect a new dataset")
         counts = report["informative_pairs"]
-        if (counts["train"] < args.minimum_informative_train
-                or counts["selection"] < args.minimum_informative_selection):
+        failures = []
+        if len(examples) // 2 < getattr(args, "minimum_training_pairs", 0):
+            failures.append("minimum_pairs")
+        if counts["train"] < args.minimum_informative_train:
+            failures.append("minimum_informative_train")
+        if counts["selection"] < args.minimum_informative_selection:
+            failures.append("minimum_informative_selection")
+        report["acceptance_data_failures"] = failures
+        report["acceptance_data_sufficient"] = not failures
+        if failures and not diagnostic:
             return {**report, "reason": "insufficient_ranking_evidence", "required_informative_pairs": {
                 "train": args.minimum_informative_train, "selection": args.minimum_informative_selection}}
         routing_lookup = load_routing_inputs(model, opponent, training, ranking, ranking_source["sources"],
@@ -173,12 +199,20 @@ def run_experiment(args, model, opponent, config, training, run):
         value_updates=args.updates, value_batch_size=args.batch_size, value_learning_rate=args.learning_rate,
         value_capacity=max(args.batch_size, len(calibration["train"])), value_fit_backoffs=0,
     )
+    if diagnostic:
+        configuration.update(value_fit=asdict(settings), diagnostic_only=getattr(args, "diagnostic_only", False),
+            acceptance_minimums={"pairs": getattr(args, "minimum_training_pairs", 0),
+                "informative_train": args.minimum_informative_train,
+                "informative_selection": args.minimum_informative_selection,
+                "arena_maps": args.minimum_arena_maps})
+        run.write_config(**configuration)
 
     def record_routed_head(weight, step, metrics, state):
         if step % args.log_interval == 0 or step == args.updates:
             directory = run.directory / f"calibration-{weight!r}"
             directory.mkdir(exist_ok=True)
             torch.save({"value_head": state, "update": step, "metrics": metrics,
+                        "calibration_weight": weight,
                         "input_checkpoint_fingerprint": configuration["checkpoint_fingerprints"]["model"],
                         "value_routing": "native_agent_id", "diagnostic_only": True}, directory / "last-head.pt")
 
@@ -189,8 +223,11 @@ def run_experiment(args, model, opponent, config, training, run):
         pair_value_weight=pair_value_weight, balance_pair_maps=weighted_pairs,
         **(dict(routing_lookup=routing_lookup, update_callback=record_routed_head) if routed else {}),
     )
+    report["optimisation_updates"] = sum(item.get("applied_steps", 0) for item in report["fit"].get("variants", {}).values())
+    report["optimisation_update_scope"] = "sum_across_independent_variants"
+    report["diagnostic_fit"] = diagnostic
     if state is None:
-        return {**report, "reason": "no_calibrated_ranking_improvement"}
+        return {**report, "reason": "diagnostic_fit_complete" if diagnostic else "no_calibrated_ranking_improvement"}
     original = deepcopy(model.value_head.state_dict())
     try:
         model.value_head.load_state_dict(state)
@@ -201,6 +238,8 @@ def run_experiment(args, model, opponent, config, training, run):
     report.update(saved_checkpoint=None if routed else str(args.model_out),
                   diagnostic_checkpoint=str(candidate_path), head_updated=True, reason="arena_pending")
     run.finish(report, plots=False)
+    if routed and (report.get("acceptance_data_failures") or getattr(args, "diagnostic_only", False)):
+        return {**report, "reason": "diagnostic_fit_complete", "ready_for_mcts": False}
     benchmark = evaluate_mcts_value_heads(
         model, opponent, replace(training, seed=args.validation_seed), mcts, args.validation_games,
         fitted_heads={"calibrated": state, "original": original}, isolate_failed_pairs=True, **pool,

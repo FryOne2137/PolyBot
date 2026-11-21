@@ -1194,8 +1194,9 @@ def _routed_options(path, **overrides):
 
 
 @pytest.mark.parametrize("gameplay_passes", [False, True])
+@pytest.mark.parametrize("diagnostic_mode", [False, True])
 def test_routed_pipeline_keeps_models_frozen_reuses_cache_and_requires_paired_arena(
-        replayable_value_run, monkeypatch, gameplay_passes):
+        replayable_value_run, monkeypatch, gameplay_passes, diagnostic_mode):
     from copy import deepcopy
     from polybot.training.flat_experiments import model_fingerprint
     import train_ranked_value as trainer
@@ -1238,7 +1239,7 @@ def test_routed_pipeline_keeps_models_frozen_reuses_cache_and_requires_paired_ar
     monkeypatch.setattr(trainer, "collect_decisive_value_pairs", collect)
     monkeypatch.setattr(trainer, "fit_calibrated_heads", fit)
     monkeypatch.setattr(trainer, "evaluate_mcts_value_heads", arena)
-    args = _routed_options(path)
+    args = _routed_options(path, diagnostic_fit=diagnostic_mode)
     run = TrainingRun(path / "routed-run")
     report = module.run_training(args, model, opponent, source, run)
     assert observed == ["collect", "fit", "arena"] and calls == [5000, 6000]
@@ -1282,3 +1283,76 @@ def test_routed_pipeline_rejects_legacy_stochastic_labels_and_reused_arena_maps(
     with pytest.raises(ValueError, match="historical"):
         module.run_training(args, model, opponent, module.read_source(path / "source-run"), TrainingRun(path / "reused-arena"))
     assert calls == [5000, 6000]
+
+
+def test_diagnostic_value_fit_runs_below_data_thresholds_without_any_acceptance_bypass(replayable_value_run, monkeypatch):
+    import train_ranked_value as trainer
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _routed_trainer(monkeypatch)
+    _fresh_routed_pairs(path, path / "fresh-pairs", model, opponent)
+    args = _routed_options(path, collect_pairs=0, diagnostic_fit=True, minimum_pairs=64,
+        minimum_informative_train=24, minimum_informative_selection=12)
+    monkeypatch.setattr(trainer, "evaluate_mcts_value_heads", lambda *args, **kwargs: pytest.fail("insufficient evidence must not enter arena"))
+    run = TrainingRun(path / "diagnostic-run")
+    report = module.run_training(args, model, opponent, module.read_source(path / "source-run"), run)
+    assert report["optimisation_updates"] == 4 and report["diagnostic_fit"]
+    assert not report["ready_for_mcts"] and not report["benchmark_performed"] and not args.model_out.exists()
+    assert set(report["acceptance_data_failures"]) == {"minimum_pairs", "minimum_informative_train", "minimum_informative_selection"}
+    snapshot = torch.load(run.directory / "calibration-0.2/last-head.pt", weights_only=True)
+    assert snapshot["update"] == 4 and snapshot["diagnostic_only"]
+    assert (args.pairs_dir / "value-split.json").is_file()
+    assert report["input_weights_unchanged"] and calls == [5000, 6000]
+
+
+def test_saved_data_are_fitted_before_any_new_collection_and_survive_a_collection_interrupt(replayable_value_run, monkeypatch):
+    import train_ranked_value as trainer
+    from polybot.training.flat_experiments import model_fingerprint
+
+    model, opponent, path, _, _, calls = replayable_value_run
+    module = _routed_trainer(monkeypatch)
+    _fresh_routed_pairs(path, path / "fresh-pairs", model, opponent)
+    args = _routed_options(path, diagnostic_fit=True, minimum_pairs=64,
+        minimum_informative_train=24, minimum_informative_selection=12)
+    run = TrainingRun(path / "interrupted-run")
+    before = model_fingerprint(model), model_fingerprint(opponent)
+
+    def interrupted(*args, **kwargs):
+        initial = json.loads((run.directory / "saved-pairs-fit/summary.json").read_text())
+        assert initial["optimisation_updates"] == 4 and not initial["benchmark_performed"]
+        assert before == (model_fingerprint(model), model_fingerprint(opponent))
+        raise KeyboardInterrupt("stop after the saved-data fit")
+
+    monkeypatch.setattr(trainer, "collect_decisive_value_pairs", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        module.run_training(args, model, opponent, module.read_source(path / "source-run"), run)
+    assert json.loads((run.directory / "summary.json").read_text())["phase"] == "collection_pending"
+    assert before == (model_fingerprint(model), model_fingerprint(opponent)) and calls == [5000, 6000]
+    assert not args.model_out.exists()
+
+
+def test_even_a_fit_admitted_diagnostic_head_cannot_bypass_data_or_gameplay_gates(replayable_value_run, monkeypatch):
+    from copy import deepcopy
+    import train_ranked_value as trainer
+
+    model, opponent, path, _, _, _ = replayable_value_run
+    module = _routed_trainer(monkeypatch)
+    _fresh_routed_pairs(path, path / "fresh-pairs", model, opponent)
+    args = _routed_options(path, collect_pairs=0, diagnostic_fit=True, minimum_pairs=64,
+        minimum_informative_train=24, minimum_informative_selection=12)
+
+    def fit(candidate, *args, **kwargs):
+        state = deepcopy(candidate.value_head.state_dict())
+        state["2.bias"] += 0.1
+        return state, {"selected": {"update": 1}, "variants": {"0.2": {"applied_steps": 1}}}
+
+    monkeypatch.setattr(trainer, "fit_calibrated_heads", fit)
+    monkeypatch.setattr(trainer, "evaluate_mcts_value_heads", lambda *args, **kwargs: pytest.fail("no arena for insufficient evidence"))
+    run = TrainingRun(path / "unqualified-diagnostic")
+    report = module.run_training(args, model, opponent, module.read_source(path / "source-run"), run)
+    assert report["optimisation_updates"] == 1 and Path(report["diagnostic_checkpoint"]).is_file()
+    assert not args.model_out.exists() and not report["ready_for_mcts"] and not report["benchmark_performed"]
+    snapshot = report["ranking_sources"]["sources"][0]["directory"]
+    before = Path(snapshot, "weighted_pairs.jsonl").read_bytes()
+    (args.pairs_dir / "weighted_pairs.jsonl").write_text("")
+    assert Path(snapshot, "weighted_pairs.jsonl").read_bytes() == before

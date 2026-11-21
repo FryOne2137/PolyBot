@@ -13,10 +13,10 @@ from audit_public import audit_worktree, candidate_paths, is_private_artifact
 
 
 ROOT_FILES = {
-    ".gitignore", ".gitattributes", "LICENSE", "README.md", "CONTRIBUTING.md", "SECURITY.md",
-    "CITATION.cff", "pyproject.toml", "requirements.txt", "requirements-dev.txt",
+    ".gitignore", ".gitattributes", "LICENSE", "README.md",
+    "CITATION.cff", "pyproject.toml", "requirements.txt",
 }
-SOURCE_DIRECTORIES = {"src", "scripts", "tests", "examples", "docs", ".github"}
+SOURCE_DIRECTORIES = {"src", "scripts", "tests", "docs", ".github"}
 SOURCE_SUFFIXES = {".py", ".md", ".txt", ".toml", ".json", ".yml", ".yaml", ".svg", ".png", ".pdf", ".webp", ".cff"}
 
 

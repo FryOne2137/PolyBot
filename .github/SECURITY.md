@@ -22,5 +22,5 @@ publication candidates and can inspect reachable history, but does not establish
 the absence of secrets. Review its limitations and consider an independent
 secret-scanning tool before changing repository visibility.
 
-See the [publication checklist](docs/public_release.md) for source exports,
+See the [publication checklist](../docs/public_release.md) for source exports,
 historical artifacts and author metadata.

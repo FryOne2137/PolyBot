@@ -1,7 +1,7 @@
 # Contributing
 
-Use the [installation guide](docs/installation.md) and install
-`requirements-dev.txt`. Scripts run from the repository; tests resolve `src/`
+Use the [installation guide](../docs/installation.md) and install
+`requirements.txt`. Scripts run from the repository root; tests resolve `src/`
 through `pyproject.toml`.
 
 ```bash

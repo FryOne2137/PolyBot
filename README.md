@@ -47,6 +47,6 @@ Score is `(wins + 0.5 × draws) / games`. Self-play shows behavior; matches agai
 
 ---
 
-[MIT license](LICENSE) · [Citation](CITATION.cff) · [Contributing](CONTRIBUTING.md)
+[MIT license](LICENSE) · [Citation](CITATION.cff) · [Contributing](.github/CONTRIBUTING.md)
 
 Unofficial research project, not affiliated with The Battle of Polytopia or its developers.

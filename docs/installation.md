@@ -45,13 +45,13 @@ before installing this project's dependencies, especially for CUDA.
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 python scripts/check_environment.py --smoke
 python -m pytest
 ```
 
-For training without development tools, use `requirements.txt` instead.
-The dependency ranges are compatibility bounds, not a fully resolved lockfile.
+The single `requirements.txt` includes training, documentation and test dependencies.
+Its version ranges are compatibility bounds, not a fully resolved lockfile.
 Record the actual environment for each experiment.
 
 ## Devices

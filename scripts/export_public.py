@@ -15,13 +15,9 @@ from audit_public import audit_worktree, candidate_paths, is_private_artifact
 ROOT_FILES = {
     ".gitignore", ".gitattributes", "LICENSE", "README.md", "CONTRIBUTING.md", "SECURITY.md",
     "CITATION.cff", "pyproject.toml", "requirements.txt", "requirements-dev.txt",
-    "command.txt", "contributs.txt", "TRAINING_IMPROVEMENTS.md",
 }
 SOURCE_DIRECTORIES = {"src", "scripts", "tests", "examples", "docs", ".github"}
-SOURCE_SUFFIXES = {".py", ".md", ".txt", ".toml", ".json", ".yml", ".yaml", ".svg", ".png", ".cff"}
-ROOT_FIGURES = {"bot_architecture_diagram.svg", "polybot_architecture.png",
-                "polybot_architecture_paper.svg", "polybot_architecture_paper.png",
-                "polybot_model_architecture.svg", "polybot_model_architecture.png"}
+SOURCE_SUFFIXES = {".py", ".md", ".txt", ".toml", ".json", ".yml", ".yaml", ".svg", ".png", ".pdf", ".webp", ".cff"}
 
 
 def export(root: Path, destination: Path):
@@ -34,7 +30,7 @@ def export(root: Path, destination: Path):
         parts = PurePosixPath(name).parts
         if not path.is_file() or is_private_artifact(name):
             continue
-        allowed = name in ROOT_FILES or name in ROOT_FIGURES or (
+        allowed = name in ROOT_FILES or (
             parts[0] in SOURCE_DIRECTORIES and path.suffix.lower() in SOURCE_SUFFIXES
         )
         if not allowed:

@@ -100,6 +100,10 @@ def test_source_export_is_reproducible_and_contains_current_model_source(source_
     (root / "models").mkdir()
     (root / "models/private.pt").write_bytes(b"local model")
     (root / ".env").write_text("local settings")
+    (root / "docs/assets").mkdir(parents=True)
+    media = {"demo.webp": b"RIFF\x00\x00\x00\x00WEBP", "network.pdf": b"%PDF-1.4\n"}
+    for name, data in media.items():
+        (root / "docs/assets" / name).write_bytes(data)
     first, second = tmp_path / "first.zip", tmp_path / "second.zip"
     exporter.export(root, first)
     exporter.export(root, second)
@@ -108,6 +112,8 @@ def test_source_export_is_reproducible_and_contains_current_model_source(source_
         assert "src/polybot/models/new.py" in archive.namelist()
         assert all(not n.startswith((".git/", "models/", "runs/")) and n != ".env" for n in archive.namelist())
         assert archive.read("src/polybot/models/new.py") == b"class ImprovedModel: pass\n"
+        for name, data in media.items():
+            assert archive.read("docs/assets/" + name) == data
         manifest = json.loads(archive.read("PUBLIC_EXPORT.json"))
         assert not manifest["git_history_included"]
         for name, digest in manifest["files"].items():
@@ -146,9 +152,8 @@ def test_documentation_has_valid_local_links_and_current_cli_options():
 
 def test_diagrams_render_from_source_with_contained_labels(tmp_path):
     renderer = script("render_diagrams")
-    manifest = renderer.render(tmp_path, False)
+    manifest = renderer.render(tmp_path)
     assert len(manifest["figures"]) == 3
-    assert not manifest["compatibility_copies"]
     for spec in manifest["figures"].values():
         assert (tmp_path / spec["png"]).read_bytes().startswith(b"\x89PNG")
         assert spec["title"] in (tmp_path / spec["svg"]).read_text()

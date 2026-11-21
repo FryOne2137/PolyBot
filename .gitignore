@@ -246,3 +246,12 @@ tmp/
 *.key
 credentials*.json
 service-account*.json
+
+# Canonical figures live in docs/assets; local diagram drafts stay untracked.
+/output/
+/*.png
+/*.svg
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp

@@ -26,11 +26,10 @@ Update the relevant guide when CLI options, training modes or architecture chang
 Keep examples relative to the repo and make their initialization requirements
 explicit. Do not add personal paths or private checkpoint names.
 
-Edit `scripts/render_diagrams.py`, then regenerate the canonical figures and
-compatibility copies:
+Edit `scripts/render_diagrams.py`, then regenerate the documentation figures:
 
 ```bash
-python scripts/render_diagrams.py --output-dir docs/assets --compatibility-copies
+python scripts/render_diagrams.py --output-dir docs/assets
 python scripts/check_docs.py
 ```
 
@@ -38,6 +37,10 @@ SVG is the scalable source output; PNG is the portable README preview. Generatio
 validates text containment and all figures should also be reviewed visually.
 Renderer versions can change output bytes; cross-platform CI checks structure
 and links rather than assuming pixel-identical antialiasing.
+
+The detailed model diagram has its own generator, `scripts/render_network.py`.
+Both generators write to `docs/assets/`; keep generated images out of the
+repository root.
 
 ## Pull requests
 

@@ -9,19 +9,30 @@ Definitions and layout validation live in
 - [Belief-MCTS](belief_mcts.svg): detached hypotheses and the supervision boundary.
 
 Each figure has a PNG preview and a scalable SVG. `diagrams.json` records the
-generator fingerprint. Root-level historical figure names are compatibility
-copies; do not edit them independently.
+generator fingerprint. Figures are kept here rather than copied to the repository
+root.
 
 Regenerate from the repository root:
 
 ```bash
-python scripts/render_diagrams.py --output-dir docs/assets --compatibility-copies
+python scripts/render_diagrams.py --output-dir docs/assets
 python scripts/check_docs.py
 ```
 
 The figures use repository-owned shapes and text, not game artwork. Different
 renderer versions may change antialiasing; source structure and legibility are
 the validation criteria.
+
+## Detailed model diagram
+
+[model-network.pdf](model-network.pdf) shows the default network dimensions.
+The [PNG](model-network.png), [SVG](model-network.svg) and
+[parameter manifest](model-network.json) come from
+[render_network.py](../../scripts/render_network.py):
+
+```bash
+python scripts/render_network.py
+```
 
 ## Gameplay preview
 

@@ -2,8 +2,8 @@
 
 ![Neural model and decision paths](assets/architecture.png)
 
-A detailed [single-network diagram](../output/pdf/polybot-one-network-single-action-policy-v2-spaced.pdf)
-shows the actual default layer dimensions. Its [renderer](../output/pdf/render_single_action_network.py)
+A detailed [single-network diagram](assets/model-network.pdf)
+shows the actual default layer dimensions. Its [renderer](../scripts/render_network.py)
 and parameter manifest are versioned with the figure.
 
 ## Shared public-state encoder

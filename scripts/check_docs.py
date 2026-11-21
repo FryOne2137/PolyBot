@@ -136,9 +136,6 @@ def check(root: Path):
             data = png.read_bytes()
             if not data.startswith(b"\x89PNG\r\n\x1a\n") or struct.unpack(">II", data[16:24]) != (2700, 1500):
                 errors.append(f"invalid PNG size/format: {spec['png']}")
-        for alias, canonical in manifest["compatibility_copies"].items():
-            if not (root / alias).is_file() or (root / alias).read_bytes() != (assets / canonical).read_bytes():
-                errors.append(f"stale compatibility figure: {alias}")
     return {"documents": len(documents), "commands": commands, "errors": errors}
 
 

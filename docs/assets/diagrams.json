@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generator": "scripts/render_diagrams.py",
-  "generator_sha256": "d09270de49d80ba70b90c7682bc8a915183fd6534691c0165281af145476513d",
+  "generator_sha256": "c4349131d76bde87cdc68e3ed593bf43ecdb0aa414223e3c51a804892818e920",
   "figures": {
     "architecture": {
       "svg": "architecture.svg",
@@ -18,13 +18,5 @@
       "png": "belief_mcts.png",
       "title": "Belief-guided search and the supervision boundary"
     }
-  },
-  "compatibility_copies": {
-    "bot_architecture_diagram.svg": "architecture.svg",
-    "polybot_architecture.png": "architecture.png",
-    "polybot_model_architecture.svg": "architecture.svg",
-    "polybot_model_architecture.png": "architecture.png",
-    "polybot_architecture_paper.svg": "belief_mcts.svg",
-    "polybot_architecture_paper.png": "belief_mcts.png"
   }
 }

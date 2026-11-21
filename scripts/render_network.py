@@ -13,15 +13,15 @@ from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle, PathPatch
 from matplotlib.path import Path as MplPath
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from polybot.config import ModelConfig
 from polybot.models.policy_value_belief import PolicyValueBeliefNet
 from polybot.models.policy_value_belief import BELIEF_ACTION_FEATURES
 from polybot.data.token_schema import MAP_FEATURE_MAX
 
-OUT = Path(__file__).resolve().parent
-STEM = "polybot-one-network-single-action-policy-v2-spaced"
+OUT = ROOT / "docs/assets"
+STEM = "model-network"
 CFG = ModelConfig(policy_architecture="relational")
 MODEL = PolicyValueBeliefNet(CFG)
 COUNTS = {name: sum(p.numel() for p in module.parameters())

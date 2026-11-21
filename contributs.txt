@@ -1,2 +1,0 @@
-Research references and attribution have moved to docs/references.md.
-Contribution instructions are in CONTRIBUTING.md.

@@ -6,18 +6,9 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ALIASES = {
-    "bot_architecture_diagram.svg": "architecture.svg",
-    "polybot_architecture.png": "architecture.png",
-    "polybot_model_architecture.svg": "architecture.svg",
-    "polybot_model_architecture.png": "architecture.png",
-    "polybot_architecture_paper.svg": "belief_mcts.svg",
-    "polybot_architecture_paper.png": "belief_mcts.png",
-}
 COLORS = {
     "blue": ("#edf4ff", "#2457a7"), "green": ("#edf8f2", "#18724b"),
     "orange": ("#fff5e8", "#a85b0e"), "purple": ("#f5efff", "#7341a6"),
@@ -229,7 +220,7 @@ def validate_text(fig, ax, bounds):
             raise ValueError(f"diagram text does not fit its card: {artist.get_text()!r}")
 
 
-def render(output_dir: Path, compatibility_copies: bool):
+def render(output_dir: Path):
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
@@ -238,7 +229,7 @@ def render(output_dir: Path, compatibility_copies: bool):
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = {"schema_version": 1, "generator": "scripts/render_diagrams.py",
                 "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "figures": {}, "compatibility_copies": ALIASES if compatibility_copies else {}}
+                "figures": {}}
     for name, builder in (("architecture", architecture), ("training", training), ("belief_mcts", belief_mcts)):
         fig, ax, bounds = builder()
         validate_text(fig, ax, bounds)
@@ -251,9 +242,6 @@ def render(output_dir: Path, compatibility_copies: bool):
         fig.savefig(output_dir / (name + ".png"), metadata={"Software": "PolyBot diagram generator"})
         plt.close(fig)
         manifest["figures"][name] = {"svg": name + ".svg", "png": name + ".png", "title": title}
-    if compatibility_copies:
-        for destination, source in ALIASES.items():
-            shutil.copyfile(output_dir / source, ROOT / destination)
     (output_dir / "diagrams.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 
@@ -261,13 +249,9 @@ def render(output_dir: Path, compatibility_copies: bool):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "docs/assets")
-    parser.add_argument("--compatibility-copies", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
-    compatibility = args.compatibility_copies
-    if compatibility is None:
-        compatibility = args.output_dir.resolve() == (ROOT / "docs/assets").resolve()
-    manifest = render(args.output_dir, compatibility)
-    print(json.dumps({"figures": list(manifest["figures"]), "compatibility_copies": bool(compatibility)}))
+    manifest = render(args.output_dir)
+    print(json.dumps({"figures": list(manifest["figures"])}))
 
 
 if __name__ == "__main__":

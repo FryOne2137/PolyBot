@@ -42,6 +42,7 @@ def training_options(args, source):
         calibration_cache=args.calibration_cache, require_calibration_cache=True,
         routed_value=True, pair_source_policy="mcts-zero", pair_rollout_temperature=0.0,
         pair_collection_mode="pooled", collect_decisive_pairs=args.collect_pairs,
+        resume_rollouts_only=getattr(args, "resume_rollouts_only", False),
         minimum_collected_pairs=min(args.collect_pairs, args.minimum_pairs) if args.collect_pairs else 0,
         collected_pairs_dir=args.pairs_dir, pair_source_seed=args.pair_source_seed,
         pair_source_games=args.source_games, pair_source_batch_games=previous["num_envs"] - previous["num_envs"] % 2,
@@ -103,6 +104,8 @@ def main():
     parser.add_argument("--device", choices=("cuda", "cpu", "mps", "auto"), default="cuda")
     parser.add_argument("--collect-pairs", type=int, default=192,
                         help="Fresh pooled successor pairs; zero reuses --pairs-dir without games until the arena.")
+    parser.add_argument("--resume-rollouts-only", action="store_true",
+                        help="Label existing candidates without source games or new probes; keeps the collection identity.")
     parser.add_argument("--minimum-pairs", type=int, default=64)
     parser.add_argument("--candidate-pool", type=int, default=256)
     parser.add_argument("--source-games", type=int, default=192)
@@ -131,6 +134,8 @@ def main():
         args.calibration_weights = tuple(float(item) for item in args.calibration_weights.split(","))
         source = read_source(args.source_run)
         training_options(args, source)
+        if args.resume_rollouts_only and (args.collect_pairs == 0 or not (args.pairs_dir / "pairs.jsonl").is_file()):
+            raise ValueError("--resume-rollouts-only needs an existing collection and positive --collect-pairs")
         if (args.collect_pairs < 0 or args.minimum_pairs < 2 or args.candidate_pool < 2
                 or (args.collect_pairs > 0 and args.collect_pairs < args.minimum_pairs) or args.split_seed < 0
                 or args.source_games < 2 or args.source_games % 2 or args.probes_per_game < 1

@@ -2311,6 +2311,7 @@ def _invalid_evaluation_result(
     invalid_attempts: int,
     discarded_pairs: int,
     replacement_events: Sequence[Mapping[str, Any]],
+    failure_details: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Return a complete, explicitly invalid gate result without hanging."""
     _paired_uncertainty(totals, scores)
@@ -2326,6 +2327,8 @@ def _invalid_evaluation_result(
     totals["discarded_evaluation_pairs"] = float(discarded_pairs)
     totals["invalid_evaluation_attempts"] = float(invalid_attempts)
     totals["evaluation_replacement_events"] = list(replacement_events)
+    if failure_details is not None:
+        totals["belief_failure_details"] = dict(failure_details)
     return totals
 
 
@@ -2611,6 +2614,10 @@ def evaluate_matches_pool(
                             invalid_attempts=invalid_evaluation_attempts,
                             discarded_pairs=discarded_evaluation_pairs,
                             replacement_events=replacement_events,
+                            failure_details={"message": str(error), "env_ids": error.env_ids.tolist(),
+                                "map_seeds": [int(seeds[row]) for row in pair_rows],
+                                "moves": [int(moves[row]) for row in pair_rows],
+                                "diagnostics": list(error.diagnostics)[:16]},
                         )
 
                     already_counted = int(progress_counted[pair_rows].sum())

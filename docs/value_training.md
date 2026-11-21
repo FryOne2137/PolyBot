@@ -918,6 +918,26 @@ appropriate. An interrupted collection can resume from the same pair
 directory; `--collect-pairs 0` skips collection for an existing compatible
 dataset, but still performs the arena if a candidate is admitted.
 
+If a source MCTS batch is invalid, the collector retries each of its original
+maps once as a separate swapped-seat pair, while time remains. Seeds are not
+replaced and callbacks from the invalid batch are discarded. Persistently
+invalid pairs are skipped and remain reserved; successful isolated pairs
+retain their own prefixes and root fingerprints. `source-evaluations.jsonl`
+records validity, map seeds, the actual invalid reason and available belief
+diagnostics (including moves). Retry-game and failed-map counters are separate
+from the budget of original source games. Unexpected exceptions and a valid
+evaluation returning the wrong map schedule still stop collection.
+
+`--resume-rollouts-only` labels the candidates already saved in `--pairs-dir`
+without source games or new probes. It preserves the collection identity,
+saved particles and per-pair repeat numbering, so it can resume a scouting
+run that stopped before its first rollout. The collection time budget applies
+to this invocation. Once saved candidates are exhausted, the trainer can fit
+even below the original collection target, provided the unchanged minimum
+pair and informative-label requirements are met. This flag does not mean
+zero new games: the forced-action continuations and the eventual arena are
+still played. It does not relax any quality gate.
+
 `--model-out` is written only after the **entire planned arena** completes
 and shows evidence against both controls. Each map's two seats form one
 observation. Admission requires a positive mean score delta and a one-sided

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 
@@ -37,7 +38,8 @@ class Disagreement:
 
 
 def _sample_source_positions(model, opponent, training, mcts, games, *, num_envs, num_threads,
-                             history, samples_per_game, source_policy="raw", max_pending_leaves=4):
+                             history, samples_per_game, source_policy="raw", max_pending_leaves=4,
+                             isolate_failed_pairs=False, deadline=None):
     if source_policy not in ("raw", "mcts-zero"):
         raise ValueError("unknown value source policy")
     prefixes = defaultdict(list)
@@ -70,8 +72,46 @@ def _sample_source_positions(model, opponent, training, mcts, games, *, num_envs
         map_seeds=schedule, replace_failed_pairs=False, model_a_label=f"disagreement source {source_policy}",
         model_b_label="raw opponent", action_callback=action_callback, game_callback=game_callback,
     )
-    if not report["valid"] or report["evaluated_map_seeds"] != schedule:
-        raise RuntimeError("disagreement source did not play the fixed schedule")
+    attempt = {"map_seeds": schedule[::2], "planned_games": games, "valid": bool(report["valid"]),
+               "completed_games": int(report.get("completed_games", len(games_played))),
+               "invalid_reason": report.get("invalid_reason"),
+               "belief_failure_details": report.get("belief_failure_details")}
+    if report["valid"] and report.get("evaluated_map_seeds") != schedule:
+        raise RuntimeError(f"disagreement source changed the fixed map schedule: expected {schedule}, "
+                           f"received {report.get('evaluated_map_seeds')}")
+    if not report["valid"]:
+        if not isolate_failed_pairs:
+            raise RuntimeError(f"invalid disagreement source evaluation on seeds {schedule[::2]}: "
+                               f"{report.get('invalid_reason', 'unknown reason')}")
+        # A fixed comparison may fail because one position exhausts belief
+        # recovery. Retry each original map once in isolation, without replacing
+        # its seed. Never accept callbacks from the discarded batch.
+        attempts, failed, probes, merged_prefixes = [attempt], [], [], {}
+        terminal_games = 0
+        if games == 2:
+            failed = schedule[::2]
+        else:
+            for offset, seed in enumerate(schedule[::2]):
+                if deadline is not None and time.monotonic() >= deadline:
+                    failed.extend(schedule[::2][offset:])
+                    break
+                sub_probes, sub_prefixes, sub_report = _sample_source_positions(
+                    model, opponent, replace(training, seed=seed), mcts, 2,
+                    num_envs=min(2, num_envs), num_threads=num_threads, history=history,
+                    samples_per_game=samples_per_game, source_policy=source_policy,
+                    max_pending_leaves=max_pending_leaves, isolate_failed_pairs=True, deadline=deadline,
+                )
+                attempts.extend(sub_report["source_evaluation_attempts"])
+                failed.extend(sub_report["failed_map_seeds"])
+                terminal_games += sub_report["terminal_source_games"]
+                probes.extend(replace(position, game=position.game + 2 * offset) for position in sub_probes)
+                merged_prefixes.update({game + 2 * offset: prefix for game, prefix in sub_prefixes.items()})
+        return probes, merged_prefixes, {
+            "valid": not failed, "terminal_source_games": terminal_games,
+            "map_seeds": [seed for seed in schedule[::2] if seed not in failed],
+            "failed_map_seeds": failed, "source_evaluation_attempts": attempts,
+            "deadline_reached": deadline is not None and time.monotonic() >= deadline,
+        }
 
     sampled = []
     # Visit one probe per source game before taking another from the same game.
@@ -90,7 +130,8 @@ def _sample_source_positions(model, opponent, training, mcts, games, *, num_envs
                     selected.append(bucket.pop())
         sampled.append(selected)
     probes = [rows[index] for index in range(samples_per_game) for rows in sampled if index < len(rows)]
-    return probes, prefixes, {"terminal_source_games": len(games_played), "map_seeds": schedule[::2]}
+    return probes, prefixes, {"valid": True, "terminal_source_games": len(games_played), "map_seeds": schedule[::2],
+                             "failed_map_seeds": [], "source_evaluation_attempts": [attempt]}
 
 
 def _public_row(packet, row):

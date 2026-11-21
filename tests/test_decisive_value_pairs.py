@@ -166,3 +166,82 @@ def test_pooled_scouts_first_fills_batches_and_reuses_uncertain_legacy_rollouts(
         assert report["imported"]["paired_repeats"] == 32
     else:
         assert source_calls == [1000, 1002] and report["completed_paired_repeats"] == 8
+
+
+def test_failed_source_maps_are_journalled_and_consume_a_bounded_reserved_budget(tmp_path, monkeypatch):
+    calls = []
+    model = torch.nn.Linear(1, 1)
+
+    def source(model, opponent, training, mcts, games, **kwargs):
+        assert kwargs["isolate_failed_pairs"] and kwargs["deadline"] > 0
+        calls.append(training.seed)
+        report = {"valid": False, "failed_map_seeds": [training.seed], "source_evaluation_attempts": [{
+            "map_seeds": [training.seed], "planned_games": games, "valid": False,
+            "invalid_reason": "belief failed", "belief_failure_details": {"message": "bad particle", "moves": [58]}}]}
+        return [], {}, report
+
+    monkeypatch.setattr(collector, "_sample_source_positions", source)
+    settings = collector.DecisivePairCollection(target=2, seed=1000, source_games=4,
+        source_batch_games=2, mode="pooled", source_policy="mcts-zero")
+    report = collector.collect_decisive_value_pairs(model, model, TrainingConfig(device="cpu"), MCTSConfig(),
+        output=tmp_path, settings=settings, excluded_map_seeds={2000},
+        pool=dict(num_envs=4, num_threads=1, max_pending_leaves=1, visible_action_history=0))
+    assert calls == [1000, 1001] and report["reason"] == "source_game_budget_exhausted"
+    assert report["failed_source_batches"] == report["failed_source_maps"] == 2
+    assert report["source_evaluation_games"] == 4 and report["usable_pairs"] == 0
+    assert report["reserved_map_seeds"] == [1000, 1001]
+    journal = [json.loads(line) for line in (tmp_path / "source-evaluations.jsonl").read_text().splitlines()]
+    assert len(journal) == 2 and journal[1]["map_seeds"] == [1001]
+    assert journal[0]["belief_failure_details"]["moves"] == [58]
+
+
+def test_rollouts_only_resume_reuses_existing_candidates_without_new_source_games(tmp_path, monkeypatch):
+    import hashlib
+
+    model = torch.nn.Linear(1, 1)
+    pool = dict(num_envs=4, num_threads=1, max_pending_leaves=1, visible_action_history=0)
+    settings = collector.DecisivePairCollection(target=2, seed=1000, source_games=8, source_batch_games=4,
+        mode="pooled", candidate_pool=2, min_rollouts=2, max_rollouts=2, screening_rollouts=2)
+
+    def source(model, opponent, training, mcts, games, **kwargs):
+        return [_ReplayPosition(game, training.seed + game // 2, game % 2, 1, f"root-{game}")
+                for game in range(2)], {game: [1, 2] for game in range(2)}, {}
+
+    monkeypatch.setattr(collector, "_sample_source_positions", source)
+    monkeypatch.setattr(collector, "_compare_probes", lambda search, batch, *args, **kwargs:
+        ({"belief_zero": [{"action_id": 10} for _ in batch], "belief_soft_z": [{"action_id": 11} for _ in batch]},
+         {}, np.zeros((len(batch), 2, 1, 1, 24))))
+    monkeypatch.setattr(collector, "RoutedPoolSearch", lambda *args, **kwargs: SimpleNamespace())
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt("stop before the first rollout")
+
+    monkeypatch.setattr(collector, "_branches", interrupted)
+    options = dict(output=tmp_path, settings=settings, excluded_map_seeds={2000}, pool=pool)
+    with pytest.raises(KeyboardInterrupt):
+        collector.collect_decisive_value_pairs(model, model, TrainingConfig(device="cpu"), MCTSConfig(), **options)
+    paths = [tmp_path / "pairs.jsonl", *tmp_path.glob("*-particles.npz")]
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("resume must not create source games or new probes")
+
+    played = []
+
+    def branches(search, batch, prefixes, repeat, temperature, output, **kwargs):
+        for pair in batch:
+            played.append((pair.pair_id, kwargs["repeat_by_pair"][pair.pair_id]))
+            for arm in ("zero", "soft_z"):
+                np.savez_compressed(output / f"pair-{pair.pair_id:03d}-{arm}-successor.npz", to_play=pair.position.player)
+        return [{"score_a": 1.0, "truncated": False} for _ in range(2 * len(batch))]
+
+    monkeypatch.setattr(collector, "_sample_source_positions", unexpected)
+    monkeypatch.setattr(collector, "_compare_probes", unexpected)
+    monkeypatch.setattr(collector, "_branches", branches)
+    report = collector.collect_decisive_value_pairs(model, model, TrainingConfig(device="cpu"), MCTSConfig(),
+                                                    **options, resume_rollouts_only=True)
+    assert report["resume_rollouts_only"] and report["usable_pairs"] == report["imported"]["candidates"] == 2
+    assert report["reason"] == "saved_candidates_complete"
+    assert report["completed_paired_repeats"] == 4 and len(played) == len(set(played)) == 4
+    assert report["reserved_map_seeds"] == [1000, 1001] and report["source_games"] == 4
+    assert before == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}

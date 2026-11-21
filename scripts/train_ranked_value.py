@@ -112,6 +112,7 @@ def run_experiment(args, model, opponent, config, training, run):
         summary = collect_decisive_value_pairs(
             model, opponent, training, mcts, output=args.collected_pairs_dir, settings=collection,
             excluded_map_seeds=attempted | planned["arena"], pool=pool,
+            **(dict(resume_rollouts_only=True) if getattr(args, "resume_rollouts_only", False) else {}),
         )
         report["decisive_collection"] = summary
         run.event("decisive_pair_collection", **summary)

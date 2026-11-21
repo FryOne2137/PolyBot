@@ -20,6 +20,7 @@ from .belief_recovery import BeliefRecoveryRequired
 from .flat_experiments import model_fingerprint
 from .flat_value import paired_outcome_weights
 from .routed_self_play_pool import RoutedPoolSearch, _evaluation_belief_retries
+from .run_artifacts import _jsonable
 
 
 @dataclass(frozen=True)
@@ -181,7 +182,7 @@ def _append(path, records):
 
 
 def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, settings,
-                                 excluded_map_seeds, pool):
+                                 excluded_map_seeds, pool, resume_rollouts_only=False):
     """Collect up to target confirmed pairs, saving every probe and paired repeat."""
     started = time.monotonic()
     deadline = started + settings.hours * 3600
@@ -240,6 +241,8 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             row["pair_id"], row["map_seed"], row["player"], row["move"] - 1, row["root_fingerprint"],
         ), tuple(row["choices"][arm]["action_id"] for arm in ARMS)) for row in metadata
     }
+    if resume_rollouts_only and (settings.mode != "pooled" or not positions):
+        raise ValueError("rollouts-only resume needs existing pooled candidate pairs")
     prefixes = {row["pair_id"]: row["action_prefix"] for row in metadata}
     known = {(row["map_seed"], row["player"], row["move"] - 1) for row in metadata}
     candidates_by_map = Counter(row["map_seed"] for row in metadata)
@@ -293,6 +296,10 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             "labels_file": labels_file, "imported": imported,
             "reason": reason, "elapsed_hours_this_invocation": (time.monotonic() - started) / 3600,
             "source_games": state["source_games"], "candidates": len(positions),
+            "resume_rollouts_only": resume_rollouts_only,
+            "failed_source_batches": state.get("failed_source_batches", 0),
+            "failed_source_maps": state.get("failed_source_maps", 0),
+            "source_evaluation_games": state.get("source_evaluation_games", 0),
             "compared_probes": state["compared_probes"], "failed_probes": state["failed_probes"],
             "attempted_paired_repeats": sum(len(rows) for rows in results.values()),
             "completed_paired_repeats": sum(row["completed_paired_repeats"] for row in decisions.values()),
@@ -323,7 +330,8 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             break
         scouting = False
         if settings.mode == "pooled":
-            available_source = bool(state["pending_probes"]) or state["source_games"] < settings.source_games
+            available_source = not resume_rollouts_only and (
+                bool(state["pending_probes"]) or state["source_games"] < settings.source_games)
             scouting = (not state.get("pooled_scout_complete", False)
                         and len(positions) < settings.candidate_pool and time.monotonic() < scout_deadline
                         and available_source)
@@ -338,7 +346,8 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             active = [] if scouting else batch
             state["pooled_phase"] = "scouting" if scouting else phase
             if not scouting and not active:
-                reason = "refinement_complete" if summary["reached_target"] else "source_game_budget_exhausted"
+                reason = ("saved_candidates_complete" if resume_rollouts_only else
+                          "refinement_complete" if summary["reached_target"] else "source_game_budget_exhausted")
                 break
         else:
             active = [positions[key] for key, row in decisions.items() if row["status"] == "pending"]
@@ -444,17 +453,34 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
         state["next_seed"] = cursor + games // 2
         state["source_games"] += games
         checkpoint("source_games")
-        probes, source_prefixes, _ = _sample_source_positions(
+        probes, source_prefixes, source_report = _sample_source_positions(
             model, opponent, replace(training, seed=cursor), mcts, games,
             num_envs=pool["num_envs"], num_threads=pool["num_threads"],
             history=pool["visible_action_history"], samples_per_game=settings.probes_per_game,
-            **(dict(source_policy=settings.source_policy, max_pending_leaves=pool["max_pending_leaves"])
+            **(dict(source_policy=settings.source_policy, max_pending_leaves=pool["max_pending_leaves"],
+                    isolate_failed_pairs=True, deadline=deadline)
                if settings.source_policy != "raw" else {}),
         )
+        attempts = source_report.get("source_evaluation_attempts", [])
+        if attempts:
+            _append(output / "source-evaluations.jsonl", _jsonable(attempts))
+            state["source_evaluation_games"] = state.get("source_evaluation_games", 0) + sum(
+                int(row["planned_games"]) for row in attempts)
+            state["failed_source_batches"] = state.get("failed_source_batches", 0) + sum(not row["valid"] for row in attempts)
+        failed_maps = source_report.get("failed_map_seeds", [])
+        state["failed_source_maps"] = state.get("failed_source_maps", 0) + len(failed_maps)
+        for attempt in attempts:
+            if not attempt["valid"]:
+                details = attempt.get("belief_failure_details") or {}
+                print(f"value source invalid | seeds={attempt['map_seeds']} | "
+                      f"reason={attempt.get('invalid_reason')} | {details.get('message', '')}", flush=True)
+        if failed_maps:
+            print(f"value source skipped | seeds={failed_maps} | saved_candidates={len(positions)}", flush=True)
         state["pending_probes"] = [{
             "position": asdict(position), "prefix": source_prefixes[position.game],
             "phase": PHASES[3 * position.prefix_length // len(source_prefixes[position.game])],
         } for position in probes]
+        checkpoint("source_batch_complete")
     _, summary = checkpoint(reason)
     print(f"value collection complete | mode={settings.mode} | usable={summary['usable_pairs']}/{settings.target} | "
           f"confirmed={summary['confirmed_pairs']} | maps={summary['usable_maps']} | reason={reason}", flush=True)

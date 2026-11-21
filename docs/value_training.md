@@ -938,6 +938,14 @@ pair and informative-label requirements are met. This flag does not mean
 zero new games: the forced-action continuations and the eventual arena are
 still played. It does not relax any quality gate.
 
+Collection progress reports `informative` from the labels already obtained,
+even before the minimum fitting budget is reached. `collected_pair_counts`
+records usable labels, nonzero observed differences, covered maps and the
+remaining minimum budget. Train/selection `informative_pairs` is `null`
+until the whole-map split is actually computed; an early collection exit
+must not present unmeasured split counts as zero. `confirmed=0` is the
+separate sign-test result, not a count of all usable or nonzero-mean pairs.
+
 `--model-out` is written only after the **entire planned arena** completes
 and shows evidence against both controls. Each map's two seats form one
 observation. Admission requires a positive mean score delta and a one-sided

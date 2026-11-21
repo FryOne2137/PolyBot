@@ -385,7 +385,7 @@ def collect_decisive_value_pairs(model, opponent, training, mcts, *, output, set
             _, progress = checkpoint("collecting")
             prefix = (f"pooled value pairs | usable={progress['usable_pairs']}/{settings.target} | confirmed={progress['confirmed_pairs']}"
                       if settings.mode == "pooled" else f"decisive value pairs | confirmed={progress['confirmed_pairs']}/{settings.target}")
-            print(f"{prefix} | phase={state.get('pooled_phase', 'confirmation')} | "
+            print(f"{prefix} | informative={progress['usable_informative_pairs']} | phase={state.get('pooled_phase', 'confirmation')} | "
                   f"candidates={len(positions)} | paired_rollouts={progress['attempted_paired_repeats']} | "
                   f"mean_pair_batch={progress['mean_pairs_per_rollout_batch']:.2f} | "
                   f"elapsed={progress['elapsed_hours_this_invocation']:.2f}h", flush=True)

@@ -478,7 +478,10 @@ def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(
         assert {2137, 2138, 2139, 2140, 5000, 5001, 5002, 6000, 6001, 6002, 7000, 7001} <= kwargs["excluded_map_seeds"]
         calls.append("collect")
         return {"confirmed_pairs": 0 if mode == "pooled" else 4 if enough_new_pairs else 0,
-                "usable_pairs": 4 if enough_new_pairs else 0, "reached_target": enough_new_pairs}
+                "usable_pairs": 4 if enough_new_pairs else 2, "reached_target": enough_new_pairs,
+                "usable_informative_pairs": 3 if enough_new_pairs else 1,
+                "usable_maps": 4 if enough_new_pairs else 2,
+                "confirmed_maps": 4 if enough_new_pairs else 0}
 
     def fit(candidate, ranking, calibration, *args, **kwargs):
         calls.append("fit")
@@ -511,6 +514,13 @@ def test_new_pair_pipeline_loads_cache_first_and_trains_only_confirmed_new_maps(
     assert not report["benchmark_performed"]
     assert report["reason"] == ("no_calibrated_ranking_improvement" if enough_new_pairs else
                                 "insufficient_usable_new_pairs" if mode == "pooled" else "insufficient_confirmed_new_pairs")
+    if not enough_new_pairs:
+        assert report["informative_pairs"] is None
+        assert report["collected_pair_counts"]["informative_pairs"] == (1 if mode == "pooled" else 0)
+        assert report["collected_pair_counts"]["missing_pairs"] == (2 if mode == "pooled" else 4)
+    else:
+        assert report["informative_pairs"] is not None
+        assert report["collected_pair_counts"]["informative_pairs"] == (3 if mode == "pooled" else 4)
 
 
 @pytest.fixture

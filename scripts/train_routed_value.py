@@ -162,7 +162,7 @@ def main():
     run = training_run_from_args(args, "value")
     report = run_training(args, model, opponent, source, run)
     report["run_dir"] = str(run.finish(report, plots=False))
-    print_summary({key: report.get(key) for key in ("run_dir", "reason", "informative_pairs", "routing_counts",
+    print_summary({key: report.get(key) for key in ("run_dir", "reason", "collected_pair_counts", "informative_pairs", "routing_counts",
         "ready_for_mcts", "saved_checkpoint", "diagnostic_checkpoint", "input_weights_unchanged",
         "gameplay_admission", "score_delta_vs_original", "score_delta_vs_zero")})
 

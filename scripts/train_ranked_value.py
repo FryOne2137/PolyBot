@@ -54,7 +54,8 @@ def run_experiment(args, model, opponent, config, training, run):
     report = {
         "ranking_sources": source, "ranking_split": split, "saved_checkpoint": None, "head_updated": False,
         "benchmark_performed": False, "beats_zero": None, "calibration": {},
-        "informative_pairs": {name: len(informative_pairs(rows)) // 2 for name, rows in ranking.items()},
+        "informative_pairs": None if collect_target else {
+            name: len(informative_pairs(rows)) // 2 for name, rows in ranking.items()},
     }
     schedules = {
         "train": (training.seed, args.calibration_games),
@@ -117,6 +118,13 @@ def run_experiment(args, model, opponent, config, training, run):
         report["decisive_collection"] = summary
         run.event("decisive_pair_collection", **summary)
         collected_count = summary.get("usable_pairs", summary["confirmed_pairs"]) if weighted_pairs else summary["confirmed_pairs"]
+        report["collected_pair_counts"] = {
+            "usable_pairs": collected_count,
+            "informative_pairs": summary.get("usable_informative_pairs") if weighted_pairs else collected_count,
+            "maps": summary.get("usable_maps" if weighted_pairs else "confirmed_maps"),
+            "required_pairs": args.minimum_collected_pairs,
+            "missing_pairs": max(0, args.minimum_collected_pairs - collected_count),
+        }
         if collected_count < args.minimum_collected_pairs:
             return {**report, "reason": "insufficient_usable_new_pairs" if weighted_pairs else "insufficient_confirmed_new_pairs"}
         examples, new_source = load_ranking_sources(model, training, [args.collected_pairs_dir], history=args.visible_action_history)
